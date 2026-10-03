@@ -414,6 +414,7 @@ def get_state() -> dict[str, Any]:
         try:
             endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
             if endpoint:
+                server_meta = endpoint.get("server_metadata") or {}
                 state["active_pool_endpoint"] = {
                     "endpoint_id": endpoint.get("endpoint_id", ""),
                     "protocol": endpoint.get("protocol", ""),
@@ -422,6 +423,11 @@ def get_state() -> dict[str, Any]:
                     "hostname": endpoint.get("hostname", ""),
                     "current_ip": endpoint.get("current_ip", ""),
                     "country": endpoint.get("country", ""),
+                    "location": server_meta.get("location") or endpoint.get("country", ""),
+                    "owner": server_meta.get("owner") or server_meta.get("as_name") or "",
+                    "ip_type": server_meta.get("ip_type") or "",
+                    "quality": server_meta.get("quality") or "",
+                    "speed": endpoint.get("latest_speed", 0),
                     "latency_ms": endpoint.get("latency_ewma", 0),
                     "jitter_ms": endpoint.get("jitter_ewma", 0),
                     "selection_score": endpoint.get("selection_score", 0),
@@ -880,12 +886,12 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "ping": int(endpoint.get("latest_ping") or 0),
         "speed": int(endpoint.get("latest_speed") or 0),
         "sessions": int(endpoint.get("latest_sessions") or 0),
-        "owner": str(server_metadata.get("owner") or server_metadata.get("as_name") or ""),
+        "owner": str(server_metadata.get("owner") or server_metadata.get("isp") or server_metadata.get("as_name") or ""),
         "asn": str(server_metadata.get("asn") or ""),
         "as_name": str(server_metadata.get("as_name") or ""),
-        "location": endpoint.get("country") or "",
+        "location": str(server_metadata.get("location") or endpoint.get("country") or ""),
         "ip_type": str(server_metadata.get("ip_type") or ""),
-        "quality": "",
+        "quality": str(server_metadata.get("quality") or ""),
 
         "latency_ms": int(endpoint.get("latency_ewma") or 0),
         "config_file": str(endpoint.get("config_ref") or ""),
@@ -1402,6 +1408,51 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         protocol_discovery_lock.release()
 
 
+def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
+    """Fill ISP, ASN, location and IP-type for multi-protocol server records from the shared IP cache/query."""
+    endpoints = node_pool.list_endpoints(limit=1000)
+    seen: set[str] = set()
+    probe_nodes: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        protocol = str(endpoint.get("protocol") or "").lower()
+        if protocol == "openvpn":
+            continue
+        ip = str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
+        if not ip or ip in seen:
+            continue
+        meta = endpoint.get("server_metadata") or {}
+        if all(str(meta.get(k) or "").strip() for k in ("owner", "as_name", "ip_type", "location")):
+            continue
+        seen.add(ip)
+        probe_nodes.append({"ip": ip, "remote_host": ip})
+        if len(probe_nodes) >= max(1, int(max_ips)):
+            break
+
+    if not probe_nodes:
+        return 0
+    try:
+        vpn_utils.enrich_ip_info(probe_nodes)
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"多协议 IP/ISP 信息补全失败: {exc}")
+        return 0
+    updates: dict[str, dict[str, Any]] = {}
+    for node in probe_nodes:
+        ip = str(node.get("ip") or "").strip()
+        if not ip:
+            continue
+        updates[ip] = {
+            "owner": node.get("owner") or "",
+            "asn": node.get("asn") or "",
+            "as_name": node.get("as_name") or "",
+            "location": node.get("location") or "",
+            "ip_type": node.get("ip_type") or "",
+            "quality": node.get("quality") or "",
+        }
+    updated = node_pool.update_server_metadata_batch(updates)
+    if updated:
+        log_to_json("INFO", "Main", f"多协议 IP/ISP 信息补全 {updated} 台服务器")
+    return updated
+
 def protocol_catalog_loop() -> None:
     # Initial catalog refresh shortly after startup, then refresh periodically.
     time.sleep(10)
@@ -1409,6 +1460,7 @@ def protocol_catalog_loop() -> None:
         try:
             if not ISOLATED_INSTANCE:
                 refresh_multi_protocol_catalog(force=True)
+                refresh_protocol_ip_metadata(max_ips=100)
         except Exception as exc:
             log_to_json("WARNING", "Main", f"多协议目录后台刷新异常: {exc}")
         time.sleep(600)
@@ -1583,6 +1635,220 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     return available_nodes + untested_nodes + unavailable_nodes
 
+_COUNTRY_REGION_GROUPS = {
+    "east_asia": {"中国", "日本", "韩国", "台湾", "香港", "澳门", "蒙古"},
+    "southeast_asia": {"新加坡", "马来西亚", "印度尼西亚", "泰国", "越南", "菲律宾", "柬埔寨"},
+    "south_asia": {"印度"},
+    "north_america": {"美国", "加拿大", "墨西哥"},
+    "south_america": {"巴西", "阿根廷", "智利", "哥伦比亚"},
+    "europe": {"英国", "爱尔兰", "法国", "德国", "荷兰", "比利时", "卢森堡", "瑞士", "奥地利", "意大利", "西班牙", "葡萄牙", "波兰", "捷克", "匈牙利", "罗马尼亚", "希腊", "瑞典", "挪威", "丹麦", "芬兰", "冰岛", "乌克兰", "土耳其", "格鲁吉亚"},
+    "middle_east": {"以色列", "阿联酋", "沙特阿拉伯", "伊朗", "伊拉克"},
+    "central_asia": {"哈萨克斯坦"},
+    "oceania": {"澳大利亚", "新西兰"},
+    "africa": {"南非", "埃及"},
+}
+
+def country_region(country: Any) -> str:
+    normalized = normalized_country_name(country)
+    for region, countries in _COUNTRY_REGION_GROUPS.items():
+        if normalized in countries:
+            return region
+    return ""
+
+def country_preference_rank(target_country: Any, candidate_country: Any) -> int:
+    target = normalized_country_name(target_country)
+    candidate = normalized_country_name(candidate_country)
+    if not target:
+        return 0
+    if candidate == target:
+        return 0
+    target_region = country_region(target)
+    candidate_region = country_region(candidate)
+    if target_region and target_region == candidate_region:
+        return 1
+    return 2
+
+def ip_type_preference_rank(preferred: str, actual: Any) -> int:
+    preferred = str(preferred or "all").lower()
+    actual = str(actual or "").lower()
+    if preferred == "all":
+        return 0
+    if preferred == "residential":
+        if actual == "residential":
+            return 0
+        if actual == "mobile":
+            return 1
+        return 2
+    if preferred == "hosting":
+        return 0 if actual == "hosting" else 1
+    return 0
+
+def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
+    meta = endpoint.get("server_metadata") or {}
+    if meta.get("ip_type"):
+        return str(meta.get("ip_type") or "")
+    return str((endpoint.get("metadata") or {}).get("ip_type") or "")
+
+def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    if routing_mode == "fixed_ip":
+        return 99
+    if routing_mode == "favorites":
+        return 99
+    country_rank = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
+    ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
+    return country_rank * 2 + ip_rank
+
+def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple[int, int, float, int, float, int, float]:
+    status = str(endpoint.get("status") or "").upper()
+    status_rank = 0 if status == "HOT" else 1
+    latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or endpoint.get("latest_ping") or 999999)
+    if latency <= 0:
+        latency = 999999
+    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    jitter = float(endpoint.get("jitter_ewma") or 999999)
+    success_streak = int(endpoint.get("success_streak") or 0)
+    selection_score = float(endpoint.get("selection_score") or 0)
+    return (
+        routing_preference_tier(endpoint, ui_cfg),
+        status_rank,
+        latency,
+        -speed,
+        jitter,
+        -success_streak,
+        -selection_score,
+    )
+
+def openvpn_node_to_routing_endpoint(node: dict[str, Any]) -> dict[str, Any]:
+    key = node_pool.server_key(node)
+    eid = openvpn_pool_endpoint_id(node)
+    return {
+        "endpoint_id": eid,
+        "server_key": key,
+        "protocol": "openvpn",
+        "transport": str(node.get("proto") or ""),
+        "port": parse_int(node.get("remote_port")),
+        "status": "HOT" if node.get("probe_status") == "available" else "AVAILABLE",
+        "first_seen": float(node.get("fetched_at") or 0),
+        "last_seen": float(node.get("fetched_at") or 0),
+        "last_success": float(node.get("probed_at") or 0),
+        "success_streak": 1 if node.get("probe_status") == "available" else 0,
+        "fail_streak": 0,
+        "latency_ewma": float(node.get("latency_ms") or node.get("ping") or 0),
+        "jitter_ewma": 0,
+        "latest_ping": int(node.get("ping") or 0),
+        "latest_speed": int(node.get("speed") or 0),
+        "latest_sessions": int(node.get("sessions") or 0),
+        "latest_server_score": int(node.get("score") or 0),
+        "country": node.get("country") or "",
+        "hostname": node.get("host_name") or node.get("remote_host") or node.get("ip") or "",
+        "current_ip": node.get("ip") or node.get("remote_host") or "",
+        "metadata": {
+            "node_id": node.get("id") or "",
+            "trusted_observation": True,
+        },
+        "server_metadata": {
+            "owner": node.get("owner") or "",
+            "asn": node.get("asn") or "",
+            "as_name": node.get("as_name") or "",
+            "location": node.get("location") or "",
+            "ip_type": node.get("ip_type") or "",
+            "quality": node.get("quality") or "",
+        },
+    }
+
+def routing_node_service_key(node: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple[int, int, float, int, float, int, float]:
+    return routing_service_key(openvpn_node_to_routing_endpoint(node), ui_cfg)
+
+def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    endpoints: dict[str, dict[str, Any]] = {}
+    try:
+        for endpoint in node_pool.ranked_hot_pool(limit=100, per_server_limit=2):
+            eid = str(endpoint.get("endpoint_id") or "")
+            if eid:
+                endpoints[eid] = endpoint
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"Hot Pool 读取失败: {exc}")
+    for node in read_nodes():
+        if node.get("probe_status") != "available" or node.get("active"):
+            continue
+        endpoint = openvpn_node_to_routing_endpoint(node)
+        if endpoint.get("endpoint_id") and endpoint.get("endpoint_id") not in endpoints:
+            endpoints[endpoint["endpoint_id"]] = endpoint
+    candidates = []
+    for endpoint in endpoints.values():
+        eid = str(endpoint.get("endpoint_id") or "")
+        if not eid or eid == exclude_endpoint_id:
+            continue
+        if endpoint.get("status") not in ("HOT", "AVAILABLE"):
+            continue
+        if str(endpoint.get("protocol") or "").lower() != "openvpn" and not bool((endpoint.get("metadata") or {}).get("trusted_observation")):
+            continue
+        endpoint["routing_tier"] = routing_preference_tier(endpoint, ui_cfg)
+        endpoint["routing_country_rank"] = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
+        endpoint["routing_ip_rank"] = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
+        candidates.append(endpoint)
+    candidates.sort(key=lambda endpoint: routing_service_key(endpoint, ui_cfg))
+    return candidates[:max(1, min(int(limit), 100))]
+
+def current_active_routing_endpoint() -> dict[str, Any] | None:
+    if active_pool_endpoint_id:
+        return node_pool.get_endpoint(active_pool_endpoint_id)
+    if active_openvpn_node_id:
+        node = next((n for n in read_nodes() if n.get("id") == active_openvpn_node_id), None)
+        return openvpn_node_to_routing_endpoint(node) if node else None
+    return None
+
+def maybe_recover_preferred_route(force: bool = False) -> bool:
+    ui_cfg = load_ui_config()
+    if ui_cfg.get("routing_mode") in ("fixed_ip", "favorites") or not bool(ui_cfg.get("connection_enabled", True)):
+        return False
+    has_preference = bool(ui_cfg.get("force_country")) or str(ui_cfg.get("routing_ip_type", "all")) != "all"
+    if not has_preference:
+        return False
+    state = get_state()
+    if bool(state.get("priority_running")):
+        return False
+    now = time.time()
+    last_check = float(state.get("last_preference_recovery_at") or 0)
+    if not force and now - last_check < 60:
+        return False
+    set_state(last_preference_recovery_at=now)
+    current = current_active_routing_endpoint()
+    if not current:
+        return False
+    if routing_preference_tier(current, ui_cfg) == 0:
+        return False
+    preferred = [ep for ep in unified_hot_pool_candidates(ui_cfg, limit=30) if int(ep.get("routing_tier") or 99) == 0 and str(ep.get("status") or "").upper() == "HOT"]
+    if not preferred:
+        return False
+    target = preferred[0]
+    try:
+        ok = try_unified_failover(exclude_endpoint_id=str(current.get("endpoint_id") or ""), attempts=3, preferred_only=True)
+        if ok:
+            set_state(preference_recovery_at=time.time(), preference_recovery_endpoint=str(target.get("endpoint_id") or ""), last_check_message="已恢复用户设定的国家/IP类型偏好")
+        return ok
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"偏好路由恢复失败: {exc}")
+        return False
+
+def apply_user_routing_preferences() -> None:
+    try:
+        ui_cfg = load_ui_config()
+        if ui_cfg.get("routing_mode") in ("fixed_ip", "favorites") or not bool(ui_cfg.get("connection_enabled", True)):
+            return
+        target_country = str(ui_cfg.get("force_country") or "").strip()
+        if target_country:
+            priority_result = start_country_priority(target_country)
+            if priority_result.get("running"):
+                return
+        if active_tunnel_running():
+            maybe_recover_preferred_route(force=True)
+        else:
+            auto_switch_node()
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"应用用户路由偏好失败: {exc}")
+
 def apply_routing_filters(
     nodes: list[dict[str, Any]],
     ui_cfg: dict[str, Any],
@@ -1590,31 +1856,10 @@ def apply_routing_filters(
 ) -> list[dict[str, Any]]:
     candidates = list(nodes)
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    target_country = ui_cfg.get("force_country", "")
-
-    if routing_mode == "fixed_region" and target_country:
-        candidates = [
-            n for n in candidates
-            if country_matches(n.get("country"), target_country)
-        ]
-    elif routing_mode == "favorites":
+    if routing_mode == "favorites":
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         candidates = [n for n in candidates if n.get("id") in fav_ids]
-
-    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    if routing_ip_type == "residential":
-        candidates = [
-            n for n in candidates
-            if n.get("ip_type") in ("residential", "mobile")
-            or (include_unknown_ip_type and not n.get("ip_type"))
-        ]
-    elif routing_ip_type == "hosting":
-        candidates = [
-            n for n in candidates
-            if n.get("ip_type") == "hosting"
-            or (include_unknown_ip_type and not n.get("ip_type"))
-        ]
-
+    # fixed_region is now a soft preference. fixed_ip is handled by callers.
     return candidates
 
 def normalized_country_name(country: Any) -> str:
@@ -1646,21 +1891,12 @@ def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any
     routing_mode = ui_cfg.get("routing_mode", "auto")
     node_id = str(node.get("id") or "")
 
-    if routing_mode == "fixed_region":
-        target_country = ui_cfg.get("force_country", "")
-        if target_country and not country_matches(node.get("country"), target_country):
-            raise RuntimeError(f"当前已锁定国家【{target_country}】，不能连接其他国家节点")
-    elif routing_mode == "favorites":
+    if routing_mode == "favorites":
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         if node_id not in fav_ids:
             raise RuntimeError("当前处于仅用收藏模式，不能连接未收藏节点")
-
-    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    node_ip_type = node.get("ip_type")
-    if routing_ip_type == "residential" and node_ip_type not in ("residential", "mobile"):
-        raise RuntimeError("当前已锁定住宅 IP 出站，不能连接非住宅节点")
-    if routing_ip_type == "hosting" and node_ip_type != "hosting":
-        raise RuntimeError("当前已锁定机房 IP 出站，不能连接非机房节点")
+    # fixed_region/force_country and routing_ip_type are soft preferences.
+    # Automatic routing may temporarily fall back for availability, then recover.
 
 def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str = "路由规则已更新") -> str | None:
     active_id = active_openvpn_node_id
@@ -2106,70 +2342,59 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
-        print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
+        print("[自动切换] 连续切换失败已达 3 次，等待后台检测周期继续恢复。", flush=True)
         return
-        
     ui_cfg = load_ui_config()
-    connection_enabled = ui_cfg.get("connection_enabled", True)
-    if not connection_enabled:
+    if not bool(ui_cfg.get("connection_enabled", True)):
         print("[自动切换] 连接已禁用，不进行自动切换。", flush=True)
         return
-
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    target_country = ui_cfg.get("force_country", "")
-
-    if routing_mode == "fixed_ip":
-        print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
+    target_country = str(ui_cfg.get("force_country") or "").strip()
+    if routing_mode in ("fixed_ip", "favorites"):
         return
 
-    # Find the next best available node
-    with lock:
-        nodes = read_nodes()
-        candidates = [
-            n for n in nodes 
-            if n.get("probe_status") == "available" 
-            and not n.get("active")
-        ]
-        candidates = apply_routing_filters(candidates, ui_cfg)
-            
-        candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
-        
+    current = current_active_routing_endpoint()
+    exclude_endpoint_id = str(current.get("endpoint_id") or "") if current else ""
+    candidates = unified_hot_pool_candidates(ui_cfg, exclude_endpoint_id=exclude_endpoint_id, limit=30)
     if candidates:
-        next_node = candidates[0]
-        msg = f"当前连接已失效或代理连通性检测失败，正在自动切换至最佳备用节点: {next_node['id']}"
+        preferred = candidates[0]
+        msg = (
+            f"当前连接失效，正在按偏好层级选择备用节点: "
+            f"tier={preferred.get('routing_tier')} {preferred.get('protocol')} {preferred.get('endpoint_id')}"
+        )
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
-        try:
-            connect_node(next_node["id"])
-        except Exception as e:
-            err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
-            print(f"[自动切换] {err_msg}", flush=True)
-            log_to_json("WARNING", "VPN", err_msg)
-            auto_switch_node(attempt + 1)
-    else:
-        msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
-        if routing_mode == "fixed_region" and target_country:
-            msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
-        print(f"[自动切换] {msg}", flush=True)
-        log_to_json("WARNING", "VPN", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_nodes()
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(active_openvpn_node_id="", last_check_message=msg)
-        
-        def bg_fetch_and_switch():
+        for endpoint in candidates[:max(1, min(5, len(candidates)))]:
             try:
-                # 避免所有节点不可用时连续拉取/测试导致 CPU 与 tun 网卡风暴。
-                time.sleep(60)
-                maintain_valid_nodes(force=False)
-                auto_switch_node(attempt + 1)
-            except Exception as e:
-                print(f"[自动切换后台补齐] 获取并测试节点失败: {e}", flush=True)
-        
-        threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
+                connect_ranked_endpoint(endpoint)
+                return
+            except Exception as exc:
+                log_to_json("WARNING", "VPN", f"备用节点 {endpoint.get('endpoint_id')} 切换失败: {exc}")
+        auto_switch_node(attempt + 1)
+        return
+
+    msg = "没有经过验证的备用节点，保留服务状态并进入后台补齐/重测。"
+    print(f"[自动切换] {msg}", flush=True)
+    log_to_json("WARNING", "VPN", msg)
+    stop_all_tunnels()
+    with lock:
+        nodes = read_nodes()
+        for item in nodes:
+            item["active"] = False
+        write_json(NODES_FILE, nodes)
+    set_state(active_openvpn_node_id="", active_pool_endpoint_id="", active_tunnel_protocol="", last_check_message=msg, proxy_ok=False, proxy_ip="-", proxy_latency_ms=0)
+
+    def bg_fetch_and_switch():
+        try:
+            if target_country:
+                start_country_priority(target_country)
+            time.sleep(5)
+            maintain_valid_nodes(force=False)
+            time.sleep(2)
+            auto_switch_node(attempt + 1)
+        except Exception as exc:
+            print(f"[自动切换后台补齐] 获取并测试节点失败: {exc}", flush=True)
+    threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
 def connect_node(node_id: str, enable_connection: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -2552,26 +2777,11 @@ def connect_ranked_endpoint(endpoint: dict[str, Any]) -> str:
 
 def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    if routing_mode in ("fixed_ip", "favorites"):
-        return False
-    if routing_mode == "fixed_region":
-        target_country = ui_cfg.get("force_country", "")
-        if target_country and not country_matches(endpoint.get("country"), target_country):
-            return False
+    # Fixed IP/favorites are hard constraints; country/IP type are soft preferences.
+    return routing_mode not in ("fixed_ip", "favorites")
 
-    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    if routing_ip_type != "all":
-        server_meta = endpoint.get("server_metadata") or {}
-        ip_type = str(server_meta.get("ip_type") or "")
-        if routing_ip_type == "residential" and ip_type not in ("residential", "mobile"):
-            return False
-        if routing_ip_type == "hosting" and ip_type != "hosting":
-            return False
-    return True
-
-def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bool:
+def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4, preferred_only: bool = False) -> bool:
     if not failover_lock.acquire(blocking=False):
-        # Another watcher is already performing the replacement.
         return True
     started = time.time()
     ui_cfg = load_ui_config()
@@ -2587,18 +2797,19 @@ def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bo
         from_protocol = "openvpn"
         from_endpoint = str(active_openvpn_node_id or "")
 
-    ui_cfg = load_ui_config()
     hot_pool = [
-        ep for ep in node_pool.ranked_hot_pool(limit=12, per_server_limit=2)
-        if ep.get("endpoint_id") != exclude_endpoint_id
-        and endpoint_allowed_by_pool_routing(ep, ui_cfg)
+        ep for ep in unified_hot_pool_candidates(ui_cfg, exclude_endpoint_id=exclude_endpoint_id, limit=100)
+        if endpoint_allowed_by_pool_routing(ep, ui_cfg)
     ]
+    if preferred_only:
+        hot_pool = [ep for ep in hot_pool if int(ep.get("routing_tier") or 99) == 0]
     set_state(
         failover_in_progress=True,
         failover_started_at=started,
         failover_from_protocol=from_protocol,
         failover_from_endpoint=from_endpoint,
         failover_candidate_count=len(hot_pool),
+        failover_preferred_only=preferred_only,
     )
     last_error = ""
     for endpoint in hot_pool[:max(1, attempts)]:
@@ -2606,17 +2817,14 @@ def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bo
             connect_ranked_endpoint(endpoint)
             if not bool(load_ui_config().get("connection_enabled", True)):
                 stop_all_tunnels()
-                set_state(
-                    failover_in_progress=False,
-                    last_failover_ok=False,
-                    last_failover_error="用户已手动断开连接",
-                )
+                set_state(failover_in_progress=False, last_failover_ok=False, last_failover_error="用户已手动断开连接")
                 failover_lock.release()
                 return False
             duration_ms = int((time.time() - started) * 1000)
             set_state(
                 hot_pool_size=len(hot_pool),
                 hot_pool_selected_score=endpoint.get("selection_score", 0),
+                failover_selected_tier=int(endpoint.get("routing_tier") or 0),
                 failover_in_progress=False,
                 last_failover_ok=True,
                 last_failover_at=time.time(),
@@ -2627,20 +2835,12 @@ def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4) -> bo
                 last_failover_to_endpoint=str(endpoint.get("endpoint_id") or ""),
                 last_failover_error="",
             )
-            log_to_json(
-                "INFO",
-                "VPN",
-                f"统一 Hot Pool 切换成功 {from_protocol or '-'} -> {endpoint.get('protocol')}，耗时 {duration_ms} ms",
-            )
+            log_to_json("INFO", "VPN", f"统一 Hot Pool 切换成功 tier={endpoint.get('routing_tier')} {from_protocol or '-'} -> {endpoint.get('protocol')}，耗时 {duration_ms} ms")
             failover_lock.release()
             return True
         except Exception as exc:
             last_error = str(exc)
-            log_to_json(
-                "WARNING",
-                "VPN",
-                f"统一 Hot Pool 切换失败 {endpoint.get('protocol')} {endpoint.get('endpoint_id')}: {exc}",
-            )
+            log_to_json("WARNING", "VPN", f"统一 Hot Pool 切换失败 {endpoint.get('protocol')} {endpoint.get('endpoint_id')}: {exc}")
     duration_ms = int((time.time() - started) * 1000)
     set_state(
         failover_in_progress=False,
@@ -2793,7 +2993,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if not n.get("active") and n.get("probe_status") != "unavailable"
                 ]
                 fast_candidates = apply_routing_filters(fast_candidates, ui_cfg, include_unknown_ip_type=True)
-                fast_candidates.sort(key=probe_priority_key)
+                fast_candidates.sort(key=lambda n: routing_node_service_key(n, ui_cfg))
                 fast_test_ids = [
                     n["id"] for n in fast_candidates
                     if n.get("id")
@@ -4311,6 +4511,7 @@ INDEX_HTML = r"""<!doctype html>
             <th style="width: 90px;">状态</th>
             <th style="width: 220px;">IP 地址 : 端口</th>
             <th style="width: 110px;">协议</th>
+            <th style="width: 95px;">延迟</th>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">IP 类型</th>
@@ -4419,30 +4620,30 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-desc">锁定IP，不自动切换</div>
               </div>
               <div class="option-card" data-value="fixed_region" onclick="setRoutingMode('fixed_region')">
-                <div class="option-card-title">固定地区</div>
-                <div class="option-card-desc">锁定特定国家地区</div>
+                <div class="option-card-title">优先地区</div>
+                <div class="option-card-desc">优先指定国家，失效自动回退</div>
               </div>
             </div>
           </div>
           
           <div id="net_force_country_group" class="form-group" style="margin-bottom: 16px; display: none;">
-            <label class="form-label" for="net_force_country">锁定国家地区</label>
+            <label class="form-label" for="net_force_country">优先国家地区</label>
             <select id="net_force_country" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
               <option value="">正在加载节点国家...</option>
             </select>
           </div>
           
           <div class="form-group" style="margin-bottom: 16px;">
-            <label class="form-label">IP 出站类型过滤</label>
+            <label class="form-label">IP 出站类型偏好</label>
             <input type="hidden" id="net_routing_ip_type" value="all">
             <div class="option-group" id="routing_ip_type_group">
               <div class="option-card active" data-value="all" onclick="setRoutingIpType('all')">
-                <div class="option-card-title">所有IP</div>
-                <div class="option-card-desc">机房 + 住宅</div>
+                <div class="option-card-title">不限类型</div>
+                <div class="option-card-desc">机房 + 住宅均可</div>
               </div>
               <div class="option-card" data-value="residential" onclick="setRoutingIpType('residential')">
-                <div class="option-card-title">住宅IP</div>
-                <div class="option-card-desc">静态家宽</div>
+                <div class="option-card-title">住宅 IP</div>
+                <div class="option-card-desc">优先家宽，不可用自动回退</div>
               </div>
               <div class="option-card" data-value="hosting" onclick="setRoutingIpType('hosting')">
                 <div class="option-card-title">机房IP</div>
@@ -4452,7 +4653,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           
           <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
-            ℹ️ <strong>自动配置</strong>：全自动测试并选择最佳IP。在使用过程中，如果当前连接节点没有失效，将不再更换IP；如果当前节点失效，系统将立刻秒级自动漂移到其他最快的可用节点。
+            ℹ️ <strong>服务可用性优先</strong>：国家和 IP 类型作为偏好，不作为硬锁定。系统按“目标国家 → IP 类型 → 稳定性 → 延迟 → 带宽”选择；目标暂时不可用时自动回退到同区域或全网可用节点，目标恢复后自动切回。
           </div>
         </div>
         
@@ -4876,8 +5077,12 @@ function render(){
               ${esc(endpointAddress)}${ep.port ? ":" + esc(String(ep.port)) : ""}
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
-              <span>活动网卡: <strong>${esc(state.active_tunnel_interface || "-")}</strong></span>
-              <span style="margin-left: 12px;">8500 出口延时: <strong>${latencyText}</strong></span>
+              <span>协议: <strong>${esc(protocolName)}</strong></span>
+              <span style="margin-left: 12px;">物理位置: <strong>${esc(ep.location || translateCountry(ep.country || "-"))}</strong></span>
+              <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
+              <span style="margin-left: 12px;">运营主体: <strong>${esc(ep.owner || "-")}</strong></span>
+              <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(ep.ip_type))}</strong></span>
+              <span style="margin-left: 12px;">带宽: <strong>${esc(speed(ep.speed))}</strong></span>
               <span style="margin-left: 12px;">Hot Pool: <strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
             </div>
           </div>
@@ -5028,7 +5233,7 @@ function render(){
 
   // Render table rows
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    $("rows").innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
@@ -5072,6 +5277,7 @@ function render(){
         <td style="white-space: nowrap; text-align: center;">
           <span class="badge" style="border-color: rgba(20, 184, 166, 0.25); color: var(--primary); background: rgba(20, 184, 166, 0.08);">${esc(protocolName)}</span>
         </td>
+        <td style="white-space: nowrap; text-align: center;">${latencyText}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(displayLocation)}">${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(translateIpType(n.ip_type))}">${esc(translateIpType(n.ip_type))}</td>
@@ -5597,7 +5803,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，且后台仅并发测速该国家的节点。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
+    warningDiv.innerHTML = `ℹ️ <strong>优先地区</strong>：优先选择您指定的国家；若目标国家暂时没有可用节点，系统会自动放宽国家/IP 类型限制，按稳定性、延迟和带宽选择可用出口；目标恢复后自动切回。`;
   } else if (mode === "favorites") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -5630,10 +5836,10 @@ function populateRoutingCountries() {
     }
   });
   
-  const countries = Object.keys(countMap).sort();
-  let html = '<option value="">请选择要锁定的国家...</option>';
+  const countries = Object.keys(countMap).sort((a,b) => a.localeCompare(b, "zh-CN"));
+  let html = '<option value="">请选择优先国家...</option>';
   countries.forEach(c => {
-    html += `<option value="${esc(c)}">${esc(c)} (${countMap[c]}个节点)</option>`;
+    html += `<option value="${esc(c)}">${esc(c)} ${countMap[c]}</option>`;
   });
   select.innerHTML = html;
   
@@ -6406,6 +6612,7 @@ def background_proxy_checker() -> None:
                     proxy_latency_ms=res["latency_ms"],
                     proxy_error=""
                 )
+                maybe_recover_preferred_route()
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 first_error = res.get("error", "未知错误")
@@ -6420,6 +6627,7 @@ def background_proxy_checker() -> None:
                         proxy_latency_ms=confirm["latency_ms"],
                         proxy_error=""
                     )
+                    maybe_recover_preferred_route()
                     log_to_json("WARNING", "Proxy", f"首次健康检查失败但复检恢复，保持当前节点: {first_error}")
                     continue
 
@@ -6957,7 +7165,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_mode == "fixed_region" and not force_country:
-                    self.send_json({"ok": False, "error": "启用固定地区前，请先选择一个要锁定的国家"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "启用优先地区前，请先选择一个目标国家"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
@@ -6989,6 +7197,8 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(auth_file, ui_cfg)
 
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
+                if routing_mode == "fixed_region" or routing_ip_type != "all":
+                    threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
                 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
                 if restart_needed:
@@ -7019,7 +7229,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_mode == "fixed_region" and not force_country:
-                    self.send_json({"ok": False, "error": "启用固定地区前，请先选择一个要锁定的国家"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "启用优先地区前，请先选择一个目标国家"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
@@ -7045,8 +7255,10 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(auth_file, ui_cfg)
 
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "出站路由配置已更新")
+                if routing_mode == "fixed_region" or routing_ip_type != "all":
+                    threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
                 
-                self.send_json({"ok": True, "message": policy_message or "出站路由配置更新成功，已即时生效！"})
+                self.send_json({"ok": True, "message": policy_message or "出站路由配置更新成功，偏好已即时应用，目标恢复后会自动切回！"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
