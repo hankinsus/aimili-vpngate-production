@@ -4051,7 +4051,7 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
+        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
       </div>
       <div style="display: flex; gap: 8px; align-items: center;">
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
