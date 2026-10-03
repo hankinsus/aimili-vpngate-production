@@ -2174,8 +2174,18 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
 def apply_user_routing_preferences() -> None:
     try:
         ui_cfg = load_ui_config()
-        if ui_cfg.get("routing_mode") in ("fixed_ip", "favorites") or not bool(ui_cfg.get("connection_enabled", True)):
+        if not bool(ui_cfg.get("connection_enabled", True)):
             return
+        if ui_cfg.get("routing_mode") == "fixed_ip":
+            return
+        if ui_cfg.get("routing_mode") == "favorites":
+            # Favorites is a hard outbound routing mode: when the current tunnel
+            # is not one of the user's favorites, leave the current tunnel state
+            # to the enforcement path and immediately select a favorite endpoint.
+            if not active_tunnel_running():
+                auto_switch_node()
+            return
+
         target_country = str(ui_cfg.get("force_country") or "").strip()
         if target_country:
             priority_result = start_country_priority(target_country)
