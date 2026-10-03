@@ -104,6 +104,16 @@ else
     if [ -d "${INSTALL_DIR}" ]; then
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
+        # Always bind an existing installation to the requested public repository.
+        if [ -d ".git" ]; then
+            git remote set-url origin "${GITHUB_URL}" || true
+        else
+            echo -e "  -> 检测到非 Git 安装目录，将先保留备份后重新克隆..."
+            cd "$(dirname "${INSTALL_DIR}")"
+            mv "${INSTALL_DIR}" "${INSTALL_DIR}.backup-$(date +%Y%m%d-%H%M%S)"
+            git clone -b "${DEPLOY_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"
+            cd "${INSTALL_DIR}"
+        fi
         git fetch --all || true
         git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
         echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
