@@ -322,7 +322,8 @@ def fetch_openvpn_endpoint_page(host: str, timeout: int = 6) -> dict[str, Any] |
                 "port": int(item.get("port") or 0),
             }
             for item in (server.get("protocols") or [])
-            if str(item.get("protocol") or "").lower() == "openvpn"
+            if str(item.get("protocol") or "").lower()
+            in {"softether", "l2tp-ipsec", "openvpn", "sstp"}
         ]
         if not protocols:
             continue
