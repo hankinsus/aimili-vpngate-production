@@ -450,7 +450,7 @@ def get_state() -> dict[str, Any]:
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["password_set"] = bool(ui_cfg.get("password"))
     state["proxy_port"] = 8500
-    state["proxy_access"] = os.environ.get("LOCAL_PROXY_ALLOW", "0.0.0.0/0,::/0")
+    state["proxy_access"] = os.environ.get("LOCAL_PROXY_ALLOW", "127.0.0.1/32,::1/128")
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
