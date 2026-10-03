@@ -832,6 +832,7 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "config_file": str(config_path),
         "config_text": config_text,
         "proto": proto,
+        "protocol": "openvpn",
         "remote_host": remote_host,
         "remote_port": remote_port,
         "fetched_at": time.time(),
@@ -4036,6 +4037,7 @@ INDEX_HTML = r"""<!doctype html>
           <tr>
             <th style="width: 90px;">状态</th>
             <th style="width: 220px;">IP 地址 : 端口</th>
+            <th style="width: 110px;">协议</th>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">IP 类型</th>
@@ -4047,7 +4049,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     
     <!-- 分页控制栏 -->
-    <div class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
+    <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
       </div>
@@ -4353,8 +4355,21 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
-const pageSize = 99999;
+const pageSize = 100;
 let currentPageNodes = [];
+
+const translateProtocol = p => {
+  const key = String(p || "").trim().toLowerCase();
+  const dict = {
+    "openvpn": "OpenVPN",
+    "softether": "SoftEther",
+    "sstp": "SSTP",
+    "l2tp-ipsec": "L2TP/IPsec",
+    "l2tp_ipsec": "L2TP/IPsec",
+    "l2tp": "L2TP/IPsec"
+  };
+  return dict[key] || (key ? key.toUpperCase() : "OpenVPN");
+};
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -4556,7 +4571,7 @@ function render(){
     const latencyValue = Number(state.proxy_latency_ms || ep.latency_ms || 0);
     const latencyClass = getLatencyClass(latencyValue);
     const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
-    const protocolName = String(ep.protocol || state.active_tunnel_protocol || "VPN").toUpperCase();
+    const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
     const endpointAddress = ep.hostname || ep.current_ip || ep.endpoint_id || "-";
     activeCardContainer.innerHTML = `
       <div class="active-card">
@@ -4595,13 +4610,14 @@ function render(){
           <div class="active-card-details">
             <div class="active-card-title">
               <span class="badge available"><span class="badge-pulse"></span>已连接</span>
-              <strong>${esc(translateCountry(activeNode.country))} 节点</strong>
+              <strong>${esc(translateCountry(activeNode.country))} · ${esc(translateProtocol(activeNode.protocol || "openvpn"))}</strong>
             </div>
             <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
               ${esc(activeNode.ip || activeNode.remote_host)}:${activeNode.remote_port || ""}
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
-              <span>物理位置: <strong>${esc(displayLocation)}</strong></span>
+              <span>协议: <strong>${esc(translateProtocol(activeNode.protocol || "openvpn"))}</strong></span>
+              <span style="margin-left: 12px;">物理位置: <strong>${esc(displayLocation)}</strong></span>
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
@@ -4707,7 +4723,7 @@ function render(){
 
   // Render table rows
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    $("rows").innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
@@ -4719,6 +4735,7 @@ function render(){
       const latencyClass = getLatencyClass(n.latency_ms);
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
+      const protocolName = translateProtocol(n.protocol || "openvpn");
       
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
@@ -4741,6 +4758,9 @@ function render(){
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td style="white-space: nowrap; text-align: center;">
+          <span class="badge" style="border-color: rgba(20, 184, 166, 0.25); color: var(--primary); background: rgba(20, 184, 166, 0.08);">${esc(protocolName)}</span>
+        </td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(displayLocation)}">${esc(displayLocation)}</td>
         <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(translateIpType(n.ip_type))}">${esc(translateIpType(n.ip_type))}</td>
