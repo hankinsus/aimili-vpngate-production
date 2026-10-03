@@ -287,7 +287,7 @@ def load_ui_config() -> dict[str, Any]:
             "password": "",
             "host": "127.0.0.1",
             "port": UI_PORT,
-            "proxy_port": 8500,
+            "proxy_port": env_int("LOCAL_PROXY_PORT", 8500, 1, 65535),
             "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
@@ -329,7 +329,7 @@ def load_ui_config() -> dict[str, Any]:
             config["port"] = normalized_port
             updated = True
 
-        normalized_proxy_port = 8500
+        normalized_proxy_port = env_int("LOCAL_PROXY_PORT", 8500, 1, 65535)
         if normalized_proxy_port != config.get("proxy_port"):
             config["proxy_port"] = normalized_proxy_port
             updated = True
@@ -347,7 +347,7 @@ def load_ui_config() -> dict[str, Any]:
 try:
     _init_cfg = load_ui_config()
     if "proxy_port" in _init_cfg:
-        LOCAL_PROXY_PORT = 8500
+        LOCAL_PROXY_PORT = bounded_int(_init_cfg["proxy_port"], LOCAL_PROXY_PORT, 1, 65535)
     if "port" in _init_cfg:
         UI_PORT = bounded_int(_init_cfg["port"], 8501, 1, 65535)
     if "host" in _init_cfg:
