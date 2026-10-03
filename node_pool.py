@@ -568,12 +568,18 @@ class NodePool:
 
         selected: list[dict[str, Any]] = []
         per_server: dict[str, int] = {}
+        seen_ips: set[str] = set()
         for endpoint in candidates:
             key = str(endpoint.get("server_key") or "")
+            ip = str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
+            if ip and ip in seen_ips:
+                continue
             if per_server.get(key, 0) >= max(1, int(per_server_limit)):
                 continue
             selected.append(endpoint)
             per_server[key] = per_server.get(key, 0) + 1
+            if ip:
+                seen_ips.add(ip)
             if len(selected) >= max(1, min(int(limit), 50)):
                 break
         return selected
