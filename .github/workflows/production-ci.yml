@@ -26,7 +26,7 @@ jobs:
           import re
           from pathlib import Path
           text = Path("vpngate_manager.py").read_text(encoding="utf-8")
-          blocks = [m.group(1) for m in re.finditer(r"<script[^>]*>([\\s\\S]*?)</script>", text, re.I)]
+          blocks = re.findall(r"<script[^>]*>(.*?)</script>", text, flags=re.I | re.S)
           assert len(blocks) >= 2, len(blocks)
           Path("/tmp/aimili_embedded.js").write_text("\n\n".join(blocks), encoding="utf-8")
           print(f"validated {len(blocks)} script blocks")
