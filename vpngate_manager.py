@@ -159,6 +159,14 @@ ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
+GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
+GITHUB_BRANCH = "main"
+GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
+GITHUB_UPDATE_TIMEOUT_SECONDS = 8
+github_update_lock = threading.Lock()
+github_update_running = False
+github_update_last_result: dict[str, Any] = {}
+
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
@@ -210,6 +218,171 @@ last_checker_heartbeat = 0.0
 last_pinger_heartbeat = 0.0
 global_country_coverage_heartbeat = 0.0
 server_start_time = time.time()
+
+def _local_git_commit() -> str:
+    try:
+        result = subprocess.run([
+            "git", "rev-parse", "HEAD",
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        value = result.stdout.strip()
+        return value if re.fullmatch(r"[0-9a-f]{40}", value) else ""
+    except Exception:
+        return ""
+
+
+def _remote_git_commit() -> str:
+    request = urllib.request.Request(
+        GITHUB_API_COMMIT_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "AimiliVPN-Updater",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=GITHUB_UPDATE_TIMEOUT_SECONDS) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    value = str(data.get("sha") or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else ""
+
+
+def current_github_version() -> dict[str, Any]:
+    local = _local_git_commit()
+    return {
+        "ok": bool(local),
+        "repository": GITHUB_REPOSITORY,
+        "branch": GITHUB_BRANCH,
+        "current_version": local[:8] if local else "未知",
+        "current_commit": local,
+        "source": "git",
+    }
+
+
+def check_github_update() -> dict[str, Any]:
+    local = _local_git_commit()
+    if not local:
+        return {
+            "ok": False,
+            "error": "当前安装目录不是有效 Git 仓库，无法检查正式版更新。",
+            "repository": GITHUB_REPOSITORY,
+            "branch": GITHUB_BRANCH,
+        }
+    try:
+        remote = _remote_git_commit()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"无法访问 GitHub 正式版：{exc}",
+            "repository": GITHUB_REPOSITORY,
+            "branch": GITHUB_BRANCH,
+            "current_version": local[:8],
+        }
+    if not remote:
+        return {
+            "ok": False,
+            "error": "GitHub 未返回有效的 main 分支版本。",
+            "repository": GITHUB_REPOSITORY,
+            "branch": GITHUB_BRANCH,
+            "current_version": local[:8],
+        }
+    return {
+        "ok": True,
+        "repository": GITHUB_REPOSITORY,
+        "branch": GITHUB_BRANCH,
+        "current_version": local[:8],
+        "current_commit": local,
+        "latest_version": remote[:8],
+        "latest_commit": remote,
+        "has_update": local != remote,
+        "checked_at": time.time(),
+    }
+
+
+def start_github_update() -> dict[str, Any]:
+    global github_update_running, github_update_last_result
+    with github_update_lock:
+        if github_update_running:
+            return {"ok": False, "error": "正在更新正式版，请稍候。", "running": True}
+
+        check = check_github_update()
+        if not check.get("ok"):
+            return check
+        if not check.get("has_update"):
+            github_update_last_result = {
+                "ok": True,
+                "status": "latest",
+                "current_version": check.get("current_version"),
+                "latest_version": check.get("latest_version"),
+                "checked_at": time.time(),
+            }
+            return {
+                "ok": True,
+                "status": "latest",
+                "message": "当前已经是 GitHub 正式版最新版本。",
+                "current_version": check.get("current_version"),
+                "latest_version": check.get("latest_version"),
+            }
+
+        github_update_running = True
+        github_update_last_result = {
+            "ok": True,
+            "status": "starting",
+            "from_version": check.get("current_version"),
+            "to_version": check.get("latest_version"),
+            "started_at": time.time(),
+        }
+
+        log_path = DATA_DIR / "github_update.log"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        log_handle = open(log_path, "a", encoding="utf-8")
+        script = (
+            "set -e\n"
+            f"cd {shlex.quote(str(ROOT_DIR))}\n"
+            f"echo '[GitHub Update] started at '$(date -Is)\n"
+            f"git fetch --prune origin {shlex.quote(GITHUB_BRANCH)}\n"
+            f"git checkout {shlex.quote(GITHUB_BRANCH)}\n"
+            f"git reset --hard origin/{shlex.quote(GITHUB_BRANCH)}\n"
+            "find . -type d -name __pycache__ -prune -exec rm -rf {} +\n"
+            "python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py tunnel_adapters.py vpngate_discovery.py\n"
+            "echo '[GitHub Update] build check passed at '$(date -Is)\n"
+            "systemctl restart aimilivpn\n"
+        )
+        try:
+            systemd_run = shutil.which("systemd-run")
+            if systemd_run:
+                unit_name = f"aimilivpn-github-update-{int(time.time())}"
+                subprocess.Popen([
+                    systemd_run,
+                    "--quiet",
+                    "--unit", unit_name,
+                    "--collect",
+                    "/bin/bash",
+                    "-lc",
+                    script,
+                ], cwd=str(ROOT_DIR), stdout=log_handle, stderr=log_handle, start_new_session=True)
+            else:
+                subprocess.Popen(["/bin/bash", "-lc", script], cwd=str(ROOT_DIR), stdout=log_handle, stderr=log_handle, start_new_session=True)
+            threading.Timer(20.0, _clear_github_update_running).start()
+        except Exception:
+            log_handle.close()
+            github_update_running = False
+            raise
+        return {
+            "ok": True,
+            "status": "starting",
+            "message": f"已发现新版本 {check.get('latest_version')}，正在从 GitHub 更新并重启服务。",
+            "current_version": check.get("current_version"),
+            "latest_version": check.get("latest_version"),
+        }
+
+
+def _clear_github_update_running() -> None:
+    global github_update_running
+    github_update_running = False
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -4720,7 +4893,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow: visible !important;
     }
     .toolbar-custom-select[data-filter-id="country_filter"] {
-      width: 250px;
+      width: 240px;
     }
     .toolbar-custom-select.open {
       z-index: 10070;
@@ -4814,7 +4987,7 @@ INDEX_HTML = r"""<!doctype html>
       background: transparent;
       color: var(--text-primary);
       font: inherit;
-      font-size: 17px;
+      font-size: 15px;
       font-weight: 600;
       text-align: left;
       cursor: pointer;
@@ -4830,10 +5003,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-option-count {
       color: var(--text-primary);
-      font-size: 17px;
+      font-size: 15px;
       font-weight: 700;
       line-height: 1;
-      min-width: 70px;
+      min-width: 64px;
       text-align: right;
       flex: 0 0 70px;
       white-space: nowrap;
@@ -5321,6 +5494,68 @@ INDEX_HTML = r"""<!doctype html>
     }
     .dropdown-content a:hover {
       background: rgba(255,255,255,0.08);
+    }
+
+    #github_dropdown {
+      min-width: 300px;
+      overflow: visible;
+      padding: 4px;
+    }
+
+    #github_dropdown > a {
+      border-radius: 7px;
+      font-size: 13px;
+      padding: 8px 10px;
+    }
+
+    .github-update-panel {
+      border-top: 1px solid rgba(129,140,248,.16);
+      margin-top: 3px;
+      padding: 9px 10px 8px;
+    }
+
+    .github-update-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 24px;
+    }
+
+    .github-update-label {
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .github-update-version {
+      color: var(--text-primary);
+      font-size: 12px;
+      font-weight: 700;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .github-update-message {
+      margin-top: 4px;
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.45;
+      min-height: 16px;
+    }
+
+    .github-update-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .github-update-actions button {
+      height: 30px;
+      min-height: 30px;
+      padding: 0 11px;
+      font-size: 12px;
+      border-radius: 7px;
+      flex: 1;
     }
 
     /* Modal styles */
@@ -5909,6 +6144,17 @@ INDEX_HTML = r"""<!doctype html>
       </button>
       <div id="github_dropdown" class="dropdown-content">
         <a href="https://github.com/hankinsus/aimili-vpngate-production" target="_blank">正式版</a>
+        <div class="github-update-panel" id="github_update_panel">
+          <div class="github-update-row">
+            <span class="github-update-label">当前版本</span>
+            <code class="github-update-version" id="github_current_version">读取中...</code>
+          </div>
+          <div class="github-update-message" id="github_update_message">点击“检查更新”获取 GitHub 最新版本。</div>
+          <div class="github-update-actions">
+            <button type="button" id="github_check_update">检查更新</button>
+            <button type="button" id="github_apply_update" class="btn-primary" style="display:none;">立即更新</button>
+          </div>
+        </div>
       </div>
     </div>
     <a href="https://t.me/ILovestudycn" target="_blank" class="btn-telegram">
@@ -7830,6 +8076,95 @@ $("btn_test_proxy").onclick = async () => {
   }
 };
 
+// GitHub production version / update
+let githubUpdateBusy = false;
+
+function setGithubUpdateMessage(message, type = "normal") {
+  const el = $("github_update_message");
+  if (!el) return;
+  el.textContent = message || "";
+  el.style.color = type === "success" ? "var(--success)" : (type === "error" ? "var(--danger)" : "var(--text-secondary)");
+}
+
+function setGithubUpdateButtonBusy(busy, label) {
+  const btn = $("github_check_update");
+  if (!btn) return;
+  btn.disabled = !!busy;
+  btn.textContent = label || (busy ? "检查中..." : "检查更新");
+}
+
+async function loadGithubCurrentVersion() {
+  try {
+    const result = await fetchJsonWithTimeout("./api/github_version", {}, 4000);
+    const el = $("github_current_version");
+    if (el) el.textContent = result.current_version || "未知";
+  } catch (e) {
+    const el = $("github_current_version");
+    if (el) el.textContent = "未知";
+  }
+}
+
+async function checkGithubUpdate() {
+  if (githubUpdateBusy) return;
+  githubUpdateBusy = true;
+  setGithubUpdateButtonBusy(true, "检查中...");
+  const applyBtn = $("github_apply_update");
+  if (applyBtn) applyBtn.style.display = "none";
+  setGithubUpdateMessage("正在检查 GitHub 正式版...");
+  try {
+    const result = await fetchJsonWithTimeout("./api/github_update/check", { method: "POST" }, 10000);
+    const current = result.current_version || "未知";
+    const latest = result.latest_version || current;
+    const currentEl = $("github_current_version");
+    if (currentEl) currentEl.textContent = current;
+    if (result.ok && result.has_update) {
+      setGithubUpdateMessage("发现新版本 " + latest + "，当前 " + current + "。", "success");
+      if (applyBtn) { applyBtn.style.display = "inline-flex"; applyBtn.disabled = false; }
+    } else if (result.ok) {
+      setGithubUpdateMessage("当前已经是最新正式版（" + current + "）。", "success");
+    } else {
+      setGithubUpdateMessage(result.error || "检查更新失败。", "error");
+    }
+  } catch (e) {
+    setGithubUpdateMessage("检查更新失败：" + (e.message || "网络错误"), "error");
+  } finally {
+    githubUpdateBusy = false;
+    setGithubUpdateButtonBusy(false);
+  }
+}
+
+async function applyGithubUpdate() {
+  if (githubUpdateBusy) return;
+  const btn = $("github_apply_update");
+  if (!btn) return;
+  githubUpdateBusy = true;
+  btn.disabled = true;
+  setGithubUpdateButtonBusy(true, "更新中...");
+  setGithubUpdateMessage("正在拉取 GitHub 正式版，更新完成后服务会自动重启...");
+  try {
+    const result = await fetchJsonWithTimeout("./api/github_update", { method: "POST" }, 10000);
+    if (!result.ok) {
+      setGithubUpdateMessage(result.error || "更新启动失败。", "error");
+      btn.disabled = false;
+      setGithubUpdateButtonBusy(false);
+      githubUpdateBusy = false;
+      return;
+    }
+    if (result.status === "latest") {
+      setGithubUpdateMessage(result.message || "当前已经是最新版本。", "success");
+      btn.style.display = "none";
+      setGithubUpdateButtonBusy(false);
+      githubUpdateBusy = false;
+      return;
+    }
+    setGithubUpdateMessage(result.message || "更新已启动，服务即将重启。", "success");
+    setTimeout(() => window.location.reload(), 7000);
+  } catch (e) {
+    setGithubUpdateMessage("更新请求已发出；如果服务正在重启，请稍候刷新页面。", "success");
+    setTimeout(() => window.location.reload(), 7000);
+  }
+}
+
 // Admin dropdown toggle & GitHub dropdown toggle
 const adminBtn = $("admin_btn");
 const adminDropdown = $("admin_dropdown");
@@ -7851,6 +8186,21 @@ if (githubBtn && githubDropdown) {
     const isShow = githubDropdown.style.display === "block";
     githubDropdown.style.display = isShow ? "none" : "block";
     if (adminDropdown) adminDropdown.style.display = "none";
+    if (!isShow) loadGithubCurrentVersion();
+  };
+}
+
+if ($("github_check_update")) {
+  $("github_check_update").onclick = (e) => {
+    e.stopPropagation();
+    checkGithubUpdate();
+  };
+}
+
+if ($("github_apply_update")) {
+  $("github_apply_update").onclick = (e) => {
+    e.stopPropagation();
+    applyGithubUpdate();
   };
 }
 
@@ -9667,6 +10017,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(link_test_path.read_bytes(), "text/html; charset=utf-8")
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/github_version":
+            self.send_json(current_github_version())
+        elif effective_path == "/api/github_update/status":
+            self.send_json({
+                "ok": True,
+                "running": github_update_running,
+                "last_result": github_update_last_result,
+            })
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
@@ -9993,6 +10351,22 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self.is_authorized():
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if effective_path == "/api/github_update/check":
+            try:
+                self.send_json(check_github_update())
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+            return
+
+        if effective_path == "/api/github_update":
+            try:
+                result = start_github_update()
+                self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT)
+            except Exception as exc:
+                log_to_json("WARNING", "Main", f"GitHub 正式版更新启动失败: {exc}")
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         if effective_path == "/api/logs/manage":
