@@ -183,14 +183,14 @@ A domain is not required. The default deployment keeps exactly three public port
 
 The public proxy uses fixed TCP port `8500`. Configure username, password, and source IP/CIDR access in `/etc/default/aimilivpn`:
 
-### 🌟 Recommended VPS Deals
-[![BandwagonHost Premium Optimized Routes](https://img.shields.io/badge/BandwagonHost-Premium%20Optimized%20Routes-red?style=for-the-badge)](https://bandwagonhost.com/aff.php?aff=81790)
-[![RackNerd 6000GB Bandwidth](https://img.shields.io/badge/RackNerd-6000GB%2Fmonth%20Bandwidth-blue?style=for-the-badge)](https://my.racknerd.com/aff.php?aff=18708)
+### 🌟 Recommended VPS Deals: Simple and Convenient
+[![Dedicated Streaming Media - Top 3-Network Optimization](https://img.shields.io/badge/Dedicated%20Streaming%20Media-Top%203--Network%20Optimization-red?style=for-the-badge)](https://yiy.one/register?codes=98BA33)
+[![Unlimited Traffic - Residential IP](https://img.shields.io/badge/Unlimited%20Traffic-Residential%20IP-blue?style=for-the-badge)](https://www.miyaip.com/?invitecode=2955039)
 
-| Pick | Best for | Highlights | Link |
+| Recommendation | Suitable for | Highlights | Entry |
 | --- | --- | --- | --- |
-| **BandwagonHost** | Users who care most about China connectivity, latency, and route quality | **Premium China Telecom/Unicom/Mobile optimized routes**, ideal for demanding cross-border networking and long-term use | [View deals](https://bandwagonhost.com/aff.php?aff=81790) |
-| **RackNerd** | Budget deployments, testing, and long-running lightweight services | **6000GB monthly bandwidth**, affordable pricing, and generous specs for value-focused VPS use | [View deals](https://my.racknerd.com/aff.php?aff=18708) |
+| **Stable Streaming Media** | Users who care more about access quality, latency, and route limits for cross-border use | **Top-tier three-network optimized routes**, with access to OpenAI/ChatGPT, YouTube, Netflix, Disney+, and other services; suitable for demanding network-experience and long-term stability needs | [View now](https://yiy.one/register?codes=98BA33) |
+| **Static Residential IP** | Users looking for low-cost cross-border e-commerce, streaming, live-streaming, or residential-IP use cases | **Unlimited traffic**, affordable pricing, and one month of testing; suitable for users who want to test before long-term use | [View now](https://www.miyaip.com/?invitecode=2955039) |
 
 
 ### 📢 ILovestudy Official Resources & Support
