@@ -72,5 +72,3 @@ UI 统一显示：
 ## 环境变量
 
 RESOURCE_SHARE_SYNC_INTERVAL_SECONDS 只控制后台到期扫描频率，默认 300 秒；每个 Peer 的实际同步周期独立保存为小时/天/周。
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
