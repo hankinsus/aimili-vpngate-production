@@ -120,6 +120,9 @@ TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 5000, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
+COUNTRY_AVAILABLE_MIN = env_int("COUNTRY_AVAILABLE_MIN", 5, 1, 8)
+COUNTRY_AVAILABLE_TARGET = env_int("COUNTRY_AVAILABLE_TARGET", 8, 5, 8)
+COUNTRY_PRIORITY_BATCH = env_int("COUNTRY_PRIORITY_BATCH", 5, 1, 10)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 20, 5, 100)
 ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 3, 1, 20)
@@ -172,6 +175,8 @@ active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
 protocol_discovery_lock = threading.Lock()
 protocol_probe_lock = threading.Lock()
+country_priority_lock = threading.Lock()
+country_priority_request = ""
 failover_lock = threading.Lock()
 link_probe_lock = threading.Lock()
 link_probe_usage: dict[str, tuple[float, int]] = {}
@@ -1736,6 +1741,141 @@ def release_test_index(idx: int) -> None:
 def test_config_path(node_id: str) -> Path:
     safe_id = safe_name(node_id)
     return CONFIG_DIR / f".test_{safe_id}_{uuid.uuid4().hex}.ovpn"
+
+
+def country_priority_snapshot(country: str) -> dict[str, Any]:
+    target_country = str(country or "").strip()
+    if not target_country:
+        return {"country": "", "available": 0, "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN}
+    available_servers: set[str] = set()
+    available_nodes = 0
+    candidate_refs: list[dict[str, Any]] = []
+    openvpn_nodes = read_nodes()
+    for node in openvpn_nodes:
+        if not country_matches(node.get("country"), target_country):
+            continue
+        status = str(node.get("probe_status") or "not_checked").lower()
+        key = node_pool.server_key(node)
+        if status == "available":
+            available_nodes += 1
+            available_servers.add(key)
+        elif status in ("not_checked", "unavailable"):
+            candidate_refs.append({"kind": "openvpn", "id": str(node.get("id") or ""), "server_key": key, "status": status, "probed_at": float(node.get("probed_at") or 0), "latency_ms": parse_int(node.get("latency_ms"))})
+    try:
+        endpoints = node_pool.list_endpoints(limit=1000)
+    except Exception:
+        endpoints = []
+    for endpoint in endpoints:
+        if str(endpoint.get("protocol") or "").lower() == "openvpn":
+            continue
+        if not country_matches(endpoint.get("country"), target_country):
+            continue
+        status = str(endpoint.get("status") or "NEW").upper()
+        key = str(endpoint.get("server_key") or "")
+        if status in ("HOT", "AVAILABLE"):
+            available_nodes += 1
+            available_servers.add(key)
+        elif status in ("NEW", "DEGRADED", "COOLDOWN"):
+            candidate_refs.append({"kind": "pool", "id": "pool:" + str(endpoint.get("endpoint_id") or ""), "server_key": key, "status": status.lower(), "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0), "latency_ms": parse_int(endpoint.get("latency_ewma"))})
+    priority = {"not_checked": 0, "new": 0, "unavailable": 1, "degraded": 2, "cooldown": 3}
+    candidate_refs.sort(key=lambda x: (priority.get(str(x.get("status")), 4), x.get("server_key") in available_servers, x.get("probed_at") or 0, x.get("latency_ms") or 999999))
+    return {"country": target_country, "available": available_nodes, "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "candidates": candidate_refs}
+
+def _test_pool_reference(ref: dict[str, Any]) -> dict[str, Any]:
+    kind = str(ref.get("kind") or "")
+    ident = str(ref.get("id") or "")
+    if kind == "openvpn":
+        return {"ok": True, "kind": kind, "node": test_node_by_id(ident)}
+    if kind == "pool":
+        endpoint_id = ident.removeprefix("pool:")
+        result = probe_pool_endpoint(endpoint_id)
+        endpoint = node_pool.get_endpoint(endpoint_id)
+        node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
+        return {"ok": bool(result.get("ok")), "kind": kind, "node": node, "result": result}
+    return {"ok": False, "error": "未知测试类型"}
+
+def country_priority_worker(country: str) -> None:
+    global country_priority_request, is_connecting
+    try:
+        rounds = 0
+        while rounds < 12:
+            rounds += 1
+            snapshot = country_priority_snapshot(country)
+            available = int(snapshot.get("available") or 0)
+            if available >= COUNTRY_AVAILABLE_TARGET:
+                set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 已达到 {available} 个可用节点")
+                return
+            candidates = snapshot.get("candidates") or []
+            if not candidates:
+                set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 当前可检测候选不足，已得到 {available} 个可用节点")
+                return
+            batch: list[dict[str, Any]] = []
+            seen_servers: set[str] = set()
+            for ref in candidates:
+                key = str(ref.get("server_key") or "")
+                if key and key in seen_servers:
+                    continue
+                batch.append(ref)
+                if key: seen_servers.add(key)
+                if len(batch) >= COUNTRY_PRIORITY_BATCH:
+                    break
+            openvpn_refs = [x for x in batch if x.get("kind") == "openvpn"]
+            pool_refs = [x for x in batch if x.get("kind") == "pool"]
+            if openvpn_refs and maintenance_lock.acquire(blocking=False):
+                try:
+                    with lock:
+                        busy = is_connecting
+                    if not busy:
+                        with lock:
+                            is_connecting = True
+                        set_state(is_connecting=True, last_check_message=f"正在优先检测 {country}，目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
+                        test_multiple_nodes([str(x.get("id")) for x in openvpn_refs if x.get("id")])
+                finally:
+                    with lock:
+                        is_connecting = False
+                    set_state(is_connecting=False)
+                    maintenance_lock.release()
+            for ref in pool_refs:
+                if is_connecting:
+                    break
+                _test_pool_reference(ref)
+            snapshot = country_priority_snapshot(country)
+            available = int(snapshot.get("available") or 0)
+            set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{country} 优先检测中：{available}/{COUNTRY_AVAILABLE_TARGET} 个可用节点")
+            if available >= COUNTRY_AVAILABLE_MIN and not (snapshot.get("candidates") or []):
+                break
+            if country_priority_request and country_priority_request != country:
+                break
+            time.sleep(1)
+        final = country_priority_snapshot(country)
+        available = int(final.get("available") or 0)
+        set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 优先检测完成：{available} 个可用节点")
+    except Exception as exc:
+        set_state(priority_country=country, priority_available=0, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 优先检测异常：{exc}")
+    finally:
+        pending = country_priority_request if country_priority_request and country_priority_request != country else ""
+        country_priority_request = ""
+        if country_priority_lock.locked():
+            country_priority_lock.release()
+        if pending:
+            start_country_priority(pending)
+
+def start_country_priority(country: str) -> dict[str, Any]:
+    global country_priority_request
+    target = str(country or "").strip()
+    if not target:
+        return {"ok": False, "error": "国家不能为空"}
+    snapshot = country_priority_snapshot(target)
+    country_priority_request = target
+    if snapshot.get("available", 0) >= COUNTRY_AVAILABLE_TARGET:
+        country_priority_request = ""
+        set_state(priority_country=target, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{target} 已有 {snapshot.get('available')} 个可用节点，无需重复检测")
+        return {"ok": True, "running": False, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET}
+    if not country_priority_lock.acquire(blocking=False):
+        return {"ok": True, "running": True, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET, "message": "已有国家优先检测任务运行中"}
+    set_state(priority_country=target, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{target} 优先检测已启动：目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
+    threading.Thread(target=country_priority_worker, args=(target,), daemon=True).start()
+    return {"ok": True, "running": True, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET}
 
 def test_node_by_id(node_id: str) -> dict[str, Any]:
     with lock:
@@ -3529,6 +3669,43 @@ INDEX_HTML = r"""<!doctype html>
     .official-business { grid-column:1 / -1; }
     @media (max-width:576px) { .official-grid{grid-template-columns:1fr;} .official-business{grid-column:auto;} }
 
+    .status-badge-button {
+      appearance: none;
+      -webkit-appearance: none;
+      font-family: inherit;
+      line-height: inherit;
+      cursor: pointer;
+      transition: transform .15s ease, filter .15s ease, box-shadow .15s ease;
+    }
+    .status-badge-button:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.08);
+      box-shadow: 0 4px 12px rgba(99,102,241,.18);
+    }
+    .status-badge-button:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+    .country-priority {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: -12px 0 20px;
+      padding: 10px 14px;
+      border: 1px solid rgba(20,184,166,.18);
+      border-radius: 10px;
+      background: rgba(20,184,166,.05);
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+    .country-priority.running {
+      border-color: rgba(245,158,11,.25);
+      background: rgba(245,158,11,.06);
+    }
+    @media (max-width: 768px) {
+      .country-priority { flex-wrap: wrap; }
+    }
+
     .toolbar {
       background: var(--bg-surface);
       backdrop-filter: blur(12px);
@@ -4093,6 +4270,7 @@ INDEX_HTML = r"""<!doctype html>
       收藏菜单
     </button>
   </section>
+  <div id="country_priority_status" class="country-priority" style="display:none;"></div>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
@@ -4562,21 +4740,18 @@ function getLatencyClass(ms) {
 function updateCountryFilter() {
   const select = $("country_filter");
   const selectedValue = select.value;
-  const countries = Array.from(new Set(nodes.map(n => n ? translateCountry(n.country) : "").filter(Boolean))).sort();
-  
-  const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
-  if (JSON.stringify(countries) === JSON.stringify(currentOptions)) {
-    return;
-  }
-  
-  select.innerHTML = '<option value="">所有国家</option>' + 
-    countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
-  
-  if (countries.includes(selectedValue)) {
-    select.value = selectedValue;
-  } else {
-    select.value = "";
-  }
+  const counts = {};
+  nodes.forEach(n => {
+    if (!n) return;
+    const country = translateCountry(n.country);
+    if (!country || country === "-") return;
+    counts[country] = (counts[country] || 0) + 1;
+  });
+  const countries = Object.keys(counts).sort((a,b) => a.localeCompare(b, "zh-CN"));
+  select.innerHTML = `<option value="">所有国家 ${nodes.length}</option>` +
+    countries.map(c => `<option value="${esc(c)}">${esc(c)} ${counts[c]}</option>`).join("");
+  if (countries.includes(selectedValue)) select.value = selectedValue;
+  else select.value = "";
 }
 
 function getFilteredNodes() {
@@ -4757,6 +4932,23 @@ function render(){
     `;
   }
 
+  const priorityStatusEl = $("country_priority_status");
+  if (priorityStatusEl) {
+    const pc = String(state.priority_country || "");
+    if (pc) {
+      const av = Number(state.priority_available || 0);
+      const target = Number(state.priority_target || 8);
+      const min = Number(state.priority_minimum || 5);
+      priorityStatusEl.style.display = "flex";
+      priorityStatusEl.className = state.priority_running ? "country-priority running" : "country-priority";
+      priorityStatusEl.innerHTML = state.priority_running
+        ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>${av}/${target} 个可用节点，目标 ${min}-${target}</span>`
+        : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>${esc(state.priority_message || (av + " 个可用节点"))}</span>`;
+    } else {
+      priorityStatusEl.style.display = "none";
+    }
+  }
+
   const shown = getFilteredNodes();
   
   if ($("total")) $("total").textContent = nodes.length; 
@@ -4848,9 +5040,12 @@ function render(){
       const nodeAddress = nodeHost + nodePort;
       
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
-      const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
-      const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
-      const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
+      const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
+      const statusCell = isCurrentlyActive
+        ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
+        : canRetest
+          ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="点击立即检测此节点" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
+          : `<span class="badge ${badgeClass}">${badgeText}</span>`;
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
@@ -4866,7 +5061,7 @@ function render(){
         : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
 
       return `<tr ${rowClass}>
-        <td><span class="badge ${badgeClass}">${badgeText}</span></td>
+        <td>${statusCell}</td>
         <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(nodeAddress)}">${esc(nodeAddress)}</td>
         <td style="white-space: nowrap; text-align: center;">
           <span class="badge" style="border-color: rgba(20, 184, 166, 0.25); color: var(--primary); background: rgba(20, 184, 166, 0.08);">${esc(protocolName)}</span>
@@ -4911,6 +5106,68 @@ $("btn_last_page").onclick = () => {
   currentPage = totalPages;
   render();
 };
+
+async function prioritizeCountry(country){
+  const selected = String(country || "").trim();
+  countryPriorityRequestSeq += 1;
+  const requestSeq = countryPriorityRequestSeq;
+  if (countryPriorityPollInterval) {
+    clearInterval(countryPriorityPollInterval);
+    countryPriorityPollInterval = null;
+  }
+  if (!selected) {
+    state.priority_country = "";
+    state.priority_running = false;
+    render();
+    return;
+  }
+  state.priority_country = selected;
+  state.priority_running = true;
+  state.priority_available = 0;
+  state.priority_target = 8;
+  state.priority_minimum = 5;
+  state.priority_message = `${selected} 优先检测已启动`;
+  render();
+  try {
+    const response = await fetch("./api/prioritize_country", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ country: selected })
+    });
+    const result = await response.json();
+    if (requestSeq !== countryPriorityRequestSeq) return;
+    if (!result.ok) {
+      state.priority_running = false;
+      state.priority_message = result.error || "国家优先检测启动失败";
+      render();
+      return;
+    }
+    const poll = async () => {
+      if (requestSeq !== countryPriorityRequestSeq) return;
+      try {
+        const r = await fetch("./api/nodes");
+        const d = await r.json();
+        if (requestSeq !== countryPriorityRequestSeq) return;
+        nodes = Array.isArray(d.nodes) ? d.nodes : [];
+        state = d.state || {};
+        stableSortNodes();
+        updateCountryFilter();
+        render();
+        if (!state.priority_running || String(state.priority_country || "") !== selected) {
+          if (countryPriorityPollInterval) { clearInterval(countryPriorityPollInterval); countryPriorityPollInterval = null; }
+        }
+      } catch (e) {}
+    };
+    await poll();
+    countryPriorityPollInterval = setInterval(poll, 1500);
+  } catch (e) {
+    if (requestSeq === countryPriorityRequestSeq) {
+      state.priority_running = false;
+      state.priority_message = "国家优先检测请求失败";
+      render();
+    }
+  }
+}
 
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
@@ -4957,6 +5214,8 @@ async function toggleFavorite(id, event) {
 
 let pollInterval = null;
 let refreshPollInterval = null;
+let countryPriorityPollInterval = null;
+let countryPriorityRequestSeq = 0;
 
 function refreshButtonBusy(message = "正在后台更新...") {
   const btn = $("refresh");
@@ -5123,7 +5382,12 @@ async function load(){
     startConnectionPolling();
   }
 }
-$("country_filter").onchange=()=>{ currentPage = 1; render(); };
+$("country_filter").onchange=()=>{
+  currentPage = 1;
+  render();
+  const country = $("country_filter").value;
+  if (country) prioritizeCountry(country);
+};
 $("protocol_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
@@ -7014,12 +7278,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""), enable_connection=True)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/prioritize_country":
+            try:
+                payload = self.read_json_body()
+                country = str(payload.get("country") or "").strip()
+                if not country:
+                    self.send_json({"ok": False, "error": "国家不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                self.send_json(start_country_priority(country))
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
         elif effective_path == "/api/test_node":
             try:
                 payload = self.read_json_body()
                 node_id = str(payload.get("id") or "")
                 if not node_id.strip():
                     self.send_json({"ok": False, "error": "节点 ID 不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if node_id.startswith("pool:"):
+                    endpoint_id = node_id.removeprefix("pool:")
+                    result = probe_pool_endpoint(endpoint_id)
+                    endpoint = node_pool.get_endpoint(endpoint_id)
+                    node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
+                    self.send_json({"ok": bool(result.get("ok")), "node": node, "result": result}, HTTPStatus.OK)
                     return
                 if not maintenance_lock.acquire(blocking=False):
                     self.send_json({"ok": False, "error": "当前已有连接或节点维护任务正在运行，请稍后再试"}, HTTPStatus.CONFLICT)
@@ -7124,6 +7406,12 @@ def main() -> None:
             "failover_in_progress": False,
             "last_failover_ok": None,
             "last_failover_duration_ms": 0,
+            "priority_country": "",
+            "priority_available": 0,
+            "priority_target": COUNTRY_AVAILABLE_TARGET,
+            "priority_minimum": COUNTRY_AVAILABLE_MIN,
+            "priority_running": False,
+            "priority_message": "",
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
