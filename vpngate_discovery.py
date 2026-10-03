@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import concurrent.futures
 import html
 import re
 import urllib.parse
@@ -184,6 +185,66 @@ def parse_server_table(raw_html: str) -> list[dict[str, Any]]:
 
     return results
 
+_PROTOCOL_FILTER_NAMES = {
+    "softether": "C_SoftEther",
+    "l2tp-ipsec": "C_L2TP",
+    "openvpn": "C_OpenVPN",
+    "sstp": "C_SSTP",
+}
+
+def fetch_server_table_protocol(url: str, protocol: str, timeout: int = 12) -> list[dict[str, Any]]:
+    """Submit VPN Gate's own protocol filter and parse the returned partial table."""
+    key = str(protocol or "").strip().lower()
+    checkbox = _PROTOCOL_FILTER_NAMES.get(key)
+    if not checkbox:
+        raise ValueError(f"unsupported VPN Gate protocol filter: {protocol}")
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 AimiliVPN/3.0", "Accept": "text/html"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+
+    form_match = re.search(
+        r"<form[^>]+method=[\"']post[\"'][^>]*action=[\"']([^\"']*)[\"'][^>]*>",
+        raw,
+        re.I,
+    )
+    action = form_match.group(1) if form_match else "./"
+    post_url = urllib.parse.urljoin(url, html.unescape(action))
+
+    fields: dict[str, str] = {}
+    for match in re.finditer(
+        r"<input[^>]+type=[\"']hidden[\"'][^>]*name=[\"']([^\"']+)[\"'][^>]*value=[\"']([^\"']*)[\"']",
+        raw,
+        re.I,
+    ):
+        fields[html.unescape(match.group(1))] = html.unescape(match.group(2))
+
+    fields["__EVENTTARGET"] = ""
+    fields["__EVENTARGUMENT"] = ""
+    fields["Button3"] = "Refresh Servers List"
+    for name in _PROTOCOL_FILTER_NAMES.values():
+        fields.pop(name, None)
+    fields[checkbox] = "on"
+
+    encoded = urllib.parse.urlencode(fields).encode("utf-8")
+    post_req = urllib.request.Request(
+        post_url,
+        data=encoded,
+        headers={
+            "User-Agent": "Mozilla/5.0 AimiliVPN/3.0",
+            "Accept": "text/html",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(post_req, timeout=timeout) as response:
+        filtered_html = response.read().decode("utf-8", errors="replace")
+    return parse_server_table(filtered_html)
+
+
 def fetch_server_table(url: str = VPNGATE_HTML_URL, timeout: int = 15) -> list[dict[str, Any]]:
     req = urllib.request.Request(
         url,
@@ -206,14 +267,109 @@ def fetch_mirror_urls(url: str = VPNGATE_MIRROR_LIST_URL, timeout: int = 10) -> 
         raw = response.read().decode("utf-8", errors="replace")
     urls = []
     seen = set()
-    for match in re.finditer(r"https?://[^\s\"'<>]+/en/", raw, re.I):
+    for match in re.finditer(r"https?://[^\s\"'<>]+/(?:en|cn|ja)/", raw, re.I):
         mirror = html.unescape(match.group(0)).strip()
-        if mirror.lower().startswith("https://www.vpngate.net/"):
+        if mirror.lower().startswith(("https://www.vpngate.net/", "http://www.vpngate.net/")):
             continue
+        mirror = re.sub(r"/(?:cn|ja)/?$", "/en/", mirror, flags=re.I)
         if mirror not in seen:
             seen.add(mirror)
             urls.append(mirror)
     return urls
+
+
+def fetch_openvpn_endpoint_page(host: str, timeout: int = 12) -> dict[str, Any] | None:
+    """Use VPN Gate's direct OpenVPN endpoint page as an exact-host fallback."""
+    target = str(host or "").strip()
+    if not target or not (target.lower().endswith(".opengw.net") or re.fullmatch(r"[0-9a-fA-F:.]+", target)):
+        return None
+    query = urllib.parse.urlencode({"fqdn": target})
+    url = f"https://www.vpngate.net/en/do_openvpn.aspx?{query}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 AimiliVPN/3.0", "Accept": "text/html"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    host_match = re.search(r"Destination DDNS Hostname:\s*([^<\r\n]+)", raw, re.I)
+    ddns = (html.unescape(host_match.group(1)).strip().lower() if host_match else target.lower())
+    ip_match = re.search(r"Destination IP Address:\s*([0-9a-fA-F:.]+)", raw, re.I)
+    ip = ip_match.group(1).strip() if ip_match else ""
+    ports = re.findall(r"OpenVPN Configuration File:\s*[^<\r\n]+?\((TCP|UDP)\s+(\d+)\)", html.unescape(raw), re.I)
+    protocols = []
+    seen = set()
+    for transport, port_text in ports:
+        item = ("openvpn", transport.lower(), int(port_text))
+        if item not in seen:
+            seen.add(item)
+            protocols.append({"protocol": "openvpn", "transport": transport.lower(), "port": int(port_text)})
+    if not protocols:
+        return None
+    return {
+        "hostname": ddns,
+        "ip": ip,
+        "country": "",
+        "sessions": 0,
+        "speed": 0,
+        "ping": 0,
+        "score": 0,
+        "protocols": protocols,
+        "_sources": [url],
+    }
+
+def find_server_by_endpoint(host: str, port: int, max_mirrors: int | None = None) -> tuple[dict[str, Any] | None, list[str]]:
+    """Find one VPN Gate server by hostname/IP + advertised port, returning as soon as a source matches."""
+    target_host = str(host or "").strip().lower()
+    target_port = int(port or 0)
+    sources = [VPNGATE_HTML_URL]
+    try:
+        mirrors = fetch_mirror_urls()
+        if max_mirrors is not None:
+            mirrors = mirrors[:max(0, int(max_mirrors))]
+        sources.extend(mirrors)
+    except Exception:
+        pass
+
+    def match_source(source: str) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+        try:
+            servers = fetch_server_table(source, timeout=10)
+        except Exception:
+            return source, [], None
+        for server in servers:
+            hostname = str(server.get("hostname") or "").strip().lower()
+            ip = str(server.get("ip") or "").strip()
+            if target_host not in {hostname, ip}:
+                continue
+            if not any(int(item.get("port") or 0) == target_port for item in server.get("protocols") or []):
+                continue
+            return source, servers, dict(server)
+        return source, servers, None
+
+    successful: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as executor:
+        futures = {executor.submit(match_source, source): source for source in sources}
+        for future in concurrent.futures.as_completed(futures):
+            source, servers, matched = future.result()
+            if servers:
+                successful.append(source)
+            if matched:
+                matched["_sources"] = [source]
+                # Collect corroborating protocol metadata from already completed/fast sources later
+                # only when it arrives; the caller can safely probe the selected endpoint locally.
+                matched["source_count"] = 1
+                matched["trusted_observation"] = source == VPNGATE_HTML_URL
+                return matched, successful
+
+    endpoint_page = fetch_openvpn_endpoint_page(target_host)
+    if endpoint_page:
+        endpoint_page["source_count"] = 1
+        endpoint_page["trusted_observation"] = True
+        successful.append("https://www.vpngate.net/en/do_openvpn.aspx")
+        return endpoint_page, successful
+    return None, successful
 
 def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
@@ -270,24 +426,48 @@ def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]
         )
     return result
 
-def fetch_multi_source_tables(max_mirrors: int = 2) -> tuple[list[dict[str, Any]], list[str]]:
+def fetch_multi_source_tables(max_mirrors: int | None = None, include_protocol_filters: bool = True) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fetch the main site plus all current mirrors independently and optionally repeat through VPN Gate protocol filters."""
     sources = [VPNGATE_HTML_URL]
     try:
         mirrors = fetch_mirror_urls()
-        sources.extend(mirrors[: max(0, int(max_mirrors))])
+        if max_mirrors is not None:
+            mirrors = mirrors[:max(0, int(max_mirrors))]
+        sources.extend(mirrors)
     except Exception:
         pass
 
-    snapshots: list[list[dict[str, Any]]] = []
-    successful_sources: list[str] = []
-    for source in sources:
+    protocols = ("softether", "l2tp-ipsec", "openvpn", "sstp")
+
+    def fetch_one(source: str) -> tuple[str, list[list[dict[str, Any]]]]:
+        snapshots: list[list[dict[str, Any]]] = []
         try:
             servers = fetch_server_table(source, timeout=12)
+            for server in servers:
+                server["_source_url"] = source
             if servers:
-                for server in servers:
-                    server["_source_url"] = source
                 snapshots.append(servers)
-                successful_sources.append(source)
         except Exception:
-            continue
+            pass
+
+        if include_protocol_filters:
+            for protocol in protocols:
+                try:
+                    servers = fetch_server_table_protocol(source, protocol, timeout=12)
+                    for server in servers:
+                        server["_source_url"] = f"{source}#protocol={protocol}"
+                    if servers:
+                        snapshots.append(servers)
+                except Exception:
+                    continue
+        return source, snapshots
+
+    snapshots: list[list[dict[str, Any]]] = []
+    successful_sources: list[str] = []
+    workers = min(8, max(1, len(sources)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for source, source_snapshots in executor.map(fetch_one, sources):
+            if source_snapshots:
+                snapshots.extend(source_snapshots)
+                successful_sources.append(source)
     return merge_servers(snapshots), successful_sources
