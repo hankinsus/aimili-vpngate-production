@@ -9698,7 +9698,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "server_time": time.time(),
                 "proxy_host": LOCAL_PROXY_HOST,
-                "proxy_port": 8500,
+                "proxy_port": LOCAL_PROXY_PORT,
                 "proxy_port_reachable": local_proxy_port_reachable(),
                 "proxy_ok": bool(state.get("proxy_ok")),
                 "proxy_latency_ms": parse_int(state.get("proxy_latency_ms")),
