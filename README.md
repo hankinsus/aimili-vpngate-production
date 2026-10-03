@@ -105,14 +105,14 @@ AimiliVPN 的八合一代理固定使用 **`8500/tcp`**，支持 HTTP、HTTPS CO
 sudo vim /etc/default/aimilivpn
 
 LOCAL_PROXY_USER="socks5"
-LOCAL_PROXY_PASS="netsecai.com"
+LOCAL_PROXY_PASS="ilovestudy"
 LOCAL_PROXY_ALLOW="你的公网IP/32"
 
 sudo chmod 600 /etc/default/aimilivpn
 sudo ml restart
 ```
 
-多个来源使用逗号或分号分隔；使用 `0.0.0.0/0,::/0` 表示允许所有来源，但仍需要代理用户名和密码。
+多个来源使用逗号或分号分隔；使用 `0.0.0.0/0,::/0` 表示允许所有来源，但仍需要代理用户名和密码。默认密码为 `ilovestudy`，公网部署后建议立即修改。
 
 ---
 
@@ -195,13 +195,15 @@ The public proxy uses fixed TCP port `8500`. Configure username, password, and s
 
 ### 📢 ILovestudy Official Resources & Support
 
-- **Website**: https://ilovestudycn.com
-- **IP node checker**: https://ilovestudyip.com
-- **Blog**: https://ilovestudyus.blogspot.com/
-- **YouTube**: https://www.youtube.com/@ILovestudycn
-- **Telegram group**: https://t.me/ILovestudycn
-- **Telegram channel**: https://t.me/ILovestudyus
-- **Business**: ilovestudyus@gmail.com
+| Resource | Address | Purpose |
+| --- | --- | --- |
+| Website | https://ilovestudycn.com | Project homepage and product information |
+| IP Node Checker | https://ilovestudyip.com | IP and node inspection tools |
+| Blog | https://ilovestudyus.blogspot.com/ | Tutorials and technical articles |
+| YouTube | https://www.youtube.com/@ILovestudycn | Video tutorials |
+| Telegram Group | https://t.me/ILovestudycn | User discussion and feedback |
+| Telegram Channel | https://t.me/ILovestudyus | Project announcements and updates |
+| Business Cooperation | ilovestudyus@gmail.com | Business and partnership inquiries |
 
 ---
 
@@ -229,7 +231,7 @@ Open your browser and navigate to the printed URL (e.g. `https://your_vps_ip:844
 3. Switch routes mode (Smart Auto, Specific Region, or Specific Server Node) according to your needs.
 
 #### Step 3: Use Localhost Proxy (Core Step)
-The HTTP/SOCKS5 eight-in-one proxy uses fixed TCP port **`8500`** and routes traffic through the active VPN tunnel. Access is controlled by `LOCAL_PROXY_ALLOW`, with `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` authentication.
+The HTTP/SOCKS5 eight-in-one proxy uses fixed TCP port **`8500`** and routes traffic through the active VPN tunnel. The installer default password is `ilovestudy`; change it after deployment when the proxy is reachable from the public internet. Access is controlled by `LOCAL_PROXY_ALLOW`, with `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` authentication.
 
 * **🐍 Proxy in Python**:
   ```python
