@@ -841,6 +841,61 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
         "probed_at": 0,
     }
 
+
+def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
+    protocol = str(endpoint.get("protocol") or "").strip().lower()
+    if not protocol or protocol == "openvpn":
+        return {}
+    metadata = endpoint.get("metadata") or {}
+    server_metadata = endpoint.get("server_metadata") or {}
+    status = str(endpoint.get("status") or "NEW").upper()
+    probe_status = {
+        "HOT": "available",
+        "AVAILABLE": "available",
+        "NEW": "not_checked",
+        "DEGRADED": "unavailable",
+        "COOLDOWN": "unavailable",
+        "STALE": "unavailable",
+        "RETIRED": "unavailable",
+    }.get(status, "not_checked")
+    ip = str(endpoint.get("current_ip") or metadata.get("ip") or "").strip()
+    host = str(metadata.get("hostname") or endpoint.get("hostname") or ip).strip()
+    try:
+        port = int(endpoint.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return {
+        "id": f"pool:{endpoint.get('endpoint_id', '')}",
+        "pool_endpoint_id": str(endpoint.get("endpoint_id") or ""),
+        "country": endpoint.get("country") or "",
+        "country_short": "",
+        "host_name": host,
+        "ip": ip,
+        "score": int(endpoint.get("latest_server_score") or 0),
+        "ping": int(endpoint.get("latest_ping") or 0),
+        "speed": int(endpoint.get("latest_speed") or 0),
+        "sessions": int(endpoint.get("latest_sessions") or 0),
+        "owner": str(server_metadata.get("owner") or server_metadata.get("as_name") or ""),
+        "asn": str(server_metadata.get("asn") or ""),
+        "as_name": str(server_metadata.get("as_name") or ""),
+        "location": endpoint.get("country") or "",
+        "ip_type": str(server_metadata.get("ip_type") or ""),
+        "quality": "",
+
+        "latency_ms": int(endpoint.get("latency_ewma") or 0),
+        "config_file": str(endpoint.get("config_ref") or ""),
+        "proto": str(endpoint.get("transport") or ""),
+        "protocol": protocol,
+        "remote_host": host,
+        "remote_port": port,
+        "fetched_at": float(endpoint.get("last_seen") or 0),
+        "probe_status": probe_status,
+        "probe_message": str(metadata.get("last_error") or ""),
+        "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0),
+        "active": False,
+    }
+
+
 def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
@@ -1340,6 +1395,19 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "pool": node_pool.stats()}
     finally:
         protocol_discovery_lock.release()
+
+
+def protocol_catalog_loop() -> None:
+    # Initial catalog refresh shortly after startup, then refresh periodically.
+    time.sleep(10)
+    while True:
+        try:
+            if not ISOLATED_INSTANCE:
+                refresh_multi_protocol_catalog(force=True)
+        except Exception as exc:
+            log_to_json("WARNING", "Main", f"多协议目录后台刷新异常: {exc}")
+        time.sleep(600)
+
 
 def connect_pool_endpoint(endpoint_id: str) -> str:
     global active_external_tunnel, active_pool_endpoint_id, active_openvpn_node_id, is_connecting
@@ -3818,6 +3886,20 @@ INDEX_HTML = r"""<!doctype html>
       box-sizing: border-box;
       animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
+    .vps-modal-content {
+      max-height: calc(100vh - 32px);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+    .vps-modal-header {
+      position: sticky;
+      top: -32px;
+      z-index: 5;
+      background: rgba(22, 30, 49, 0.98);
+      padding: 14px 0 16px;
+      border-bottom: 1px solid rgba(20, 184, 166, 0.16);
+    }
+
     @keyframes modalFadeIn {
       from { transform: scale(0.95); opacity: 0; }
       to { transform: scale(1); opacity: 1; }
@@ -3991,6 +4073,13 @@ INDEX_HTML = r"""<!doctype html>
     </select>
     <select id="country_filter">
       <option value="">所有国家</option>
+    </select>
+    <select id="protocol_filter">
+      <option value="">所有协议</option>
+      <option value="openvpn">OpenVPN</option>
+      <option value="softether">SoftEther</option>
+      <option value="sstp">SSTP</option>
+      <option value="l2tp-ipsec">L2TP/IPsec</option>
     </select>
     <select id="ip_type_filter">
       <option value="">所有IP类型</option>
@@ -4194,8 +4283,8 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- VPS 购买推荐 Modal -->
   <div id="vps_recommend_modal" class="modal">
-    <div class="modal-content" style="max-width: 640px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+    <div class="modal-content vps-modal-content" style="max-width: 640px;">
+      <div class="vps-modal-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--warning);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364.364l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
           VPS 购买推荐
@@ -4492,11 +4581,15 @@ function updateCountryFilter() {
 
 function getFilteredNodes() {
   const selectedCountry = $("country_filter").value;
+  const selectedProtocol = $("protocol_filter").value;
   const selectedIpType = $("ip_type_filter").value;
   const selectedStatus = $("status_filter").value;
   return nodes.filter(n => {
     if (!n) return false;
     if (selectedCountry && translateCountry(n.country) !== selectedCountry) {
+      return false;
+    }
+    if (selectedProtocol && String(n.protocol || "openvpn").toLowerCase() !== selectedProtocol) {
       return false;
     }
     if (selectedIpType) {
@@ -4525,13 +4618,27 @@ function getFilteredNodes() {
 }
 
 function stableSortNodes() {
+  const statusRank = { available: 0, testing: 1, not_checked: 2, unavailable: 3 };
+  const protocolRank = { softether: 0, sstp: 1, "l2tp-ipsec": 2, openvpn: 3 };
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
+    const aActive = a.active || (a.pool_endpoint_id && state.active_pool_endpoint_id === a.pool_endpoint_id);
+    const bActive = b.active || (b.pool_endpoint_id && state.active_pool_endpoint_id === b.pool_endpoint_id);
+    if (aActive !== bActive) return aActive ? -1 : 1;
+    const aRank = statusRank[a.probe_status || "not_checked"] ?? 2;
+    const bRank = statusRank[b.probe_status || "not_checked"] ?? 2;
+    if (aRank !== bRank) return aRank - bRank;
+    const aProtocol = String(a.protocol || "openvpn").toLowerCase();
+    const bProtocol = String(b.protocol || "openvpn").toLowerCase();
+    const ap = protocolRank[aProtocol] ?? 9;
+    const bp = protocolRank[bProtocol] ?? 9;
+    if (ap !== bp) return ap - bp;
+    const aLatency = Number(a.latency_ms || 0);
+    const bLatency = Number(b.latency_ms || 0);
+    if (aLatency > 0 && bLatency > 0 && aLatency !== bLatency) return aLatency - bLatency;
     const aScore = a.score || 0;
     const bScore = b.score || 0;
-    if (bScore !== aScore) {
-      return bScore - aScore;
-    }
+    if (bScore !== aScore) return bScore - aScore;
     const aId = a.id || "";
     const bId = b.id || "";
     return aId.localeCompare(bId);
@@ -4727,7 +4834,7 @@ function render(){
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
-      const isCurrentlyActive = activeNode && n.id === activeNode.id;
+      const isCurrentlyActive = (n.pool_endpoint_id && state.active_pool_endpoint_id === n.pool_endpoint_id) || (!!activeNode && n.id === activeNode.id);
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
       
       const badgeClass = isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked');
@@ -4736,6 +4843,9 @@ function render(){
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
       const protocolName = translateProtocol(n.protocol || "openvpn");
+      const nodeHost = n.ip || n.remote_host || "-";
+      const nodePort = Number(n.remote_port || 0) > 0 ? ":" + String(n.remote_port) : "";
+      const nodeAddress = nodeHost + nodePort;
       
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
@@ -4757,7 +4867,7 @@ function render(){
 
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
+        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(nodeAddress)}">${esc(nodeAddress)}</td>
         <td style="white-space: nowrap; text-align: center;">
           <span class="badge" style="border-color: rgba(20, 184, 166, 0.25); color: var(--primary); background: rgba(20, 184, 166, 0.08);">${esc(protocolName)}</span>
         </td>
@@ -4917,8 +5027,18 @@ function startConnectionPolling() {
 }
 
 async function connectNode(id){
+  const selectedNode = nodes.find(n => n && n.id === id);
+  const poolEndpointId = selectedNode && selectedNode.pool_endpoint_id ? selectedNode.pool_endpoint_id : "";
   state.is_connecting = true;
-  state.active_openvpn_node_id = id;
+  if (poolEndpointId) {
+    state.active_openvpn_node_id = "";
+    state.active_pool_endpoint_id = poolEndpointId;
+    state.active_tunnel_protocol = selectedNode.protocol || "";
+  } else {
+    state.active_openvpn_node_id = id;
+    state.active_pool_endpoint_id = "";
+    state.active_tunnel_protocol = "";
+  }
   state.active_node_latency = "正在连接";
   state.last_check_message = "正在发送连接请求...";
   render();
@@ -4926,10 +5046,10 @@ async function connectNode(id){
   startConnectionPolling();
   
   try {
-    const r = await fetch("./api/connect",{
+    const r = await fetch(poolEndpointId ? "./api/connect_pool_endpoint" : "./api/connect",{
       method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({id})
+      body: poolEndpointId ? JSON.stringify({endpoint_id: poolEndpointId}) : JSON.stringify({id})
     });
     const result = await r.json();
     if (!result.ok) {
@@ -4939,6 +5059,12 @@ async function connectNode(id){
         pollInterval = null;
       }
       state.is_connecting = false;
+      if (poolEndpointId) {
+        state.active_pool_endpoint_id = "";
+        state.active_tunnel_protocol = "";
+      } else {
+        state.active_openvpn_node_id = "";
+      }
       render();
       return;
     }
@@ -4949,6 +5075,12 @@ async function connectNode(id){
       pollInterval = null;
     }
     state.is_connecting = false;
+    if (poolEndpointId) {
+      state.active_pool_endpoint_id = "";
+      state.active_tunnel_protocol = "";
+    } else {
+      state.active_openvpn_node_id = "";
+    }
     render();
   }
 }
@@ -4992,6 +5124,7 @@ async function load(){
   }
 }
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
+$("protocol_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 
@@ -5468,6 +5601,13 @@ function openVpsModal() {
 function closeVpsModal() {
   $("vps_recommend_modal").style.display = "none";
 }
+
+$("vps_recommend_modal").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeVpsModal();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeVpsModal();
+});
 
 async function logoutAdmin() {
   try {
@@ -6164,6 +6304,15 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/nodes":
             global last_active_ping_time, last_active_latency, active_openvpn_node_id
             nodes = read_nodes()
+            try:
+                for endpoint in node_pool.list_endpoints(limit=1000):
+                    if str(endpoint.get("protocol") or "").lower() == "openvpn":
+                        continue
+                    pool_node = protocol_endpoint_to_ui_node(endpoint)
+                    if pool_node:
+                        nodes.append(pool_node)
+            except Exception as exc:
+                log_to_json("WARNING", "Main", f"多协议节点列表合并失败: {exc}")
             active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
                 n["active"] = (active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
@@ -7035,6 +7184,9 @@ def main() -> None:
     if ENABLE_PINGER_LOOP:
         threading.Thread(target=active_node_pinger, daemon=True).start()
         enabled_loops.append("pinger")
+    if not ISOLATED_INSTANCE:
+        threading.Thread(target=protocol_catalog_loop, daemon=True).start()
+        enabled_loops.append("protocol-catalog")
     if ENABLE_PROTOCOL_PROBE_LOOP:
         threading.Thread(target=protocol_probe_loop, daemon=True).start()
         enabled_loops.append("protocol-probe")
