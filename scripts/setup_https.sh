@@ -102,14 +102,15 @@ EOF
 fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  ufw allow 8443/tcp >/dev/null; ufw allow 18443/tcp >/dev/null
+  ufw allow 8443/tcp >/dev/null; ufw allow 8500/tcp >/dev/null; ufw allow 18443/tcp >/dev/null
 fi
 if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
   firewall-cmd --permanent --add-port=8443/tcp >/dev/null || true
+  firewall-cmd --permanent --add-port=8500/tcp >/dev/null || true
   firewall-cmd --permanent --add-port=18443/tcp >/dev/null || true
   firewall-cmd --reload >/dev/null || true
 fi
 
 echo "HTTPS 管理后台: https://${PUBLIC_IP}:8443/"
 echo "HTTPS 订阅入口: https://${PUBLIC_IP}:18443/"
-echo "内部管理服务:   http://127.0.0.1:8500/"
+echo "内部管理服务:   http://127.0.0.1:8501/"
