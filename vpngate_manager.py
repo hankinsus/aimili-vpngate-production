@@ -1930,7 +1930,40 @@ def _build_manual_openvpn_node(host: str, ip: str, port: int) -> dict[str, Any] 
 
 def add_manual_vpngate_node(value: str) -> dict[str, Any]:
     host, port = parse_manual_endpoint(value)
-    server, sources = vpngate_discovery.find_server_by_endpoint(host, port)
+
+    # VPN Gate hostnames can be verified directly from the current OpenVPN
+    # page. Do this first so a stale/dead hostname returns quickly instead of
+    # falling through to the full mirror discovery pipeline.
+    direct_server = None
+    direct_sources: list[str] = []
+    if host.lower().endswith(".opengw.net"):
+        direct_server = vpngate_discovery.fetch_openvpn_endpoint_page(host, timeout=6)
+        if direct_server:
+            exact = any(
+                str(item.get("protocol") or "").lower() == "openvpn"
+                and int(item.get("port") or 0) == int(port)
+                for item in (direct_server.get("protocols") or [])
+            )
+            if exact:
+                direct_server["source_count"] = 1
+                direct_server["trusted_observation"] = True
+                direct_sources = list(direct_server.get("_sources") or [])
+            else:
+                direct_server = None
+                raise ValueError(
+                    "VPN Gate 当前官方源已找到该服务器，但未确认你输入的地址+端口为 OpenVPN，"
+                    "可能是端口已变化；请复制当前页面显示的 OpenVPN TCP/UDP 端口后再添加。"
+                )
+        else:
+            raise ValueError(
+                "VPN Gate 当前官方源暂未找到该节点，可能节点已下线或信息已刷新；"
+                "请从当前 VPN Gate 页面复制最新的地址+端口后再添加。"
+            )
+
+    if direct_server:
+        server, sources = direct_server, direct_sources
+    else:
+        server, sources = vpngate_discovery.find_server_by_endpoint(host, port)
 
     if server:
         node_pool.upsert_discovery_snapshot([server], source="manual_add")
@@ -8125,7 +8158,7 @@ async function submitAddNode(){
     if (submit) { submit.disabled = true; submit.textContent = "正在查询..."; }
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在快速查询 VPN Gate 当前节点并确认地址 + 端口协议，请稍候...</div>';
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在查询 VPN Gate 当前节点并确认地址 + 端口，通常几秒内完成...</div>';
     }
     const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
@@ -8156,7 +8189,11 @@ async function submitAddNode(){
   } catch (err) {
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--danger);background:rgba(244,63,94,.07);border:1px solid rgba(244,63,94,.2);border-radius:8px;">添加失败：' + esc(err.message || err) + '</div>';
+      const errText = String(err?.message || err || "未知错误");
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--danger);background:rgba(244,63,94,.07);border:1px solid rgba(244,63,94,.2);border-radius:8px;">' +
+        '<div style="font-size:13px;font-weight:600;">添加失败</div>' +
+        '<div style="margin-top:6px;line-height:1.5;">' + esc(errText) + '</div>' +
+      '</div>';
     }
     if (submit) { submit.textContent = "重新识别"; submit.disabled = false; }
   }
