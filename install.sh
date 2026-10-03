@@ -1065,7 +1065,7 @@ elif command -v rc-service >/dev/null 2>&1; then
     rc-service aimilivpn restart || true
 fi
 
-# Configure the public HTTPS front end (8443) and subscription endpoint (18443).
+# Configure the public HTTPS management front end (8443); leave the external 18443 subscription service untouched.
 if [ -x "${INSTALL_DIR}/scripts/setup_https.sh" ]; then
     echo -e "\n正在配置 HTTPS 管理后台与订阅入口..."
     bash "${INSTALL_DIR}/scripts/setup_https.sh"
