@@ -5050,11 +5050,12 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-primary);
       font: inherit;
       font-size: 14px;
-      font-weight: 600;
+      font-weight: 500;
       text-align: left;
       cursor: pointer;
       transition: all .2s ease;
       box-sizing: border-box;
+      -webkit-font-smoothing: antialiased;
     }
     .toolbar-custom-select-button:hover,
     .toolbar-custom-select.open .toolbar-custom-select-button {
@@ -5074,7 +5075,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-select-arrow {
       color: var(--text-secondary);
-      font-size: 18px;
+      font-size: 16px;
       line-height: 1;
       flex: 0 0 auto;
       transform: translateY(-1px);
@@ -5114,7 +5115,7 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-option {
       width: 100%;
-      min-height: 42px;
+      min-height: 40px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -5126,23 +5127,28 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-primary);
       font: inherit;
       font-size: 14px;
-      font-weight: 600;
+      font-weight: 500;
       text-align: left;
       cursor: pointer;
+      -webkit-font-smoothing: antialiased;
       box-sizing: border-box;
       user-select: none;
     }
     .toolbar-custom-option:hover,
-    .toolbar-custom-option:focus-visible,
+    .toolbar-custom-option:focus-visible {
+      background: rgba(99,102,241,.08);
+      color: var(--text-primary);
+      outline: none;
+    }
     .toolbar-custom-option.active {
-      background: rgba(99,102,241,.20);
-      color: #fff;
+      background: rgba(99,102,241,.12);
+      color: var(--text-primary);
       outline: none;
     }
     .toolbar-custom-option-count {
-      color: var(--text-primary);
+      color: var(--text-secondary);
       font-size: 13px;
-      font-weight: 700;
+      font-weight: 500;
       line-height: 1;
       min-width: 58px;
       text-align: right;
@@ -7518,11 +7524,15 @@ function render(){
       const min = Number(state.priority_minimum || 5);
       const inventory = Number(state.priority_inventory || 0);
       const inventoryTarget = Number(state.priority_inventory_target || 20);
+      const rawPriorityMessage = String(state.priority_message || (av + " 个可用节点"));
+      const priorityMessage = /unauthorized|http\\s*401/i.test(rawPriorityMessage)
+        ? "管理员会话已失效，请刷新页面并重新登录"
+        : rawPriorityMessage;
       priorityStatusEl.style.display = "flex";
       priorityStatusEl.className = state.priority_running ? "country-priority running" : "country-priority";
       priorityStatusEl.innerHTML = state.priority_running
         ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av}/${target} · 目标 ${min}-${target}</span>`
-        : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>库存 ${inventory}/${inventoryTarget} IP · ${esc(state.priority_message || (av + " 个可用节点"))}</span>`;
+        : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>库存 ${inventory}/${inventoryTarget} IP · ${esc(priorityMessage)}</span>`;
     } else {
       priorityStatusEl.style.display = "none";
     }
@@ -7725,14 +7735,17 @@ async function prioritizeCountry(country){
   try {
     const response = await fetch("./api/prioritize_country", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ country: selected })
     });
-    const result = await response.json();
+    const result = await response.json().catch(() => ({}));
     if (requestSeq !== countryPriorityRequestSeq) return;
-    if (!result.ok) {
+    if (!response.ok || !result.ok) {
       state.priority_running = false;
-      state.priority_message = result.error || "国家优先检测启动失败";
+      state.priority_message = response.status === 401 || /unauthorized/i.test(String(result.error || ""))
+        ? "管理员会话已失效，请刷新页面并重新登录"
+        : (result.error || "国家优先检测启动失败");
       render();
       return;
     }
@@ -7832,7 +7845,11 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
     }));
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = new Error(data.error || ("HTTP " + response.status));
+      const error = new Error(
+        response.status === 401
+          ? "管理员会话已失效，请刷新页面并重新登录"
+          : (data.error || ("HTTP " + response.status))
+      );
       error.status = response.status;
       throw error;
     }
@@ -8771,8 +8788,12 @@ load();
 setInterval(async () => {
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
-      const r = await fetch("./api/nodes");
+      const r = await fetch("./api/nodes", {credentials:"same-origin", cache:"no-store"});
       const d = await r.json();
+      if (r.status === 401) {
+        window.location.reload();
+        return;
+      }
       nodes = d.nodes || [];
       state = d.state || {};
       stableSortNodes();
