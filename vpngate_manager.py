@@ -1426,58 +1426,106 @@ def parse_manual_endpoint(value: str) -> tuple[str, int]:
         raise ValueError("节点格式应为 域名:端口，例如 vpn536329081.opengw.net:1965")
     return match.group(1).strip(), int(match.group(2))
 
+def _manual_openvpn_template() -> str:
+    """Return a current VPN Gate OpenVPN template already present on this instance."""
+    try:
+        for node in read_nodes():
+            text = str(node.get("config_text") or "").strip()
+            if text and "<ca>" in text and "<key>" in text and "remote " in text:
+                return text
+    except Exception:
+        pass
+    return ""
+
+def _build_manual_openvpn_node(host: str, ip: str, port: int) -> dict[str, Any] | None:
+    template = _manual_openvpn_template()
+    if not template:
+        try:
+            fetched = fetch_candidates()
+            for node in fetched:
+                template = str(node.get("config_text") or "").strip()
+                if template and "<ca>" in template and "<key>" in template and "remote " in template:
+                    break
+        except Exception:
+            template = ""
+    if not template:
+        return None
+    config_text = re.sub(r"(?m)^remote\s+\S+\s+\d+\s*$", f"remote {host} {int(port)}", template, count=1)
+    config_text = re.sub(r"(?m)^proto\s+\S+\s*$", "proto tcp", config_text, count=1)
+    node_id = safe_name(f"MANUAL_{host}_{port}_tcp")
+    config_path = CONFIG_DIR / f"{node_id}.ovpn"
+    node = {
+        "id": node_id, "country": "", "country_short": "", "host_name": host, "ip": ip or host,
+        "score": 0, "ping": 0, "speed": 0, "sessions": 0, "owner": "", "asn": "", "as_name": "",
+        "location": "", "ip_type": "", "quality": "manual", "latency_ms": 0,
+        "config_file": str(config_path), "config_text": config_text, "proto": "tcp", "protocol": "openvpn",
+        "remote_host": host, "remote_port": int(port), "fetched_at": time.time(),
+        "probe_status": "not_checked", "probe_message": "手动添加，等待本机验证", "probed_at": 0,
+        "manual_added": True, "manual_source": "user_input",
+    }
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        config_path.write_text(config_text, encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        vpn_utils.enrich_ip_info([node])
+    except Exception:
+        pass
+    return node
+
 def add_manual_vpngate_node(value: str) -> dict[str, Any]:
     host, port = parse_manual_endpoint(value)
     server, sources = vpngate_discovery.find_server_by_endpoint(host, port)
-    if not server:
-        raise RuntimeError(f"未在 VPN Gate 官方站点或当前镜像中找到 {host}:{port}；请确认节点地址和端口仍在运行。")
 
-    # Persist every advertised protocol for this server. The input port is only
-    # the lookup key; protocols such as OpenVPN UDP may use another advertised port.
-    node_pool.upsert_discovery_snapshot([server], source="manual_add")
-
-    openvpn_node: dict[str, Any] | None = None
-    try:
-        api_text = fetch_api_text(API_URL, True)
-        for row in parse_vpngate_rows(api_text):
-            row_ip = str(row.get("IP") or "").strip()
-            row_host = str(row.get("HostName") or "").strip().lower()
-            if row_ip != str(server.get("ip") or "").strip() and row_host != str(server.get("hostname") or "").strip().lower():
-                continue
-            encoded = row.get("OpenVPN_ConfigData_Base64", "")
-            if encoded:
-                openvpn_node = row_to_node(row, decode_config(encoded))
-                break
-    except Exception as exc:
-        log_to_json("WARNING", "Main", f"手动添加节点时获取 OpenVPN 配置失败: {exc}")
-
-    if openvpn_node:
+    if server:
+        node_pool.upsert_discovery_snapshot([server], source="manual_add")
+        openvpn_node: dict[str, Any] | None = None
         try:
-            node_pool.upsert_openvpn_snapshot([openvpn_node], source="manual_add")
+            api_text = fetch_api_text(API_URL, True)
+            for row in parse_vpngate_rows(api_text):
+                row_ip = str(row.get("IP") or "").strip()
+                row_host = str(row.get("HostName") or "").strip().lower()
+                if row_ip != str(server.get("ip") or "").strip() and row_host != str(server.get("hostname") or "").strip().lower():
+                    continue
+                encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                if encoded:
+                    openvpn_node = row_to_node(row, decode_config(encoded))
+                    break
         except Exception as exc:
-            log_to_json("WARNING", "Main", f"手动添加 OpenVPN 节点写入失败: {exc}")
+            log_to_json("WARNING", "Main", f"手动添加节点时获取 OpenVPN 配置失败: {exc}")
+        if openvpn_node:
+            try:
+                node_pool.upsert_openvpn_snapshot([openvpn_node], source="manual_add")
+            except Exception as exc:
+                log_to_json("WARNING", "Main", f"手动添加 OpenVPN 节点写入失败: {exc}")
+        protocols = [{"protocol": str(e.get("protocol") or "").lower(), "transport": str(e.get("transport") or "").upper(), "port": int(e.get("port") or 0)} for e in (server.get("protocols") or [])]
+        return {"ok": True, "mode": "official_match", "input": f"{host}:{port}", "hostname": server.get("hostname") or host, "ip": server.get("ip") or "", "country": server.get("country") or "", "protocols": protocols, "source_count": len(set(sources)), "sources": sources, "openvpn_added": bool(openvpn_node)}
 
-    protocols = []
-    for endpoint in server.get("protocols") or []:
-        label = str(endpoint.get("protocol") or "").lower()
-        transport = str(endpoint.get("transport") or "").upper()
-        ep_port = int(endpoint.get("port") or 0)
-        protocols.append({
-            "protocol": label,
-            "transport": transport,
-            "port": ep_port,
-        })
-    return {
-        "ok": True,
-        "input": f"{host}:{port}",
-        "hostname": server.get("hostname") or host,
-        "ip": server.get("ip") or "",
-        "country": server.get("country") or "",
-        "protocols": protocols,
-        "source_count": len(sources),
-        "sources": sources,
-        "openvpn_added": bool(openvpn_node),
-    }
+    resolved_ip = host
+    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", resolved_ip):
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET)
+            if infos:
+                resolved_ip = infos[0][4][0]
+        except Exception as exc:
+            raise RuntimeError(f"无法解析节点域名 {host}: {exc}")
+    is_vpngate_host = host.lower().endswith(".opengw.net")
+    if not is_vpngate_host and not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", resolved_ip):
+        raise RuntimeError("未找到该节点的权威协议信息，且地址不是可识别的 VPN Gate 节点")
+    manual_node = _build_manual_openvpn_node(host, resolved_ip, port)
+    if not manual_node:
+        raise RuntimeError("节点已解析，但当前实例没有可用于生成 OpenVPN 配置的 VPN Gate 模板；先点击一次“更新节点”再添加。")
+    with lock:
+        existing = read_nodes()
+        existing = [n for n in existing if n.get("id") != manual_node["id"]]
+        existing.append(manual_node)
+        write_json(NODES_FILE, sort_all_nodes(existing))
+    try:
+        node_pool.upsert_openvpn_snapshot([manual_node], source="manual_add")
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"手动 OpenVPN 资源写入 Master Pool 失败: {exc}")
+    return {"ok": True, "mode": "manual_unverified", "input": f"{host}:{port}", "hostname": host, "ip": resolved_ip, "country": manual_node.get("country") or "", "protocols": [{"protocol": "openvpn", "transport": "TCP", "port": port}], "source_count": 0, "sources": [], "openvpn_added": True, "probe_status": "not_checked", "message": "官方当前列表未出现该节点，已加入手动待验证 OpenVPN TCP 资源；验证通过后才会进入可用池。"}
 
 def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
     """Fill ISP, ASN, location and IP-type for multi-protocol server records from the shared IP cache/query."""
