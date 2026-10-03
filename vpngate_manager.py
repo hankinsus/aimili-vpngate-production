@@ -236,6 +236,28 @@ def _local_git_commit() -> str:
 
 
 def _remote_git_commit() -> str:
+    # Prefer the Git remote ref over the GitHub REST API. The API can be
+    # temporarily stale, which could otherwise make a newer production
+    # checkout look like it needs a downgrade.
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "origin", f"refs/heads/{GITHUB_BRANCH}"],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=GITHUB_UPDATE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[1] == f"refs/heads/{GITHUB_BRANCH}":
+                    value = parts[0].strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{40}", value):
+                        return value
+    except Exception:
+        pass
+
     request = urllib.request.Request(
         GITHUB_API_COMMIT_URL,
         headers={
@@ -271,6 +293,7 @@ def check_github_update() -> dict[str, Any]:
             "repository": GITHUB_REPOSITORY,
             "branch": GITHUB_BRANCH,
         }
+
     try:
         remote = _remote_git_commit()
     except Exception as exc:
@@ -281,6 +304,7 @@ def check_github_update() -> dict[str, Any]:
             "branch": GITHUB_BRANCH,
             "current_version": local[:8],
         }
+
     if not remote:
         return {
             "ok": False,
@@ -289,7 +313,45 @@ def check_github_update() -> dict[str, Any]:
             "branch": GITHUB_BRANCH,
             "current_version": local[:8],
         }
-    return {
+
+    local_only = 0
+    remote_only = 0
+    relation = "different"
+    try:
+        fetched = subprocess.run(
+            ["git", "fetch", "--quiet", "--prune", "origin", GITHUB_BRANCH],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=GITHUB_UPDATE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if fetched.returncode == 0:
+            compare = subprocess.run(
+                ["git", "rev-list", "--left-right", "--count", f"{local}...origin/{GITHUB_BRANCH}"],
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if compare.returncode == 0:
+                fields = compare.stdout.strip().split()
+                if len(fields) == 2:
+                    local_only, remote_only = int(fields[0]), int(fields[1])
+                    if local_only == 0 and remote_only == 0:
+                        relation = "same"
+                    elif local_only == 0 and remote_only > 0:
+                        relation = "remote_ahead"
+                    elif local_only > 0 and remote_only == 0:
+                        relation = "local_ahead"
+                    else:
+                        relation = "diverged"
+    except Exception:
+        pass
+
+    has_update = relation == "remote_ahead"
+    result = {
         "ok": True,
         "repository": GITHUB_REPOSITORY,
         "branch": GITHUB_BRANCH,
@@ -297,9 +359,18 @@ def check_github_update() -> dict[str, Any]:
         "current_commit": local,
         "latest_version": remote[:8],
         "latest_commit": remote,
-        "has_update": local != remote,
+        "has_update": has_update,
+        "relation": relation,
         "checked_at": time.time(),
     }
+    if relation == "local_ahead":
+        result["message"] = "当前服务器版本高于 GitHub 正式版，不执行降级更新。"
+    elif relation == "diverged":
+        result["ok"] = False
+        result["error"] = "当前服务器与 GitHub 正式版 main 已分叉，为避免误覆盖本地版本，暂不自动更新。"
+    elif relation == "different":
+        result["message"] = "已获取 GitHub 远端版本，但暂时无法确认提交关系；为避免误降级，不执行自动更新。"
+    return result
 
 
 def start_github_update() -> dict[str, Any]:
