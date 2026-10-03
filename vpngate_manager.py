@@ -1776,8 +1776,14 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
             available_nodes += 1
             available_servers.add(key)
         elif status in ("NEW", "DEGRADED", "COOLDOWN"):
-            candidate_refs.append({"kind": "pool", "id": "pool:" + str(endpoint.get("endpoint_id") or ""), "server_key": key, "status": status.lower(), "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0), "latency_ms": parse_int(endpoint.get("latency_ewma"))})
+            candidate_refs.append({"kind": "pool", "id": "pool:" + str(endpoint.get("endpoint_id") or ""), "server_key": key, "status": status.lower(), "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0), "ready_at": float(endpoint.get("next_test") or 0), "latency_ms": parse_int(endpoint.get("latency_ewma"))})
     priority = {"not_checked": 0, "new": 0, "unavailable": 1, "degraded": 2, "cooldown": 3}
+    now = time.time()
+    candidate_refs = [
+        x for x in candidate_refs
+        if str(x.get("status")) in ("not_checked", "new")
+        or (float(x.get("ready_at") or 0) <= now and now - float(x.get("probed_at") or 0) >= 900)
+    ]
     candidate_refs.sort(key=lambda x: (priority.get(str(x.get("status")), 4), x.get("server_key") in available_servers, x.get("probed_at") or 0, x.get("latency_ms") or 999999))
     return {"country": target_country, "available": available_nodes, "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "candidates": candidate_refs}
 
@@ -5181,7 +5187,7 @@ async function testNode(btn, id, event){
       body: JSON.stringify({ id })
     });
     const result = await response.json();
-    if (result.ok && result.node) {
+    if (result.node) {
       const idx = nodes.findIndex(n => n && n.id === id);
       if (idx !== -1) {
         nodes[idx] = result.node;
