@@ -609,6 +609,36 @@ class NodePool:
                 item.pop("server_metadata_json", None)
             return item
 
+    def update_server_metadata_batch(self, metadata_by_ip: dict[str, dict[str, Any]]) -> int:
+        """Merge external IP classification (ISP/IP type/location) into server metadata."""
+        if not metadata_by_ip:
+            return 0
+        updated = 0
+        with self.lock, closing(self._connect()) as db:
+            for ip, updates in metadata_by_ip.items():
+                ip = str(ip or "").strip()
+                if not ip or not isinstance(updates, dict):
+                    continue
+                rows = db.execute("SELECT server_key, metadata_json FROM servers WHERE current_ip=?", (ip,)).fetchall()
+                for row in rows:
+                    try:
+                        meta = json.loads(row["metadata_json"] or "{}")
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    except Exception:
+                        meta = {}
+                    changed = False
+                    for key in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                        value = updates.get(key)
+                        if value not in (None, "") and meta.get(key) != value:
+                            meta[key] = value
+                            changed = True
+                    if changed:
+                        db.execute("UPDATE servers SET metadata_json=? WHERE server_key=?", (json.dumps(meta, ensure_ascii=False), row["server_key"]))
+                        updated += 1
+            db.commit()
+        return updated
+
     def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "") -> None:
         now = time.time()
         with self.lock, closing(self._connect()) as db:
