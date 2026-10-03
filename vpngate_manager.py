@@ -4900,18 +4900,18 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-select-button {
       width: 100%;
-      height: 46px;
+      height: 44px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
+      gap: 8px;
       border: 1px solid var(--border-color);
       border-radius: 9px;
-      padding: 0 14px;
+      padding: 0 13px;
       background: rgba(255,255,255,.03);
       color: var(--text-primary);
       font: inherit;
-      font-size: 16px;
+      font-size: 14px;
       font-weight: 600;
       text-align: left;
       cursor: pointer;
@@ -4976,18 +4976,18 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-option {
       width: 100%;
-      min-height: 48px;
+      min-height: 42px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 0 14px;
+      gap: 10px;
+      padding: 0 12px;
       border: 0;
       border-radius: 8px;
       background: transparent;
       color: var(--text-primary);
       font: inherit;
-      font-size: 15px;
+      font-size: 14px;
       font-weight: 600;
       text-align: left;
       cursor: pointer;
@@ -5003,12 +5003,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-option-count {
       color: var(--text-primary);
-      font-size: 15px;
+      font-size: 13px;
       font-weight: 700;
       line-height: 1;
-      min-width: 64px;
+      min-width: 58px;
       text-align: right;
-      flex: 0 0 70px;
+      flex: 0 0 62px;
       white-space: nowrap;
     }
 
