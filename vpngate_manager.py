@@ -510,7 +510,7 @@ def get_state() -> dict[str, Any]:
     elif active_openvpn_running():
         state["active_tunnel_protocol"] = "openvpn"
     else:
-        state.setdefault("active_tunnel_protocol", "")
+        state["active_tunnel_protocol"] = ""
     state["is_connecting"] = is_connecting
     state["manual_connection_active"] = manual_connection_active
     state["manual_connection_epoch"] = manual_connection_epoch
@@ -4690,27 +4690,37 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-select {
       position: relative;
-      width: 180px;
-      height: 42px;
+      width: 200px;
+      height: 46px;
       flex: 0 0 auto;
+      z-index: 100;
+      overflow: visible !important;
+    }
+    .toolbar-custom-select[data-filter-id="country_filter"] {
+      width: 230px;
+    }
+    .toolbar-custom-select.open {
+      z-index: 10070;
     }
     .toolbar-custom-select-button {
       width: 100%;
-      height: 42px;
+      height: 46px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 0 12px;
+      border-radius: 9px;
+      padding: 0 14px;
       background: rgba(255,255,255,.03);
       color: var(--text-primary);
       font: inherit;
-      font-size: 14px;
+      font-size: 16px;
+      font-weight: 600;
       text-align: left;
       cursor: pointer;
       transition: all .2s ease;
+      box-sizing: border-box;
     }
     .toolbar-custom-select-button:hover,
     .toolbar-custom-select.open .toolbar-custom-select-button {
@@ -4718,7 +4728,11 @@ INDEX_HTML = r"""<!doctype html>
       background: #0f172a;
       box-shadow: 0 0 0 2px rgba(99,102,241,.12);
     }
-    #country_filter_label {
+    .toolbar-custom-select-button:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+    .toolbar-custom-select-label {
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -4726,7 +4740,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-select-arrow {
       color: var(--text-secondary);
-      font-size: 15px;
+      font-size: 18px;
       line-height: 1;
       flex: 0 0 auto;
       transform: translateY(-1px);
@@ -4739,10 +4753,10 @@ INDEX_HTML = r"""<!doctype html>
       position: absolute;
       left: 0;
       right: 0;
-      top: calc(100% + 6px);
-      z-index: 10060;
-      min-width: 220px;
-      max-height: 340px;
+      top: calc(100% + 8px);
+      z-index: 10080;
+      min-width: 100%;
+      max-height: min(360px, calc(100vh - 170px));
       overflow-y: auto;
       overscroll-behavior: contain;
       padding: 5px;
@@ -4759,44 +4773,42 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select.open .toolbar-custom-select-menu {
       display: block;
     }
-    .toolbar-custom-select-menu::-webkit-scrollbar {
-      width: 4px;
-    }
-    .toolbar-custom-select-menu::-webkit-scrollbar-track {
-      background: transparent;
-    }
-    .toolbar-custom-select-menu::-webkit-scrollbar-thumb {
-      background: rgba(20,184,166,.42);
-      border-radius: 999px;
-    }
-    .toolbar-custom-select-menu::-webkit-scrollbar-thumb:hover {
-      background: rgba(20,184,166,.62);
-    }
+    .toolbar-custom-select-menu::-webkit-scrollbar { width: 4px; }
+    .toolbar-custom-select-menu::-webkit-scrollbar-track { background: transparent; }
+    .toolbar-custom-select-menu::-webkit-scrollbar-thumb { background: rgba(20,184,166,.42); border-radius: 999px; }
+    .toolbar-custom-select-menu::-webkit-scrollbar-thumb:hover { background: rgba(20,184,166,.62); }
+
     .toolbar-custom-option {
       width: 100%;
-      min-height: 34px;
+      min-height: 46px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
-      padding: 0 10px;
+      gap: 12px;
+      padding: 0 14px;
       border: 0;
-      border-radius: 7px;
+      border-radius: 8px;
       background: transparent;
       color: var(--text-primary);
       font: inherit;
-      font-size: 13px;
+      font-size: 16px;
+      font-weight: 600;
       text-align: left;
       cursor: pointer;
+      box-sizing: border-box;
+      user-select: none;
     }
     .toolbar-custom-option:hover,
+    .toolbar-custom-option:focus-visible,
     .toolbar-custom-option.active {
-      background: rgba(99,102,241,.17);
+      background: rgba(99,102,241,.20);
       color: #fff;
+      outline: none;
     }
     .toolbar-custom-option-count {
       color: var(--text-secondary);
-      font-size: 11px;
+      font-size: 14px;
+      font-weight: 500;
       flex: 0 0 auto;
     }
 
@@ -5929,35 +5941,60 @@ INDEX_HTML = r"""<!doctype html>
 
 
   <section class="toolbar">
-    <select id="status_filter">
+    <select id="status_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
       <option value="testing">检测中</option>
       <option value="unavailable">失效节点</option>
     </select>
+    <div id="status_filter_widget" class="toolbar-custom-select" data-filter-id="status_filter" aria-label="状态筛选">
+      <button id="status_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
+        <span id="status_filter_label" class="toolbar-custom-select-label">全部节点</span>
+        <span class="toolbar-custom-select-arrow">⌄</span>
+      </button>
+      <div id="status_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+    </div>
+
     <select id="country_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="">所有国家</option>
     </select>
-    <div id="country_filter_widget" class="toolbar-custom-select" aria-label="国家筛选">
-      <button id="country_filter_button" type="button" class="toolbar-custom-select-button" aria-expanded="false">
-        <span id="country_filter_label">所有国家</span>
+    <div id="country_filter_widget" class="toolbar-custom-select" data-filter-id="country_filter" aria-label="国家筛选">
+      <button id="country_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
+        <span id="country_filter_label" class="toolbar-custom-select-label">所有国家</span>
         <span class="toolbar-custom-select-arrow">⌄</span>
       </button>
       <div id="country_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
     </div>
-    <select id="protocol_filter">
+
+    <select id="protocol_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="">所有协议</option>
       <option value="openvpn">OpenVPN</option>
       <option value="softether">SSL-VPN</option>
       <option value="sstp">SSTP</option>
       <option value="l2tp-ipsec">L2TP/IPsec</option>
     </select>
-    <select id="ip_type_filter">
+    <div id="protocol_filter_widget" class="toolbar-custom-select" data-filter-id="protocol_filter" aria-label="协议筛选">
+      <button id="protocol_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
+        <span id="protocol_filter_label" class="toolbar-custom-select-label">所有协议</span>
+        <span class="toolbar-custom-select-arrow">⌄</span>
+      </button>
+      <div id="protocol_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+    </div>
+
+    <select id="ip_type_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="">所有IP类型</option>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
       <option value="mobile">移动网</option>
     </select>
+    <div id="ip_type_filter_widget" class="toolbar-custom-select" data-filter-id="ip_type_filter" aria-label="IP 类型筛选">
+      <button id="ip_type_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
+        <span id="ip_type_filter_label" class="toolbar-custom-select-label">所有IP类型</span>
+        <span class="toolbar-custom-select-arrow">⌄</span>
+      </button>
+      <div id="ip_type_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+    </div>
+
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
@@ -6682,60 +6719,144 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   return true;
 }
 
-function renderCustomCountryFilter() {
-  const select = $("country_filter");
-  const label = $("country_filter_label");
-  const menu = $("country_filter_menu");
-  if (!select || !label || !menu) return;
+const CUSTOM_FILTER_CONFIG = {
+  status_filter: {widget:"status_filter_widget", button:"status_filter_button", label:"status_filter_label", menu:"status_filter_menu"},
+  country_filter: {widget:"country_filter_widget", button:"country_filter_button", label:"country_filter_label", menu:"country_filter_menu"},
+  protocol_filter: {widget:"protocol_filter_widget", button:"protocol_filter_button", label:"protocol_filter_label", menu:"protocol_filter_menu"},
+  ip_type_filter: {widget:"ip_type_filter_widget", button:"ip_type_filter_button", label:"ip_type_filter_label", menu:"ip_type_filter_menu"}
+};
+
+function renderCustomFilter(selectId, withCount = false) {
+  const cfg = CUSTOM_FILTER_CONFIG[selectId];
+  const select = cfg ? $(selectId) : null;
+  const label = cfg ? $(cfg.label) : null;
+  const menu = cfg ? $(cfg.menu) : null;
+  if (!cfg || !select || !label || !menu) return;
 
   const selected = select.options[select.selectedIndex];
-  label.textContent = selected ? selected.textContent : "所有国家";
+  const nextLabel = selected ? selected.textContent : "";
+  if (label.textContent !== nextLabel) label.textContent = nextLabel;
 
-  menu.innerHTML = Array.from(select.options).map(option => {
+  const html = Array.from(select.options).map(option => {
     const value = String(option.value || "");
     const textValue = String(option.textContent || "");
     const active = value === String(select.value || "");
-    const parts = textValue.split(" · ");
+    const parts = withCount ? textValue.split(" · ") : [textValue];
     const name = parts.shift() || textValue;
     const count = parts.join(" · ");
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') +
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
-      '" onclick="chooseCountryFilter(' + JSON.stringify(value) + ')">' +
+      '" data-filter-option="1" data-filter-value="' + esc(value) + '">' +
       '<span>' + esc(name) + '</span>' +
       (count ? '<span class="toolbar-custom-option-count">' + esc(count) + '</span>' : '') +
       '</button>';
   }).join("");
+
+  // Background refreshes run every 1.5–2s. Do not replace an unchanged open menu.
+  if (menu.innerHTML !== html) menu.innerHTML = html;
 }
 
-function closeCustomCountryFilter() {
-  const widget = $("country_filter_widget");
-  const button = $("country_filter_button");
-  if (widget) widget.classList.remove("open");
-  if (button) button.setAttribute("aria-expanded", "false");
+function renderCustomCountryFilter() {
+  renderCustomFilter("country_filter", true);
 }
 
-function toggleCustomCountryFilter(event) {
-  if (event) event.stopPropagation();
-  const widget = $("country_filter_widget");
-  const button = $("country_filter_button");
-  if (!widget) return;
+function renderAllCustomFilters() {
+  renderCustomFilter("status_filter");
+  renderCustomCountryFilter();
+  renderCustomFilter("protocol_filter");
+  renderCustomFilter("ip_type_filter");
+}
+
+function closeCustomFilters(exceptId = "") {
+  Object.keys(CUSTOM_FILTER_CONFIG).forEach(id => {
+    if (id === exceptId) return;
+    const cfg = CUSTOM_FILTER_CONFIG[id];
+    const widget = $(cfg.widget);
+    const button = $(cfg.button);
+    if (widget) widget.classList.remove("open");
+    if (button) button.setAttribute("aria-expanded", "false");
+  });
+}
+
+function toggleCustomFilter(selectId, event) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  const cfg = CUSTOM_FILTER_CONFIG[selectId];
+  const widget = cfg ? $(cfg.widget) : null;
+  const button = cfg ? $(cfg.button) : null;
+  if (!cfg || !widget) return;
   const opening = !widget.classList.contains("open");
-  document.querySelectorAll(".toolbar-custom-select.open").forEach(el => el.classList.remove("open"));
+  closeCustomFilters(selectId);
   widget.classList.toggle("open", opening);
   if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
   if (opening) {
-    const selected = $("country_filter")?.value || "";
-    const active = $("country_filter_menu")?.querySelector(".toolbar-custom-option.active");
+    const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
     if (active) active.scrollIntoView({block:"nearest"});
   }
 }
 
+function chooseCustomFilter(selectId, value) {
+  const cfg = CUSTOM_FILTER_CONFIG[selectId];
+  const select = $(selectId);
+  if (!cfg || !select) return;
+  const nextValue = String(value ?? "");
+  select.value = Array.from(select.options).some(option => String(option.value) === nextValue) ? nextValue : "";
+  renderCustomFilter(selectId, selectId === "country_filter");
+  closeCustomFilters();
+  select.dispatchEvent(new Event("change", {bubbles:true}));
+}
+
+function closeCustomCountryFilter() {
+  closeCustomFilters();
+}
+function toggleCustomCountryFilter(event) {
+  toggleCustomFilter("country_filter", event);
+}
 function chooseCountryFilter(value) {
-  const select = $("country_filter");
-  if (!select) return;
-  select.value = String(value || "");
-  closeCustomCountryFilter();
-  select.dispatchEvent(new Event("change", {bubbles: true}));
+  chooseCustomFilter("country_filter", value);
+}
+
+function bindCustomFilterEvents() {
+  if (document.body?.dataset.customFilterEventsBound === "1") return;
+  document.body.dataset.customFilterEventsBound = "1";
+
+  document.addEventListener("click", event => {
+    const option = event.target?.closest?.(".toolbar-custom-option[data-filter-option]");
+    if (option) {
+      const widget = option.closest(".toolbar-custom-select");
+      const selectId = widget?.dataset?.filterId || "";
+      if (selectId) {
+        event.preventDefault();
+        chooseCustomFilter(selectId, option.dataset.filterValue || "");
+      }
+      return;
+    }
+
+    const toggle = event.target?.closest?.("[data-filter-toggle]");
+    if (toggle) {
+      const widget = toggle.closest(".toolbar-custom-select");
+      const selectId = widget?.dataset?.filterId || "";
+      if (selectId) toggleCustomFilter(selectId, event);
+      return;
+    }
+
+    if (!event.target?.closest?.(".toolbar-custom-select")) closeCustomFilters();
+  });
+
+  document.addEventListener("keydown", event => {
+    const toggle = event.target?.closest?.("[data-filter-toggle]");
+    if (!toggle) return;
+    const widget = toggle.closest(".toolbar-custom-select");
+    const selectId = widget?.dataset?.filterId || "";
+    if (!selectId) return;
+    if (event.key === "Enter" || event.key === " ") {
+      toggleCustomFilter(selectId, event);
+    } else if (event.key === "Escape") {
+      closeCustomFilters();
+    }
+  });
 }
 
 function updateCountryFilter() {
@@ -7088,7 +7209,7 @@ function render(){
         state.priority_running ||
         state.global_pool_refresh_running
       );
-      const manualConnectBusy = !!state.manual_connection_active ||
+      const manualConnectBusy = manualConnectionUiBusy || !!state.manual_connection_active ||
         (!!state.is_connecting && !backgroundDetectionRunning);
       const connectBtn = isCurrentlyActive
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
@@ -7190,10 +7311,10 @@ async function prioritizeCountry(country){
       return;
     }
     const poll = async () => {
-      if (requestSeq !== countryPriorityRequestSeq) return;
+      if (requestSeq !== countryPriorityRequestSeq || countryPriorityPollBusy) return;
+      countryPriorityPollBusy = true;
       try {
-        const r = await fetch("./api/nodes");
-        const d = await r.json();
+        const d = await fetchJsonWithTimeout("./api/nodes", {}, 8000);
         if (requestSeq !== countryPriorityRequestSeq) return;
         nodes = Array.isArray(d.nodes) ? d.nodes : [];
         state = d.state || {};
@@ -7203,7 +7324,13 @@ async function prioritizeCountry(country){
         if (!state.priority_running || String(state.priority_country || "") !== selected) {
           if (countryPriorityPollInterval) { clearInterval(countryPriorityPollInterval); countryPriorityPollInterval = null; }
         }
-      } catch (e) {}
+      } catch (e) {
+        if (requestSeq === countryPriorityRequestSeq && e?.name !== "AbortError") {
+          console.warn("国家优先检测轮询暂时失败，保留当前结果", e);
+        }
+      } finally {
+        countryPriorityPollBusy = false;
+      }
     };
     await poll();
     countryPriorityPollInterval = setInterval(poll, 1500);
@@ -7222,12 +7349,11 @@ async function testNode(btn, id, event){
   render();
 
   try {
-    const response = await fetch("./api/test_node", {
+    const result = await fetchJsonWithTimeout("./api/test_node", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id })
-    });
-    const result = await response.json();
+    }, 30000);
     if (result.node) {
       const idx = nodes.findIndex(n => n && n.id === id);
       if (idx !== -1) {
@@ -7263,6 +7389,30 @@ let pollInterval = null;
 let refreshPollInterval = null;
 let countryPriorityPollInterval = null;
 let countryPriorityRequestSeq = 0;
+let connectionPollBusy = false;
+let refreshPollBusy = false;
+let countryPriorityPollBusy = false;
+let manualConnectionUiBusy = false;
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
+  try {
+    const response = await fetch(url, Object.assign({}, options, {
+      cache:"no-store",
+      signal:controller.signal
+    }));
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.error || ("HTTP " + response.status));
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function refreshButtonBusy(message = "正在后台更新...") {
   const btn = $("refresh");
@@ -7282,9 +7432,10 @@ function startRefreshPolling() {
   if (refreshPollInterval) clearInterval(refreshPollInterval);
   refreshButtonBusy("正在刷新全球库...");
   refreshPollInterval = setInterval(async () => {
+    if (refreshPollBusy) return;
+    refreshPollBusy = true;
     try {
-      const resp = await fetch("./api/nodes");
-      const data = await resp.json();
+      const data = await fetchJsonWithTimeout("./api/nodes", {}, 8000);
       nodes = Array.isArray(data.nodes) ? data.nodes : [];
       state = data.state || {};
       stableSortNodes();
@@ -7297,9 +7448,12 @@ function startRefreshPolling() {
         refreshButtonIdle();
       }
     } catch (pe) {
+      if (pe?.name === "AbortError") return;
       clearInterval(refreshPollInterval);
       refreshPollInterval = null;
       refreshButtonIdle();
+    } finally {
+      refreshPollBusy = false;
     }
   }, 1500);
 }
@@ -7307,9 +7461,10 @@ function startRefreshPolling() {
 function startConnectionPolling() {
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
+    if (connectionPollBusy) return;
+    connectionPollBusy = true;
     try {
-      const resp = await fetch("./api/nodes");
-      const data = await resp.json();
+      const data = await fetchJsonWithTimeout("./api/nodes", {}, 8000);
       nodes = Array.isArray(data.nodes) ? data.nodes : [];
       state = data.state || {};
       stableSortNodes();
@@ -7325,17 +7480,24 @@ function startConnectionPolling() {
         load();
       }
     } catch(pe) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-      load();
+      if (pe?.name !== "AbortError") {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        load();
+      }
+    } finally {
+      connectionPollBusy = false;
     }
   }, 2000);
 }
 
 async function connectNode(id){
+  if (manualConnectionUiBusy) return;
+  manualConnectionUiBusy = true;
   const selectedNode = nodes.find(n => n && n.id === id);
   const poolEndpointId = selectedNode && selectedNode.pool_endpoint_id ? selectedNode.pool_endpoint_id : "";
   state.is_connecting = true;
+  state.manual_connection_active = true;
   if (poolEndpointId) {
     state.active_openvpn_node_id = "";
     state.active_pool_endpoint_id = poolEndpointId;
@@ -7368,6 +7530,7 @@ async function connectNode(id){
       state.active_node_latency = "自动切换";
       render();
     }
+    if (result.ok) manualConnectionUiBusy = false;
     if (!result.ok) {
       alert("连接失败: " + (result.error || "未知错误"));
       if (pollInterval) {
@@ -7375,6 +7538,8 @@ async function connectNode(id){
         pollInterval = null;
       }
       state.is_connecting = false;
+      state.manual_connection_active = false;
+      manualConnectionUiBusy = false;
       if (poolEndpointId) {
         state.active_pool_endpoint_id = "";
         state.active_tunnel_protocol = "";
@@ -7391,6 +7556,8 @@ async function connectNode(id){
       pollInterval = null;
     }
     state.is_connecting = false;
+    state.manual_connection_active = false;
+    manualConnectionUiBusy = false;
     if (poolEndpointId) {
       state.active_pool_endpoint_id = "";
       state.active_tunnel_protocol = "";
@@ -7545,14 +7712,11 @@ $("country_filter").onchange=()=>{
   const country = $("country_filter").value;
   if (country) prioritizeCountry(country);
 };
-$("country_filter_button").onclick=toggleCustomCountryFilter;
-document.addEventListener("click", (event) => {
-  const widget = $("country_filter_widget");
-  if (widget && !widget.contains(event.target)) closeCustomCountryFilter();
-});
 $("protocol_filter").onchange=applyNodeFilterChange;
 $("ip_type_filter").onchange=applyNodeFilterChange;
 $("status_filter").onchange=applyNodeFilterChange;
+renderAllCustomFilters();
+bindCustomFilterEvents();
 
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在刷新全球库...");
