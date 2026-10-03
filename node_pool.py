@@ -199,7 +199,9 @@ class NodePool:
             db.commit()
 
     def list_endpoints(self, protocol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 1000))
+        # The UI is paginated; keep the backend ceiling high enough that the
+        # persistent Master Pool is not accidentally truncated at 1000 endpoints.
+        limit = max(1, min(int(limit), 5000))
         with self.lock, closing(self._connect()) as db:
             params: list[Any] = []
             where = ""
@@ -361,6 +363,209 @@ class NodePool:
                     (missing, state, row["server_key"]),
                 )
             db.commit()
+
+    def upsert_shared_snapshot(self, resources: list[dict[str, Any]], peer_id: str, source_name: str = "shared") -> int:
+        """Import sanitized peer resources. Remote health is metadata only; local probing grants trust."""
+        peer_id = str(peer_id or "").strip()
+        if not peer_id or not isinstance(resources, list):
+            return 0
+        now = time.time()
+        imported = 0
+        with self.lock, closing(self._connect()) as db:
+            for resource in resources[:5000]:
+                if not isinstance(resource, dict):
+                    continue
+                protocol = str(resource.get("protocol") or "").strip().lower()
+                transport = str(resource.get("transport") or "unknown").strip().lower()
+                try:
+                    port = int(resource.get("port") or 0)
+                except (TypeError, ValueError):
+                    port = 0
+                hostname = str(resource.get("hostname") or "").strip().lower()
+                ip = str(resource.get("ip") or "").strip()
+                key = hostname or ip or str(resource.get("server_key") or "").strip().lower()
+                if not key or not protocol:
+                    continue
+                country = str(resource.get("country") or "").strip()
+                server_meta_in = resource.get("server") if isinstance(resource.get("server"), dict) else {}
+
+                existing_server = db.execute(
+                    "SELECT * FROM servers WHERE server_key=?",
+                    (key,),
+                ).fetchone()
+                if existing_server:
+                    try:
+                        server_meta = json.loads(existing_server["metadata_json"] or "{}")
+                        if not isinstance(server_meta, dict):
+                            server_meta = {}
+                    except Exception:
+                        server_meta = {}
+                    peer_ids = set(str(x) for x in (server_meta.get("shared_peer_ids") or []) if x)
+                    peer_ids.add(peer_id)
+                    server_meta["shared_peer_ids"] = sorted(peer_ids)
+                    server_meta["shared_peer_count"] = len(peer_ids)
+                    server_meta["source"] = server_meta.get("source") or source_name
+                    server_meta["shared_at"] = now
+                    for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                        value = str(server_meta_in.get(field) or "").strip()
+                        if value and not str(server_meta.get(field) or "").strip():
+                            server_meta[field] = value
+                    hostname_db = str(existing_server["hostname"] or "") or hostname
+                    ip_db = str(existing_server["current_ip"] or "") or ip
+                    country_db = str(existing_server["country"] or "") or country
+                    db.execute(
+                        "UPDATE servers SET hostname=?, current_ip=?, country=?, last_seen=?, last_source=?, metadata_json=? WHERE server_key=?",
+                        (hostname_db, ip_db, country_db, now, "shared:" + peer_id, json.dumps(server_meta, ensure_ascii=False), key),
+                    )
+                else:
+                    server_meta = {
+                        "source": source_name,
+                        "shared_peer_ids": [peer_id],
+                        "shared_peer_count": 1,
+                        "shared_at": now,
+                    }
+                    for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                        value = str(server_meta_in.get(field) or "").strip()
+                        if value:
+                            server_meta[field] = value
+                    db.execute(
+                        """
+                        INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            key, hostname, ip, country, now, now, "shared:" + peer_id, 0, "NEW",
+                            json.dumps(server_meta, ensure_ascii=False),
+                        ),
+                    )
+
+                eid = self.endpoint_id(key, protocol, transport, port)
+                existing_endpoint = db.execute(
+                    "SELECT * FROM endpoints WHERE endpoint_id=?",
+                    (eid,),
+                ).fetchone()
+                if existing_endpoint:
+                    try:
+                        endpoint_meta = json.loads(existing_endpoint["metadata_json"] or "{}")
+                        if not isinstance(endpoint_meta, dict):
+                            endpoint_meta = {}
+                    except Exception:
+                        endpoint_meta = {}
+                    peer_ids = set(str(x) for x in (endpoint_meta.get("source_peer_ids") or []) if x)
+                    peer_ids.add(peer_id)
+                    endpoint_meta.update({
+                        "hostname": hostname or endpoint_meta.get("hostname") or "",
+                        "ip": ip or endpoint_meta.get("ip") or "",
+                        "source": endpoint_meta.get("source") or source_name,
+                        "peer_id": peer_id,
+                        "shared_at": now,
+                        "source_peer_ids": sorted(peer_ids),
+                        "source_peer_count": len(peer_ids),
+                    })
+                    # Never downgrade a locally verified endpoint because a peer reported it as NEW.
+                    db.execute(
+                        "UPDATE endpoints SET last_seen=?, metadata_json=?, status=CASE WHEN status IN ('RETIRED','STALE') THEN 'NEW' ELSE status END WHERE endpoint_id=?",
+                        (now, json.dumps(endpoint_meta, ensure_ascii=False), eid),
+                    )
+                else:
+                    endpoint_meta = {
+                        "hostname": hostname,
+                        "ip": ip,
+                        "source": source_name,
+                        "peer_id": peer_id,
+                        "shared_at": now,
+                        "source_peer_ids": [peer_id],
+                        "source_peer_count": 1,
+                        "trusted_observation": False,
+                        "remote_status": str(resource.get("status") or "NEW"),
+                        "remote_latency_ms": int(resource.get("latency_ms") or 0),
+                    }
+                    db.execute(
+                        """
+                        INSERT INTO endpoints(endpoint_id, server_key, protocol, transport, port, config_ref, status, first_seen, last_seen, metadata_json)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            eid, key, protocol, transport, port, "", "NEW", now, now,
+                            json.dumps(endpoint_meta, ensure_ascii=False),
+                        ),
+                    )
+                imported += 1
+            db.commit()
+        return imported
+
+    def remove_shared_peer(self, peer_id: str) -> int:
+        peer_id = str(peer_id or "").strip()
+        if not peer_id:
+            return 0
+        removed = 0
+        with self.lock, closing(self._connect()) as db:
+            rows = db.execute("SELECT endpoint_id, server_key, status, metadata_json FROM endpoints").fetchall()
+            for row in rows:
+                try:
+                    meta = json.loads(row["metadata_json"] or "{}")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                except Exception:
+                    meta = {}
+                peers = set(str(x) for x in (meta.get("source_peer_ids") or []) if x)
+                if str(meta.get("peer_id") or ""):
+                    peers.add(str(meta.get("peer_id")))
+                if peer_id not in peers:
+                    continue
+                peers.discard(peer_id)
+                if peers:
+                    meta["source_peer_ids"] = sorted(peers)
+                    meta["source_peer_count"] = len(peers)
+                    if str(meta.get("peer_id") or "") == peer_id:
+                        meta["peer_id"] = sorted(peers)[0]
+                    db.execute(
+                        "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                        (json.dumps(meta, ensure_ascii=False), row["endpoint_id"]),
+                    )
+                    continue
+                if bool(meta.get("trusted_observation")) or str(row["status"] or "") in ("HOT", "AVAILABLE"):
+                    meta.pop("peer_id", None)
+                    meta.pop("source_peer_ids", None)
+                    meta.pop("source_peer_count", None)
+                    meta["source"] = "local"
+                    db.execute(
+                        "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                        (json.dumps(meta, ensure_ascii=False), row["endpoint_id"]),
+                    )
+                else:
+                    db.execute("DELETE FROM endpoints WHERE endpoint_id=?", (row["endpoint_id"],))
+                    removed += 1
+
+            server_rows = db.execute("SELECT server_key, metadata_json FROM servers").fetchall()
+            for row in server_rows:
+                try:
+                    meta = json.loads(row["metadata_json"] or "{}")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                except Exception:
+                    meta = {}
+                peers = set(str(x) for x in (meta.get("shared_peer_ids") or []) if x)
+                if peer_id not in peers:
+                    continue
+                peers.discard(peer_id)
+                meta["shared_peer_ids"] = sorted(peers)
+                meta["shared_peer_count"] = len(peers)
+                meta["source"] = "shared" if peers else (meta.get("source") or "local")
+                db.execute(
+                    "UPDATE servers SET metadata_json=? WHERE server_key=?",
+                    (json.dumps(meta, ensure_ascii=False), row["server_key"]),
+                )
+            db.execute(
+                """
+                DELETE FROM servers
+                WHERE server_key NOT IN (SELECT DISTINCT server_key FROM endpoints)
+                  AND json_extract(metadata_json, '$.shared_peer_count') IS NOT NULL
+                  AND json_extract(metadata_json, '$.shared_peer_count') = 0
+                """
+            )
+            db.commit()
+        return removed
 
     def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "") -> None:
         key = self.server_key(node)
@@ -770,3 +975,5 @@ class NodePool:
                 for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
             }
             return {"servers": servers, "endpoints": endpoints, "states": states}
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
