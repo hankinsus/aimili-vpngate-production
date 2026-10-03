@@ -7314,7 +7314,7 @@ async function prioritizeCountry(country){
       if (requestSeq !== countryPriorityRequestSeq || countryPriorityPollBusy) return;
       countryPriorityPollBusy = true;
       try {
-        const d = await fetchJsonWithTimeout("./api/nodes", {}, 8000);
+        const d = await fetchNodesState(8000);
         if (requestSeq !== countryPriorityRequestSeq) return;
         nodes = Array.isArray(d.nodes) ? d.nodes : [];
         state = d.state || {};
@@ -7394,6 +7394,8 @@ let refreshPollBusy = false;
 let countryPriorityPollBusy = false;
 let manualConnectionUiBusy = false;
 
+let nodesFetchPromise = null;
+
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
@@ -7412,6 +7414,13 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchNodesState(timeoutMs = 8000) {
+  if (nodesFetchPromise) return nodesFetchPromise;
+  nodesFetchPromise = fetchJsonWithTimeout("./api/nodes", {}, timeoutMs)
+    .finally(() => { nodesFetchPromise = null; });
+  return nodesFetchPromise;
 }
 
 function refreshButtonBusy(message = "正在后台更新...") {
@@ -7435,7 +7444,7 @@ function startRefreshPolling() {
     if (refreshPollBusy) return;
     refreshPollBusy = true;
     try {
-      const data = await fetchJsonWithTimeout("./api/nodes", {}, 8000);
+      const data = await fetchNodesState(8000);
       nodes = Array.isArray(data.nodes) ? data.nodes : [];
       state = data.state || {};
       stableSortNodes();
@@ -7464,7 +7473,7 @@ function startConnectionPolling() {
     if (connectionPollBusy) return;
     connectionPollBusy = true;
     try {
-      const data = await fetchJsonWithTimeout("./api/nodes", {}, 8000);
+      const data = await fetchNodesState(8000);
       nodes = Array.isArray(data.nodes) ? data.nodes : [];
       state = data.state || {};
       stableSortNodes();
@@ -7517,14 +7526,17 @@ async function connectNode(id){
     const fallbackEndpointIds = selectedNode && Array.isArray(selectedNode.pool_endpoint_ids)
       ? selectedNode.pool_endpoint_ids
       : (poolEndpointId ? [poolEndpointId] : []);
-    const r = await fetch(poolEndpointId ? "./api/connect_pool_endpoint" : "./api/connect",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: poolEndpointId
-        ? JSON.stringify({endpoint_id: poolEndpointId, endpoint_ids: fallbackEndpointIds})
-        : JSON.stringify({id})
-    });
-    const result = await r.json();
+    const result = await fetchJsonWithTimeout(
+      poolEndpointId ? "./api/connect_pool_endpoint" : "./api/connect",
+      {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: poolEndpointId
+          ? JSON.stringify({endpoint_id: poolEndpointId, endpoint_ids: fallbackEndpointIds})
+          : JSON.stringify({id})
+      },
+      240000
+    );
     if (result.ok && result.auto_fallback) {
       state.last_check_message = result.message || "当前节点失败，正在自动切换备用节点...";
       state.active_node_latency = "自动切换";
@@ -7571,8 +7583,7 @@ async function connectNode(id){
 async function disconnectNode(){
   if (!confirm("确定要断开当前的 VPN 连接吗？")) return;
   try {
-    const response = await fetch("./api/disconnect", { method: "POST" });
-    const result = await response.json();
+    const result = await fetchJsonWithTimeout("./api/disconnect", { method: "POST" }, 15000);
     if (result.ok) {
       try {
         await fetch("./api/test_proxy", { method: "POST" });
@@ -7646,13 +7657,12 @@ async function submitAddNode(){
       resultBox.style.display = "block";
       resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在查询主站、镜像和协议来源，请稍候...</div>';
     }
-    const response = await fetch("./api/add_node", {
+    const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
       body: JSON.stringify({address})
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.ok) throw new Error(data.error || "未找到节点");
+    }, 45000);
+    if (!data.ok) throw new Error(data.error || "未找到节点");
     const protocols = (data.protocols || []).map(p => {
       const name = translateProtocol(p.protocol);
       return name + (p.transport ? " · " + String(p.transport).toUpperCase() : "") + (p.port ? " :" + p.port : "");
@@ -7682,8 +7692,7 @@ async function submitAddNode(){
 }
 
 async function load(){
-  const r=await fetch("./api/nodes");
-  const d=await r.json();
+  const d = await fetchNodesState(8000);
   nodes=Array.isArray(d.nodes) ? d.nodes : [];
   state=d.state||{};
 
@@ -7721,9 +7730,8 @@ bindCustomFilterEvents();
 $("refresh").onclick=async()=>{
   refreshButtonBusy("正在刷新全球库...");
   try{
-    const response = await fetch("./api/refresh_global_pool",{method:"POST"});
-    const data = await response.json().catch(()=>({}));
-    if (!response.ok || data.ok === false) throw new Error(data.error || "全球库刷新启动失败");
+    const data = await fetchJsonWithTimeout("./api/refresh_global_pool",{method:"POST"}, 10000);
+    if (data.ok === false) throw new Error(data.error || "全球库刷新启动失败");
     state = Object.assign({}, state, {
       global_pool_refresh_running: true,
       global_pool_refresh_status: "running",
@@ -7751,8 +7759,7 @@ $("btn_test_proxy").onclick = async () => {
   latVal.textContent = "";
 
   try {
-    const response = await fetch("./api/test_proxy", { method: "POST" });
-    const result = await response.json();
+    const result = await fetchJsonWithTimeout("./api/test_proxy", { method: "POST" }, 10000);
     if (result.ok) {
       badge.className = "badge available";
       badge.textContent = "可用";
@@ -8295,16 +8302,13 @@ function renderGatewayServices(services) {
 }
 
 async function resourceShareAdminPost(action, payload={}) {
-  const response = await fetch("./api/resource_share/" + action, {
+  return fetchJsonWithTimeout("./api/resource_share/" + action, {
     method: "POST",
     credentials: "same-origin",
     cache: "no-store",
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(payload)
-  });
-  const data = await response.json().catch(()=>({}));
-  if (!response.ok || data.ok === false) throw new Error(data.error || "请求失败");
-  return data;
+  }, 15000);
 }
 
 function resourceShareTime(ts) {
@@ -8342,8 +8346,7 @@ function closeResourceShareModal() {
 
 async function loadResourceShareStatus() {
   try {
-    const res = await fetch("./api/resource_share/status");
-    const data = await res.json();
+    const data = await fetchJsonWithTimeout("./api/resource_share/status", {}, 10000);
     if (!data.ok) throw new Error(data.error || "加载失败");
     if ($("rs_local_url")) {
       $("rs_local_url").value = data.local_url || (window.location.origin + "/resource-share");
@@ -8836,8 +8839,7 @@ async function toggleResourcePeer(peerId, enabled) {
 
 async function editResourcePeerLegacy(peerId) {
   try {
-    const res = await fetch("./api/resource_share/status");
-    const data = await res.json();
+    const data = await fetchJsonWithTimeout("./api/resource_share/status", {}, 10000);
     const peer = (data.peers || []).find(function(item) { return item.peer_id === peerId; });
     if (!peer) throw new Error("Peer 不存在");
     const name = window.prompt("共享服务器名称", peer.name || "");
