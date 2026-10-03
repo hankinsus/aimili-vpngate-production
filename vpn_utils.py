@@ -613,7 +613,7 @@ def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
     return 2010, "[ERR_OVPN_UNKNOWN] OpenVPN 其他运行时异常。原因: 连接握手期间发生其他协议错误，详细信息请查看日志尾部。"
 
 
-def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1") -> tuple[int, str] | None:
+def diagnose_local_obstructions(proxy_port: int = 8500, host: str = "127.0.0.1") -> tuple[int, str] | None:
     import sys
     # 1. 检查端口是否被占用
     is_ipv6 = ":" in host or host == ""
