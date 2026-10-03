@@ -120,6 +120,7 @@ TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 5000, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
+COUNTRY_INVENTORY_TARGET = env_int("COUNTRY_INVENTORY_TARGET", 20, 5, 100)
 COUNTRY_AVAILABLE_MIN = env_int("COUNTRY_AVAILABLE_MIN", 5, 1, 8)
 COUNTRY_AVAILABLE_TARGET = env_int("COUNTRY_AVAILABLE_TARGET", 8, 5, 8)
 COUNTRY_PRIORITY_BATCH = env_int("COUNTRY_PRIORITY_BATCH", 5, 1, 10)
@@ -177,6 +178,7 @@ protocol_discovery_lock = threading.Lock()
 protocol_probe_lock = threading.Lock()
 country_priority_lock = threading.Lock()
 country_priority_request = ""
+country_priority_last_discovery: dict[str, float] = {}
 failover_lock = threading.Lock()
 link_probe_lock = threading.Lock()
 link_probe_usage: dict[str, tuple[float, int]] = {}
@@ -1392,7 +1394,7 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
     if not protocol_discovery_lock.acquire(blocking=False):
         return {"ok": True, "running": True, "pool": node_pool.stats()}
     try:
-        servers, sources = vpngate_discovery.fetch_multi_source_tables(max_mirrors=2)
+        servers, sources = vpngate_discovery.fetch_multi_source_tables(max_mirrors=None)
         node_pool.upsert_discovery_snapshot(servers, source="official_html_multi")
         last_protocol_discovery_at = time.time()
         stats = node_pool.stats()
@@ -1409,6 +1411,73 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
     finally:
         protocol_discovery_lock.release()
 
+
+def parse_manual_endpoint(value: str) -> tuple[str, int]:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("节点地址不能为空")
+    if raw.startswith("["):
+        match = re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+)$", raw)
+        if not match:
+            raise ValueError("IPv6 节点格式应为 [IPv6]:端口")
+        return match.group(1), int(match.group(2))
+    match = re.match(r"^([^:]+):(\d+)$", raw)
+    if not match:
+        raise ValueError("节点格式应为 域名:端口，例如 vpn536329081.opengw.net:1965")
+    return match.group(1).strip(), int(match.group(2))
+
+def add_manual_vpngate_node(value: str) -> dict[str, Any]:
+    host, port = parse_manual_endpoint(value)
+    server, sources = vpngate_discovery.find_server_by_endpoint(host, port)
+    if not server:
+        raise RuntimeError(f"未在 VPN Gate 官方站点或当前镜像中找到 {host}:{port}；请确认节点地址和端口仍在运行。")
+
+    # Persist every advertised protocol for this server. The input port is only
+    # the lookup key; protocols such as OpenVPN UDP may use another advertised port.
+    node_pool.upsert_discovery_snapshot([server], source="manual_add")
+
+    openvpn_node: dict[str, Any] | None = None
+    try:
+        api_text = fetch_api_text(API_URL, True)
+        for row in parse_vpngate_rows(api_text):
+            row_ip = str(row.get("IP") or "").strip()
+            row_host = str(row.get("HostName") or "").strip().lower()
+            if row_ip != str(server.get("ip") or "").strip() and row_host != str(server.get("hostname") or "").strip().lower():
+                continue
+            encoded = row.get("OpenVPN_ConfigData_Base64", "")
+            if encoded:
+                openvpn_node = row_to_node(row, decode_config(encoded))
+                break
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"手动添加节点时获取 OpenVPN 配置失败: {exc}")
+
+    if openvpn_node:
+        try:
+            node_pool.upsert_openvpn_snapshot([openvpn_node], source="manual_add")
+        except Exception as exc:
+            log_to_json("WARNING", "Main", f"手动添加 OpenVPN 节点写入失败: {exc}")
+
+    protocols = []
+    for endpoint in server.get("protocols") or []:
+        label = str(endpoint.get("protocol") or "").lower()
+        transport = str(endpoint.get("transport") or "").upper()
+        ep_port = int(endpoint.get("port") or 0)
+        protocols.append({
+            "protocol": label,
+            "transport": transport,
+            "port": ep_port,
+        })
+    return {
+        "ok": True,
+        "input": f"{host}:{port}",
+        "hostname": server.get("hostname") or host,
+        "ip": server.get("ip") or "",
+        "country": server.get("country") or "",
+        "protocols": protocols,
+        "source_count": len(sources),
+        "sources": sources,
+        "openvpn_added": bool(openvpn_node),
+    }
 
 def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
     """Fill ISP, ASN, location and IP-type for multi-protocol server records from the shared IP cache/query."""
@@ -1986,8 +2055,9 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
     target_country = str(country or "").strip()
     if not target_country:
         return {"country": "", "available": 0, "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN}
+    inventory_ips: set[str] = set()
+    available_ips: set[str] = set()
     available_servers: set[str] = set()
-    available_nodes = 0
     candidate_refs: list[dict[str, Any]] = []
     openvpn_nodes = read_nodes()
     for node in openvpn_nodes:
@@ -1995,8 +2065,10 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
             continue
         status = str(node.get("probe_status") or "not_checked").lower()
         key = node_pool.server_key(node)
+        ip = str(node.get("ip") or node.get("remote_host") or "").strip()
+        if ip: inventory_ips.add(ip)
         if status == "available":
-            available_nodes += 1
+            if ip: available_ips.add(ip)
             available_servers.add(key)
         elif status in ("not_checked", "unavailable"):
             candidate_refs.append({"kind": "openvpn", "id": str(node.get("id") or ""), "server_key": key, "status": status, "probed_at": float(node.get("probed_at") or 0), "latency_ms": parse_int(node.get("latency_ms"))})
@@ -2011,8 +2083,10 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
             continue
         status = str(endpoint.get("status") or "NEW").upper()
         key = str(endpoint.get("server_key") or "")
+        ip = str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
+        if ip: inventory_ips.add(ip)
         if status in ("HOT", "AVAILABLE"):
-            available_nodes += 1
+            if ip: available_ips.add(ip)
             available_servers.add(key)
         elif status in ("NEW", "DEGRADED", "COOLDOWN"):
             candidate_refs.append({"kind": "pool", "id": "pool:" + str(endpoint.get("endpoint_id") or ""), "server_key": key, "status": status.lower(), "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0), "ready_at": float(endpoint.get("next_test") or 0), "latency_ms": parse_int(endpoint.get("latency_ewma"))})
@@ -2024,7 +2098,7 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
         or (float(x.get("ready_at") or 0) <= now and now - float(x.get("probed_at") or 0) >= 900)
     ]
     candidate_refs.sort(key=lambda x: (priority.get(str(x.get("status")), 4), x.get("server_key") in available_servers, x.get("probed_at") or 0, x.get("latency_ms") or 999999))
-    return {"country": target_country, "available": available_nodes, "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "candidates": candidate_refs}
+    return {"country": target_country, "inventory": len(inventory_ips), "available": len(available_ips), "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "inventory_target": COUNTRY_INVENTORY_TARGET, "candidates": candidate_refs}
 
 def _test_pool_reference(ref: dict[str, Any]) -> dict[str, Any]:
     kind = str(ref.get("kind") or "")
@@ -2047,12 +2121,23 @@ def country_priority_worker(country: str) -> None:
             rounds += 1
             snapshot = country_priority_snapshot(country)
             available = int(snapshot.get("available") or 0)
+            inventory = int(snapshot.get("inventory") or 0)
+            if rounds == 1 and inventory < COUNTRY_INVENTORY_TARGET:
+                now = time.time()
+                last_discovery = float(country_priority_last_discovery.get(country, 0) or 0)
+                if now - last_discovery >= 600:
+                    country_priority_last_discovery[country] = now
+                    set_state(priority_country=country, priority_available=available, priority_inventory=inventory, priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{country} 资源不足 {COUNTRY_INVENTORY_TARGET} IP，正在优先从主站和全部镜像补充资源")
+                    refresh_multi_protocol_catalog(force=True)
+                    snapshot = country_priority_snapshot(country)
+                    available = int(snapshot.get("available") or 0)
+                    inventory = int(snapshot.get("inventory") or 0)
             if available >= COUNTRY_AVAILABLE_TARGET:
-                set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 已达到 {available} 个可用节点")
+                set_state(priority_country=country, priority_inventory=inventory, priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 已达到 {available} 个可用节点")
                 return
             candidates = snapshot.get("candidates") or []
             if not candidates:
-                set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 当前可检测候选不足，已得到 {available} 个可用节点")
+                set_state(priority_country=country, priority_inventory=inventory, priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 当前可检测候选不足，已得到 {available} 个可用节点")
                 return
             batch: list[dict[str, Any]] = []
             seen_servers: set[str] = set()
@@ -2086,7 +2171,8 @@ def country_priority_worker(country: str) -> None:
                 _test_pool_reference(ref)
             snapshot = country_priority_snapshot(country)
             available = int(snapshot.get("available") or 0)
-            set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{country} 优先检测中：{available}/{COUNTRY_AVAILABLE_TARGET} 个可用节点")
+            inventory = int(snapshot.get("inventory") or 0)
+            set_state(priority_country=country, priority_inventory=inventory, priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{country} 优先检测中：库存 {inventory}/{COUNTRY_INVENTORY_TARGET} IP，可用 {available}/{COUNTRY_AVAILABLE_TARGET}")
             if available >= COUNTRY_AVAILABLE_MIN and not (snapshot.get("candidates") or []):
                 break
             if country_priority_request and country_priority_request != country:
@@ -2094,9 +2180,10 @@ def country_priority_worker(country: str) -> None:
             time.sleep(1)
         final = country_priority_snapshot(country)
         available = int(final.get("available") or 0)
-        set_state(priority_country=country, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 优先检测完成：{available} 个可用节点")
+        inventory = int(final.get("inventory") or 0)
+        set_state(priority_country=country, priority_inventory=inventory, priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=available, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 优先检测完成：库存 {inventory} IP，可用 {available} 个节点")
     except Exception as exc:
-        set_state(priority_country=country, priority_available=0, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 优先检测异常：{exc}")
+        set_state(priority_country=country, priority_inventory=0, priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=0, priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{country} 优先检测异常：{exc}")
     finally:
         pending = country_priority_request if country_priority_request and country_priority_request != country else ""
         country_priority_request = ""
@@ -2114,11 +2201,11 @@ def start_country_priority(country: str) -> dict[str, Any]:
     country_priority_request = target
     if snapshot.get("available", 0) >= COUNTRY_AVAILABLE_TARGET:
         country_priority_request = ""
-        set_state(priority_country=target, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{target} 已有 {snapshot.get('available')} 个可用节点，无需重复检测")
+        set_state(priority_country=target, priority_inventory=int(snapshot.get("inventory") or 0), priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{target} 已有 {snapshot.get('available')} 个可用节点，无需重复检测")
         return {"ok": True, "running": False, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET}
     if not country_priority_lock.acquire(blocking=False):
         return {"ok": True, "running": True, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET, "message": "已有国家优先检测任务运行中"}
-    set_state(priority_country=target, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{target} 优先检测已启动：目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
+    set_state(priority_country=target, priority_inventory=int(snapshot.get("inventory") or 0), priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{target} 优先检测已启动：目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
     threading.Thread(target=country_priority_worker, args=(target,), daemon=True).start()
     return {"ok": True, "running": True, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET}
 
@@ -4410,6 +4497,10 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
     </button>
+    <button id="btn_add_node" class="btn-primary" type="button" onclick="openAddNodeModal()" style="background: rgba(129,140,248,0.14); border: 1px solid rgba(129,140,248,0.35);">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14" /></svg>
+      添加节点
+    </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
@@ -4463,7 +4554,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="protocol_filter">
       <option value="">所有协议</option>
       <option value="openvpn">OpenVPN</option>
-      <option value="softether">SoftEther</option>
+      <option value="softether">SoftEther / SSL-VPN</option>
       <option value="sstp">SSTP</option>
       <option value="l2tp-ipsec">L2TP/IPsec</option>
     </select>
@@ -4839,7 +4930,7 @@ const translateProtocol = p => {
   const key = String(p || "").trim().toLowerCase();
   const dict = {
     "openvpn": "OpenVPN",
-    "softether": "SoftEther",
+    "softether": "SoftEther / SSL-VPN",
     "sstp": "SSTP",
     "l2tp-ipsec": "L2TP/IPsec",
     "l2tp_ipsec": "L2TP/IPsec",
@@ -4861,7 +4952,8 @@ const translateQuality = q => {
 
 const translateIpType = t => {
   const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "proxy": "代理 IP"};
-  return dict[t] || t || "-";
+  const key = String(t || "").trim().toLowerCase();
+  return dict[key] || (key && key !== "unknown" ? key : "—");
 };
 
 const translateCountry = c => {
@@ -4950,16 +5042,19 @@ function getLatencyClass(ms) {
 function updateCountryFilter() {
   const select = $("country_filter");
   const selectedValue = select.value;
-  const counts = {};
+  const ipSets = {};
   nodes.forEach(n => {
     if (!n) return;
     const country = translateCountry(n.country);
     if (!country || country === "-") return;
-    counts[country] = (counts[country] || 0) + 1;
+    const ip = String(n.ip || n.current_ip || n.remote_host || "").trim();
+    if (!ipSets[country]) ipSets[country] = new Set();
+    if (ip) ipSets[country].add(ip);
   });
-  const countries = Object.keys(counts).sort((a,b) => a.localeCompare(b, "zh-CN"));
-  select.innerHTML = `<option value="">所有国家 ${nodes.length}</option>` +
-    countries.map(c => `<option value="${esc(c)}">${esc(c)} ${counts[c]}</option>`).join("");
+  const countries = Object.keys(ipSets).sort((a,b) => a.localeCompare(b, "zh-CN"));
+  const totalIps = new Set(nodes.map(n => String(n && (n.ip || n.current_ip || n.remote_host || "")).trim()).filter(Boolean)).size;
+  select.innerHTML = `<option value="">所有国家 ${totalIps}</option>` +
+    countries.map(c => `<option value="${esc(c)}">${esc(c)} ${ipSets[c].size}</option>`).join("");
   if (countries.includes(selectedValue)) select.value = selectedValue;
   else select.value = "";
 }
@@ -5153,11 +5248,13 @@ function render(){
       const av = Number(state.priority_available || 0);
       const target = Number(state.priority_target || 8);
       const min = Number(state.priority_minimum || 5);
+      const inventory = Number(state.priority_inventory || 0);
+      const inventoryTarget = Number(state.priority_inventory_target || 20);
       priorityStatusEl.style.display = "flex";
       priorityStatusEl.className = state.priority_running ? "country-priority running" : "country-priority";
       priorityStatusEl.innerHTML = state.priority_running
-        ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>${av}/${target} 个可用节点，目标 ${min}-${target}</span>`
-        : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>${esc(state.priority_message || (av + " 个可用节点"))}</span>`;
+        ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av}/${target} · 目标 ${min}-${target}</span>`
+        : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>库存 ${inventory}/${inventoryTarget} IP · ${esc(state.priority_message || (av + " 个可用节点"))}</span>`;
     } else {
       priorityStatusEl.style.display = "none";
     }
@@ -5469,7 +5566,7 @@ function startRefreshPolling() {
       refreshPollInterval = null;
       refreshButtonIdle();
     }
-  }, 1000);
+  }, 2000);
 }
 
 function startConnectionPolling() {
@@ -5497,7 +5594,7 @@ function startConnectionPolling() {
       pollInterval = null;
       load();
     }
-  }, 1000);
+  }, 2000);
 }
 
 async function connectNode(id){
@@ -5580,6 +5677,40 @@ async function disconnectNode(){
 
 
 
+
+async function openAddNodeModal(){
+  const address = window.prompt("添加 VPN Gate 节点\n请输入 域名:端口 或 IP:端口，例如：vpn536329081.opengw.net:1965");
+  if (!address) return;
+  const btn = $("btn_add_node");
+  if (btn) { btn.disabled = true; btn.textContent = "识别中..."; }
+  try {
+    const response = await fetch("./api/add_node", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({address: address.trim()})
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      alert("添加节点失败：\n" + (result.error || "未找到节点"));
+      return;
+    }
+    const protocolText = (result.protocols || []).map(p => {
+      const name = translateProtocol(p.protocol);
+      return p.transport ? name + " " + p.transport + (p.port ? ":" + p.port : "") : name;
+    }).join("\n");
+    alert(
+      "节点已加入资源池\n\n" +
+      "服务器：" + (result.hostname || result.ip || address) + "\n" +
+      "物理位置：" + (result.country || "-") + "\n" +
+      "匹配协议：\n" + (protocolText || "-")
+    );
+    await load();
+  } catch (err) {
+    alert("连接服务器失败，请稍后重试。");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "添加节点"; }
+  }
+}
 
 async function load(){
   const r=await fetch("./api/nodes"); 
@@ -7313,6 +7444,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": True, "message": "已在后台启动节点更新流程", "running": False})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/add_node":
+            try:
+                payload = self.read_json_body(max_bytes=8192)
+                value = str(payload.get("address") or payload.get("node") or "").strip()
+                result = add_manual_vpngate_node(value)
+                self.send_json(result)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
             try:
                 payload = self.read_json_body(max_bytes=262144)
@@ -7628,6 +7769,8 @@ def main() -> None:
             "last_failover_ok": None,
             "last_failover_duration_ms": 0,
             "priority_country": "",
+            "priority_inventory": 0,
+            "priority_inventory_target": COUNTRY_INVENTORY_TARGET,
             "priority_available": 0,
             "priority_target": COUNTRY_AVAILABLE_TARGET,
             "priority_minimum": COUNTRY_AVAILABLE_MIN,
