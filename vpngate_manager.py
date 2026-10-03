@@ -6782,7 +6782,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:18px;">
         <div>
           <h3 style="margin:0; font-size:20px; font-weight:700; color:var(--text-primary);">添加 VPN Gate 节点</h3>
-          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名:端口、IPv4:端口，也支持 IPv6 [地址]:端口。系统会先查询 VPN Gate 当前来源确认协议，再写入资源池。</div>
+          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名:端口、IPv4:端口，也支持 IPv6 [地址]:端口。优先直接查询 VPN Gate 当前节点，确认“地址 + 端口”后立即写入资源池。</div>
         </div>
         <button type="button" onclick="closeAddNodeModal()" style="width:32px;height:32px;border:1px solid var(--border-color);background:rgba(255,255,255,.03);border-radius:8px;color:var(--text-secondary);cursor:pointer;">✕</button>
       </div>
@@ -6797,7 +6797,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div style="margin-top:14px; padding:12px 13px; border:1px solid rgba(99,102,241,.16); background:rgba(99,102,241,.04); border-radius:9px; font-size:11px; color:var(--text-secondary); line-height:1.55;">
         <div style="font-weight:600; color:var(--text-primary); margin-bottom:4px;">识别流程</div>
-        主站 → 官方镜像 → 直接 OpenVPN 页面；只有确认到“地址 + 端口”对应的协议后才允许加入，避免手动添加产生错误协议。
+        直接查询 VPN Gate 当前节点 → 确认地址 + 端口对应的 OpenVPN 协议 → 立即加入资源池。当前官方源未找到时会快速返回，不再长时间等待镜像查询。
       </div>
 
       <div id="add_node_result" style="display:none; margin-top:14px;"></div>
@@ -8155,7 +8155,7 @@ async function submitAddNode(){
     return;
   }
   try {
-    if (submit) { submit.disabled = true; submit.textContent = "正在查询..."; }
+    if (submit) { submit.disabled = true; submit.textContent = "正在确认..."; }
     if (resultBox) {
       resultBox.style.display = "block";
       resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在查询 VPN Gate 当前节点并确认地址 + 端口，通常几秒内完成...</div>';
