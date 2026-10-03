@@ -9,6 +9,9 @@ NGINX_CONF="/etc/nginx/conf.d/aimilivpn-production.conf"
 ACME_CONF="/etc/nginx/conf.d/aimilivpn-acme.conf"
 ACME_ROOT="/var/www/aimilivpn-acme"
 SUB_DIR="/var/lib/aimilivpn/subscriptions"
+ENABLE_IP_ACME="${AIMILIVPN_ENABLE_ACME_IP_CERT:-0}"
+ACME_AVAILABLE=0
+ACME_ISSUED=0
 
 if [ "$(id -u)" != "0" ]; then echo "错误: 需要 root 权限。" >&2; exit 1; fi
 
@@ -43,14 +46,14 @@ PUBLIC_IP="${PUBLIC_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org || true)
 [ -z "$PUBLIC_IP" ] && PUBLIC_IP="127.0.0.1"
 
 # 先生成可用的后备证书，保证 Nginx 即使 ACME 失败也能启动。
-openssl req -x509 -nodes -newkey rsa:2048 -days 7 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" >/dev/null 2>&1
+openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" >/dev/null 2>&1
 chmod 600 "$KEY_FILE"; chmod 644 "$CERT_FILE"
 
 install -m 0644 "$ROOT_DIR/scripts/nginx/aimilivpn-production.conf" "$NGINX_CONF"
 rm -f "$ACME_CONF"
 
 # 只有 80 端口空闲时才启用 HTTP-01，避免抢占用户已有网站。
-if ! ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)80$'; then
+if [ "$ENABLE_IP_ACME" = "1" ] && ! ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)80$'; then
   install -m 0644 "$ROOT_DIR/scripts/nginx/aimilivpn-acme.conf" "$ACME_CONF"
   ACME_AVAILABLE=1
 else
@@ -83,17 +86,30 @@ HOOK
   fi
 fi
 
+# In the default three-port mode, never leave ACME port 80 enabled after a failed/disabled attempt.
+if [ "$ACME_AVAILABLE" = "1" ] && [ "$ACME_ISSUED" != "1" ]; then
+  rm -f "$ACME_CONF"
+  service_reload
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --remove-port=80/tcp >/dev/null || true
+    firewall-cmd --reload >/dev/null || true
+  fi
+fi
+
 nginx -t && service_reload
 
-if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^certbot.timer'; then
+if [ "$ACME_ISSUED" = "1" ] && command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^certbot.timer'; then
   systemctl enable --now certbot.timer >/dev/null 2>&1 || true
-elif [ -d /etc/cron.daily ]; then
+elif [ "$ACME_ISSUED" = "1" ] && [ -d /etc/cron.daily ]; then
   cat > /etc/cron.daily/aimilivpn-certbot-renew <<'EOF'
 #!/bin/sh
 certbot renew --quiet
 EOF
   chmod 755 /etc/cron.daily/aimilivpn-certbot-renew
-elif [ -d /etc/periodic/daily ]; then
+elif [ "$ACME_ISSUED" = "1" ] && [ -d /etc/periodic/daily ]; then
   cat > /etc/periodic/daily/aimilivpn-certbot-renew <<'EOF'
 #!/bin/sh
 certbot renew --quiet
