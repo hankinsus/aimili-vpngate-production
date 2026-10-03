@@ -2030,7 +2030,7 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
     if routing_mode == "fixed_ip":
         return 99
     if routing_mode == "favorites":
-        return 99
+        return 0
     country_rank = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
     ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
     # Country proximity is the primary preference; IP type is secondary.
@@ -2120,6 +2120,8 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
         if endpoint.get("status") not in ("HOT", "AVAILABLE"):
             continue
         if str(endpoint.get("protocol") or "").lower() != "openvpn" and not bool((endpoint.get("metadata") or {}).get("trusted_observation")):
+            continue
+        if ui_cfg.get("routing_mode") == "favorites" and not endpoint_allowed_by_pool_routing(endpoint, ui_cfg):
             continue
         endpoint["routing_tier"] = routing_preference_tier(endpoint, ui_cfg)
         endpoint["routing_country_rank"] = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
@@ -2715,7 +2717,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         return
     routing_mode = ui_cfg.get("routing_mode", "auto")
     target_country = str(ui_cfg.get("force_country") or "").strip()
-    if routing_mode in ("fixed_ip", "favorites"):
+    if routing_mode == "fixed_ip":
         return
 
     current = current_active_routing_endpoint()
@@ -3261,8 +3263,19 @@ def connect_ranked_endpoint(endpoint: dict[str, Any], manual: bool = False) -> s
 
 def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    # Fixed IP/favorites are hard constraints; country/IP type are soft preferences.
-    return routing_mode not in ("fixed_ip", "favorites")
+    if routing_mode == "fixed_ip":
+        return False
+    if routing_mode == "favorites":
+        favorite_ids = {str(x) for x in (ui_cfg.get("favorite_node_ids") or []) if str(x)}
+        endpoint_id = str(endpoint.get("endpoint_id") or "")
+        metadata = endpoint.get("metadata") or {}
+        variants = {
+            endpoint_id,
+            "pool:" + endpoint_id if endpoint_id else "",
+            str(metadata.get("node_id") or ""),
+        }
+        return bool(favorite_ids.intersection(variants))
+    return True
 
 def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4, preferred_only: bool = False, manual: bool = False) -> bool:
     if not failover_lock.acquire(blocking=False):
@@ -4697,7 +4710,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow: visible !important;
     }
     .toolbar-custom-select[data-filter-id="country_filter"] {
-      width: 230px;
+      width: 250px;
     }
     .toolbar-custom-select.open {
       z-index: 10070;
@@ -4780,7 +4793,7 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-option {
       width: 100%;
-      min-height: 46px;
+      min-height: 48px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -4791,7 +4804,7 @@ INDEX_HTML = r"""<!doctype html>
       background: transparent;
       color: var(--text-primary);
       font: inherit;
-      font-size: 16px;
+      font-size: 17px;
       font-weight: 600;
       text-align: left;
       cursor: pointer;
@@ -4806,10 +4819,14 @@ INDEX_HTML = r"""<!doctype html>
       outline: none;
     }
     .toolbar-custom-option-count {
-      color: var(--text-secondary);
-      font-size: 14px;
-      font-weight: 500;
-      flex: 0 0 auto;
+      color: var(--text-primary);
+      font-size: 17px;
+      font-weight: 700;
+      line-height: 1;
+      min-width: 70px;
+      text-align: right;
+      flex: 0 0 70px;
+      white-space: nowrap;
     }
 
     .toolbar input {
@@ -6151,6 +6168,10 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-title">优先地区</div>
                 <div class="option-card-desc">优先指定国家，失效自动回退</div>
               </div>
+              <div class="option-card" data-value="favorites" onclick="setRoutingMode('favorites')">
+                <div class="option-card-title">仅用收藏</div>
+                <div class="option-card-desc">只在收藏节点中自动连接与切换</div>
+              </div>
             </div>
           </div>
 
@@ -6194,13 +6215,13 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
 
-  <!-- ILovestudy 官方入口 Modal -->
+  <!-- 我爱研究.ILovestudy 官网入口 Modal -->
   <div id="vps_recommend_modal" class="modal">
     <div class="modal-content vps-modal-content official-portal-modal" style="max-width: 640px;">
       <div class="vps-modal-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3a9 9 0 100 18 9 9 0 000-18zm0 0c2.1 2.45 3.25 5.49 3.25 9S14.1 18.55 12 21m0-18C9.9 5.45 8.75 8.49 8.75 12S9.9 18.55 12 21M3 12h18" /></svg>
-          ILovestudy 官网入口
+          我爱研究.ILovestudy 官网入口
         </h3>
         <button type="button" onclick="closeVpsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
@@ -6894,7 +6915,10 @@ function updateCountryFilter() {
     if (matchesOther) countryIps[country].visible.add(ip);
   });
 
-  const countries = Object.keys(countryIps).sort((a,b) => a.localeCompare(b, "zh-CN"));
+  const countries = Object.keys(countryIps).sort((a,b) => {
+    const diff = countryIps[b].total.size - countryIps[a].total.size;
+    return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
+  });
   const totalCount = hasOtherFilter ? filteredAllIps.size : new Set(
     nodes.map(n => String(n && (n.ip || n.current_ip || n.remote_host || "")).trim()).filter(Boolean)
   ).size;
@@ -7492,7 +7516,7 @@ function startConnectionPolling() {
         clearInterval(pollInterval);
         pollInterval = null;
         fetchJsonWithTimeout("./api/test_proxy", { method: "POST" }, 8000).catch(() => {});
-        load();
+        render();
       }
     } catch(pe) {
       if (pe?.name !== "AbortError") {
@@ -7722,10 +7746,16 @@ function applyNodeFilterChange() {
 
 $("country_filter").onchange=()=>{
   currentPage = 1;
+  const country = $("country_filter").value || "";
   updateCountryFilter();
   render();
-  const country = $("country_filter").value;
-  if (country) prioritizeCountry(country);
+  if (country) {
+    setTimeout(() => {
+      if (($("country_filter")?.value || "") === country) {
+        prioritizeCountry(country);
+      }
+    }, 0);
+  }
 };
 $("protocol_filter").onchange=applyNodeFilterChange;
 $("ip_type_filter").onchange=applyNodeFilterChange;
@@ -7971,7 +8001,10 @@ function populateRoutingCountries() {
     }
   });
 
-  const countries = Object.keys(countMap).sort((a,b) => a.localeCompare(b, "zh-CN"));
+  const countries = Object.keys(countMap).sort((a,b) => {
+    const diff = countMap[b] - countMap[a];
+    return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
+  });
   let html = '<option value="">请选择优先国家...</option>';
   countries.forEach(c => {
     html += `<option value="${esc(c)}">${esc(c)} ${countMap[c]}</option>`;
