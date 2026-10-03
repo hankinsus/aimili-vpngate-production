@@ -279,47 +279,59 @@ def fetch_mirror_urls(url: str = VPNGATE_MIRROR_LIST_URL, timeout: int = 10) -> 
     return urls
 
 
-def fetch_openvpn_endpoint_page(host: str, timeout: int = 12) -> dict[str, Any] | None:
-    """Use VPN Gate's direct OpenVPN endpoint page as an exact-host fallback."""
+def fetch_openvpn_endpoint_page(host: str, timeout: int = 6) -> dict[str, Any] | None:
+    """Use VPN Gate's direct OpenVPN page to confirm an exact host/IP quickly.
+
+    VPN Gate currently returns the normal server table from this endpoint.
+    Parse the returned table instead of relying on an obsolete page label.
+    """
     target = str(host or "").strip()
-    if not target or not (target.lower().endswith(".opengw.net") or re.fullmatch(r"[0-9a-fA-F:.]+", target)):
+    if not target or not (
+        target.lower().endswith(".opengw.net")
+        or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", target)
+        or re.fullmatch(r"[0-9a-fA-F:]+", target)
+    ):
         return None
     query = urllib.parse.urlencode({"fqdn": target})
     url = f"https://www.vpngate.net/en/do_openvpn.aspx?{query}"
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 AimiliVPN/3.0", "Accept": "text/html"},
+        headers={"User-Agent": "Mozilla/5.0 AimiliVPN/3.0", "Accept": "text/html,application/xhtml+xml"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with urllib.request.urlopen(req, timeout=max(2, int(timeout))) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except Exception:
         return None
-    host_match = re.search(r"Destination DDNS Hostname:\s*([^<\r\n]+)", raw, re.I)
-    ddns = (html.unescape(host_match.group(1)).strip().lower() if host_match else target.lower())
-    ip_match = re.search(r"Destination IP Address:\s*([0-9a-fA-F:.]+)", raw, re.I)
-    ip = ip_match.group(1).strip() if ip_match else ""
-    ports = re.findall(r"OpenVPN Configuration File:\s*[^<\r\n]+?\((TCP|UDP)\s+(\d+)\)", html.unescape(raw), re.I)
-    protocols = []
-    seen = set()
-    for transport, port_text in ports:
-        item = ("openvpn", transport.lower(), int(port_text))
-        if item not in seen:
-            seen.add(item)
-            protocols.append({"protocol": "openvpn", "transport": transport.lower(), "port": int(port_text)})
-    if not protocols:
-        return None
-    return {
-        "hostname": ddns,
-        "ip": ip,
-        "country": "",
-        "sessions": 0,
-        "speed": 0,
-        "ping": 0,
-        "score": 0,
-        "protocols": protocols,
-        "_sources": [url],
-    }
+
+    target_lower = target.lower()
+    try:
+        servers = parse_server_table(raw)
+    except Exception:
+        servers = []
+
+    for server in servers:
+        hostname = str(server.get("hostname") or "").strip().lower()
+        ip = str(server.get("ip") or "").strip()
+        if target_lower not in {hostname, ip}:
+            continue
+        protocols = [
+            {
+                "protocol": str(item.get("protocol") or "").lower(),
+                "transport": str(item.get("transport") or "").lower(),
+                "port": int(item.get("port") or 0),
+            }
+            for item in (server.get("protocols") or [])
+            if str(item.get("protocol") or "").lower() == "openvpn"
+        ]
+        if not protocols:
+            continue
+        result = dict(server)
+        result["protocols"] = protocols
+        result["_sources"] = [url]
+        return result
+    return None
+
 
 def find_server_by_endpoint(host: str, port: int, max_mirrors: int | None = None) -> tuple[dict[str, Any] | None, list[str]]:
     """Find a VPN Gate server by host/IP + advertised port across the current source set."""
@@ -327,6 +339,16 @@ def find_server_by_endpoint(host: str, port: int, max_mirrors: int | None = None
     target_port = int(port or 0)
     if not target_host or target_port <= 0:
         return None, []
+
+    # Fast path: check the exact VPN Gate host before downloading the mirror list.
+    direct = fetch_openvpn_endpoint_page(target_host, timeout=6)
+    if direct:
+        direct_protocols = direct.get("protocols") or []
+        if any(int(item.get("port") or 0) == target_port for item in direct_protocols):
+            direct["source_count"] = 1
+            direct["trusted_observation"] = True
+            source_url = str((direct.get("_sources") or [VPNGATE_HTML_URL])[0])
+            return direct, [source_url]
 
     sources = [VPNGATE_HTML_URL]
     try:
