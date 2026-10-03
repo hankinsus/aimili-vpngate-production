@@ -6731,7 +6731,13 @@ function renderCustomFilter(selectId, withCount = false) {
   const select = cfg ? $(selectId) : null;
   const label = cfg ? $(cfg.label) : null;
   const menu = cfg ? $(cfg.menu) : null;
+  const widget = cfg ? $(cfg.widget) : null;
   if (!cfg || !select || !label || !menu) return;
+
+  // Background polling repaints the page every 1.5–2s. Never replace the
+  // live option DOM while the dropdown is open, otherwise a click can land
+  // on an element that was just destroyed/recreated.
+  if (widget?.classList.contains("open")) return;
 
   const selected = select.options[select.selectedIndex];
   const nextLabel = selected ? selected.textContent : "";
@@ -6746,7 +6752,8 @@ function renderCustomFilter(selectId, withCount = false) {
     const count = parts.join(" · ");
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') +
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
-      '" data-filter-option="1" data-filter-value="' + esc(value) + '">' +
+      '" data-filter-option="1" data-filter-value="' + esc(value) + '"' +
+      ' onclick="event.preventDefault();event.stopPropagation();chooseCustomFilter(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
       '<span>' + esc(name) + '</span>' +
       (count ? '<span class="toolbar-custom-option-count">' + esc(count) + '</span>' : '') +
       '</button>';
@@ -6789,6 +6796,7 @@ function toggleCustomFilter(selectId, event) {
   if (!cfg || !widget) return;
   const opening = !widget.classList.contains("open");
   closeCustomFilters(selectId);
+  if (opening) renderCustomFilter(selectId, selectId === "country_filter");
   widget.classList.toggle("open", opening);
   if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
   if (opening) {
@@ -6803,8 +6811,8 @@ function chooseCustomFilter(selectId, value) {
   if (!cfg || !select) return;
   const nextValue = String(value ?? "");
   select.value = Array.from(select.options).some(option => String(option.value) === nextValue) ? nextValue : "";
-  renderCustomFilter(selectId, selectId === "country_filter");
   closeCustomFilters();
+  renderCustomFilter(selectId, selectId === "country_filter");
   select.dispatchEvent(new Event("change", {bubbles:true}));
 }
 
@@ -7483,9 +7491,7 @@ function startConnectionPolling() {
       if (!state.is_connecting && !state.maintenance_running) {
         clearInterval(pollInterval);
         pollInterval = null;
-        try {
-          await fetch("./api/test_proxy", { method: "POST" });
-        } catch(pe){}
+        fetchJsonWithTimeout("./api/test_proxy", { method: "POST" }, 8000).catch(() => {});
         load();
       }
     } catch(pe) {
