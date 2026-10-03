@@ -447,6 +447,8 @@ def get_state() -> dict[str, Any]:
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
+    state["hot_pool_size"] = int(state.get("hot_pool_size") or 0)
+    state["hot_pool_target"] = int(state.get("hot_pool_target") or HOT_POOL_TARGET)
     _proxy_display = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
     state["local_proxy"] = f"http://{_proxy_display}:8500"
     state.setdefault("last_fetch_status", "not_started")
@@ -1697,7 +1699,8 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
         return 99
     country_rank = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
     ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
-    return country_rank * 2 + ip_rank
+    # Country proximity is the primary preference; IP type is secondary.
+    return country_rank * 10 + ip_rank
 
 def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple[int, int, float, int, float, int, float]:
     status = str(endpoint.get("status") or "").upper()
