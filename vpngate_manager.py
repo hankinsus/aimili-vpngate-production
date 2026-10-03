@@ -213,6 +213,7 @@ is_connecting = False
 manual_connection_lock = threading.RLock()
 manual_connection_active = False
 manual_connection_epoch = 0
+manual_add_probe_lock = threading.Lock()
 last_active_ping_time = 0.0
 last_active_latency = 0
 
@@ -1358,6 +1359,7 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "remote_host": host,
         "remote_port": port,
         "fetched_at": float(endpoint.get("last_seen") or 0),
+        "manual_added_at": float(metadata.get("manual_added_at") or 0),
         "probe_status": probe_status,
         "probe_message": str(metadata.get("last_error") or ""),
         "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0),
@@ -1891,7 +1893,7 @@ def _manual_openvpn_template() -> str:
         pass
     return ""
 
-def _build_manual_openvpn_node(host: str, ip: str, port: int) -> dict[str, Any] | None:
+def _build_manual_openvpn_node(host: str, ip: str, port: int, transport: str = "tcp") -> dict[str, Any] | None:
     template = _manual_openvpn_template()
     if not template:
         try:
@@ -1905,14 +1907,17 @@ def _build_manual_openvpn_node(host: str, ip: str, port: int) -> dict[str, Any] 
     if not template:
         return None
     config_text = re.sub(r"(?m)^remote\s+\S+\s+\d+\s*$", f"remote {host} {int(port)}", template, count=1)
-    config_text = re.sub(r"(?m)^proto\s+\S+\s*$", "proto tcp", config_text, count=1)
-    node_id = safe_name(f"MANUAL_{host}_{port}_tcp")
+    transport = str(transport or "tcp").strip().lower()
+    if transport not in ("tcp", "udp"):
+        transport = "tcp"
+    config_text = re.sub(r"(?m)^proto\s+\S+\s*$", f"proto {transport}", config_text, count=1)
+    node_id = safe_name(f"MANUAL_{host}_{port}_{transport}")
     config_path = CONFIG_DIR / f"{node_id}.ovpn"
     node = {
         "id": node_id, "country": "", "country_short": "", "host_name": host, "ip": ip or host,
         "score": 0, "ping": 0, "speed": 0, "sessions": 0, "owner": "", "asn": "", "as_name": "",
         "location": "", "ip_type": "", "quality": "manual", "latency_ms": 0,
-        "config_file": str(config_path), "config_text": config_text, "proto": "tcp", "protocol": "openvpn",
+        "config_file": str(config_path), "config_text": config_text, "proto": transport, "protocol": "openvpn",
         "remote_host": host, "remote_port": int(port), "fetched_at": time.time(),
         "probe_status": "not_checked", "probe_message": "手动添加，等待本机验证", "probed_at": 0,
         "manual_added": True, "manual_source": "user_input",
@@ -1928,127 +1933,280 @@ def _build_manual_openvpn_node(host: str, ip: str, port: int) -> dict[str, Any] 
         pass
     return node
 
-def add_manual_vpngate_node(value: str) -> dict[str, Any]:
-    host, port = parse_manual_endpoint(value)
-
-    # VPN Gate hostnames can be verified directly from the current OpenVPN
-    # page. Do this first so a stale/dead hostname returns quickly instead of
-    # falling through to the full mirror discovery pipeline.
-    direct_server = None
-    direct_sources: list[str] = []
-    if host.lower().endswith(".opengw.net"):
-        direct_server = vpngate_discovery.fetch_openvpn_endpoint_page(host, timeout=6)
-        if direct_server:
-            exact = any(
-                str(item.get("protocol") or "").lower() == "openvpn"
-                and int(item.get("port") or 0) == int(port)
-                for item in (direct_server.get("protocols") or [])
-            )
-            if exact:
-                direct_server["source_count"] = 1
-                direct_server["trusted_observation"] = True
-                direct_sources = list(direct_server.get("_sources") or [])
-            else:
-                direct_server = None
-                raise ValueError(
-                    "VPN Gate 当前官方源已找到该服务器，但未确认你输入的地址+端口为 OpenVPN，"
-                    "可能是端口已变化；请复制当前页面显示的 OpenVPN TCP/UDP 端口后再添加。"
-                )
-        else:
-            raise ValueError(
-                "VPN Gate 当前官方源暂未找到该节点，可能节点已下线或信息已刷新；"
-                "请从当前 VPN Gate 页面复制最新的地址+端口后再添加。"
-            )
-
-    if direct_server:
-        server, sources = direct_server, direct_sources
-    else:
-        server, sources = vpngate_discovery.find_server_by_endpoint(host, port)
-
-    if server:
-        node_pool.upsert_discovery_snapshot([server], source="manual_add")
-
-        # The exact endpoint is already confirmed by the current VPN Gate page.
-        # Avoid a second full API download; reuse the local OpenVPN template.
-        openvpn_node: dict[str, Any] | None = None
-        try:
-            has_exact_openvpn = any(
-                str(item.get("protocol") or "").lower() == "openvpn"
-                and int(item.get("port") or 0) == int(port)
-                for item in (server.get("protocols") or [])
-            )
-            if has_exact_openvpn:
-                openvpn_node = _build_manual_openvpn_node(
-                    str(server.get("hostname") or host),
-                    str(server.get("ip") or "") or host,
-                    int(port),
-                )
-                if openvpn_node:
-                    for key in ("country", "score", "ping", "speed", "sessions", "owner", "asn", "as_name", "location", "ip_type"):
-                        value = server.get(key)
-                        if value not in (None, ""):
-                            openvpn_node[key] = value
-                    openvpn_node["country_short"] = str(server.get("country_short") or openvpn_node.get("country_short") or "")
-        except Exception as exc:
-            log_to_json("WARNING", "Main", f"手动添加节点生成 OpenVPN 配置失败: {exc}")
-        if openvpn_node:
-            try:
-                node_pool.upsert_openvpn_snapshot([openvpn_node], source="manual_add")
-            except Exception as exc:
-                log_to_json("WARNING", "Main", f"手动添加 OpenVPN 节点写入失败: {exc}")
-
-        protocols = [
-            {
-                "protocol": str(e.get("protocol") or "").lower(),
-                "transport": str(e.get("transport") or "").upper(),
-                "port": int(e.get("port") or 0),
-            }
-            for e in (server.get("protocols") or [])
-        ]
+def _manual_probe_openvpn(host: str, ip: str, port: int, transport: str = "tcp", timeout: int = 9) -> dict[str, Any]:
+    transport = str(transport or "tcp").strip().lower()
+    if transport not in ("tcp", "udp"):
+        transport = "tcp"
+    started = time.perf_counter()
+    template = _manual_openvpn_template()
+    if not template:
         return {
-            "ok": True,
-            "mode": "official_match",
-            "input": f"{host}:{port}",
-            "hostname": server.get("hostname") or host,
-            "ip": server.get("ip") or "",
-            "country": server.get("country") or "",
-            "protocols": protocols,
-            "source_count": len(set(sources)),
-            "sources": sources,
-            "openvpn_added": bool(openvpn_node),
+            "protocol": "openvpn",
+            "transport": transport,
+            "port": int(port),
+            "ok": False,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "message": "本机没有可复用的 VPN Gate OpenVPN 配置模板",
         }
+    test_id = safe_name(f"MANUAL_TEST_{host}_{port}_{transport}")
+    temp_path = test_config_path(test_id)
+    idx = None
+    try:
+        config_text = re.sub(r"(?m)^remote\s+\S+\s+\d+\s*$", f"remote {host} {int(port)}", template, count=1)
+        config_text = re.sub(r"(?m)^proto\s+\S+\s*$", f"proto {transport}", config_text, count=1)
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path.write_text(config_text, encoding="utf-8")
+        idx = get_free_test_index()
+        ok, message, _process = run_openvpn_until_ready(
+            str(temp_path), keep_alive=False, route_nopull=True, timeout=int(timeout), dev=f"tun{idx}"
+        )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        return {
+            "protocol": "openvpn",
+            "transport": transport,
+            "port": int(port),
+            "ok": bool(ok),
+            "elapsed_ms": elapsed_ms,
+            "message": "OpenVPN 隧道建立成功" if ok else message,
+        }
+    except Exception as exc:
+        return {
+            "protocol": "openvpn",
+            "transport": transport,
+            "port": int(port),
+            "ok": False,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+            "message": str(exc),
+        }
+    finally:
+        if idx is not None:
+            release_test_index(idx)
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
 
+
+def _manual_probe_protocol(host: str, ip: str, protocol: str, port: int, transport: str = "tcp") -> dict[str, Any]:
+    protocol = str(protocol or "").strip().lower()
+    transport = str(transport or "tcp").strip().lower()
+    started = time.perf_counter()
+    token = uuid.uuid4().hex[:8]
+    try:
+        if protocol == "openvpn":
+            return _manual_probe_openvpn(host, ip, port, transport=transport)
+
+        if protocol == "softether":
+            if not tunnel_adapters.SoftEtherAdapter.available():
+                return {"protocol": protocol, "transport": transport, "port": int(port), "ok": False, "elapsed_ms": 0, "message": "SSL-VPN 组件未安装"}
+            adapter = tunnel_adapters.SoftEtherAdapter()
+            account = f"manual{token}"
+            nic = f"m{token}"
+            result = adapter.connect(host=host, port=int(port) if int(port or 0) > 0 else 443, account=account, nic=nic, username="vpn", password="vpn")
+            ok = bool(result and result.ok and result.interface)
+            message = result.message if result else "SSL-VPN 未建立"
+            if result is not None:
+                try:
+                    adapter.disconnect(account=account, nic=nic, delete=True, added_routes=((result.details or {}).get("added_host_routes") if result.details else []))
+                except Exception:
+                    pass
+            return {"protocol": protocol, "transport": transport, "port": int(port), "ok": ok, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": "SSL-VPN 隧道建立成功" if ok else message}
+
+        if protocol == "sstp":
+            if not tunnel_adapters.SSTPAdapter.available():
+                return {"protocol": protocol, "transport": transport, "port": int(port), "ok": False, "elapsed_ms": 0, "message": "MS-SSTP 组件未安装"}
+            adapter = tunnel_adapters.SSTPAdapter()
+            target = host if int(port or 0) in (0, 443) else f"{host}:{int(port)}"
+            result = adapter.connect(target, username="vpn", password="vpn", timeout=10)
+            ok = bool(result and result.ok and result.interface)
+            message = result.message if result else "MS-SSTP 未建立"
+            if result is not None:
+                try:
+                    tunnel_adapters.SSTPAdapter.disconnect(result.process, added_routes=((result.details or {}).get("added_host_routes") if result.details else []))
+                except Exception:
+                    pass
+            return {"protocol": protocol, "transport": transport, "port": int(port), "ok": ok, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": "MS-SSTP 隧道建立成功" if ok else message}
+
+        if protocol == "l2tp-ipsec":
+            if not l2tp_adapter.available():
+                return {"protocol": protocol, "transport": "udp", "port": 0, "ok": False, "elapsed_ms": 0, "message": "L2TP/IPsec 组件未安装"}
+            namespace = f"aimili-manual-{token}"
+            result = l2tp_adapter.connect(host=host, username="vpn", password="vpn", psk="vpn", namespace=namespace, timeout=12)
+            ok = bool(result and result.ok and result.interface)
+            message = result.message if result else "L2TP/IPsec 未建立"
+            if result is not None and result.ok:
+                try:
+                    l2tp_adapter.disconnect(namespace)
+                except Exception:
+                    pass
+            return {"protocol": protocol, "transport": "udp", "port": 0, "ok": ok, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": "L2TP/IPsec 隧道建立成功" if ok else message}
+
+        return {"protocol": protocol, "transport": transport, "port": int(port), "ok": False, "elapsed_ms": 0, "message": "不支持的手动直连协议"}
+    except Exception as exc:
+        return {"protocol": protocol, "transport": transport, "port": int(port), "ok": False, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": str(exc)}
+
+
+def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str, Any], source_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = time.time()
+    protocol = str(result.get("protocol") or "").lower()
+    transport = str(result.get("transport") or "tcp").lower()
+    port = int(result.get("port") or 0)
+    source_info = source_info or {}
+
+    if protocol == "openvpn":
+        node = _build_manual_openvpn_node(host, ip or host, port, transport=transport)
+        if not node:
+            raise RuntimeError("OpenVPN 已建立成功，但当前实例没有可复用的配置模板，无法保存节点")
+        node["country"] = country or node.get("country") or ""
+        node["manual_added_at"] = now
+        node["manual_source"] = "direct_connection"
+        node["probe_status"] = "available"
+        node["probe_message"] = "手动直连验证通过"
+        node["probed_at"] = now
+        node["latency_ms"] = int(result.get("elapsed_ms") or 0)
+        node_pool.upsert_openvpn_snapshot([node], source="manual_direct")
+        node_pool.record_probe(node, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过")
+        with lock:
+            nodes = read_nodes()
+            nodes = [item for item in nodes if str(item.get("id") or "") != str(node.get("id") or "")]
+            nodes.append(node)
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+        return node
+
+    server = {
+        "hostname": host,
+        "ip": ip or host,
+        "country": country or "",
+        "protocols": [{"protocol": protocol, "transport": transport, "port": port}],
+        "source_count": 1 if source_info.get("found") else 0,
+        "trusted_observation": True,
+        "_sources": list(source_info.get("sources") or ["manual_direct"]),
+        "manual_added_at": now,
+    }
+    node_pool.upsert_discovery_snapshot([server], source="manual_direct")
+    endpoint_id = node_pool.endpoint_id(node_pool.server_key(server), protocol, transport, port)
+    node_pool.record_endpoint_probe(endpoint_id, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过")
+    endpoint = node_pool.get_endpoint(endpoint_id)
+    if not endpoint:
+        raise RuntimeError("直连已通过，但写入 Master Pool 后无法读取协议端点")
+    ui_node = protocol_endpoint_to_ui_node(endpoint)
+    ui_node["manual_added_at"] = now
+    ui_node["manual_source"] = "direct_connection"
+    ui_node["probe_status"] = "available"
+    ui_node["probe_message"] = "手动直连验证通过"
+    ui_node["probed_at"] = now
+    ui_node["latency_ms"] = int(result.get("elapsed_ms") or 0)
+    with lock:
+        nodes = read_nodes()
+        nodes = [item for item in nodes if not (str(item.get("pool_endpoint_id") or "") == endpoint_id or str(item.get("id") or "") == "pool:" + endpoint_id)]
+        nodes.append(ui_node)
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+    return ui_node
+
+
+def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
+    host, port = parse_manual_endpoint(value)
     resolved_ip = host
-    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", resolved_ip):
+    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", resolved_ip) and ":" not in resolved_ip:
         try:
             infos = socket.getaddrinfo(host, None, socket.AF_INET)
             if infos:
-                resolved_ip = infos[0][4][0]
-        except Exception as exc:
-            raise RuntimeError(f"无法解析节点域名 {host}: {exc}")
-    is_vpngate_host = host.lower().endswith(".opengw.net")
-    if not is_vpngate_host and not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", resolved_ip):
-        raise RuntimeError("未找到该节点的权威协议信息，且地址不是可识别的 VPN Gate 节点")
-    openvpn_page = vpngate_discovery.fetch_openvpn_endpoint_page(host)
-    confirmed_openvpn_port = bool(
-        openvpn_page
-        and any(int(item.get("port") or 0) == int(port) for item in (openvpn_page.get("protocols") or []))
-    )
-    if not confirmed_openvpn_port:
-        raise RuntimeError("VPN Gate 当前来源未确认该地址+端口的协议类型，已拒绝将其误标记为 OpenVPN；请稍后重新添加。")
-    manual_node = _build_manual_openvpn_node(host, resolved_ip, port)
-    if not manual_node:
-        raise RuntimeError("节点已解析，但当前实例没有可用于生成 OpenVPN 配置的 VPN Gate 模板；先点击一次“更新节点”再添加。")
-    with lock:
-        existing = read_nodes()
-        existing = [n for n in existing if n.get("id") != manual_node["id"]]
-        existing.append(manual_node)
-        write_json(NODES_FILE, sort_all_nodes(existing))
+                resolved_ip = str(infos[0][4][0])
+        except Exception:
+            resolved_ip = host
+
+    if not manual_add_probe_lock.acquire(blocking=False):
+        raise RuntimeError("已有手动节点直连验证任务正在运行，请稍候")
+
     try:
-        node_pool.upsert_openvpn_snapshot([manual_node], source="manual_add")
-    except Exception as exc:
-        log_to_json("WARNING", "Main", f"手动 OpenVPN 资源写入 Master Pool 失败: {exc}")
-    return {"ok": True, "mode": "manual_unverified", "input": f"{host}:{port}", "hostname": host, "ip": resolved_ip, "country": manual_node.get("country") or "", "protocols": [{"protocol": "openvpn", "transport": "TCP", "port": port}], "source_count": 0, "sources": [], "openvpn_added": True, "probe_status": "not_checked", "message": "官方当前列表未出现该节点，已加入手动待验证 OpenVPN TCP 资源；验证通过后才会进入可用池。"}
+        source_info = {"found": False, "sources": []}
+        official = None
+        if host.lower().endswith(".opengw.net"):
+            try:
+                official = vpngate_discovery.fetch_openvpn_endpoint_page(host, timeout=4)
+            except Exception:
+                official = None
+            if official:
+                source_info = {"found": True, "sources": list(official.get("_sources") or [])}
+
+        official_protocols: dict[str, list[tuple[str, int]]] = {}
+        if official:
+            for item in official.get("protocols") or []:
+                p = str(item.get("protocol") or "").lower()
+                t = str(item.get("transport") or "tcp").lower()
+                pport = int(item.get("port") or 0)
+                official_protocols.setdefault(p, []).append((t, pport))
+
+        attempts: list[dict[str, Any]] = []
+        protocol_order = ["openvpn", "softether", "sstp", "l2tp-ipsec"]
+
+        for protocol in protocol_order:
+            transport = "tcp"
+            test_port = int(port)
+            offered = official_protocols.get(protocol) or []
+
+            if official:
+                if protocol == "l2tp-ipsec":
+                    if not offered:
+                        attempts.append({"protocol": protocol, "transport": "udp", "port": 0, "ok": False, "skipped": True, "message": "当前节点未公布 L2TP/IPsec"})
+                        continue
+                    test_port = 0
+                    transport = "udp"
+                else:
+                    exact = [item for item in offered if int(item[1]) == int(port)]
+                    if not exact:
+                        shown = offered[0]
+                        attempts.append({"protocol": protocol, "transport": shown[0], "port": int(shown[1]), "ok": False, "skipped": True, "message": f"输入端口 {port} 不是该协议当前公布的端口"})
+                        continue
+                    transport, test_port = exact[0]
+            elif protocol == "l2tp-ipsec":
+                test_port = 0
+                transport = "udp"
+
+            result = _manual_probe_protocol(host, resolved_ip, protocol, test_port, transport)
+            attempts.append(result)
+            if result.get("ok"):
+                promoted = _promote_manual_endpoint(
+                    host, resolved_ip, str((official or {}).get("country") or ""), result, source_info=source_info
+                ) if promote else None
+                return {
+                    "ok": True,
+                    "mode": "direct_connection",
+                    "passed": True,
+                    "input": f"{host}:{port}",
+                    "hostname": host,
+                    "ip": resolved_ip,
+                    "country": (official or {}).get("country") or "",
+                    "protocol": result.get("protocol"),
+                    "transport": result.get("transport"),
+                    "port": result.get("port"),
+                    "attempts": attempts,
+                    "source_count": 1 if source_info.get("found") else 0,
+                    "sources": source_info.get("sources") or [],
+                    "added": bool(promoted),
+                    "message": f"{result.get('protocol')} 直连建立成功，已通过验证并加入资源池。" if promote else f"{result.get('protocol')} 直连建立成功。",
+                }
+
+        return {
+            "ok": False,
+            "mode": "direct_connection",
+            "passed": False,
+            "input": f"{host}:{port}",
+            "hostname": host,
+            "ip": resolved_ip,
+            "attempts": attempts,
+            "source_count": 1 if source_info.get("found") else 0,
+            "sources": source_info.get("sources") or [],
+            "error": "4 种 VPN Gate 接入方式均未建立成功，节点未加入资源池。",
+        }
+    finally:
+        manual_add_probe_lock.release()
+
+
+def add_manual_vpngate_node(value: str) -> dict[str, Any]:
+    return manual_direct_verify(value, promote=True)
+
 
 def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
     """Fill ISP, ASN, location and IP-type for multi-protocol server records from the shared IP cache/query."""
@@ -2326,9 +2484,18 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             manual_connection_lock.release()
 
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = time.time()
+
+    def manual_sort_key(node: dict[str, Any]) -> tuple[int, float]:
+        ts = float(node.get("manual_added_at") or 0)
+        recent = bool(ts and now - ts <= 3600)
+        return (0 if recent else 1, -ts if recent else 0.0)
+
     available_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
         key=lambda n: (
+            0 if n.get("active") else 1,
+            manual_sort_key(n),
             0 if n.get("ip_type") in ("residential", "mobile") else 1,
             parse_int(n.get("latency_ms")) or 999999,
             -parse_int(n.get("score"))
@@ -2336,7 +2503,7 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     untested_nodes = sorted(
         [n for n in nodes if n.get("probe_status") in ("not_checked", "testing") and not n.get("active")],
-        key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
+        key=lambda n: (manual_sort_key(n), -parse_int(n.get("score")), parse_int(n.get("ping")))
     )
     unavailable_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "unavailable" and not n.get("active")],
@@ -6782,7 +6949,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:18px;">
         <div>
           <h3 style="margin:0; font-size:20px; font-weight:700; color:var(--text-primary);">添加 VPN Gate 节点</h3>
-          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名:端口、IPv4:端口，也支持 IPv6 [地址]:端口。优先直接查询 VPN Gate 当前节点，确认“地址 + 端口”后立即写入资源池。</div>
+          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名:端口、IPv4:端口，也支持 IPv6 [地址]:端口。系统直接尝试 4 种 VPN Gate 接入方式，真实建立成功后才会写入资源池。</div>
         </div>
         <button type="button" onclick="closeAddNodeModal()" style="width:32px;height:32px;border:1px solid var(--border-color);background:rgba(255,255,255,.03);border-radius:8px;color:var(--text-secondary);cursor:pointer;">✕</button>
       </div>
@@ -6792,12 +6959,12 @@ INDEX_HTML = r"""<!doctype html>
 
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
         <button type="button" class="test-btn" onclick="fillAddNodeExample('vpn536329081.opengw.net:1965')" style="height:30px;">示例域名</button>
-        <button type="button" class="test-btn" onclick="fillAddNodeExample('34.4.110.244:1965')" style="height:30px;">示例 IPv4</button>
+        <button type="button" class="test-btn" onclick="fillAddNodeExample('203.0.113.10:1965')" style="height:30px;">示例 IPv4</button>
       </div>
 
       <div style="margin-top:14px; padding:12px 13px; border:1px solid rgba(99,102,241,.16); background:rgba(99,102,241,.04); border-radius:9px; font-size:11px; color:var(--text-secondary); line-height:1.55;">
         <div style="font-weight:600; color:var(--text-primary); margin-bottom:4px;">识别流程</div>
-        直接查询 VPN Gate 当前节点 → 确认地址 + 端口对应的 OpenVPN 协议 → 立即加入资源池。当前官方源未找到时会快速返回，不再长时间等待镜像查询。
+        SSL-VPN → L2TP/IPsec → OpenVPN → MS-SSTP 依次直连验证；任一方式真正建立成功即显示“通过”，只保存通过的协议端点，并将刚添加的节点置顶。
       </div>
 
       <div id="add_node_result" style="display:none; margin-top:14px;"></div>
@@ -6845,7 +7012,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="rs-step-title"><span>②</span> 添加共享服务器</div>
           <div class="rs-help rs-form-help">这里填写对方服务器 IP/域名 + 对方给你的邀请码。系统自动判断最终是“单向共享”还是“双方双向共享”。</div>
           <div class="rs-form-grid">
-            <input id="rs_remote_url" class="input-field" placeholder="对方服务器 IP 或域名，例如 34.4.110.244">
+            <input id="rs_remote_url" class="input-field" placeholder="对方服务器 IP 或域名，例如 203.0.113.10">
             <input id="rs_invite_input" class="input-field" placeholder="对方邀请码 RS-XXXX-XXXX-XXXX-XXXX">
             <div class="rs-sync-row">
               <input id="rs_sync_interval_value" class="input-field" type="number" min="1" max="84" value="6" placeholder="同步周期">
@@ -6923,7 +7090,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="rs_edit_remote_row" class="rs-edit-grid">
           <div class="rs-edit-field">
             <label for="rs_edit_remote_url">对方服务器 IP / 域名</label>
-            <input id="rs_edit_remote_url" class="input-field" placeholder="例如 34.4.110.244">
+            <input id="rs_edit_remote_url" class="input-field" placeholder="例如 203.0.113.10">
           </div>
           <div class="rs-edit-field">
             <label for="rs_edit_remote_invite">对方邀请码</label>
@@ -7407,6 +7574,12 @@ function stableSortNodes() {
     const value = Number(n?.latency_ms || 0);
     return value > 0 ? value : Number.MAX_SAFE_INTEGER;
   };
+  const nowSeconds = Date.now() / 1000;
+  const manualRank = n => {
+    const ts = Number(n?.manual_added_at || 0);
+    const recent = ts > 0 && (nowSeconds - ts) <= 3600;
+    return [recent ? 0 : 1, recent ? -ts : 0];
+  };
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
 
@@ -7417,6 +7590,11 @@ function stableSortNodes() {
     const aRank = statusRank[a.probe_status || "not_checked"] ?? 2;
     const bRank = statusRank[b.probe_status || "not_checked"] ?? 2;
     if (aRank !== bRank) return aRank - bRank;
+
+    const am = manualRank(a);
+    const bm = manualRank(b);
+    if (am[0] !== bm[0]) return am[0] - bm[0];
+    if (am[1] !== bm[1]) return am[1] - bm[1];
 
     // Default display order: lowest measured latency first within the same
     // availability state, regardless of protocol.
@@ -8138,15 +8316,43 @@ function fillAddNodeExample(value){
   input.focus();
 }
 
+function renderManualAddAttempts(data, success) {
+  const attempts = Array.isArray(data && data.attempts) ? data.attempts : [];
+  const names = {openvpn:"OpenVPN",softether:"SSL-VPN","l2tp-ipsec":"L2TP/IPsec",sstp:"MS-SSTP"};
+  const rows = attempts.map(function(item) {
+    const protocol = String(item.protocol || "").toLowerCase();
+    const name = names[protocol] || String(item.protocol || "未知协议");
+    const transport = item.transport ? " " + String(item.transport).toUpperCase() : "";
+    const port = Number(item.port || 0) ? " :" + String(item.port) : "";
+    let icon = "•", stateText = "未检测", cls = "color:var(--text-secondary);";
+    if (item.skipped) { icon = "—"; stateText = "未继续"; }
+    else if (item.ok) { icon = "✓"; stateText = "通过"; cls = "color:var(--success);"; }
+    else { icon = "×"; stateText = "未通过"; cls = "color:var(--danger);"; }
+    const detail = item.message ? String(item.message).slice(0, 180) : "";
+    return '<div style="display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05);">' +
+      '<span style="width:18px;flex:0 0 18px;font-weight:600;' + cls + '">' + icon + '</span>' +
+      '<span style="flex:1;color:var(--text-primary);">' + esc(name + transport + port) +
+      '<span style="margin-left:8px;' + cls + '">' + stateText + '</span>' +
+      (detail ? '<span style="display:block;margin-top:2px;font-size:11px;color:var(--text-secondary);">' + esc(detail) + '</span>' : '') +
+      '</span></div>';
+  }).join("");
+  const title = success ? "✓ 直连验证通过，节点已加入资源池" : "4 种方式均未建立成功，节点未加入资源池";
+  const color = success ? "var(--success)" : "var(--danger)";
+  const border = success ? "rgba(34,197,94,.22)" : "rgba(244,63,94,.20)";
+  const bg = success ? "rgba(34,197,94,.07)" : "rgba(244,63,94,.07)";
+  const message = success ? (data.message || "直连建立成功，已通过验证并加入资源池。") : (data.error || "节点未通过直连验证。");
+  return '<div style="padding:13px 14px;background:' + bg + ';border:1px solid ' + border + ';border-radius:9px;">' +
+    '<div style="font-size:13px;font-weight:600;color:' + color + ';">' + title + '</div>' +
+    '<div style="margin-top:8px;border-top:1px solid rgba(255,255,255,.05);">' + rows + '</div>' +
+    '</div>';
+}
+
 async function submitAddNode(){
   const input = $("add_node_address");
   const submit = $("add_node_submit");
   const resultBox = $("add_node_result");
-  const address = String(input?.value || "").trim();
-  if (!address) {
-    if (input) input.focus();
-    return;
-  }
+  const address = String(input && input.value || "").trim();
+  if (!address) { if (input) input.focus(); return; }
   if (!/^[^:]+:\d+$/.test(address) && !/^\[[0-9a-fA-F:]+\]:\d+$/.test(address)) {
     if (resultBox) {
       resultBox.style.display = "block";
@@ -8155,45 +8361,25 @@ async function submitAddNode(){
     return;
   }
   try {
-    if (submit) { submit.disabled = true; submit.textContent = "正在确认..."; }
+    if (submit) { submit.disabled = true; submit.textContent = "正在直连..."; }
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在查询 VPN Gate 当前节点并确认地址 + 端口，通常几秒内完成...</div>';
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在直连验证 4 种 VPN Gate 接入方式；任一方式建立成功即通过并入库...</div>';
     }
     const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
       credentials: "same-origin",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({address})
-    }, 12000);
-    if (!data.ok) throw new Error(data.error || "未找到节点");
-    const protocols = (data.protocols || []).map(p => {
-      const name = translateProtocol(p.protocol);
-      return name + (p.transport ? " · " + String(p.transport).toUpperCase() : "") + (p.port ? " :" + p.port : "");
-    }).join("、") || "—";
-    const country = translateCountry(data.country || "") || "—";
-    const sourceCount = Number(data.source_count || 0);
-    if (resultBox) {
-      resultBox.style.display = "block";
-      resultBox.innerHTML =
-        '<div style="padding:13px 14px;background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.22);border-radius:9px;">' +
-          '<div style="font-size:13px;font-weight:700;color:var(--success);">✓ 节点已加入资源池</div>' +
-          '<div style="margin-top:7px;font-size:12px;color:var(--text-primary);">服务器：' + esc(data.hostname || data.ip || address) + '</div>' +
-          '<div style="margin-top:4px;font-size:12px;color:var(--text-secondary);">国家：' + esc(country) + ' · 协议：' + esc(protocols) + '</div>' +
-          '<div style="margin-top:4px;font-size:12px;color:var(--text-secondary);">来源确认：' + esc(sourceCount) + ' 个</div>' +
-          (data.message ? '<div style="margin-top:7px;font-size:11px;color:var(--text-secondary);line-height:1.45;">' + esc(data.message) + '</div>' : '') +
-        '</div>';
-    }
-    if (submit) { submit.textContent = "完成"; submit.disabled = false; }
-    await load();
+      body: JSON.stringify({address: address})
+    }, 60000);
+
+    if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
+    if (submit) { submit.textContent = data.ok ? "完成" : "重新识别"; submit.disabled = false; }
+    if (data.ok) await load();
   } catch (err) {
     if (resultBox) {
       resultBox.style.display = "block";
-      const errText = String(err?.message || err || "未知错误");
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--danger);background:rgba(244,63,94,.07);border:1px solid rgba(244,63,94,.2);border-radius:8px;">' +
-        '<div style="font-size:13px;font-weight:600;">添加失败</div>' +
-        '<div style="margin-top:6px;line-height:1.5;">' + esc(errText) + '</div>' +
-      '</div>';
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--danger);background:rgba(244,63,94,.07);border:1px solid rgba(244,63,94,.2);border-radius:8px;">添加失败：' + esc(err.message || err) + '</div>';
     }
     if (submit) { submit.textContent = "重新识别"; submit.disabled = false; }
   }
