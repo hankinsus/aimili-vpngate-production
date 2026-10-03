@@ -113,6 +113,8 @@ class NodePool:
                     "trusted_observation": bool(server.get("trusted_observation")),
                     "sources": list(server.get("_sources") or []),
                 }
+                if server.get("manual_added_at"):
+                    metadata["manual_added_at"] = float(server.get("manual_added_at"))
                 existing_server = db.execute(
                     "SELECT metadata_json FROM servers WHERE server_key=?",
                     (key,),
@@ -159,6 +161,8 @@ class NodePool:
                         "source_count": int(server.get("source_count") or 0),
                         "trusted_observation": bool(server.get("trusted_observation")),
                     }
+                    if server.get("manual_added_at"):
+                        endpoint_meta["manual_added_at"] = float(server.get("manual_added_at"))
                     existing_endpoint = db.execute(
                         "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
                         (eid,),
