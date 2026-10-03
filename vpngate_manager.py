@@ -6964,7 +6964,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div style="margin-top:14px; padding:12px 13px; border:1px solid rgba(99,102,241,.16); background:rgba(99,102,241,.04); border-radius:9px; font-size:11px; color:var(--text-secondary); line-height:1.55;">
         <div style="font-weight:600; color:var(--text-primary); margin-bottom:4px;">识别流程</div>
-        SSL-VPN → L2TP/IPsec → OpenVPN → MS-SSTP 依次直连验证；任一方式真正建立成功即显示“通过”，只保存通过的协议端点，并将刚添加的节点置顶。
+        OpenVPN → SSL-VPN → L2TP/IPsec → MS-SSTP 依次直连验证；任一方式真正建立成功即显示“通过”，只保存通过的协议端点，并将刚添加的节点置顶。
       </div>
 
       <div id="add_node_result" style="display:none; margin-top:14px;"></div>
@@ -8317,8 +8317,25 @@ function fillAddNodeExample(value){
 }
 
 function renderManualAddAttempts(data, success) {
-  const attempts = Array.isArray(data && data.attempts) ? data.attempts : [];
+  const rawAttempts = Array.isArray(data && data.attempts) ? data.attempts : [];
   const names = {openvpn:"OpenVPN",softether:"SSL-VPN","l2tp-ipsec":"L2TP/IPsec",sstp:"MS-SSTP"};
+  const order = ["openvpn","softether","l2tp-ipsec","sstp"];
+  const seen = {};
+  rawAttempts.forEach(function(item) { seen[String(item.protocol || "").toLowerCase()] = item; });
+  if (success) {
+    order.forEach(function(protocol) {
+      if (!seen[protocol]) {
+        seen[protocol] = {
+          protocol: protocol,
+          transport: protocol === "l2tp-ipsec" ? "udp" : "tcp",
+          port: 0,
+          skipped: true,
+          message: "已有其他接入方式通过，本次未继续测试"
+        };
+      }
+    });
+  }
+  const attempts = order.map(function(protocol) { return seen[protocol]; }).filter(Boolean);
   const rows = attempts.map(function(item) {
     const protocol = String(item.protocol || "").toLowerCase();
     const name = names[protocol] || String(item.protocol || "未知协议");
