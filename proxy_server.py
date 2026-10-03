@@ -89,7 +89,7 @@ def get_proxy_credentials() -> tuple[str | None, str | None]:
     return user or "", password or ""
 
 def get_proxy_allowlist() -> list[Any]:
-    raw = str(os.environ.get("LOCAL_PROXY_ALLOW", "0.0.0.0/0,::/0") or "").strip()
+    raw = str(os.environ.get("LOCAL_PROXY_ALLOW", "127.0.0.1/32,::1/128") or "").strip()
     if raw.lower() in {"*", "any", "all"}:
         return [ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0")]
     networks = []
