@@ -2903,13 +2903,90 @@ def openvpn_pool_endpoint_id(node: dict[str, Any] | None) -> str:
     except Exception:
         return ""
 
+def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
+    """Rehydrate a historical OpenVPN Master-Pool endpoint into nodes.json for connection."""
+    metadata = endpoint.get("metadata") or {}
+    server_meta = endpoint.get("server_metadata") or {}
+    endpoint_id = str(endpoint.get("endpoint_id") or "").strip()
+    node_id = str(metadata.get("node_id") or "").strip()
+    if not node_id:
+        transport = str(endpoint.get("transport") or "tcp").lower()
+        ip = str(endpoint.get("current_ip") or "").strip()
+        port = int(endpoint.get("port") or 0)
+        node_id = safe_name(f"{(endpoint.get("country") or "XX")}_{ip}_{port}_{transport}")
+    config_file = str(endpoint.get("config_ref") or metadata.get("config_file") or "").strip()
+    config_text = ""
+    if config_file:
+        try:
+            config_text = Path(config_file).read_text(encoding="utf-8")
+        except Exception:
+            config_text = ""
+    host = str(endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
+    port = int(endpoint.get("port") or 0)
+    transport = str(endpoint.get("transport") or "tcp").lower()
+    if not config_text:
+        config_text = _manual_openvpn_template()
+        if not config_text:
+            raise RuntimeError(f"OpenVPN Pool 端点 {endpoint_id} 缺少配置文件，且当前实例没有可用模板")
+        config_text = re.sub(r"(?m)^remote\s+\S+\s+\d+\s*$", f"remote {host} {port}", config_text, count=1)
+        config_text = re.sub(r"(?m)^proto\s+\S+\s*$", f"proto {transport}", config_text, count=1)
+        config_dir = CONFIG_DIR
+        config_dir.mkdir(exist_ok=True, parents=True)
+        config_file = str(config_dir / f"{node_id}.ovpn")
+        try:
+            Path(config_file).write_text(config_text, encoding="utf-8")
+        except Exception:
+            pass
+    node = {
+        "id": node_id,
+        "country": endpoint.get("country") or "",
+        "country_short": "",
+        "host_name": endpoint.get("hostname") or host,
+        "ip": endpoint.get("current_ip") or host,
+        "score": int(endpoint.get("latest_server_score") or 0),
+        "ping": int(endpoint.get("latest_ping") or 0),
+        "speed": int(endpoint.get("latest_speed") or 0),
+        "sessions": int(endpoint.get("latest_sessions") or 0),
+        "owner": str(server_meta.get("owner") or ""),
+        "asn": str(server_meta.get("asn") or ""),
+        "as_name": str(server_meta.get("as_name") or ""),
+        "location": str(server_meta.get("location") or endpoint.get("country") or ""),
+        "ip_type": str(server_meta.get("ip_type") or ""),
+        "quality": str(server_meta.get("quality") or ""),
+        "latency_ms": int(endpoint.get("latency_ewma") or endpoint.get("latest_ping") or 0),
+        "config_file": config_file,
+        "config_text": config_text,
+        "proto": transport,
+        "protocol": "openvpn",
+        "remote_host": host,
+        "remote_port": port,
+        "fetched_at": time.time(),
+        "probe_status": "available",
+        "probe_message": "来自 Master Pool 的已验证历史资源",
+        "probed_at": float(endpoint.get("last_success") or time.time()),
+        "pool_endpoint_id": endpoint_id,
+        "pool_rehydrated": True,
+    }
+    with lock:
+        nodes = read_nodes()
+        for idx, existing in enumerate(nodes):
+            if existing.get("id") == node_id:
+                nodes[idx].update({k: v for k, v in node.items() if v not in (None, "")})
+                write_json(NODES_FILE, sort_all_nodes(nodes))
+                return node_id
+        nodes.append(node)
+        if len(nodes) > 1000:
+            active_ids = {str(active_openvpn_node_id or "")}
+            kept = [n for n in nodes if n.get("id") in active_ids or n.get("probe_status") in ("available", "testing")]
+            kept.extend([n for n in nodes if n not in kept][-max(0, 1000-len(kept)):])
+            nodes = kept[:1000]
+        write_json(NODES_FILE, sort_all_nodes(nodes))
+    return node_id
+
 def connect_ranked_endpoint(endpoint: dict[str, Any]) -> str:
     protocol = str(endpoint.get("protocol") or "").lower()
     if protocol == "openvpn":
-        metadata = endpoint.get("metadata") or {}
-        node_id = str(metadata.get("node_id") or "").strip()
-        if not node_id:
-            raise RuntimeError("OpenVPN Hot Pool 端点缺少 node_id")
+        node_id = ensure_openvpn_node_from_pool(endpoint)
         return connect_node(node_id)
     return connect_pool_endpoint(str(endpoint.get("endpoint_id") or ""))
 
