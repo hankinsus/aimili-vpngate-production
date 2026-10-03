@@ -172,6 +172,8 @@ CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
+SESSION_FILE = DATA_DIR / "ui_sessions.json"
+SESSION_TTL_SECONDS = 30 * 24 * 3600
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
 BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 NODE_POOL_DB = DATA_DIR / "node_pool.sqlite3"
@@ -181,6 +183,7 @@ l2tp_adapter = tunnel_adapters.L2TPIPsecAdapter()
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
 active_sessions: dict[str, float] = {}
+_sessions_loaded: bool = False
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 active_external_tunnel: tunnel_adapters.TunnelResult | None = None
@@ -605,6 +608,68 @@ try:
         LOCAL_PROXY_PORT = 8500
 except Exception:
     pass
+
+def _load_persisted_sessions() -> None:
+    global _sessions_loaded
+    with lock:
+        if _sessions_loaded:
+            return
+        raw = read_json(SESSION_FILE, {})
+        now = time.time()
+        if isinstance(raw, dict):
+            for token, expiry in raw.items():
+                if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+                    continue
+                try:
+                    exp = float(expiry)
+                except (TypeError, ValueError):
+                    continue
+                if exp > now:
+                    active_sessions[token] = exp
+        _sessions_loaded = True
+
+
+def _persist_sessions() -> None:
+    with lock:
+        now = time.time()
+        snapshot = {}
+        for token, expiry in active_sessions.items():
+            try:
+                exp = float(expiry)
+            except (TypeError, ValueError):
+                continue
+            if exp > now and re.fullmatch(r"[0-9a-f]{32}", str(token)):
+                snapshot[str(token)] = exp
+        write_json(SESSION_FILE, snapshot)
+        try:
+            SESSION_FILE.chmod(0o600)
+        except OSError:
+            pass
+
+
+def _create_session() -> str:
+    _load_persisted_sessions()
+    token = uuid.uuid4().hex
+    with lock:
+        active_sessions[token] = time.time() + SESSION_TTL_SECONDS
+    _persist_sessions()
+    return token
+
+
+def _remove_session(token: str) -> None:
+    _load_persisted_sessions()
+    with lock:
+        active_sessions.pop(token, None)
+    _persist_sessions()
+
+
+def clear_persisted_sessions() -> None:
+    global _sessions_loaded
+    with lock:
+        active_sessions.clear()
+        _sessions_loaded = True
+    _persist_sessions()
+
 
 def get_session_token(password: str, username: str = "admin") -> str:
     salt = "aimilivpn_secure_salt_2026"
@@ -9932,6 +9997,7 @@ class Handler(BaseHTTPRequestHandler):
         if not session_token:
             return False
 
+        _load_persisted_sessions()
         with lock:
             exp_time = active_sessions.get(session_token)
             if exp_time is not None and exp_time > time.time():
@@ -10368,9 +10434,7 @@ class Handler(BaseHTTPRequestHandler):
                 expected_uname = ui_cfg.get("username", "admin")
 
                 if expected_pwd and input_pwd == expected_pwd and input_uname == expected_uname:
-                    token = uuid.uuid4().hex
-                    with lock:
-                        active_sessions[token] = time.time() + 30 * 24 * 3600
+                    token = _create_session()
                     body = json.dumps({"ok": True}).encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -10406,8 +10470,7 @@ class Handler(BaseHTTPRequestHandler):
                             cookies[k.strip()] = v.strip()
                 session_token = cookies.get("session")
                 if session_token:
-                    with lock:
-                        active_sessions.pop(session_token, None)
+                    _remove_session(session_token)
                 body = json.dumps({"ok": True}).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
