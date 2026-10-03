@@ -14,7 +14,7 @@ AimiliVPN 多协议节点管理系统是一款面向 Linux VPS 的自动化 VPN 
 | 用途 | 端口 | 监听方式 |
 | --- | ---: | --- |
 | HTTPS 管理后台 | `8443/tcp` | 公网，通过 Nginx 代理到 `127.0.0.1:8501` |
-| HTTPS 订阅入口 | `18443/tcp` | 公网，独立于管理后台 |
+| HTTPS 订阅入口 | `18443/tcp` | 公网，由现有订阅服务独立提供；安装器不接管 |
 | HTTP/SOCKS5 八合一 | `8500/tcp` | 公网，账号密码 + IP/CIDR 白名单 |
 | 管理后台内部服务 | `8501/tcp` | 仅 `127.0.0.1` |
 
@@ -175,7 +175,7 @@ AimiliVPN Multi-Protocol Node Management System is a Linux VPS gateway for manag
 | --- | ---: | --- |
 | HTTPS management | `8443/tcp` | Public, proxied to `127.0.0.1:8501` |
 | HTTP/SOCKS5 eight-in-one | `8500/tcp` | Public, protected by credentials + IP/CIDR allowlist |
-| HTTPS subscriptions | `18443/tcp` | Public, separate from management |
+| HTTPS subscriptions | `18443/tcp` | Public, provided by the external subscription service; installer does not replace it |
 
 A domain is not required. The default deployment keeps exactly three public ports (8443/8500/18443) and uses HTTPS with a local self-signed certificate, so browsers may show a certificate warning. Optional trusted IP-certificate mode can be enabled with `AIMILIVPN_ENABLE_ACME_IP_CERT=1`; that mode requires public TCP/80 for ACME validation and ongoing renewal. Let's Encrypt IP certificates are short-lived.
 
