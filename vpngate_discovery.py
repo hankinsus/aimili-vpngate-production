@@ -4,6 +4,7 @@ from __future__ import annotations
 import concurrent.futures
 import html
 import re
+import socket
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -321,9 +322,12 @@ def fetch_openvpn_endpoint_page(host: str, timeout: int = 12) -> dict[str, Any] 
     }
 
 def find_server_by_endpoint(host: str, port: int, max_mirrors: int | None = None) -> tuple[dict[str, Any] | None, list[str]]:
-    """Find one VPN Gate server by hostname/IP + advertised port, returning as soon as a source matches."""
+    """Find a VPN Gate server by host/IP + advertised port across the current source set."""
     target_host = str(host or "").strip().lower()
     target_port = int(port or 0)
+    if not target_host or target_port <= 0:
+        return None, []
+
     sources = [VPNGATE_HTML_URL]
     try:
         mirrors = fetch_mirror_urls()
@@ -333,7 +337,7 @@ def find_server_by_endpoint(host: str, port: int, max_mirrors: int | None = None
     except Exception:
         pass
 
-    def match_source(source: str) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+    def fetch_match(source: str) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
         try:
             servers = fetch_server_table(source, timeout=10)
         except Exception:
@@ -349,26 +353,33 @@ def find_server_by_endpoint(host: str, port: int, max_mirrors: int | None = None
         return source, servers, None
 
     successful: list[str] = []
+    matches: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as executor:
-        futures = {executor.submit(match_source, source): source for source in sources}
+        futures = [executor.submit(fetch_match, source) for source in sources]
         for future in concurrent.futures.as_completed(futures):
             source, servers, matched = future.result()
             if servers:
                 successful.append(source)
             if matched:
-                matched["_sources"] = [source]
-                # Collect corroborating protocol metadata from already completed/fast sources later
-                # only when it arrives; the caller can safely probe the selected endpoint locally.
-                matched["source_count"] = 1
-                matched["trusted_observation"] = source == VPNGATE_HTML_URL
-                return matched, successful
+                matched["_source_url"] = source
+                matches.append(matched)
+
+    if matches:
+        merged = merge_servers([matches])[0]
+        merged["_sources"] = [str(x.get("_source_url") or "") for x in matches if x.get("_source_url")]
+        base_sources = {str(u).split("#", 1)[0].rstrip("/") + "/" for u in merged["_sources"] if u}
+        main_base = VPNGATE_HTML_URL.rstrip("/") + "/"
+        merged["source_count"] = len(base_sources)
+        merged["trusted_observation"] = main_base in base_sources or merged["source_count"] >= 2
+        return merged, successful
 
     endpoint_page = fetch_openvpn_endpoint_page(target_host)
     if endpoint_page:
         endpoint_page["source_count"] = 1
         endpoint_page["trusted_observation"] = True
-        successful.append("https://www.vpngate.net/en/do_openvpn.aspx")
-        return endpoint_page, successful
+        endpoint_page["_sources"] = ["https://www.vpngate.net/en/do_openvpn.aspx"]
+        return endpoint_page, successful + ["https://www.vpngate.net/en/do_openvpn.aspx"]
+
     return None, successful
 
 def merge_servers(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
