@@ -205,9 +205,6 @@ The public proxy uses fixed TCP port `8500`. Configure username, password, and s
 
 ---
 
-### 🚀
----
-
 ### 🚀 One-Click Installation
 
 Run the corresponding command on your Linux VPS as root:
@@ -232,7 +229,7 @@ Open your browser and navigate to the printed URL (e.g. `https://your_vps_ip:844
 3. Switch routes mode (Smart Auto, Specific Region, or Specific Server Node) according to your needs.
 
 #### Step 3: Use Localhost Proxy (Core Step)
-To prevent unauthorized scanning and abuse of the proxy port on the public internet, the built-in HTTP/SOCKS5 proxy server (default port **`8500`**) **binds to localhost (`127.0.0.1`) by default**. It is designed to route traffic generated locally on the VPS, rather than acting as a public proxy server.
+The HTTP/SOCKS5 eight-in-one proxy uses fixed TCP port **`8500`** and routes traffic through the active VPN tunnel. Access is controlled by `LOCAL_PROXY_ALLOW`, with `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` authentication.
 
 * **🐍 Proxy in Python**:
   ```python
@@ -251,7 +248,7 @@ To prevent unauthorized scanning and abuse of the proxy port on the public inter
 * **⚙️ Other local services**:
   Configure your scrapers, frameworks, or utility tools on this VPS to send traffic via `服务器IP:8500`.
 
-> 💡 **Quick Note**: If you really need to open this proxy port to the public internet, you can set the environment variable `export LOCAL_PROXY_HOST="::"` before running the manager.
+> 💡 **Quick Note**: 8500 is the public proxy endpoint. Restrict source IPs/CIDRs with `LOCAL_PROXY_ALLOW` and keep username/password authentication enabled.
 
 ---
 
