@@ -329,7 +329,7 @@ try:
     if not ISOLATED_INSTANCE:
         UI_HOST = "127.0.0.1"
         UI_PORT = 8501
-        LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "0.0.0.0")
+        LOCAL_PROXY_HOST = "0.0.0.0"
         LOCAL_PROXY_PORT = 8500
 except Exception:
     pass
