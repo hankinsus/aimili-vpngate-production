@@ -4205,14 +4205,14 @@ INDEX_HTML = r"""<!doctype html>
       
       <div class="vps-links">
         <div class="vps-item">
-          <span class="vps-tag tag-normal">RNVPS (RackNerd) 推荐</span>
-          <span class="vps-desc">超低折扣价格，性价比极高，日常使用实惠方便，海外多机房可选，非常适合普通大众用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" class="vps-btn">点击进入官网</a>
+          <span class="vps-tag tag-premium">专线稳定流媒体</span>
+          <span class="vps-desc">顶级三网优化线路，适合关注国内访问质量、延迟和线路上限的跨境网络场景。</span>
+          <a href="https://yiy.one/register?codes=98BA33" target="_blank" class="vps-btn">立即查看</a>
         </div>
         <div class="vps-item">
-          <span class="vps-tag tag-premium">搬瓦工 (Bandwagon) 推荐</span>
-          <span class="vps-desc">直连三网顶级专线，经典高带宽 CN2 GIA/9929 优化线路，极致速度且超凡稳定，高端用户首选。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" class="vps-btn">点击进入官网</a>
+          <span class="vps-tag tag-normal">静态机房住宅IP</span>
+          <span class="vps-desc">不限流量、价格实惠，适合跨境电商、流媒体解锁、直播等住宅IP需求；先测试再决定。</span>
+          <a href="https://www.miyaip.com/?invitecode=2955039" target="_blank" class="vps-btn">立即查看</a>
         </div>
       </div>
       
