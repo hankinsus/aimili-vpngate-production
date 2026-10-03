@@ -112,7 +112,7 @@ sudo chmod 600 /etc/default/aimilivpn
 sudo ml restart
 ```
 
-多个来源使用逗号或分号分隔；使用 `0.0.0.0/0,::/0` 表示允许所有来源，但仍需要代理用户名和密码。默认密码为 `ilovestudy`，公网部署后建议立即修改。
+多个来源使用逗号或分号分隔；默认仅允许本机 `127.0.0.1/32,::1/128`。如需远程访问，请明确填写自己的公网 IP/CIDR；使用 `0.0.0.0/0,::/0` 表示允许所有来源。默认密码为 `ilovestudy`，公网部署后建议立即修改。
 
 ---
 
@@ -177,7 +177,7 @@ AimiliVPN Multi-Protocol Node Management System is a Linux VPS gateway for manag
 | HTTP/SOCKS5 eight-in-one | `8500/tcp` | Public, protected by credentials + IP/CIDR allowlist |
 | HTTPS subscriptions | `18443/tcp` | Public, separate from management |
 
-A domain is not required. The installer first attempts a trusted Let's Encrypt IP certificate; IP certificates are short-lived and require automated renewal. When ACME issuance is unavailable, the installer falls back to a self-signed certificate.
+A domain is not required. The default deployment keeps exactly three public ports (8443/8500/18443) and uses HTTPS with a local self-signed certificate, so browsers may show a certificate warning. Optional trusted IP-certificate mode can be enabled with `AIMILIVPN_ENABLE_ACME_IP_CERT=1`; that mode requires public TCP/80 for ACME validation and ongoing renewal. Let's Encrypt IP certificates are short-lived.
 
 ### 8500 HTTP/SOCKS5 eight-in-one
 
@@ -230,8 +230,8 @@ Open your browser and navigate to the printed URL (e.g. `https://your_vps_ip:844
 2. Under "Admin", you can trigger node fetching. The backend concurrently tests official VPNGate nodes and ranks them by latency.
 3. Switch routes mode (Smart Auto, Specific Region, or Specific Server Node) according to your needs.
 
-#### Step 3: Use Localhost Proxy (Core Step)
-The HTTP/SOCKS5 eight-in-one proxy uses fixed TCP port **`8500`** and routes traffic through the active VPN tunnel. The installer default password is `ilovestudy`; change it after deployment when the proxy is reachable from the public internet. Access is controlled by `LOCAL_PROXY_ALLOW`, with `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` authentication.
+#### Step 3: Use 8500 HTTP/SOCKS5 Eight-in-One Proxy (Core Step)
+The HTTP/SOCKS5 eight-in-one proxy uses fixed TCP port **`8500`** and routes traffic through the active VPN tunnel. The installer default username is `socks5` and the default password is `ilovestudy`; change it after deployment when the proxy is reachable from the public internet. The secure default allowlist permits only `127.0.0.1/32,::1/128`; add your public IP/CIDR for remote access. Access is controlled by `LOCAL_PROXY_ALLOW`, with `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` authentication.
 
 * **🐍 Proxy in Python**:
   ```python
