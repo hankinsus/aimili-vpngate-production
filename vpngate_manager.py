@@ -5870,7 +5870,6 @@ INDEX_HTML = r"""<!doctype html>
       </button>
       <div id="github_dropdown" class="dropdown-content">
         <a href="https://github.com/hankinsus/aimili-vpngate-production" target="_blank">正式版</a>
-        <a href="https://github.com/hankinsus/aimili-vpngate-production/releases" target="_blank">Release</a>
       </div>
     </div>
     <a href="https://t.me/ILovestudycn" target="_blank" class="btn-telegram">
