@@ -221,8 +221,8 @@ server_start_time = time.time()
 
 def _local_git_commit() -> str:
     try:
-        result = subprocess.run([
-            "git", "rev-parse", "HEAD",
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
             cwd=str(ROOT_DIR),
             capture_output=True,
             text=True,
