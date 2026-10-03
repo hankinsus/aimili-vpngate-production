@@ -95,7 +95,7 @@ CURRENT_BRANCH=""
 if [ -d "${INSTALL_DIR}/.git" ]; then
     CURRENT_BRANCH=$(cd "${INSTALL_DIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null)
 fi
-DEPLOY_BRANCH="${CURRENT_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
+DEPLOY_BRANCH="${AIMILIVPN_BRANCH:-$DEFAULT_DEPLOY_BRANCH}"
 
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (目标分支: ${DEPLOY_BRANCH})...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
@@ -142,8 +142,7 @@ if ! grep -q '^LOCAL_PROXY_USER=' "$PROXY_ENV_FILE"; then
     echo 'LOCAL_PROXY_USER="socks5"' >> "$PROXY_ENV_FILE"
 fi
 if ! grep -q '^LOCAL_PROXY_PASS=' "$PROXY_ENV_FILE"; then
-    PROXY_GENERATED_PASSWORD=$(python3 -c "import secrets,string; c=string.ascii_letters+string.digits; print(''.join(secrets.choice(c) for _ in range(16)))")
-    echo "LOCAL_PROXY_PASS=\"$PROXY_GENERATED_PASSWORD\"" >> "$PROXY_ENV_FILE"
+    echo 'LOCAL_PROXY_PASS="ilovestudy"' >> "$PROXY_ENV_FILE"
 fi
 if ! grep -q '^LOCAL_PROXY_ALLOW=' "$PROXY_ENV_FILE"; then
     echo 'LOCAL_PROXY_ALLOW="0.0.0.0/0,::/0"' >> "$PROXY_ENV_FILE"
@@ -189,6 +188,11 @@ command_args="${INSTALL_DIR}/vpngate_manager.py"
 command_background="yes"
 directory="${INSTALL_DIR}"
 pidfile="/run/aimilivpn.pid"
+
+if [ -f /etc/default/aimilivpn ]; then
+    . /etc/default/aimilivpn
+    export LOCAL_PROXY_USER LOCAL_PROXY_PASS LOCAL_PROXY_ALLOW
+fi
 
 depend() {
     need net
@@ -1137,6 +1141,7 @@ echo -e "  * 网页管理密码:          ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTPS 订阅入口:       ${BLUE}https://${PUBLIC_IP}:18443/${PLAIN}"
 echo -e "  * HTTP/SOCKS5 八合一:   ${BLUE}${PUBLIC_IP}:8500${PLAIN}"
 echo -e "  * 代理账号配置:        ${BLUE}/etc/default/aimilivpn${PLAIN}"
+echo -e "  * 默认 SOCKS5 密码:     ${YELLOW}ilovestudy${PLAIN}（建议首次部署后修改）"
 echo -e "  * HTTP/SOCKS5 代理端口: ${BLUE}127.0.0.1:${PROXY_PORT}${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
