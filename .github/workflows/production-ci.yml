@@ -20,6 +20,18 @@ jobs:
       - name: Compile Python sources
         run: |
           python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py tunnel_adapters.py vpngate_discovery.py
+      - name: Validate embedded dashboard JavaScript
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path("vpngate_manager.py").read_text(encoding="utf-8")
+          blocks = [m.group(1) for m in re.finditer(r"<script[^>]*>([\\s\\S]*?)</script>", text, re.I)]
+          assert len(blocks) >= 2, len(blocks)
+          Path("/tmp/aimili_embedded.js").write_text("\n\n".join(blocks), encoding="utf-8")
+          print(f"validated {len(blocks)} script blocks")
+          PY
+          node --check /tmp/aimili_embedded.js
       - name: Import node pool
         run: |
           python3 - <<'PY'
