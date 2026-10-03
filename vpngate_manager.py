@@ -383,17 +383,19 @@ def start_github_update() -> dict[str, Any]:
         if not check.get("ok"):
             return check
         if not check.get("has_update"):
+            status = str(check.get("relation") or "latest")
+            message = str(check.get("message") or "当前已经是 GitHub 正式版最新版本。")
             github_update_last_result = {
                 "ok": True,
-                "status": "latest",
+                "status": status,
                 "current_version": check.get("current_version"),
                 "latest_version": check.get("latest_version"),
                 "checked_at": time.time(),
             }
             return {
                 "ok": True,
-                "status": "latest",
-                "message": "当前已经是 GitHub 正式版最新版本。",
+                "status": status,
+                "message": message,
                 "current_version": check.get("current_version"),
                 "latest_version": check.get("latest_version"),
             }
@@ -8192,7 +8194,8 @@ async function checkGithubUpdate() {
       setGithubUpdateMessage("发现新版本 " + latest + "，当前 " + current + "。", "success");
       if (applyBtn) { applyBtn.style.display = "inline-flex"; applyBtn.disabled = false; }
     } else if (result.ok) {
-      setGithubUpdateMessage("当前已经是最新正式版（" + current + "）。", "success");
+      const messageType = result.relation === "local_ahead" ? "normal" : "success";
+      setGithubUpdateMessage(result.message || ("当前已经是最新正式版（" + current + "）。"), messageType);
     } else {
       setGithubUpdateMessage(result.error || "检查更新失败。", "error");
     }
