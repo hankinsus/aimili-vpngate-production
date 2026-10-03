@@ -1934,27 +1934,56 @@ def add_manual_vpngate_node(value: str) -> dict[str, Any]:
 
     if server:
         node_pool.upsert_discovery_snapshot([server], source="manual_add")
+
+        # The exact endpoint is already confirmed by the current VPN Gate page.
+        # Avoid a second full API download; reuse the local OpenVPN template.
         openvpn_node: dict[str, Any] | None = None
         try:
-            api_text = fetch_api_text(API_URL, True)
-            for row in parse_vpngate_rows(api_text):
-                row_ip = str(row.get("IP") or "").strip()
-                row_host = str(row.get("HostName") or "").strip().lower()
-                if row_ip != str(server.get("ip") or "").strip() and row_host != str(server.get("hostname") or "").strip().lower():
-                    continue
-                encoded = row.get("OpenVPN_ConfigData_Base64", "")
-                if encoded:
-                    openvpn_node = row_to_node(row, decode_config(encoded))
-                    break
+            has_exact_openvpn = any(
+                str(item.get("protocol") or "").lower() == "openvpn"
+                and int(item.get("port") or 0) == int(port)
+                for item in (server.get("protocols") or [])
+            )
+            if has_exact_openvpn:
+                openvpn_node = _build_manual_openvpn_node(
+                    str(server.get("hostname") or host),
+                    str(server.get("ip") or "") or host,
+                    int(port),
+                )
+                if openvpn_node:
+                    for key in ("country", "score", "ping", "speed", "sessions", "owner", "asn", "as_name", "location", "ip_type"):
+                        value = server.get(key)
+                        if value not in (None, ""):
+                            openvpn_node[key] = value
+                    openvpn_node["country_short"] = str(server.get("country_short") or openvpn_node.get("country_short") or "")
         except Exception as exc:
-            log_to_json("WARNING", "Main", f"手动添加节点时获取 OpenVPN 配置失败: {exc}")
+            log_to_json("WARNING", "Main", f"手动添加节点生成 OpenVPN 配置失败: {exc}")
         if openvpn_node:
             try:
                 node_pool.upsert_openvpn_snapshot([openvpn_node], source="manual_add")
             except Exception as exc:
                 log_to_json("WARNING", "Main", f"手动添加 OpenVPN 节点写入失败: {exc}")
-        protocols = [{"protocol": str(e.get("protocol") or "").lower(), "transport": str(e.get("transport") or "").upper(), "port": int(e.get("port") or 0)} for e in (server.get("protocols") or [])]
-        return {"ok": True, "mode": "official_match", "input": f"{host}:{port}", "hostname": server.get("hostname") or host, "ip": server.get("ip") or "", "country": server.get("country") or "", "protocols": protocols, "source_count": len(set(sources)), "sources": sources, "openvpn_added": bool(openvpn_node)}
+
+        protocols = [
+            {
+                "protocol": str(e.get("protocol") or "").lower(),
+                "transport": str(e.get("transport") or "").upper(),
+                "port": int(e.get("port") or 0),
+            }
+            for e in (server.get("protocols") or [])
+        ]
+        return {
+            "ok": True,
+            "mode": "official_match",
+            "input": f"{host}:{port}",
+            "hostname": server.get("hostname") or host,
+            "ip": server.get("ip") or "",
+            "country": server.get("country") or "",
+            "protocols": protocols,
+            "source_count": len(set(sources)),
+            "sources": sources,
+            "openvpn_added": bool(openvpn_node),
+        }
 
     resolved_ip = host
     if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", resolved_ip):
@@ -8096,13 +8125,14 @@ async function submitAddNode(){
     if (submit) { submit.disabled = true; submit.textContent = "正在查询..."; }
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在查询主站、镜像和协议来源，请稍候...</div>';
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在快速查询 VPN Gate 当前节点并确认地址 + 端口协议，请稍候...</div>';
     }
     const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
+      credentials: "same-origin",
       headers: {"Content-Type":"application/json"},
       body: JSON.stringify({address})
-    }, 45000);
+    }, 12000);
     if (!data.ok) throw new Error(data.error || "未找到节点");
     const protocols = (data.protocols || []).map(p => {
       const name = translateProtocol(p.protocol);
