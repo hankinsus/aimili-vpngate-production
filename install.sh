@@ -87,7 +87,7 @@ fi
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
-# 默认部署分支（在 bate 分支设为 bate；在 main 分支设为 main）
+# 默认部署分支；公开生产版本固定使用 main，可通过 AIMILIVPN_BRANCH 显式覆盖。
 DEFAULT_DEPLOY_BRANCH="main"
 
 # 自动检测本地已安装版本当前所在的分支
@@ -145,7 +145,7 @@ if ! grep -q '^LOCAL_PROXY_PASS=' "$PROXY_ENV_FILE"; then
     echo 'LOCAL_PROXY_PASS="ilovestudy"' >> "$PROXY_ENV_FILE"
 fi
 if ! grep -q '^LOCAL_PROXY_ALLOW=' "$PROXY_ENV_FILE"; then
-    echo 'LOCAL_PROXY_ALLOW="0.0.0.0/0,::/0"' >> "$PROXY_ENV_FILE"
+    echo 'LOCAL_PROXY_ALLOW="127.0.0.1/32,::1/128"' >> "$PROXY_ENV_FILE"
 fi
 if ! grep -q '^LOCAL_PROXY_HOST=' "$PROXY_ENV_FILE"; then
     echo 'LOCAL_PROXY_HOST="0.0.0.0"' >> "$PROXY_ENV_FILE"
@@ -1140,9 +1140,9 @@ echo -e "  * 网页管理账号:          ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:          ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTPS 订阅入口:       ${BLUE}https://${PUBLIC_IP}:18443/${PLAIN}"
 echo -e "  * HTTP/SOCKS5 八合一:   ${BLUE}${PUBLIC_IP}:8500${PLAIN}"
-echo -e "  * 代理账号配置:        ${BLUE}/etc/default/aimilivpn${PLAIN}"
+echo -e "  * 代理账号配置:         ${BLUE}/etc/default/aimilivpn${PLAIN}"
 echo -e "  * 默认 SOCKS5 密码:     ${YELLOW}ilovestudy${PLAIN}（建议首次部署后修改）"
-echo -e "  * HTTP/SOCKS5 代理端口: ${BLUE}127.0.0.1:${PROXY_PORT}${PLAIN}"
+echo -e "  * 默认允许来源:         ${BLUE}127.0.0.1/32,::1/128${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
