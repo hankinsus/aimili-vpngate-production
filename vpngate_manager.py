@@ -8288,6 +8288,12 @@ function openAddNodeModal(){
   const result = $("add_node_result");
   if (modal) modal.style.display = "flex";
   if (result) result.style.display = "none";
+  const submit = $("add_node_submit");
+  if (submit) {
+    submit.disabled = false;
+    submit.textContent = "开始识别";
+    submit.onclick = submitAddNode;
+  }
   if (input) {
     input.value = "";
     setTimeout(() => input.focus(), 80);
@@ -8391,7 +8397,11 @@ async function submitAddNode(){
     }, 60000);
 
     if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
-    if (submit) { submit.textContent = data.ok ? "完成" : "重新识别"; submit.disabled = false; }
+    if (submit) {
+      submit.disabled = false;
+      submit.textContent = data.ok ? "完成" : "重新识别";
+      submit.onclick = data.ok ? closeAddNodeModal : submitAddNode;
+    }
     if (data.ok) await load();
   } catch (err) {
     if (resultBox) {
