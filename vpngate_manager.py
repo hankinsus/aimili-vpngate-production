@@ -8271,7 +8271,37 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer-brand">
         <div class="footer-brand-link" aria-label="我爱研究.ILovestudy 品牌标志">
-          <img class="footer-brand-logo-image" src="./footer-logo-clean.png?v=1.0.9" alt="我爱研究.ILovestudy 标志" width="50" height="59" decoding="async" loading="lazy" />
+          <svg class="footer-brand-logo-image footer-brand-logo-svg" viewBox="0 0 96 112" role="img" aria-label="我爱研究.ILovestudy 标志">
+            <defs>
+              <linearGradient id="brandShield" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#dbeafe"/>
+                <stop offset=".38" stop-color="#60a5fa"/>
+                <stop offset=".72" stop-color="#2563eb"/>
+                <stop offset="1" stop-color="#0f172a"/>
+              </linearGradient>
+              <linearGradient id="brandMetal" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#f8fafc"/>
+                <stop offset=".45" stop-color="#94a3b8"/>
+                <stop offset="1" stop-color="#334155"/>
+              </linearGradient>
+              <linearGradient id="brandChip" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#fde68a"/>
+                <stop offset=".5" stop-color="#f59e0b"/>
+                <stop offset="1" stop-color="#92400e"/>
+              </linearGradient>
+            </defs>
+            <path d="M48 4 82 18v31c0 25-14 43-34 55C28 92 14 74 14 49V18L48 4Z" fill="url(#brandShield)" stroke="#e0f2fe" stroke-width="2.5"/>
+            <path d="M48 13 73 23v25c0 19-9 33-25 43-16-10-25-24-25-43V23l25-10Z" fill="#0f172a" opacity=".76"/>
+            <path d="M28 33c6-12 15-18 20-18s14 6 20 18M23 45c7-15 17-23 25-23s18 8 25 23" fill="none" stroke="#22d3ee" stroke-width="3.2" stroke-linecap="round"/>
+            <path d="M48 26v18" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/>
+            <rect x="34" y="42" width="28" height="28" rx="6" fill="url(#brandMetal)" stroke="#e2e8f0" stroke-width="1.5"/>
+            <rect x="40" y="48" width="16" height="16" rx="3" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
+            <path d="M44 52h8M44 56h8M44 60h8" stroke="#78350f" stroke-width="1.3" stroke-linecap="round"/>
+            <path d="M30 73 24 86M66 73l6 13M38 77l-3 17M58 77l3 17" stroke="#94a3b8" stroke-width="2.2" stroke-linecap="round"/>
+            <circle cx="24" cy="88" r="3.5" fill="#38bdf8"/><circle cx="72" cy="88" r="3.5" fill="#38bdf8"/>
+            <path d="M48 76v21" stroke="#64748b" stroke-width="2.2" stroke-linecap="round"/>
+            <circle cx="48" cy="100" r="3.5" fill="#22d3ee"/>
+          </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
             <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.8</span></span>
