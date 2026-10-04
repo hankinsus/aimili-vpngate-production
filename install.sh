@@ -62,10 +62,10 @@ if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
     apt-get update -q || true
     echo -e "  -> 正在运行 apt-get install 安装基础依赖包..."
-    apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 ppp
+    apt-get install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 python3-venv python3-pip python3-dev ppp procps net-tools dnsutils wget unzip jq openssl mount util-linux iputils-ping
     if [ "$OS_TYPE" = "ubuntu" ]; then
         echo -e "  -> 安装 Ubuntu 多协议 VPN 依赖（SoftEther / L2TP-IPsec / SSTP）..."
-        apt-get install -y softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client busybox || \
+        apt-get install -y softether-vpnclient softether-vpncmd strongswan strongswan-starter xl2tpd sstp-client ppp busybox openconnect || \
           echo -e "${YELLOW}  -> 部分多协议组件未安装成功；OpenVPN 主链路仍可继续，安装日志请检查软件源支持情况。${PLAIN}"
     fi
 elif [ "$PKG_MGR" = "apk" ]; then
@@ -73,7 +73,7 @@ elif [ "$PKG_MGR" = "apk" ]; then
     apk update || true
     echo -e "  -> 正在运行 apk add 安装基础依赖包..."
     # bash is required for this script itself and some internal logic
-    apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 bash
+    apk add openvpn curl git ca-certificates iptables iproute2 psmisc python3 python3-dev py3-pip bash procps net-tools bind-tools wget unzip jq openssl util-linux iputils
 elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
     echo -e "  -> 正在运行 $PKG_MGR 安装基础依赖包..."
     if [ "$OS_TYPE" != "fedora" ] && [ "$OS_TYPE" != "amzn" ]; then
@@ -81,8 +81,8 @@ elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
         $PKG_MGR install -y epel-release || true
     fi
     # Try installing packages. Note: iproute or iproute2
-    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute psmisc python3 || \
-    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3
+    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute psmisc python3 python3-pip python3-devel ppp procps-ng net-tools bind-utils wget unzip jq openssl util-linux iputils || \
+    $PKG_MGR install -y openvpn curl git ca-certificates iptables iproute2 psmisc python3 python3-pip python3-devel ppp procps-ng net-tools bind-utils wget unzip jq openssl util-linux iputils
 fi
 
 # 4. Clone or pull the repository
@@ -141,6 +141,15 @@ else
                 exit 1
             fi
         fi
+    fi
+fi
+
+# 4.0 Install certificate/runtime helper used by HTTPS automation when available.
+if ! command -v acme.sh >/dev/null 2>&1; then
+    echo -e "${YELLOW}  -> 安装 HTTPS 证书辅助工具 acme.sh ...${PLAIN}"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL https://get.acme.sh | sh -s email=admin@ilovestudycn.com || echo -e "${YELLOW}  -> acme.sh 在线安装失败；不会阻断主程序安装。${PLAIN}"
+        [ -f "$HOME/.acme.sh/acme.sh" ] && ln -sf "$HOME/.acme.sh/acme.sh" /usr/local/bin/acme.sh || true
     fi
 fi
 
