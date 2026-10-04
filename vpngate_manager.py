@@ -1797,10 +1797,7 @@ def stop_active_openvpn() -> None:
                 path = Path(config_to_delete)
                 if path.exists():
                     path.unlink()
-            except Exception:
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
-                pass
+            except Exception:                pass
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -3599,10 +3596,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             account = f"probe{token}"
             nic = f"p{token}"
             adapter = tunnel_adapters.SoftEtherAdapter()
-            result = adapter.connect(
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
-                host=host,
+            result = adapter.connect(                host=host,
                 port=port or 443,
                 account=account,
                 nic=nic,
@@ -5401,10 +5395,7 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-option {
       width: 100%;
-      min-height: 40px;
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
-      display: flex;
+      min-height: 40px;      display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
@@ -7203,9 +7194,6 @@ INDEX_HTML = r"""<!doctype html>
             <option value="system">系统运行 (Main/Route)</option>
           </select>
         </div>
-
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
         <button type="button" onclick="closeLogsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
@@ -9005,10 +8993,7 @@ async function saveCredentials(e) {
 
         setTimeout(() => {
           const protocol = window.location.protocol;
-          const host = window.location.hostname;
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
-          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+          const host = window.location.hostname;          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
         }, 4000);
       } else {
         successDiv.textContent = data.reauth_required ? "账号密码保存成功，请重新登录..." : "账号密码保存成功，已即时生效！";
@@ -10807,10 +10792,7 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif effective_path == "/api/resource_share/status":
             try:
-                status = resource_share.status()
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
-                status["local_url"] = self.resource_share_local_url()
+                status = resource_share.status()                status["local_url"] = self.resource_share_local_url()
                 status["pool"] = node_pool.stats()
                 self.send_json(status)
             except Exception as exc:
@@ -12295,5 +12277,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
