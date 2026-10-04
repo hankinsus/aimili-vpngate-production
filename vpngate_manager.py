@@ -857,6 +857,17 @@ def get_state() -> dict[str, Any]:
             or ""
         ).strip()
         state["server_country_code"] = str(bootstrap.get("local_server_country_code") or "").strip().upper()
+        if not state["server_country"]:
+            detected = _detect_local_server_country()
+            if detected.get("country"):
+                state["server_country"] = str(detected.get("country") or "").strip()
+                state["server_country_code"] = str(detected.get("country_code") or "").strip().upper()
+                _write_bootstrap_state(
+                    local_server_country=state["server_country"],
+                    local_server_country_code=state["server_country_code"],
+                    local_server_public_ip=str(detected.get("public_ip") or ""),
+                    detection_source=str(detected.get("source") or ""),
+                )
     except Exception:
         state.setdefault("server_country", "")
         state.setdefault("server_country_code", "")
