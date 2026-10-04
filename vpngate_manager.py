@@ -12320,7 +12320,13 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             offset = bounded_int((query.get("offset") or ["0"])[0], 0, 0, 200000)
             limit = bounded_int((query.get("limit") or ["100"])[0], 100, 1, 200)
-            page_nodes, total_nodes, cache_building = _get_ui_nodes_page(offset, limit)
+            country = str((query.get("country") or [""])[0]).strip()
+            status = str((query.get("status") or [""])[0]).strip().lower()
+            protocol = str((query.get("protocol") or [""])[0]).strip().lower()
+            ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
+            page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
+                offset, limit, country, status, protocol, ip_type
+            )
             self.send_json({
                 "ok": True,
                 "nodes": page_nodes,
@@ -12329,8 +12335,14 @@ class Handler(BaseHTTPRequestHandler):
                 "total": total_nodes,
                 "has_more": offset + len(page_nodes) < total_nodes,
                 "cache_building": cache_building,
+                "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type},
                 "generated_at": time.time(),
             })
+        elif effective_path == "/api/ui/country_catalog":
+            try:
+                self.send_json({"ok": True, **_get_ui_country_catalog()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/protocol_capabilities":
             self.send_json({"ok": True, "protocols": tunnel_adapters.capability_report()})
         elif effective_path == "/api/node_pool_stats":
@@ -13728,8 +13740,41 @@ def _get_ui_nodes_snapshot():
     return _sanitize_ui_nodes(read_nodes())
 
 
-def _get_ui_nodes_page(offset=0, limit=100):
-    """Return a bounded, sorted UI page so initial browser load stays light."""
+def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str = "", protocol: str = "", ip_type: str = "") -> bool:
+    country = str(country or "").strip()
+    status = str(status or "").strip().lower()
+    protocol = str(protocol or "").strip().lower()
+    ip_type = str(ip_type or "").strip().lower()
+
+    if country and not country_matches(node.get("country"), country):
+        location = str(node.get("location") or "").strip()
+        if country and not location.lower().startswith(country.lower()):
+            return False
+
+    node_protocol = str(node.get("protocol") or "openvpn").strip().lower()
+    if protocol and node_protocol != protocol:
+        return False
+
+    node_ip_type = str(node.get("ip_type") or "").strip().lower()
+    if ip_type and node_ip_type != ip_type:
+        return False
+
+    if status == "available":
+        return str(node.get("probe_status") or "").lower() == "available" or bool(node.get("active"))
+    if status == "testing":
+        return str(node.get("probe_status") or "").lower() == "testing"
+    if status == "unavailable":
+        return str(node.get("probe_status") or "").lower() == "unavailable" and not bool(node.get("active"))
+    return True
+
+
+def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type=""):
+    """Return a bounded page for the requested scope.
+
+    The browser should never download the global pool merely to populate a
+    dropdown. Country/status/protocol/IP-type selection is a server-side query;
+    only the selected scope is transferred to the browser.
+    """
     offset = max(0, int(offset or 0))
     limit = max(1, min(200, int(limit or 100)))
     _refresh_ui_nodes_cache_async()
@@ -13741,9 +13786,61 @@ def _get_ui_nodes_page(offset=0, limit=100):
     if not snapshot:
         snapshot = _sanitize_ui_nodes(read_nodes())
 
-    ordered = _sort_ui_nodes_for_page(snapshot)
+    filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type)]
+    ordered = _sort_ui_nodes_for_page(filtered)
     total = len(ordered)
     return ordered[offset:offset + limit], total, building
+
+
+def _get_ui_country_catalog():
+    """Return global country/IP totals without loading global rows into the UI."""
+    try:
+        catalog = node_pool.country_catalog()
+    except Exception:
+        catalog = {"total_ip_count": 0, "countries": {}}
+
+    countries = dict(catalog.get("countries") or {})
+    # Include manually-added or otherwise non-pool OpenVPN nodes.
+    try:
+        for node in read_nodes():
+            ip = str(node.get("ip") or node.get("remote_host") or "").strip()
+            country = str(node.get("country") or "").strip()
+            if not ip or not country:
+                continue
+            item = countries.setdefault(country, {
+                "ip_count": 0, "server_count": 0, "available_ip_count": 0,
+                "hosting_ip_count": 0, "residential_ip_count": 0, "mobile_ip_count": 0,
+            })
+            # Pool is authoritative for persistent IP counts. Only add an IP
+            # when it is not already represented there.
+            if item.get("_extra_ips") is None:
+                item["_extra_ips"] = set()
+            item["_extra_ips"].add(ip)
+            if str(node.get("probe_status") or "").lower() == "available":
+                item.setdefault("_extra_available_ips", set()).add(ip)
+            if str(node.get("ip_type") or "").lower() == "hosting":
+                item.setdefault("_extra_hosting_ips", set()).add(ip)
+            elif str(node.get("ip_type") or "").lower() == "mobile":
+                item.setdefault("_extra_mobile_ips", set()).add(ip)
+            elif str(node.get("ip_type") or "").lower() == "residential":
+                item.setdefault("_extra_residential_ips", set()).add(ip)
+    except Exception:
+        pass
+
+    total_ips = set()
+    for country, item in countries.items():
+        extra = item.pop("_extra_ips", set())
+        item["ip_count"] = int(item.get("ip_count") or 0) + len(extra)
+        item["available_ip_count"] = int(item.get("available_ip_count") or 0) + len(item.pop("_extra_available_ips", set()))
+        item["hosting_ip_count"] = int(item.get("hosting_ip_count") or 0) + len(item.pop("_extra_hosting_ips", set()))
+        item["residential_ip_count"] = int(item.get("residential_ip_count") or 0) + len(item.pop("_extra_residential_ips", set()))
+        item["mobile_ip_count"] = int(item.get("mobile_ip_count") or 0) + len(item.pop("_extra_mobile_ips", set()))
+        total_ips.update(range(int(item["ip_count"])))
+    return {
+        "total_ip_count": sum(int(x.get("ip_count") or 0) for x in countries.values()),
+        "countries": countries,
+        "server_country": str(_read_bootstrap_state().get("local_server_country") or "").strip(),
+    }
 
 def _get_fast_nodes_state():
     state = read_json(STATE_FILE, {})
