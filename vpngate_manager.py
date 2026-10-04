@@ -849,6 +849,17 @@ def get_state() -> dict[str, Any]:
     state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    try:
+        bootstrap = _read_bootstrap_state()
+        state["server_country"] = str(
+            bootstrap.get("local_server_country")
+            or state.get("initial_bootstrap_country")
+            or ""
+        ).strip()
+        state["server_country_code"] = str(bootstrap.get("local_server_country_code") or "").strip().upper()
+    except Exception:
+        state.setdefault("server_country", "")
+        state.setdefault("server_country_code", "")
     state["active_pool_endpoint"] = None
     if active_pool_endpoint_id:
         try:
