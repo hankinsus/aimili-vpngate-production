@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -165,7 +163,7 @@ ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.6"
+APP_VERSION = "V1.0.7"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2179,6 +2177,7 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
             nodes = [item for item in nodes if str(item.get("id") or "") != str(node.get("id") or "")]
             nodes.append(node)
             write_json(NODES_FILE, sort_all_nodes(nodes))
+        _invalidate_ui_nodes_cache()
         return node
 
     server = {
@@ -2209,6 +2208,7 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
         nodes = [item for item in nodes if not (str(item.get("pool_endpoint_id") or "") == endpoint_id or str(item.get("id") or "") == "pool:" + endpoint_id)]
         nodes.append(ui_node)
         write_json(NODES_FILE, sort_all_nodes(nodes))
+    _invalidate_ui_nodes_cache()
     return ui_node
 
 
@@ -2311,8 +2311,29 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
         manual_add_probe_lock.release()
 
 
+def _kick_manual_availability_check() -> None:
+    # 新增资源立即进入持久化可用性检测引擎；若当前正处于连接/维护临界区，
+    # 短暂重试而不阻塞前端“添加节点”请求。
+    for _ in range(10):
+        try:
+            result = availability_sweep_once("")
+            if not result.get("skipped") and not result.get("running"):
+                return
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"新增节点即时可用性检测触发失败: {exc}")
+        time.sleep(2)
+
 def add_manual_vpngate_node(value: str) -> dict[str, Any]:
-    return manual_direct_verify(value, promote=True)
+    result = manual_direct_verify(value, promote=True)
+    if result.get("ok"):
+        set_state(
+            last_check_message="新增节点已入库 · 已通知可用性检测模块，后台立即复核其余协议端点",
+            availability_engine_message="新增节点已入库 · 已通知可用性检测模块，正在立即复核",
+        )
+        threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-availability").start()
+        result["detection_queued"] = True
+        result["message"] = "节点已入库，并已立即通知可用性检测模块继续复核。"
+    return result
 
 
 def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
@@ -5093,7 +5114,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Aimili VPN｜多协议节点管理系统</title>
+  <title>Aimili VPN 多协议节点管理系统</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
@@ -5154,7 +5175,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     h1 {
-      font-size: 20px;
+      font-size: 21px;
       font-weight: 700;
       margin: 0;
       background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 100%);
@@ -5163,7 +5184,19 @@ INDEX_HTML = r"""<!doctype html>
       letter-spacing: -0.5px;
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 11px;
+    }
+
+    .header-brand-main {
+      font-weight: 760;
+      letter-spacing: -.45px;
+      white-space: nowrap;
+    }
+    .header-brand-system {
+      font-size: 1em;
+      font-weight: 700;
+      letter-spacing: -.35px;
+      white-space: nowrap;
     }
 
     .status {
@@ -5325,6 +5358,32 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .active-card-meta span strong {
+      color: var(--text-primary);
+    }
+    .active-location-with-flag,
+    .node-location-cell {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      max-width: 100%;
+      vertical-align: middle;
+    }
+    .active-location-with-flag > span:last-child,
+    .node-location-cell > .node-cell-ellipsis {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .active-hot-pool {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 5px;
+      margin-left: 2px;
+      white-space: nowrap;
+    }
+    .active-hot-pool strong {
       color: var(--text-primary);
     }
 
@@ -5662,16 +5721,27 @@ INDEX_HTML = r"""<!doctype html>
     .footer-brand strong {
       color: var(--text-primary);
       font-size: 19px;
-      font-weight: 740;
+      font-weight: 760;
       line-height: 1.22;
-      letter-spacing: -.15px;
+      letter-spacing: -.25px;
     }
     .footer-brand-version {
-      color: rgba(170,179,192,.94);
-      font-size: 12.5px;
-      font-weight: 500;
-      line-height: 1.4;
+      display: inline-flex;
+      align-items: baseline;
+      gap: 7px;
+      color: rgba(184,191,204,.94);
+      font-size: 17px;
+      font-weight: 650;
+      line-height: 1.3;
+      letter-spacing: -.2px;
       overflow-wrap: anywhere;
+    }
+    .footer-brand-version-number {
+      color: rgba(154,163,177,.88);
+      font-size: 11.5px;
+      font-weight: 520;
+      letter-spacing: 0;
+      white-space: nowrap;
     }
     .footer-channels {
       display: flex;
@@ -5681,8 +5751,8 @@ INDEX_HTML = r"""<!doctype html>
       gap: 9px;
     }
     .footer-channel {
-      width: 206px;
-      min-height: 48px;
+      width: 172px;
+      min-height: 42px;
       box-sizing: border-box;
       display: inline-flex;
       align-items: center;
@@ -5694,7 +5764,7 @@ INDEX_HTML = r"""<!doctype html>
       background: linear-gradient(180deg, rgba(18,28,49,.90), rgba(12,21,38,.82));
       box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 6px 18px rgba(0,0,0,.15);
       color: #e8edf5;
-      font-size: 13.5px;
+      font-size: 12.5px;
       font-weight: 700;
       line-height: 1;
       text-decoration: none;
@@ -5711,15 +5781,15 @@ INDEX_HTML = r"""<!doctype html>
     .footer-channel:active { transform: translateY(0); }
     .footer-channel:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
     .footer-channel-icon {
-      width: 18px;
-      height: 18px;
+      width: 16px;
+      height: 16px;
       display: grid;
       place-items: center;
-      flex: 0 0 18px;
+      flex: 0 0 16px;
     }
     .footer-channel-icon svg {
-      width: 18px;
-      height: 18px;
+      width: 16px;
+      height: 16px;
       display: block;
       fill: currentColor;
     }
@@ -5993,24 +6063,24 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text-secondary);
     }
     .country-flag-img {
-      width: 28px;
-      height: 20px;
-      min-width: 28px;
+      width: 24px;
+      height: 18px;
+      min-width: 24px;
       object-fit: cover;
       object-position: center;
       display: inline-block;
-      flex: 0 0 28px;
+      flex: 0 0 24px;
       border-radius: 3px;
       box-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 2px 6px rgba(0,0,0,.22);
       background: rgba(255,255,255,.08);
       vertical-align: middle;
     }
     .country-flag-fallback {
-      width: 28px;
-      height: 20px;
-      min-width: 28px;
+      width: 24px;
+      height: 18px;
+      min-width: 24px;
       display: inline-flex;
-      flex: 0 0 28px;
+      flex: 0 0 24px;
       align-items: center;
       justify-content: center;
       font-size: 19px;
@@ -6243,17 +6313,17 @@ INDEX_HTML = r"""<!doctype html>
     .table-container::-webkit-scrollbar-track { background: transparent; }
     .table-container::-webkit-scrollbar-thumb { background: rgba(20,184,166,.28); border-radius: 999px; }
 
-    table {
+    table.node-table {
       width: 100%;
-      min-width: 820px;
+      min-width: 1180px;
       max-width: none;
       border-collapse: collapse;
       text-align: left;
-      table-layout: auto;
+      table-layout: fixed;
     }
 
     th, td {
-      padding: 12px 9px;
+      padding: 11px 8px;
       border-bottom: 1px solid var(--border-color);
       font-size: 14px;
       box-sizing: border-box;
@@ -7355,7 +7425,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="brand">
     <h1>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
-      Aimili VPN｜多协议节点管理系统
+      <span class="header-brand-main">Aimili VPN</span><span class="header-brand-system">多协议节点管理系统</span>
     </h1>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
@@ -7538,12 +7608,12 @@ INDEX_HTML = r"""<!doctype html>
           <tr>
             <th style="width: 8%;">状态</th>
             <th style="width: 10%;">协议</th>
-            <th style="width: 18%;">IP 地址 : 端口</th>
+            <th style="width: 17%;">IP 地址 : 端口</th>
             <th style="width: 7%;">延迟</th>
-            <th style="width: 17%;">物理位置</th>
+            <th style="width: 19%;">物理位置</th>
             <th style="width: 16%;">运营主体 / ISP</th>
             <th style="width: 10%;">IP 类型</th>
-            <th style="width: 14%;">操作</th>
+            <th style="width: 13%;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -8085,10 +8155,10 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer-brand">
         <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
-          <img class="footer-brand-logo-image" src="https://ilovestudyip.com/v1/assets/ilovestudy-logo-hd.png?v=9.0.0-logo-r1" alt="我爱研究.ILovestudy 标志" width="48" height="48" decoding="async" loading="eager" />
+          <img class="footer-brand-logo-image" src="./footer-logo-clean.png?v=1.0.7" alt="我爱研究.ILovestudy 标志" width="48" height="48" decoding="async" loading="eager" />
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version">· 多协议节点管理系统 · V1.0.6</span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.7</span></span>
           </span>
         </a>
       </div>
@@ -8154,6 +8224,31 @@ function getProtocolUrl(n) {
   const transport = String(n && (n.proto || n.transport) || "tcp").trim().toLowerCase();
   if (port > 0) params.set(transport === "udp" ? "udp" : "tcp", String(port));
   return "https://www.vpngate.net/cn/do_openvpn.aspx" + (params.toString() ? "?" + params.toString() : "");
+}
+
+function formatNodeLocation(n) {
+  const country = translateCountry(n && n.country || "");
+  let location = String(n && n.location || "").trim().replace(/\s+/g, " ");
+  if (!country) return location || "—";
+  if (!location || location === "-" || location === "—") return country;
+  const knownCountryLabels = [
+    "美国","加拿大","德国","英国","法国","日本","韩国","新加坡","澳大利亚","新西兰","俄罗斯",
+    "中国","台湾","香港","澳门","荷兰","瑞典","挪威","西班牙","意大利","瑞士","奥地利","比利时",
+    "丹麦","芬兰","葡萄牙","爱尔兰","波兰","捷克","匈牙利","土耳其","印度","泰国","越南","马来西亚",
+    "印度尼西亚","菲律宾","墨西哥","巴西","阿根廷","智利","南非","以色列","阿联酋"
+  ];
+  const englishCountryPrefix = /^(United States|Canada|Germany|United Kingdom|France|Japan|Korea Republic of|Republic of Korea|Singapore|Australia|New Zealand|Russian Federation|China|Taiwan|Hong Kong|Macao|Macau|Netherlands|Sweden|Norway|Spain|Italy|Switzerland|Austria|Belgium|Denmark|Finland|Portugal|Ireland|Poland|Czech Republic|Hungary|Turkey|India|Thailand|Viet Nam|Vietnam|Malaysia|Indonesia|Philippines|Mexico|Brazil|Argentina|Chile|South Africa|Israel|United Arab Emirates)\b/i;
+  const cnMatch = location.match(new RegExp("^(" + knownCountryLabels.join("|") + ")\s*"));
+  const enMatch = location.match(englishCountryPrefix);
+  if (cnMatch) {
+    if (cnMatch[1] !== country) return country;
+    location = location.slice(cnMatch[0].length).trim();
+  } else if (enMatch) {
+    const prefixCountry = translateCountry(enMatch[1]);
+    if (prefixCountry && prefixCountry !== country) return country;
+    location = location.slice(enMatch[0].length).trim();
+  }
+  return location ? (location === country || location.startsWith(country + " ") ? location : country + " " + location) : country;
 }
 
 function renderProtocolCell(n) {
@@ -8812,6 +8907,7 @@ function render(){
     const latencyClass = getLatencyClass(latencyValue);
     const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
     const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
+    const activeDisplayLocation = formatNodeLocation({country: ep.country || "", location: ep.location || ""});
     const endpointAddress = ep.hostname || ep.current_ip || ep.endpoint_id || "-";
     const clientBadge = state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证");
     const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
@@ -8831,12 +8927,12 @@ function render(){
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
               <span>协议: <strong>${esc(protocolName)}</strong></span>
-              <span class="active-location-meta">物理位置: <strong><span class="active-location-with-flag">${countryFlag(ep.country || ep.location || "-", ep.location || translateCountry(ep.country || "-"), "eager")}<span>${esc(ep.location || translateCountry(ep.country || "-"))}</span></span></strong></span>
+              <span class="active-location-meta">物理位置: <strong><span class="active-location-with-flag">${countryFlag(ep.country || activeDisplayLocation, translateCountry(ep.country) || activeDisplayLocation, "eager")}<span>${esc(activeDisplayLocation)}</span></span></strong></span>
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(ep.owner || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(ep.ip_type))}</strong></span>
               <span style="margin-left: 12px;">带宽: <strong>${esc(speed(ep.speed))}</strong></span>
-              <span style="margin-left: 12px;">Hot Pool: <strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
+              <span class="active-hot-pool" title="当前处于 HOT 状态的节点数量；系统目标为最低热备数量"><span>热备池</span><strong>${esc(String(state.hot_pool_size || 0))} 个</strong></span>
             </div>
           </div>
         </div>
@@ -8915,7 +9011,7 @@ function render(){
     else if (bootstrapRunning) bgText = "首次安装初始化中 · 先获取资源，再检测本机国家并自动连接最低延迟节点";
     else if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
     else if (collecting) bgText = "资源收集中 · 正在从主站、镜像和多协议目录补充 Master Pool";
-    else if (probing) bgText = "可用性检测中 · 新资源优先 · 全球资源最长 4 小时滚动复检";
+    else if (probing) bgText = String(state.availability_engine_message || "可用性检测中 · 新资源优先 · 全球资源最长 4 小时滚动复检");
     else if (priorityRunning) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + "/" + Number(state.priority_target || 10);
     const detail = (tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "";
     bgActivityEl.style.display = "flex";
@@ -9061,8 +9157,8 @@ function render(){
         : (n.probe_status === "available" ? Number(n.latency_ms || 0) : 0);
       const latencyClass = getLatencyClass(rowLatencyValue);
       const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}">${rowLatencyValue} ms</span>` : "-";
-      const displayLocation = n.location || translateCountry(n.country) || "-";
-      const displayLocationFlag = countryFlag(n.country || displayLocation, displayLocation, "lazy");
+      const displayLocation = formatNodeLocation(n);
+      const displayLocationFlag = countryFlag(n.country || displayLocation, translateCountry(n.country) || displayLocation, "lazy");
       const protocolName = translateProtocol(n.protocol || "openvpn");
       const nodeHost = n.ip || n.remote_host || "-";
       const nodePort = Number(n.remote_port || 0) > 0 ? ":" + String(n.remote_port) : "";
@@ -9738,12 +9834,21 @@ async function submitAddNode(){
     }, 60000);
 
     if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
+    if (data.ok) {
+      state.last_check_message = data.message || "新增节点已入库 · 已通知可用性检测模块";
+      state.availability_engine_message = "新增节点已入库 · 已通知可用性检测模块，正在立即复核";
+      state.availability_engine_running = true;
+      render();
+    }
     if (submit) {
       submit.disabled = false;
       submit.textContent = data.ok ? "完成" : "重新识别";
       submit.onclick = data.ok ? closeAddNodeModal : submitAddNode;
     }
-    if (data.ok) await load();
+    if (data.ok) {
+      await new Promise(r => setTimeout(r, 120));
+      await load();
+    }
   } catch (err) {
     if (resultBox) {
       resultBox.style.display = "block";
@@ -12023,6 +12128,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        elif effective_path == "/footer-logo-clean.png":
+            try:
+                self.send_bytes((ROOT_DIR / "footer-logo-clean.png").read_bytes(), "image/png")
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/link-test":
             try:
                 link_test_path = ROOT_DIR / "client_link_test.html"
@@ -13412,6 +13522,14 @@ def _refresh_ui_nodes_cache_async(force=False):
             return
         ui_nodes_cache_building = True
     threading.Thread(target=_build_ui_nodes_cache, daemon=True, name="ui-node-cache").start()
+
+def _invalidate_ui_nodes_cache() -> None:
+    global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
+    with ui_nodes_cache_lock:
+        ui_nodes_cache = []
+        ui_nodes_cache_at = 0.0
+        ui_nodes_cache_building = False
+    _refresh_ui_nodes_cache_async(force=True)
 
 def _sort_ui_nodes_for_page(nodes):
     """Return the same stable ranking used by the browser, but server-side.
