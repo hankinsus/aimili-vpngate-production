@@ -998,6 +998,7 @@ def clear_active_connection_state(message: str) -> None:
             item["active"] = False
         write_json(NODES_FILE, nodes)
     set_state(
+
         active_openvpn_node_id="",
         active_pool_endpoint_id="",
         active_tunnel_protocol="",
@@ -1399,7 +1400,7 @@ def dedupe_ui_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
     protocol = str(endpoint.get("protocol") or "").strip().lower()
-    if not protocol or protocol == "openvpn":
+    if not protocol:
         return {}
     metadata = endpoint.get("metadata") or {}
     server_metadata = endpoint.get("server_metadata") or {}
@@ -1996,6 +1997,7 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "pool": node_pool.stats()}
     finally:
         protocol_discovery_lock.release()
+
 
 
 def parse_manual_endpoint(value: str) -> tuple[str, int]:
@@ -2998,6 +3000,7 @@ def current_active_routing_endpoint() -> dict[str, Any] | None:
     return None
 
 def maybe_recover_preferred_route(force: bool = False) -> bool:
+
     if manual_route_pin or ui_command_plane.is_busy():
         return False
     ui_cfg = load_ui_config()
@@ -3998,6 +4001,7 @@ def setup_probe_policy_routing(interface: str, gateway: str = "", table: int = P
     if not interface:
         return False, "缺少测试网卡"
     cleanup_probe_policy_routing(table)
+
     try:
         route_cmd = ["ip", "route", "add", "default"]
         if gateway:
@@ -4998,6 +5002,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
     body {
       margin: 0;
       padding: 0;
+
       font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background-color: var(--bg-dark);
       background-image:
@@ -5998,6 +6003,7 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid rgba(99,102,241,.16);
       border-radius: 10px;
       background: rgba(99,102,241,.045);
+
       color: var(--text-secondary);
       font-size: 12px;
       line-height: 1.45;
@@ -6998,6 +7004,7 @@ INDEX_HTML = r"""<!doctype html>
       scrollbar-color: rgba(20,184,166,.34) transparent;
     }
     .rs-modal-content::-webkit-scrollbar {
+
       width: 4px;
     }
     .rs-modal-content::-webkit-scrollbar-track {
@@ -7998,6 +8005,7 @@ INDEX_HTML = r"""<!doctype html>
           <div style="font-size: 13px; color: var(--text-secondary); text-align: right;">
             出口 IP: <span id="proxy_ip_val" class="mono" style="font-weight: 600; color: var(--text-primary);">-</span>
             <span id="proxy_latency_val" style="margin-left: 6px;"></span>
+
           </div>
         </div>
 
@@ -8285,33 +8293,40 @@ INDEX_HTML = r"""<!doctype html>
           <svg class="footer-brand-logo-image footer-brand-logo-svg" viewBox="0 0 96 112" role="img" aria-label="我爱研究.ILovestudy 标志">
             <defs>
               <linearGradient id="brandShield" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#dbeafe"/>
-                <stop offset=".38" stop-color="#60a5fa"/>
+                <stop offset="0" stop-color="#e0f2fe"/>
+                <stop offset=".36" stop-color="#60a5fa"/>
                 <stop offset=".72" stop-color="#2563eb"/>
                 <stop offset="1" stop-color="#0f172a"/>
               </linearGradient>
+              <linearGradient id="brandInner" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#0ea5e9"/>
+                <stop offset=".52" stop-color="#1d4ed8"/>
+                <stop offset="1" stop-color="#0b1738"/>
+              </linearGradient>
               <linearGradient id="brandMetal" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#f8fafc"/>
-                <stop offset=".45" stop-color="#94a3b8"/>
-                <stop offset="1" stop-color="#334155"/>
+                <stop offset="0" stop-color="#ffffff"/>
+                <stop offset=".42" stop-color="#cbd5e1"/>
+                <stop offset="1" stop-color="#64748b"/>
               </linearGradient>
               <linearGradient id="brandChip" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stop-color="#fde68a"/>
-                <stop offset=".5" stop-color="#f59e0b"/>
-                <stop offset="1" stop-color="#92400e"/>
+                <stop offset="0" stop-color="#fef3c7"/>
+                <stop offset=".48" stop-color="#fbbf24"/>
+                <stop offset="1" stop-color="#b45309"/>
               </linearGradient>
             </defs>
-            <path d="M48 4 82 18v31c0 25-14 43-34 55C28 92 14 74 14 49V18L48 4Z" fill="url(#brandShield)" stroke="#e0f2fe" stroke-width="2.5"/>
-            <path d="M48 13 73 23v25c0 19-9 33-25 43-16-10-25-24-25-43V23l25-10Z" fill="#0f172a" opacity=".76"/>
-            <path d="M28 33c6-12 15-18 20-18s14 6 20 18M23 45c7-15 17-23 25-23s18 8 25 23" fill="none" stroke="#22d3ee" stroke-width="3.2" stroke-linecap="round"/>
-            <path d="M48 26v18" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/>
-            <rect x="34" y="42" width="28" height="28" rx="6" fill="url(#brandMetal)" stroke="#e2e8f0" stroke-width="1.5"/>
-            <rect x="40" y="48" width="16" height="16" rx="3" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
-            <path d="M44 52h8M44 56h8M44 60h8" stroke="#78350f" stroke-width="1.3" stroke-linecap="round"/>
-            <path d="M30 73 24 86M66 73l6 13M38 77l-3 17M58 77l3 17" stroke="#94a3b8" stroke-width="2.2" stroke-linecap="round"/>
-            <circle cx="24" cy="88" r="3.5" fill="#38bdf8"/><circle cx="72" cy="88" r="3.5" fill="#38bdf8"/>
-            <path d="M48 76v21" stroke="#64748b" stroke-width="2.2" stroke-linecap="round"/>
-            <circle cx="48" cy="100" r="3.5" fill="#22d3ee"/>
+            <!-- Clean native shield: no decorative top/bottom lines, no external background. -->
+            <path d="M48 4 82 18v31c0 25-14 43-34 55C28 92 14 74 14 49V18L48 4Z"
+                  fill="url(#brandShield)" stroke="#e0f2fe" stroke-width="2.5" stroke-linejoin="round"/>
+            <path d="M48 13 73 23v25c0 19-9 33-25 43-16-10-25-24-25-43V23l25-10Z"
+                  fill="url(#brandInner)" stroke="#22d3ee" stroke-width="1.5" opacity=".98"/>
+            <!-- Centered chip, aligned to the shield's visual center. -->
+            <g transform="translate(48 56)">
+              <rect x="-19" y="-19" width="38" height="38" rx="8" fill="url(#brandMetal)" stroke="#f8fafc" stroke-width="1.5"/>
+              <rect x="-11" y="-11" width="22" height="22" rx="4" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
+              <path d="M-6 -5h12M-6 0h12M-6 5h12" stroke="#78350f" stroke-width="1.6" stroke-linecap="round"/>
+              <path d="M-13-25v7M0-25v7M13-25v7M-13 18v7M0 18v7M13 18v7M-25-13h7M-25 0h7M-25 13h7M18-13h7M18 0h7M18 13h7"
+                    stroke="#fbbf24" stroke-width="2.6" stroke-linecap="round"/>
+            </g>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
@@ -8982,7 +8997,7 @@ function updateCountryFilter() {
     return diff || a[0].localeCompare(b[0], "zh-CN");
   });
 
-  const total = countries.reduce((sum, [, item]) => sum + Number(item?.ip_count || 0), 0);
+  const total = Number(catalog.total_ip_count || 0);
   const globalLabel = "全球国家 · " + total + " IP";
   const options = countries.map(([country, item]) => {
     const count = Number(item?.ip_count || 0);
@@ -8990,6 +9005,10 @@ function updateCountryFilter() {
   }).join("");
 
   select.innerHTML = '<option value="">' + globalLabel + '</option>' + options;
+  // The native <select> is hidden; the visible country dropdown is a custom
+
+  // widget. Keep both in sync whenever the catalog arrives or changes.
+  renderCustomCountryFilter();
   const normalizedSelected = translateCountry(selectedValue);
   const selectedCountry = countries.find(([country]) =>
     country === selectedValue || country === normalizedSelected
@@ -9695,37 +9714,10 @@ async function loadScopedNodes(country, generation) {
   let first = await fetchScopedNodePage(0, 100, 12000);
   if (myGeneration !== scopeLoadGeneration) return;
 
-  // The Master Pool cache may still be constructing while the fast state and
-  // country catalog are already ready. Never mistake the tiny fallback
-  // read_nodes snapshot for the real scope total (the old code got stuck at
-  // 1/98/100 rows forever). Retry the first page until the authoritative
-  // snapshot is ready, then start normal pagination.
-  const catalogCountries = countryCatalogData?.countries || {};
-  const scopeLabel = translateCountry(activeCountryScope || "");
-  let expectedInventory = Number(countryCatalogData?.total_ip_count || 0);
-  if (activeCountryScope) {
-    expectedInventory = 0;
-    for (const [raw, item] of Object.entries(catalogCountries)) {
-      if (translateCountry(raw) === scopeLabel) {
-        expectedInventory += Number(item?.ip_count || 0);
-      }
-    }
-  }
-  let cacheRetry = 0;
-  while (
-    myGeneration === scopeLoadGeneration &&
-    !!first?.cache_building &&
-    Number(first?.total || 0) < Math.max(1, expectedInventory) &&
-    cacheRetry < 30
-  ) {
-    cacheRetry += 1;
-    updateNodeLoadProgress(0, Math.max(1, expectedInventory));
-    render();
-    await new Promise(resolve => setTimeout(resolve, 500));
-    first = await fetchScopedNodePage(0, 100, 12000);
-    if (myGeneration !== scopeLoadGeneration) return;
-  }
-
+  // The first page is already an authoritative SQLite/Master Pool scope
+  // query. Do not wait for the heavyweight global UI snapshot and do not
+  // compare the page row count with country IP inventory; protocol/status/IP
+  // type filters can legitimately make those numbers different.
   totalNodeCount = Number(first?.total || 0);
   nodeCacheBuilding = !!first?.cache_building;
   const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
@@ -10013,6 +10005,7 @@ async function disconnectNode(){
     alert("请求断开连接失败");
   }
 }
+
 
 
 
@@ -10617,14 +10610,15 @@ function handleRoutingModeChange(mode) {
 function populateRoutingCountries() {
   const select = $("net_force_country");
   if (!select) return;
+  // Country options come from the server-computed Master Pool catalog.
+  // Never derive them from the currently loaded/paginated node rows.
+  const catalog = countryCatalogData || { countries: {} };
   const countMap = {};
-  nodes.forEach(n => {
-    const c = translateCountry(n.country);
-    if (c) {
-      countMap[c] = (countMap[c] || 0) + 1;
-    }
+  Object.entries(catalog.countries || {}).forEach(([rawCountry, item]) => {
+    const country = translateCountry(rawCountry) || rawCountry;
+    const count = Number(item?.ip_count || 0);
+    if (country) countMap[country] = Math.max(Number(countMap[country] || 0), count);
   });
-
   const countries = Object.keys(countMap).sort((a,b) => {
     const diff = countMap[b] - countMap[a];
     return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
@@ -10634,12 +10628,12 @@ function populateRoutingCountries() {
     html += `<option value="${esc(c)}">${esc(c)} ${countMap[c]}</option>`;
   });
   select.innerHTML = html;
-
   if (state) {
     select.value = state.force_country ? translateCountry(state.force_country) : "";
   }
   syncUnifiedSelect("net_force_country");
 }
+
 
 let certificatePollInterval = null;
 let redirectToConfiguredDomainAfterCert = false;
@@ -11014,6 +11008,7 @@ $("vps_recommend_modal").addEventListener("click", (event) => {
   if (event.target === event.currentTarget) closeVpsModal();
 });
 document.addEventListener("keydown", (event) => {
+
   if (event.key === "Escape") closeVpsModal();
 });
 
@@ -12014,6 +12009,7 @@ def check_proxy_health() -> dict[str, Any]:
             pass
         finally:
             if test_sock is not None:
+
                 try:
                     test_sock.close()
                 except Exception:
@@ -13014,6 +13010,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if effective_path == "/api/resource_share/delete_invite":
+
             try:
                 payload = self.read_json_body(max_bytes=8192)
                 invite_id = str(payload.get("invite_id") or "").strip()
@@ -13789,7 +13786,10 @@ def _build_ui_nodes_cache():
     try:
         nodes = read_nodes()
         try:
-            for endpoint in node_pool.list_endpoints(limit=5000):
+            # OpenVPN is already represented by read_nodes(); Master Pool
+            # contributes the additional protocols. Pull the full pool so the
+            # UI cache is no longer capped at the old 5,000-endpoint window.
+            for endpoint in node_pool.list_endpoints(limit=10000):
                 if str(endpoint.get("protocol") or "").lower() == "openvpn":
                     continue
                 pool_node = protocol_endpoint_to_ui_node(endpoint)
@@ -13930,8 +13930,15 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     ip_type = str(ip_type or "").strip().lower()
 
     if country and not country_matches(node.get("country"), country):
+        # A populated canonical country is authoritative. Only fall back to
+        # location when the source did not provide a country at all; otherwise
+        # stale/mismatched IP geolocation must never leak another country's row
+        # into a scoped result.
+        node_country = str(node.get("country") or "").strip()
+        if node_country:
+            return False
         location = str(node.get("location") or "").strip()
-        if country and not location.lower().startswith(country.lower()):
+        if not location or not country_matches(location.split()[0], country):
             return False
 
     node_protocol = str(node.get("protocol") or "openvpn").strip().lower()
@@ -13960,56 +13967,51 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     """
     offset = max(0, int(offset or 0))
     limit = max(1, min(200, int(limit or 100)))
-    _refresh_ui_nodes_cache_async()
 
+    # Do not start/build the heavyweight global UI snapshot here. The Master
+    # Pool is the normal source for this endpoint, so a country/filter request
+    # must remain fast and independent of global cache construction.
     with ui_nodes_cache_lock:
         building = bool(ui_nodes_cache_building)
-        snapshot = [dict(x) for x in ui_nodes_cache] if ui_nodes_cache else []
 
+    # Master Pool is authoritative for every UI node read, including the
+    # explicit “全球国家” scope. The browser must never depend on the
+    # heavyweight global snapshot being complete before filters or pages work.
+    # SQLite performs the scope/count query and HTTP returns only one page.
+    try:
+        scoped_endpoints, endpoint_total = node_pool.list_endpoints_scoped(
+            country=country,
+            status=status,
+            protocol=protocol,
+            ip_type=ip_type,
+            offset=offset,
+            limit=limit,
+        )
+        scoped_nodes = [
+            protocol_endpoint_to_ui_node(endpoint)
+            for endpoint in scoped_endpoints
+        ]
+        scoped_nodes = _sanitize_ui_nodes([node for node in scoped_nodes if node])
+        # Keep the browser-facing ranking deterministic inside the returned
+        # page. The SQL query already applies the same primary status/latency
+        # ordering, so we do not materialize thousands of rows in Python.
+        ordered = _sort_ui_nodes_for_page(scoped_nodes)
+        return ordered, endpoint_total, building
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"按范围读取 Master Pool UI 页面失败，回退 UI 快照: {exc}")
+
+    # Emergency compatibility fallback for an unavailable/locked Master Pool.
+    # This path is never the normal source of country/filter data.
+    _refresh_ui_nodes_cache_async()
+    with ui_nodes_cache_lock:
+        snapshot = [dict(x) for x in ui_nodes_cache] if ui_nodes_cache else []
     if not snapshot:
         snapshot = _sanitize_ui_nodes(read_nodes())
-
-    # If the full snapshot is still building, do not expose the tiny legacy
-    # nodes.json fallback as if it were the real scope. Query the persistent
-    # Master Pool directly for the requested page. This makes the default
-    # server-country view usable immediately and also guarantees that explicit
-    # 全球国家 loading can progress past the old 98/100-row ceiling.
-    if building and not ui_nodes_cache:
-        try:
-            scoped_endpoints, scoped_total = node_pool.list_endpoints_scoped(
-                country=country,
-                status=status,
-                protocol=protocol,
-                ip_type=ip_type,
-                offset=offset,
-                limit=limit,
-            )
-            scoped_nodes = []
-            for endpoint in scoped_endpoints:
-                node = protocol_endpoint_to_ui_node(endpoint)
-                if node:
-                    scoped_nodes.append(node)
-            if country:
-                # Keep any manually-added node that is not yet represented by
-                # the persistent pool in the selected country scope.
-                manual = [
-                    n for n in _sanitize_ui_nodes(read_nodes())
-                    if _node_matches_ui_scope(n, country, status, protocol, ip_type)
-                ]
-                seen = {str(n.get("id") or n.get("pool_endpoint_id") or "") for n in scoped_nodes}
-                for n in manual:
-                    key = str(n.get("id") or n.get("pool_endpoint_id") or "")
-                    if key and key not in seen:
-                        scoped_nodes.append(n)
-                        seen.add(key)
-            return _sort_ui_nodes_for_page(scoped_nodes), max(scoped_total, len(scoped_nodes)), True
-        except Exception as exc:
-            log_to_json("WARNING", "Main", f"按范围快速读取 Master Pool 失败，回退 nodes.json: {exc}")
-
     filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type)]
     ordered = _sort_ui_nodes_for_page(filtered)
     total = len(ordered)
     return ordered[offset:offset + limit], total, building
+
 
 
 def _get_ui_country_catalog(status="", protocol="", ip_type=""):
@@ -14022,31 +14024,10 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
     except Exception:
         catalog = {"total_ip_count": 0, "countries": {}}
 
+    # Country/IP inventory is authoritative in Master Pool. Manual nodes are
+    # promoted into the same SQLite pool when added, so the UI never has to
+    # scan nodes.json or compute a second country inventory on the frontend.
     countries = dict(catalog.get("countries") or {})
-    # Include manually-added OpenVPN nodes that are not yet in Master Pool.
-    try:
-        extras: dict[str, set[str]] = {}
-        for node in read_nodes():
-            ip = str(node.get("ip") or node.get("remote_host") or "").strip()
-            country = str(node.get("country") or "").strip()
-            if not ip or not country:
-                continue
-            if protocol and str(node.get("protocol") or "openvpn").lower() != protocol:
-                continue
-            if status == "available" and str(node.get("probe_status") or "").lower() != "available" and not node.get("active"):
-                continue
-            if status == "testing" and str(node.get("probe_status") or "").lower() != "testing":
-                continue
-            if status == "unavailable" and (str(node.get("probe_status") or "").lower() != "unavailable" or node.get("active")):
-                continue
-            if ip_type and str(node.get("ip_type") or "").lower() != ip_type:
-                continue
-            extras.setdefault(country, set()).add(ip)
-        for country, ips in extras.items():
-            item = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
-            item["ip_count"] = int(item.get("ip_count") or 0) + len(ips)
-    except Exception:
-        pass
 
     bootstrap = _read_bootstrap_state()
     server_country = str(
@@ -14055,7 +14036,7 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
         or ""
     ).strip()
     return {
-        "total_ip_count": sum(int(item.get("ip_count") or 0) for item in countries.values()),
+        "total_ip_count": int(catalog.get("total_ip_count") or 0),
         "countries": countries,
         "server_country": server_country,
         "status": status,
