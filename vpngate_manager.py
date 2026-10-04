@@ -2849,17 +2849,15 @@ def country_preference_rank(target_country: Any, candidate_country: Any) -> int:
 def ip_type_preference_rank(preferred: str, actual: Any) -> int:
     preferred = str(preferred or "all").lower()
     actual = str(actual or "").lower()
-    # Default: residential first, mobile second, unknown/normal third,
-    # hosting fourth. This is a preference ladder, never a hard filter.
-    if preferred == "all":
-        return {"residential": 0, "mobile": 1, "unknown": 2, "hosting": 3, "proxy": 4}.get(actual, 2)
-    if preferred == "residential":
-        return {"residential": 0, "mobile": 1, "unknown": 2, "hosting": 3, "proxy": 4}.get(actual, 2)
-    if preferred == "mobile":
-        return {"mobile": 0, "residential": 1, "unknown": 2, "hosting": 3, "proxy": 4}.get(actual, 2)
-    if preferred == "hosting":
-        return {"hosting": 0, "residential": 1, "mobile": 2, "unknown": 3, "proxy": 4}.get(actual, 3)
-    return 0
+    # Fixed product order: mobile -> residential -> hosting -> proxy -> other.
+    ranks = {
+        "all": {"mobile": 0, "residential": 1, "hosting": 2, "proxy": 3, "unknown": 4},
+        "mobile": {"mobile": 0, "residential": 1, "hosting": 2, "proxy": 3, "unknown": 4},
+        "residential": {"residential": 0, "mobile": 1, "hosting": 2, "proxy": 3, "unknown": 4},
+        "hosting": {"hosting": 0, "mobile": 1, "residential": 2, "proxy": 3, "unknown": 4},
+    }
+    return ranks.get(preferred, ranks["all"]).get(actual, 4)
+
 
 def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
     meta = endpoint.get("server_metadata") or {}
@@ -2868,6 +2866,7 @@ def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
     return str((endpoint.get("metadata") or {}).get("ip_type") or "")
 
 ROUTING_MIN_LINE_SPEED_BPS = 50_000_000
+ROUTING_HIGH_SPEED_BPS = 500_000_000
 
 def routing_target_country(ui_cfg: dict[str, Any]) -> str:
     """Explicit country preference first; otherwise use the server's own country."""
@@ -2900,11 +2899,13 @@ def routing_favorite_rank(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> i
     return 0 if favorites.intersection(variants) else 1
 
 def routing_speed_gate(endpoint: dict[str, Any]) -> int:
-    """50 Mbps is a preferred minimum for residential/mobile; below it remains fallback."""
-    if endpoint_ip_type(endpoint) not in ("residential", "mobile"):
-        return 0
+    """Global speed ladder: >=500 Mbps, >=50 Mbps, then <50 Mbps fallback."""
     speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
-    return 0 if speed >= ROUTING_MIN_LINE_SPEED_BPS else 1
+    if speed >= ROUTING_HIGH_SPEED_BPS:
+        return 0
+    if speed >= ROUTING_MIN_LINE_SPEED_BPS:
+        return 1
+    return 2
 
 def routing_web_health_rank(endpoint: dict[str, Any]) -> int:
     status = str(endpoint.get("status") or "").upper()
@@ -2918,7 +2919,7 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
     favorite_rank = routing_favorite_rank(endpoint, ui_cfg)
     ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
     speed_gate = routing_speed_gate(endpoint)
-    return country_rank * 100 + favorite_rank * 20 + ip_rank * 5 + speed_gate
+    return country_rank * 1000 + favorite_rank * 100 + ip_rank * 20 + speed_gate * 5
 
 def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple:
     latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 999999)
