@@ -1976,18 +1976,28 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
 
 
 def parse_manual_endpoint(value: str) -> tuple[str, int]:
+    """Parse a manual VPN Gate target.
+    
+    The port is optional for VPN Gate hostnames. When it is omitted, the
+    official VPN Gate endpoint page is queried and each advertised protocol
+    port is tested independently. Explicit address:port input remains fully
+    supported.
+    """
     raw = str(value or "").strip()
     if not raw:
         raise ValueError("节点地址不能为空")
     if raw.startswith("["):
-        match = re.match(r"^\[([0-9a-fA-F:]+)\]:(\d+)$", raw)
+        match = re.match(r"^\[([0-9a-fA-F:]+)\](?::(\d+))?$", raw)
         if not match:
-            raise ValueError("IPv6 节点格式应为 [IPv6]:端口")
-        return match.group(1), int(match.group(2))
-    match = re.match(r"^([^:]+):(\d+)$", raw)
+            raise ValueError("IPv6 节点格式应为 [IPv6] 或 [IPv6]:端口")
+        return match.group(1), int(match.group(2) or 0)
+    match = re.match(r"^([^:]+)(?::(\d+))?$", raw)
     if not match:
-        raise ValueError("节点格式应为 域名:端口，例如 vpn536329081.opengw.net:1965")
-    return match.group(1).strip(), int(match.group(2))
+        raise ValueError("节点格式应为 域名、域名:端口、IPv4 或 IPv4:端口")
+    host = match.group(1).strip()
+    if not host:
+        raise ValueError("节点地址不能为空")
+    return host, int(match.group(2) or 0)
 
 def _manual_openvpn_template() -> str:
     """Return a current VPN Gate OpenVPN template already present on this instance."""
@@ -2289,16 +2299,16 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
 
         for protocol in protocol_order:
             offered = official_protocols.get(protocol) or []
-            transport = "udp" if protocol == "l2tp-ipsec" else "tcp"
+            default_transport = "udp" if protocol == "l2tp-ipsec" else "tcp"
 
-            # When the official VPN Gate page advertises multiple protocols,
-            # test each protocol on its own advertised port. Do not stop after
-            # the first success and do not incorrectly skip a valid protocol
-            # merely because the user entered another protocol's port.
+            # With a VPN Gate hostname and no explicit port, use every
+            # advertised endpoint for that protocol until one really connects.
+            # This is important because OpenVPN may advertise a TCP and a UDP
+            # port, while SSL-VPN/SSTP use the published TCP port.
             if official and not offered:
                 attempts.append({
                     "protocol": protocol,
-                    "transport": transport,
+                    "transport": default_transport,
                     "port": 0 if protocol == "l2tp-ipsec" else int(port),
                     "ok": False,
                     "skipped": True,
@@ -2306,30 +2316,38 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 })
                 continue
 
-            if official:
-                transport, test_port = offered[0]
-            elif protocol == "l2tp-ipsec":
-                test_port = 0
-                transport = "udp"
-            else:
-                test_port = int(port)
+            candidates = offered if official else (
+                [("udp", 0)] if protocol == "l2tp-ipsec" and not port else [(default_transport, int(port))]
+            )
+            protocol_passed = False
+            for transport, test_port in candidates:
+                result = _manual_probe_protocol(host, resolved_ip, protocol, int(test_port), transport)
+                attempts.append(result)
+                if not result.get("ok"):
+                    continue
 
-            result = _manual_probe_protocol(host, resolved_ip, protocol, test_port, transport)
-            attempts.append(result)
+                protocol_passed = True
+                successful_protocols.append(protocol)
+                promoted = _promote_manual_endpoint(
+                    host,
+                    resolved_ip,
+                    str((official or {}).get("country") or ""),
+                    result,
+                    source_info=source_info,
+                ) if promote else None
+                if promoted:
+                    added_nodes.append(promoted)
+                break
 
-            if not result.get("ok"):
-                continue
-
-            successful_protocols.append(protocol)
-            promoted = _promote_manual_endpoint(
-                host,
-                resolved_ip,
-                str((official or {}).get("country") or ""),
-                result,
-                source_info=source_info,
-            ) if promote else None
-            if promoted:
-                added_nodes.append(promoted)
+            if not protocol_passed and not official and not port:
+                attempts.append({
+                    "protocol": protocol,
+                    "transport": default_transport,
+                    "port": 0,
+                    "ok": False,
+                    "skipped": True,
+                    "message": "未提供端口，且当前地址无法从 VPN Gate 官方页面自动获取协议端口",
+                })
 
         if successful_protocols:
             primary = attempts[[str(item.get("protocol") or "").lower() for item in attempts].index(successful_protocols[0])]
@@ -2337,7 +2355,7 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 "ok": True,
                 "mode": "direct_connection",
                 "passed": True,
-                "input": f"{host}:{port}",
+                "input": str(value or "").strip(),
                 "hostname": host,
                 "ip": resolved_ip,
                 "country": (official or {}).get("country") or "",
@@ -2360,7 +2378,7 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
             "ok": False,
             "mode": "direct_connection",
             "passed": False,
-            "input": f"{host}:{port}",
+            "input": str(value or "").strip(),
             "hostname": host,
             "ip": resolved_ip,
             "attempts": attempts,
@@ -5218,7 +5236,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     header {
-      padding: 16px 32px;
+      padding: 10px 32px;
       background: rgba(11, 15, 25, 0.7);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
@@ -5766,8 +5784,9 @@ INDEX_HTML = r"""<!doctype html>
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
       width: 50px;
-      height: auto;
-      max-height: 60px;
+      height: 59px;
+      max-width: 50px;
+      max-height: 59px;
       display: block;
       flex: 0 0 50px;
       object-fit: contain;
@@ -6163,13 +6182,14 @@ INDEX_HTML = r"""<!doctype html>
       transform: rotate(180deg) translateY(1px);
     }
     .toolbar-custom-select-menu {
-      position: absolute;
+      position: fixed;
       left: 0;
-      right: 0;
-      top: calc(100% + 8px);
+      right: auto;
+      top: auto;
+      bottom: auto;
       z-index: 10080;
       min-width: 100%;
-      max-height: min(360px, calc(100vh - 170px));
+      max-height: min(360px, calc(100vh - 40px));
       overflow-y: auto;
       overscroll-behavior: contain;
       padding: 5px;
@@ -7959,16 +7979,16 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:18px;">
         <div>
           <h3 style="margin:0; font-size:20px; font-weight:700; color:var(--text-primary);">添加 VPN Gate 节点</h3>
-          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名:端口、IPv4:端口，也支持 IPv6 [地址]:端口。系统直接尝试 4 种 VPN Gate 接入方式，真实建立成功后才会写入资源池。</div>
+          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名、域名:端口、IPv4、IPv4:端口，也支持 IPv6 [地址] / [地址]:端口。VPN Gate .opengw.net 域名不填写端口时，系统会自动读取官方公布的各协议端口，再逐一真实验证。</div>
         </div>
         <button type="button" onclick="closeAddNodeModal()" style="width:32px;height:32px;border:1px solid var(--border-color);background:rgba(255,255,255,.03);border-radius:8px;color:var(--text-secondary);cursor:pointer;">✕</button>
       </div>
 
       <label class="form-label" for="add_node_address">节点地址</label>
-      <input id="add_node_address" class="input-field" autocomplete="off" spellcheck="false" placeholder="例如 vpn536329081.opengw.net:1965">
+      <input id="add_node_address" class="input-field" autocomplete="off" spellcheck="false" placeholder="例如 vpn99990120.opengw.net（端口可省略）">
 
       <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-        <button type="button" class="test-btn" onclick="fillAddNodeExample('vpn536329081.opengw.net:1965')" style="height:30px;">示例域名</button>
+        <button type="button" class="test-btn" onclick="fillAddNodeExample('vpn99990120.opengw.net')" style="height:30px;">示例域名</button>
         <button type="button" class="test-btn" onclick="fillAddNodeExample('203.0.113.10:1965')" style="height:30px;">示例 IPv4</button>
       </div>
 
@@ -8220,7 +8240,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer-brand">
         <div class="footer-brand-link" aria-label="我爱研究.ILovestudy 品牌标志">
-          <img class="footer-brand-logo-image" src="./footer-logo-clean.webp?v=1.0.8" alt="我爱研究.ILovestudy 标志" width="50" decoding="async" loading="eager" />
+          <img class="footer-brand-logo-image" src="./footer-logo-clean.png?v=1.0.9" alt="我爱研究.ILovestudy 标志" width="50" height="59" decoding="async" loading="lazy" />
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
             <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.8</span></span>
@@ -8722,15 +8742,26 @@ function toggleCustomFilter(selectId, event) {
   if (opening) {
     const menu = $(cfg.menu);
     if (menu) {
+      menu.style.left = "";
       menu.style.top = "";
       menu.style.bottom = "";
+      menu.style.width = "";
       requestAnimationFrame(() => {
         const rect = widget.getBoundingClientRect();
-        const menuHeight = Math.min(menu.scrollHeight || 320, Math.min(360, window.innerHeight - 40));
+        const menuHeight = Math.min(menu.scrollHeight || 320, Math.max(180, window.innerHeight - 40));
         const spaceBelow = window.innerHeight - rect.bottom - 12;
         const openUp = menuHeight > 0 && spaceBelow < menuHeight && rect.top > menuHeight + 12;
-        menu.style.top = openUp ? "auto" : "calc(100% + 8px)";
-        menu.style.bottom = openUp ? "calc(100% + 8px)" : "auto";
+        const width = Math.max(rect.width, menu.offsetWidth || 0);
+        const left = Math.min(rect.left, Math.max(8, window.innerWidth - width - 8));
+        menu.style.left = left + "px";
+        menu.style.width = width + "px";
+        if (openUp) {
+          menu.style.top = Math.max(8, rect.top - menuHeight - 8) + "px";
+          menu.style.bottom = "auto";
+        } else {
+          menu.style.top = Math.min(window.innerHeight - menuHeight - 8, rect.bottom + 8) + "px";
+          menu.style.bottom = "auto";
+        }
       });
     }
     const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
@@ -9923,10 +9954,13 @@ async function submitAddNode(){
   const resultBox = $("add_node_result");
   const address = String(input && input.value || "").trim();
   if (!address) { if (input) input.focus(); return; }
-  if (!/^[^:]+:\d+$/.test(address) && !/^\[[0-9a-fA-F:]+\]:\d+$/.test(address)) {
+  const validAddress =
+    /^[^:\s]+(?::\d{1,5})?$/.test(address) ||
+    /^\[[0-9a-fA-F:]+\](?::\d{1,5})?$/.test(address);
+  if (!validAddress) {
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:11px 12px;color:var(--warning);background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);border-radius:8px;">请输入正确的“地址:端口”格式。</div>';
+      resultBox.innerHTML = '<div style="padding:11px 12px;color:var(--warning);background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);border-radius:8px;">请输入“域名 / 域名:端口 / IPv4 / IPv4:端口”；VPN Gate .opengw.net 域名可不填写端口，系统会自动读取官方公布端口。</div>';
     }
     return;
   }
@@ -9934,7 +9968,7 @@ async function submitAddNode(){
     if (submit) { submit.disabled = true; submit.textContent = "正在直连..."; }
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在直连验证 4 种 VPN Gate 接入方式；4 种方式都会完成独立检测，所有通过的协议都会写入资源池...</div>';
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在读取 VPN Gate 官方端口并直连验证 4 种接入方式；已公布的协议会逐一测试，所有通过的协议都会写入资源池...</div>';
     }
     const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
@@ -10819,7 +10853,9 @@ async function logoutAdmin() {
   }
 }
 
-// 页面加载时自动初始化数据
+// 先把页面骨架、筛选栏和状态区域立即渲染出来；节点数据随后异步读取，
+// 避免首页被数千条节点数据阻塞在白屏/半屏状态。
+render();
 load();
 
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
