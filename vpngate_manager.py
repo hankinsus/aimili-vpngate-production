@@ -9692,8 +9692,39 @@ async function loadScopedNodes(country, generation) {
   nodeCacheBuilding = false;
   activeCountryScope = String(country || "").trim();
 
-  const first = await fetchScopedNodePage(0, 100, 12000);
+  let first = await fetchScopedNodePage(0, 100, 12000);
   if (myGeneration !== scopeLoadGeneration) return;
+
+  // The Master Pool cache may still be constructing while the fast state and
+  // country catalog are already ready. Never mistake the tiny fallback
+  // read_nodes snapshot for the real scope total (the old code got stuck at
+  // 1/98/100 rows forever). Retry the first page until the authoritative
+  // snapshot is ready, then start normal pagination.
+  const catalogCountries = countryCatalogData?.countries || {};
+  const scopeLabel = translateCountry(activeCountryScope || "");
+  let expectedInventory = Number(countryCatalogData?.total_ip_count || 0);
+  if (activeCountryScope) {
+    for (const [raw, item] of Object.entries(catalogCountries)) {
+      if (translateCountry(raw) === scopeLabel) {
+        expectedInventory += Number(item?.ip_count || 0);
+      }
+    }
+  }
+  let cacheRetry = 0;
+  while (
+    myGeneration === scopeLoadGeneration &&
+    !!first?.cache_building &&
+    Number(first?.total || 0) < Math.max(1, expectedInventory) &&
+    cacheRetry < 30
+  ) {
+    cacheRetry += 1;
+    updateNodeLoadProgress(0, Math.max(1, expectedInventory));
+    render();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    first = await fetchScopedNodePage(0, 100, 12000);
+    if (myGeneration !== scopeLoadGeneration) return;
+  }
+
   totalNodeCount = Number(first?.total || 0);
   nodeCacheBuilding = !!first?.cache_building;
   const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
