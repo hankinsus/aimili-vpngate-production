@@ -2849,16 +2849,16 @@ def country_preference_rank(target_country: Any, candidate_country: Any) -> int:
 def ip_type_preference_rank(preferred: str, actual: Any) -> int:
     preferred = str(preferred or "all").lower()
     actual = str(actual or "").lower()
+    # Default: residential first, mobile second, unknown/normal third,
+    # hosting fourth. This is a preference ladder, never a hard filter.
     if preferred == "all":
-        return 0
+        return {"residential": 0, "mobile": 1, "unknown": 2, "hosting": 3, "proxy": 4}.get(actual, 2)
     if preferred == "residential":
-        if actual == "residential":
-            return 0
-        if actual == "mobile":
-            return 1
-        return 2
+        return {"residential": 0, "mobile": 1, "unknown": 2, "hosting": 3, "proxy": 4}.get(actual, 2)
+    if preferred == "mobile":
+        return {"mobile": 0, "residential": 1, "unknown": 2, "hosting": 3, "proxy": 4}.get(actual, 2)
     if preferred == "hosting":
-        return 0 if actual == "hosting" else 1
+        return {"hosting": 0, "residential": 1, "mobile": 2, "unknown": 3, "proxy": 4}.get(actual, 3)
     return 0
 
 def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
