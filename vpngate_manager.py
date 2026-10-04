@@ -1,4 +1,5 @@
 
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -9812,6 +9813,18 @@ function populateRoutingCountries() {
 }
 
 let certificatePollInterval = null;
+let redirectToConfiguredDomainAfterCert = false;
+
+function redirectToConfiguredDomain() {
+  const domain = String(state?.web_domain || state?.web_certificate?.domain || "").trim();
+  if (!domain) return false;
+  const currentHost = String(window.location.hostname || "").trim().toLowerCase();
+  if (currentHost === domain.toLowerCase()) return false;
+  const suffix = String(state?.secret_path || "Admin").replace(/^\/+|\/+$/g, "");
+  const target = `https://${domain}:8443/${suffix}/`;
+  window.location.replace(target);
+  return true;
+}
 
 function renderCertificateStatus(certState) {
   const el = $("cred_cert_status");
@@ -9875,6 +9888,13 @@ async function startCertificatePolling() {
         state.web_certificate = data.certificate;
         state.web_domain = data.certificate.domain || state.web_domain || "";
         renderCertificateStatus(data.certificate);
+        if (
+          redirectToConfiguredDomainAfterCert &&
+          String(data.certificate.status || "") === "active"
+        ) {
+          redirectToConfiguredDomainAfterCert = false;
+          if (redirectToConfiguredDomain()) return;
+        }
         const done = !data.certificate.running && ["active", "error", "not_configured", "interrupted"].includes(String(data.certificate.status || ""));
         if (done && certificatePollInterval) {
           clearInterval(certificatePollInterval);
@@ -9993,8 +10013,18 @@ async function saveCredentials(e) {
           window.location.href = `${protocol}//${preferredHost}:${port}/${suffix}/`;
         }, 4000);
       } else {
-        const certBusy = ["issuing", "installing"].includes(String(data.certificate?.status || ""));
+        const certStatus = String(data.certificate?.status || "");
+        const configuredDomain = String(domain || data.certificate?.domain || "").trim();
+        const onConfiguredDomain = configuredDomain && String(window.location.hostname || "").trim().toLowerCase() === configuredDomain.toLowerCase();
+        if (configuredDomain && !onConfiguredDomain && certStatus === "active") {
+          successDiv.textContent = "HTTPS 证书已启用，正在切换到域名访问…";
+          successDiv.style.display = "block";
+          setTimeout(() => redirectToConfiguredDomain(), 500);
+          return;
+        }
+        const certBusy = ["issuing", "installing"].includes(certStatus);
         if (certBusy) {
+          redirectToConfiguredDomainAfterCert = !!configuredDomain && !onConfiguredDomain;
           successDiv.textContent = data.reauth_required
             ? "账号密码保存成功，HTTPS 证书正在后台申请；完成后会自动更新状态。"
             : "保存成功，HTTPS 证书正在后台申请；完成后会自动更新状态。";
