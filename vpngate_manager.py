@@ -8654,14 +8654,17 @@ function countryFlagCode(country) {
   return COUNTRY_FLAG_CODES[name] || COUNTRY_FLAG_ALIASES[raw] || COUNTRY_FLAG_ALIASES[name] || "";
 }
 
+function countryFlagEmoji(code) {
+  const value = String(code || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(value)) return "🌐";
+  return String.fromCodePoint(...value.split("").map(ch => 0x1F1E6 + ch.charCodeAt(0) - 65));
+}
+
 function countryFlag(country, title = "", loading = "lazy") {
   const code = countryFlagCode(country);
-  if (!code) return '<span class="country-flag-fallback" aria-hidden="true">🌐</span>';
-  const safeCode = code.toLowerCase();
   const label = esc(title || translateCountry(country) || country || "");
-  const safeLoading = loading === "eager" ? "eager" : "lazy";
-  return '<img class="country-flag-img" src="https://flagcdn.com/24x18/' + safeCode + '.png" alt="" title="' + label + '" width="24" height="18" loading="' + safeLoading + '" decoding="async" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline-flex\';">' +
-    '<span class="country-flag-fallback" aria-hidden="true" style="display:none;">🌐</span>';
+  return '<span class="country-flag-fallback" role="img" aria-label="' + label + '" title="' + label + '">' +
+    countryFlagEmoji(code) + '</span>';
 }
 
 function renderCustomFilter(selectId, withCount = false) {
