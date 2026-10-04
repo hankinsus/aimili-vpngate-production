@@ -9704,6 +9704,7 @@ async function loadScopedNodes(country, generation) {
   const scopeLabel = translateCountry(activeCountryScope || "");
   let expectedInventory = Number(countryCatalogData?.total_ip_count || 0);
   if (activeCountryScope) {
+    expectedInventory = 0;
     for (const [raw, item] of Object.entries(catalogCountries)) {
       if (translateCountry(raw) === scopeLabel) {
         expectedInventory += Number(item?.ip_count || 0);
