@@ -1040,11 +1040,30 @@ class NodePool:
         ]
         params: list[Any] = []
         if country:
-            # Country normalization is handled by the caller when necessary;
-            # this query covers the canonical stored value and the common English
-            # alias without scanning protocol rows in Python.
-            where.append("(s.country=? OR s.country=? OR s.country=?)")
-            params.extend([country, country.replace("美国", "United States").replace("日本", "Japan").replace("韩国", "Korea Republic of") , country])
+            aliases = {
+                "美国": "United States", "日本": "Japan", "韩国": "Korea Republic of",
+                "加拿大": "Canada", "德国": "Germany", "英国": "United Kingdom",
+                "法国": "France", "澳大利亚": "Australia", "新西兰": "New Zealand",
+                "新加坡": "Singapore", "中国": "China", "中国香港": "Hong Kong", "香港": "Hong Kong",
+                "台湾": "Taiwan", "俄罗斯": "Russian Federation", "荷兰": "Netherlands",
+                "瑞典": "Sweden", "挪威": "Norway", "西班牙": "Spain", "意大利": "Italy",
+                "瑞士": "Switzerland", "比利时": "Belgium", "奥地利": "Austria",
+                "丹麦": "Denmark", "芬兰": "Finland", "葡萄牙": "Portugal",
+                "爱尔兰": "Ireland", "波兰": "Poland", "捷克": "Czech Republic",
+                "匈牙利": "Hungary", "土耳其": "Turkey", "印度": "India",
+                "泰国": "Thailand", "越南": "Vietnam", "马来西亚": "Malaysia",
+                "印度尼西亚": "Indonesia", "菲律宾": "Philippines", "墨西哥": "Mexico",
+                "巴西": "Brazil", "阿根廷": "Argentina", "智利": "Chile",
+                "南非": "South Africa", "以色列": "Israel", "阿联酋": "United Arab Emirates",
+                "罗马尼亚": "Romania", "乌克兰": "Ukraine", "柬埔寨": "Cambodia",
+                "哈萨克斯坦": "Kazakhstan", "格鲁吉亚": "Georgia", "蒙古": "Mongolia",
+                "伊朗": "Iran", "伊拉克": "Iraq", "哥伦比亚": "Colombia",
+                "沙特阿拉伯": "Saudi Arabia", "希腊": "Greece", "冰岛": "Iceland",
+                "卢森堡": "Luxembourg", "澳门": "Macao",
+            }
+            alias = aliases.get(country, country)
+            where.append("(s.country=? OR s.country=?)")
+            params.extend([country, alias])
         if protocol:
             where.append("e.protocol=?")
             params.append(protocol)
