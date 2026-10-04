@@ -148,10 +148,14 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 # Public ports: 8443 HTTPS management, 8500 HTTP/SOCKS5 proxy, 18443 HTTPS subscriptions.
 # The manager UI itself stays on a private loopback listener and is exposed only by Nginx on 8443.
-LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "0.0.0.0")
+LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = 8500
 UI_HOST = os.environ.get("UI_HOST", "127.0.0.1")
 UI_PORT = 8501
+# Default local proxy profile: SOCKS5 on 127.0.0.1:8500 with authentication.
+os.environ.setdefault("LOCAL_PROXY_USER", "socks5")
+os.environ.setdefault("LOCAL_PROXY_PASS", "ilovestudy")
+os.environ.setdefault("LOCAL_PROXY_ALLOW", "127.0.0.1/32,::1/128")
 ACTIVE_ROUTE_TABLE = env_int("ACTIVE_ROUTE_TABLE", 100, 1, 252)
 ISOLATED_INSTANCE = env_flag("ISOLATED_INSTANCE", False)
 DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
@@ -7293,12 +7297,26 @@ INDEX_HTML = r"""<!doctype html>
     .rs-item-link .test-btn {
       flex: 0 0 auto;
     }
-    .rs-invite-management-actions {
-      width: 100%;
-      justify-content: flex-end;
+    .rs-invite-management-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
       margin-top: 9px;
       padding-top: 9px;
       border-top: 1px solid rgba(148,163,184,.10);
+    }
+    .rs-invite-management-row .rs-item-meta {
+      margin-top: 0;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .rs-invite-management-actions {
+      width: auto;
+      justify-content: flex-end;
+      margin-top: 0;
+      padding-top: 0;
+      border-top: 0;
     }
     .rs-copy-link-btn {
       min-width: 92px;
@@ -7473,6 +7491,13 @@ INDEX_HTML = r"""<!doctype html>
       }
       .rs-edit-sync-row {
         grid-template-columns: 1fr 1fr;
+      }
+      .rs-invite-management-row {
+        align-items: flex-start;
+      }
+      .rs-invite-management-actions {
+        width: auto;
+        justify-content: flex-start;
       }
       .rs-item-actions {
         width: 100%;
@@ -9480,7 +9505,7 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 8500}`;
-  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${localProxy} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`; }
+  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP/SOCKS5 代理本地接口（默认 SOCKS5）：${localProxy} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`; }
 
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -9547,9 +9572,9 @@ function render(){
   // a false "no matching nodes" result.
   if (currentPageNodes.length === 0) {
     const hasServerInventory = Number(totalNodeCount || 0) > 0;
-    const resourceLoading = hasServerInventory && nodes.length === 0;
+    const resourceLoading = hasServerInventory && (nodes.length === 0 || nodeCacheBuilding || state.global_pool_refresh_running);
     const emptyText = resourceLoading
-      ? `<span class="badge not_checked"><span class="badge-pulse"></span>资源获取中</span><div style="margin-top:8px;">已发现 ${Number(totalNodeCount || 0)} 个资源记录，正在从 Master Pool 获取节点详情，请稍候...</div>`
+      ? `<span class="badge not_checked"><span class="badge-pulse"></span>资源获取中</span><div style="margin-top:8px;">已发现 ${Number(totalNodeCount || 0)} 个资源记录，正在从 Master Pool 获取节点详情，请稍候……</div>`
       : "未找到符合过滤条件的备选节点。";
     $("rows").innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyText}</td></tr>`;
   } else {
@@ -11421,14 +11446,16 @@ function renderResourceShareInvites(invites) {
           (inviteUrl
             ? '<div class="rs-item-link rs-item-link-primary"><span>' + safeUrl + '</span><button class="test-btn rs-copy-link-btn" data-invite-url="' + safeUrl + '" onclick="copyResourceShareInviteLink(this.dataset.inviteUrl)">复制链接</button></div>'
             : '<div class="rs-item-meta" style="color:var(--warning);">该历史邀请未能恢复完整链接，请重新创建邀请链接。</div>') +
-          '<div class="rs-item-meta">允许来源：' + esc(scope) + ' · 创建时间：' + esc(resourceShareTime(invite.created_at)) + ' · 有效期：永不过期</div>' +
-          (revoked ? '<div class="rs-item-meta" style="color:var(--warning);">此链接已撤销，不再授权新的共享访问。你可以恢复，或永久删除。</div>' : '') +
-          '<div class="rs-item-actions rs-invite-management-actions">' +
+          '<div class="rs-invite-management-row">' +
+            '<div class="rs-item-meta">允许来源：' + esc(scope) + ' · 创建时间：' + esc(resourceShareTime(invite.created_at)) + ' · 有效期：永不过期</div>' +
+            '<div class="rs-item-actions rs-invite-management-actions">' +
             (!revoked ? '<button class="test-btn" onclick="editResourceInvite(\'' + esc(invite.invite_id) + '\')">修改</button>' : '') +
             (!revoked ? '<button class="test-btn" style="color:var(--warning);border-color:rgba(245,158,11,.3);" onclick="revokeResourceInvite(\'' + esc(invite.invite_id) + '\')">撤销</button>' : '') +
             (revoked ? '<button class="test-btn" style="color:var(--primary);border-color:rgba(20,184,166,.3);" onclick="restoreResourceInvite(\'' + esc(invite.invite_id) + '\')">恢复</button>' : '') +
             (revoked ? '<button class="test-btn" style="color:var(--danger);border-color:rgba(244,63,94,.3);" onclick="deleteResourceInvite(\'' + esc(invite.invite_id) + '\')">永久删除</button>' : '') +
+            '</div>' +
           '</div>' +
+          (revoked ? '<div class="rs-item-meta" style="color:var(--warning);">此链接已撤销，不再授权新的共享访问。你可以恢复，或永久删除。</div>' : '') +
       '</div>' +
     '</div>';
   }).join("");
@@ -15005,7 +15032,7 @@ def main() -> None:
             "target_valid_nodes": TARGET_VALID_NODES,
             "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
-            "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+            "local_proxy": f"socks5://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
