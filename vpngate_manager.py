@@ -998,7 +998,6 @@ def clear_active_connection_state(message: str) -> None:
             item["active"] = False
         write_json(NODES_FILE, nodes)
     set_state(
-
         active_openvpn_node_id="",
         active_pool_endpoint_id="",
         active_tunnel_protocol="",
@@ -1997,7 +1996,6 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "pool": node_pool.stats()}
     finally:
         protocol_discovery_lock.release()
-
 
 
 def parse_manual_endpoint(value: str) -> tuple[str, int]:
@@ -3000,7 +2998,6 @@ def current_active_routing_endpoint() -> dict[str, Any] | None:
     return None
 
 def maybe_recover_preferred_route(force: bool = False) -> bool:
-
     if manual_route_pin or ui_command_plane.is_busy():
         return False
     ui_cfg = load_ui_config()
@@ -4001,7 +3998,6 @@ def setup_probe_policy_routing(interface: str, gateway: str = "", table: int = P
     if not interface:
         return False, "缺少测试网卡"
     cleanup_probe_policy_routing(table)
-
     try:
         route_cmd = ["ip", "route", "add", "default"]
         if gateway:
@@ -5002,7 +4998,6 @@ LOGIN_HTML = r"""<!DOCTYPE html>
     body {
       margin: 0;
       padding: 0;
-
       font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background-color: var(--bg-dark);
       background-image:
@@ -6003,7 +5998,6 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid rgba(99,102,241,.16);
       border-radius: 10px;
       background: rgba(99,102,241,.045);
-
       color: var(--text-secondary);
       font-size: 12px;
       line-height: 1.45;
@@ -7004,7 +6998,6 @@ INDEX_HTML = r"""<!doctype html>
       scrollbar-color: rgba(20,184,166,.34) transparent;
     }
     .rs-modal-content::-webkit-scrollbar {
-
       width: 4px;
     }
     .rs-modal-content::-webkit-scrollbar-track {
@@ -8005,7 +7998,6 @@ INDEX_HTML = r"""<!doctype html>
           <div style="font-size: 13px; color: var(--text-secondary); text-align: right;">
             出口 IP: <span id="proxy_ip_val" class="mono" style="font-weight: 600; color: var(--text-primary);">-</span>
             <span id="proxy_latency_val" style="margin-left: 6px;"></span>
-
           </div>
         </div>
 
@@ -9006,7 +8998,6 @@ function updateCountryFilter() {
 
   select.innerHTML = '<option value="">' + globalLabel + '</option>' + options;
   // The native <select> is hidden; the visible country dropdown is a custom
-
   // widget. Keep both in sync whenever the catalog arrives or changes.
   renderCustomCountryFilter();
   const normalizedSelected = translateCountry(selectedValue);
@@ -10010,7 +10001,6 @@ async function disconnectNode(){
 
 
 
-
 function openAddNodeModal(){
   const modal = $("add_node_modal");
   const input = $("add_node_address");
@@ -11008,7 +10998,6 @@ $("vps_recommend_modal").addEventListener("click", (event) => {
   if (event.target === event.currentTarget) closeVpsModal();
 });
 document.addEventListener("keydown", (event) => {
-
   if (event.key === "Escape") closeVpsModal();
 });
 
@@ -12009,7 +11998,6 @@ def check_proxy_health() -> dict[str, Any]:
             pass
         finally:
             if test_sock is not None:
-
                 try:
                     test_sock.close()
                 except Exception:
@@ -13010,7 +12998,6 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if effective_path == "/api/resource_share/delete_invite":
-
             try:
                 payload = self.read_json_body(max_bytes=8192)
                 invite_id = str(payload.get("invite_id") or "").strip()
@@ -14011,7 +13998,6 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     ordered = _sort_ui_nodes_for_page(filtered)
     total = len(ordered)
     return ordered[offset:offset + limit], total, building
-
 
 
 def _get_ui_country_catalog(status="", protocol="", ip_type=""):
