@@ -1,15 +1,13 @@
 
-# Aimili VPN｜多协议节点管理系统 🌐
+# Aimili VPN 多协议节点管理系统 🌐
 
 Bilingual: [中文](#中文) | [English](#english)
 
 本项目用于在 Linux VPS 上统一管理 OpenVPN、SoftEther、SSTP、L2TP/IPsec 等多协议节点，提供节点资源采集、持续可用性检测、真实连接延迟、自动故障切换、HTTP/SOCKS5 出站代理与 Web 管理。
 
-### ⭐ 我的邀请入口
+
 [🎁 专线流媒体｜顶级三网优化](https://yiy.one/register?codes=98BA33)
-
 [📢 无限流量住宅 IP](https://www.miyaip.com/?invitecode=2955039)
-
 <a name="中文"></a>
 
 ## 中文
@@ -25,7 +23,7 @@ Bilingual: [中文](#中文) | [English](#english)
 | 用途 | 端口 | 监听方式 |
 | --- | ---: | --- |
 | HTTPS 管理后台 | `8443/tcp` | 公网，通过 Nginx 代理到 `127.0.0.1:8501` |
-| HTTP/SOCKS5 八合一代理 | `8500/tcp` | 公网，由账号密码与 IP/CIDR 白名单控制 |
+| HTTP/SOCKS5 代理 | `8500/tcp` | 公网，由账号密码与 IP/CIDR 白名单控制 |
 | HTTPS 订阅入口 | `18443/tcp` | 公网，由现有订阅服务提供 |
 | 管理后台内部服务 | `8501/tcp` | 仅本机 `127.0.0.1` |
 
@@ -90,7 +88,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/hankinsus/aimili-vpngate-produ
 4. 点击“切换”时，系统会先建立并验证新隧道，再完成切换；切换期间顶部和活动节点卡片都会显示“切换中”。
 5. 连接建立后，8500 端口的 HTTP/SOCKS5 流量通过当前活动 VPN 隧道出站。
 
-### 8. HTTP/SOCKS5 八合一代理
+### 8. HTTP/SOCKS5 代理
 
 代理固定使用 `8500/tcp`。访问来源由 `LOCAL_PROXY_ALLOW` 控制，并可配合 `LOCAL_PROXY_USER` / `LOCAL_PROXY_PASS` 使用账号密码认证。
 
@@ -156,17 +154,15 @@ export https_proxy="http://服务器IP:8500"
 
 The system is designed for Linux VPS deployments and manages OpenVPN, SoftEther, SSTP, and L2TP/IPsec resources from one web console. It provides resource collection, continuous availability testing, real connection latency, automatic failover, an HTTP/SOCKS5 egress proxy, and web administration.
 
-### ⭐ My invitation links
+
 [🎁 Dedicated Streaming Media｜Top 3-Network Optimization](https://yiy.one/register?codes=98BA33)
-
 [📢 Unlimited Traffic Residential IP](https://www.miyaip.com/?invitecode=2955039)
-
 ### 2. Port architecture
 
 | Purpose | Port | Binding |
 | --- | ---: | --- |
 | HTTPS management | `8443/tcp` | Public, proxied by Nginx to `127.0.0.1:8501` |
-| HTTP/SOCKS5 eight-in-one proxy | `8500/tcp` | Public, protected by credentials and IP/CIDR allowlist |
+| HTTP/SOCKS5 proxy | `8500/tcp` | Public, protected by credentials and IP/CIDR allowlist |
 | HTTPS subscriptions | `18443/tcp` | Public, provided by the existing subscription service |
 | Internal management service | `8501/tcp` | Local only: `127.0.0.1` |
 
@@ -231,7 +227,7 @@ After installation, the terminal prints the current HTTPS management address. Th
 4. When you click Switch, the system establishes and validates the new tunnel before completing the switch. The top status area and active-node card both show the live “Switching” state.
 5. Once connected, HTTP/SOCKS5 traffic on port `8500` exits through the active VPN tunnel.
 
-### 8. HTTP/SOCKS5 eight-in-one proxy
+### 8. HTTP/SOCKS5 proxy
 
 The proxy uses fixed TCP port `8500`. Source access is controlled by `LOCAL_PROXY_ALLOW`, with optional username/password authentication through `LOCAL_PROXY_USER` and `LOCAL_PROXY_PASS`.
 
@@ -286,4 +282,4 @@ Thank you for using and reporting issues. The official project entry point is [I
 
 ---
 
-**Version: V1.0.6**
+**Version: V1.0.7**
