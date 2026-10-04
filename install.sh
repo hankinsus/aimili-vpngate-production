@@ -217,6 +217,40 @@ chmod 600 "$PROXY_ENV_FILE"
 echo -e "${GREEN}  -> 本地代理默认: SOCKS5 127.0.0.1:8500${PLAIN}"
 echo -e "${GREEN}  -> 账号: socks5 / 密码: ilovestudy${PLAIN}"
 
+# 4.6 Install independent GitHub self-update helper.
+# The updater must live outside the aimilivpn.service cgroup so it can safely
+# reset the repository and restart the main service.
+cat > /usr/local/sbin/aimilivpn-github-update <<'UPDATER'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DIR="${INSTALL_DIR:-/opt/aimilivpn}"
+DATA_DIR="${VPNGATE_DATA_DIR:-$ROOT_DIR/vpngate_data}"
+LOG_FILE="$DATA_DIR/github_update.log"
+mkdir -p "$DATA_DIR"
+exec >>"$LOG_FILE" 2>&1
+echo "[GitHub Update] started $(date -Is)"
+cd "$ROOT_DIR"
+git fetch --prune origin main
+git checkout main
+git reset --hard origin/main
+find . -type d -name __pycache__ -prune -exec rm -rf {} +
+python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py tunnel_adapters.py vpngate_discovery.py
+echo "[GitHub Update] build check passed $(date -Is)"
+systemctl restart aimilivpn
+UPDATER
+chmod 755 /usr/local/sbin/aimilivpn-github-update
+
+cat > /etc/systemd/system/aimilivpn-github-update.service <<'UNIT'
+[Unit]
+Description=AimiliVPN GitHub production updater
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aimilivpn-github-update
+TimeoutStartSec=15min
+UNIT
+systemctl daemon-reload
 # 5. Configure Service
 echo -e "\n${YELLOW}[3/4] 正在配置系统服务...${PLAIN}"
 if command -v systemctl >/dev/null 2>&1; then
