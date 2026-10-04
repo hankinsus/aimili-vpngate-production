@@ -1,3 +1,5 @@
+[Reading 14795 lines from start (total: 14795 lines, 0 remaining)]
+
 
 #!/usr/bin/env python3
 from __future__ import annotations
@@ -9619,6 +9621,33 @@ let refreshPollBusy = false;
 let countryPriorityPollBusy = false;
 let manualConnectionUiBusy = false;
 
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 10000));
+  try {
+    const requestOptions = Object.assign({
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {"Accept": "application/json"}
+    }, options || {});
+    requestOptions.credentials = "same-origin";
+    requestOptions.cache = "no-store";
+    requestOptions.signal = controller.signal;
+    requestOptions.headers = Object.assign({"Accept": "application/json"}, options && options.headers ? options.headers : {});
+    const response = await fetch(url, requestOptions);
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+    if (response.status === 401) throw new Error("登录状态已失效，请重新登录");
+    if (!response.ok) throw new Error(data && data.error ? data.error : ("HTTP " + response.status));
+    return data;
+  } catch (err) {
+    if (err && err.name === "AbortError") throw new Error("请求超时，请稍后重试");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 let nodesFetchPromise = null;
 let lastGoodNodesState = null;
 let totalNodeCount = 0;
@@ -10158,7 +10187,7 @@ async function submitAddNode(){
 }
 
 let initialNodeLoadRetryCount = 0;
-async function load(){
+async function loadLegacy(){
   const generation = ++nodeLoadGeneration;
   // A fresh page load starts with the first 100 rows only. Any previous
   // progressive loader sees the generation change and exits without touching
@@ -14766,3 +14795,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
