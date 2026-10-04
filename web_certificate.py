@@ -1,5 +1,3 @@
-[Reading 423 lines from start (total: 423 lines, 0 remaining)]
-
 from __future__ import annotations
 
 import json
@@ -423,5 +421,3 @@ server {{
             "expires_at": int(meta.get("expires_at") or 0),
             "issuer": str(meta.get("issuer") or ""),
         }
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]

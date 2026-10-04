@@ -1,5 +1,3 @@
-[Reading 1036 lines from start (total: 1036 lines, 0 remaining)]
-
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -1036,5 +1034,3 @@ class NodePool:
                 for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
             }
             return {"servers": servers, "endpoints": endpoints, "states": states}
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]

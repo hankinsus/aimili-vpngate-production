@@ -1,5 +1,3 @@
-[Reading 67 lines from start (total: 67 lines, 0 remaining)]
-
 from __future__ import annotations
 
 import time
@@ -67,5 +65,3 @@ class UICommandPlane:
 
 
 ui_command_plane = UICommandPlane()
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
