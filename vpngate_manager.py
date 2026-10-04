@@ -2161,11 +2161,43 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
     port = int(result.get("port") or 0)
     source_info = source_info or {}
 
+    # Immediately enrich manually-added endpoints so the row is usable in the
+    # country/location filters as soon as the user clicks “完成”. The periodic
+    # metadata loop remains a fallback, not a prerequisite for first display.
+    enriched: dict[str, Any] = {"ip": ip or host, "remote_host": host}
+    try:
+        vpn_utils.enrich_ip_info([enriched])
+    except Exception as exc:
+        log_to_json("WARNING", "Probe", f"手工节点 IP 信息补全失败: {exc}")
+    location = str(enriched.get("location") or "").strip()
+    inferred_country = str(country or "").strip()
+    if not inferred_country and location:
+        country_prefixes = [
+            "United Arab Emirates", "United Kingdom", "United States",
+            "South Africa", "New Zealand", "Saudi Arabia", "Czech Republic",
+            "Costa Rica", "Dominican Republic", "Hong Kong", "Taiwan",
+            "Russian Federation", "Viet Nam", "Korea Republic of",
+        ]
+        location_lower = location.lower()
+        for prefix in sorted(country_prefixes, key=len, reverse=True):
+            if location_lower == prefix.lower() or location_lower.startswith(prefix.lower() + " "):
+                inferred_country = prefix
+                break
+        if not inferred_country:
+            inferred_country = location.split(" ", 1)[0]
+    metadata_updates = {
+        key: enriched.get(key) or ""
+        for key in ("owner", "asn", "as_name", "location", "ip_type", "quality")
+    }
+
     if protocol == "openvpn":
         node = _build_manual_openvpn_node(host, ip or host, port, transport=transport)
         if not node:
             raise RuntimeError("OpenVPN 已建立成功，但当前实例没有可复用的配置模板，无法保存节点")
-        node["country"] = country or node.get("country") or ""
+        node["country"] = inferred_country or node.get("country") or ""
+        for key, value in metadata_updates.items():
+            if value:
+                node[key] = value
         node["manual_added_at"] = now
         node["manual_source"] = "direct_connection"
         node["probe_status"] = "available"
@@ -2185,7 +2217,7 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
     server = {
         "hostname": host,
         "ip": ip or host,
-        "country": country or "",
+        "country": inferred_country or "",
         "protocols": [{"protocol": protocol, "transport": transport, "port": port}],
         "source_count": 1 if source_info.get("found") else 0,
         "trusted_observation": True,
@@ -2193,6 +2225,8 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
         "manual_added_at": now,
     }
     node_pool.upsert_discovery_snapshot([server], source="manual_direct")
+    if any(metadata_updates.values()) and (ip or host):
+        node_pool.update_server_metadata_batch({str(ip or host): metadata_updates})
     endpoint_id = node_pool.endpoint_id(node_pool.server_key(server), protocol, transport, port)
     node_pool.record_endpoint_probe(endpoint_id, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过")
     endpoint = node_pool.get_endpoint(endpoint_id)
@@ -2245,57 +2279,82 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 p = str(item.get("protocol") or "").lower()
                 t = str(item.get("transport") or "tcp").lower()
                 pport = int(item.get("port") or 0)
-                official_protocols.setdefault(p, []).append((t, pport))
+                if p and pport > 0:
+                    official_protocols.setdefault(p, []).append((t, pport))
 
         attempts: list[dict[str, Any]] = []
-        protocol_order = ["openvpn", "softether", "sstp", "l2tp-ipsec"]
+        added_nodes: list[dict[str, Any]] = []
+        successful_protocols: list[str] = []
+        protocol_order = ["openvpn", "softether", "l2tp-ipsec", "sstp"]
 
         for protocol in protocol_order:
-            transport = "tcp"
-            test_port = int(port)
             offered = official_protocols.get(protocol) or []
+            transport = "udp" if protocol == "l2tp-ipsec" else "tcp"
+
+            # When the official VPN Gate page advertises multiple protocols,
+            # test each protocol on its own advertised port. Do not stop after
+            # the first success and do not incorrectly skip a valid protocol
+            # merely because the user entered another protocol's port.
+            if official and not offered:
+                attempts.append({
+                    "protocol": protocol,
+                    "transport": transport,
+                    "port": 0 if protocol == "l2tp-ipsec" else int(port),
+                    "ok": False,
+                    "skipped": True,
+                    "message": f"当前节点未公布 {protocol} 接入方式",
+                })
+                continue
 
             if official:
-                if protocol == "l2tp-ipsec":
-                    if not offered:
-                        attempts.append({"protocol": protocol, "transport": "udp", "port": 0, "ok": False, "skipped": True, "message": "当前节点未公布 L2TP/IPsec"})
-                        continue
-                    test_port = 0
-                    transport = "udp"
-                else:
-                    exact = [item for item in offered if int(item[1]) == int(port)]
-                    if not exact:
-                        shown = offered[0]
-                        attempts.append({"protocol": protocol, "transport": shown[0], "port": int(shown[1]), "ok": False, "skipped": True, "message": f"输入端口 {port} 不是该协议当前公布的端口"})
-                        continue
-                    transport, test_port = exact[0]
+                transport, test_port = offered[0]
             elif protocol == "l2tp-ipsec":
                 test_port = 0
                 transport = "udp"
+            else:
+                test_port = int(port)
 
             result = _manual_probe_protocol(host, resolved_ip, protocol, test_port, transport)
             attempts.append(result)
-            if result.get("ok"):
-                promoted = _promote_manual_endpoint(
-                    host, resolved_ip, str((official or {}).get("country") or ""), result, source_info=source_info
-                ) if promote else None
-                return {
-                    "ok": True,
-                    "mode": "direct_connection",
-                    "passed": True,
-                    "input": f"{host}:{port}",
-                    "hostname": host,
-                    "ip": resolved_ip,
-                    "country": (official or {}).get("country") or "",
-                    "protocol": result.get("protocol"),
-                    "transport": result.get("transport"),
-                    "port": result.get("port"),
-                    "attempts": attempts,
-                    "source_count": 1 if source_info.get("found") else 0,
-                    "sources": source_info.get("sources") or [],
-                    "added": bool(promoted),
-                    "message": f"{result.get('protocol')} 直连建立成功，已通过验证并加入资源池。" if promote else f"{result.get('protocol')} 直连建立成功。",
-                }
+
+            if not result.get("ok"):
+                continue
+
+            successful_protocols.append(protocol)
+            promoted = _promote_manual_endpoint(
+                host,
+                resolved_ip,
+                str((official or {}).get("country") or ""),
+                result,
+                source_info=source_info,
+            ) if promote else None
+            if promoted:
+                added_nodes.append(promoted)
+
+        if successful_protocols:
+            primary = attempts[[str(item.get("protocol") or "").lower() for item in attempts].index(successful_protocols[0])]
+            return {
+                "ok": True,
+                "mode": "direct_connection",
+                "passed": True,
+                "input": f"{host}:{port}",
+                "hostname": host,
+                "ip": resolved_ip,
+                "country": (official or {}).get("country") or "",
+                "protocol": primary.get("protocol"),
+                "transport": primary.get("transport"),
+                "port": primary.get("port"),
+                "protocols": successful_protocols,
+                "attempts": attempts,
+                "added": bool(added_nodes),
+                "added_nodes": added_nodes,
+                "source_count": 1 if source_info.get("found") else 0,
+                "sources": source_info.get("sources") or [],
+                "message": (
+                    f"直连验证完成：{len(successful_protocols)} 种协议通过，"
+                    f"{'已全部写入资源池并加入筛选列表。' if promote else ''}"
+                ),
+            }
 
         return {
             "ok": False,
@@ -2305,6 +2364,8 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
             "hostname": host,
             "ip": resolved_ip,
             "attempts": attempts,
+            "added": False,
+            "added_nodes": [],
             "source_count": 1 if source_info.get("found") else 0,
             "sources": source_info.get("sources") or [],
             "error": "4 种 VPN Gate 接入方式均未建立成功，节点未加入资源池。",
@@ -5704,13 +5765,15 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
-      width: 48px;
-      height: 48px;
+      width: 50px;
+      height: auto;
+      max-height: 60px;
       display: block;
-      flex: 0 0 48px;
+      flex: 0 0 50px;
       object-fit: contain;
       object-position: center;
-      filter: brightness(.82) contrast(1.10) saturate(1.08) drop-shadow(0 4px 11px rgba(20,184,166,.11));
+      background: transparent;
+      filter: none;
     }
     .footer-brand-copy {
       display: flex;
@@ -8156,13 +8219,13 @@ INDEX_HTML = r"""<!doctype html>
       </section>
 
       <div class="footer-brand">
-        <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
-          <img class="footer-brand-logo-image" src="./footer-logo-clean.png?v=1.0.7" alt="我爱研究.ILovestudy 标志" width="50" decoding="async" loading="eager" />
+        <div class="footer-brand-link" aria-label="我爱研究.ILovestudy 品牌标志">
+          <img class="footer-brand-logo-image" src="./footer-logo-clean.webp?v=1.0.8" alt="我爱研究.ILovestudy 标志" width="50" decoding="async" loading="eager" />
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.7</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.8</span></span>
           </span>
-        </a>
+        </div>
       </div>
 
       <div class="footer-channels" aria-label="官方频道入口">
@@ -8229,7 +8292,7 @@ function getProtocolUrl(n) {
 }
 
 function formatNodeLocation(n) {
-  const country = translateCountry(n && n.country || "");
+  const country = getNodeCountry(n);
   let location = String(n && n.location || "").trim().replace(/\s+/g, " ");
   if (!country) return location || "—";
   if (!location || location === "-" || location === "—") return country;
@@ -8392,7 +8455,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   const selectedIpType = $("ip_type_filter")?.value || "";
   const selectedStatus = $("status_filter")?.value || "";
 
-  if (!ignoreCountry && selectedCountry && translateCountry(n.country) !== selectedCountry) return false;
+  if (!ignoreCountry && selectedCountry && getNodeCountry(n) !== selectedCountry) return false;
   if (selectedProtocol && String(n.protocol || "openvpn").toLowerCase() !== selectedProtocol) return false;
 
   const ipType = String(n.ip_type || "").toLowerCase();
@@ -8737,6 +8800,35 @@ function bindCustomFilterEvents() {
   });
 }
 
+function getNodeCountry(n) {
+  const explicit = translateCountry(n && n.country);
+  if (explicit && explicit !== "—" && explicit !== "-") return explicit;
+  const location = String(n && n.location || "").trim().replace(/\s+/g, " ");
+  if (!location) return "";
+  const prefixes = [
+    "United Arab Emirates","United Kingdom","United States","South Africa","New Zealand",
+    "Saudi Arabia","Czech Republic","Costa Rica","Dominican Republic","Russian Federation",
+    "Korea Republic of","Viet Nam","Vietnam","Hong Kong","Taiwan","Macao","Macau",
+    "Croatia","Yemen","Japan","Korea","Thailand","Singapore","Malaysia","Indonesia","India",
+    "Philippines","Australia","Canada","Ukraine","France","Germany","Netherlands","Sweden",
+    "Norway","Spain","Turkey","Brazil","Argentina","Chile","Mexico","Egypt","Romania",
+    "Poland","Kazakhstan","Georgia","Mongolia","Iran","Iraq","Colombia","Cambodia","Ireland",
+    "Italy","Switzerland","Belgium","Austria","Denmark","Finland","Portugal","Greece",
+    "Hungary","Israel","Iceland","Luxembourg","美国","加拿大","德国","英国","法国","日本",
+    "韩国","新加坡","澳大利亚","新西兰","俄罗斯","中国","台湾","香港","澳门","荷兰","瑞典",
+    "挪威","西班牙","意大利","瑞士","奥地利","比利时","丹麦","芬兰","葡萄牙","爱尔兰",
+    "波兰","捷克","匈牙利","土耳其","印度","泰国","越南","马来西亚","印度尼西亚","菲律宾",
+    "墨西哥","巴西","阿根廷","智利","南非","以色列","阿联酋"
+  ];
+  const lower = location.toLowerCase();
+  for (const prefix of prefixes) {
+    if (lower === prefix.toLowerCase() || lower.startsWith(prefix.toLowerCase() + " ")) {
+      return translateCountry(prefix);
+    }
+  }
+  return "";
+}
+
 function updateCountryFilter() {
   const select = $("country_filter");
   if (!select) return;
@@ -8750,7 +8842,7 @@ function updateCountryFilter() {
 
   nodes.forEach(n => {
     if (!n) return;
-    const country = translateCountry(n.country);
+    const country = getNodeCountry(n);
     const ip = String(n.ip || n.current_ip || n.remote_host || "").trim();
     if (!country || country === "—" || country === "-" || !ip) return;
 
@@ -8768,16 +8860,21 @@ function updateCountryFilter() {
     const diff = countryIps[b].total.size - countryIps[a].total.size;
     return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
   });
-  const totalCount = hasOtherFilter ? filteredAllIps.size : new Set(
+  const loadedIpCount = new Set(
     nodes.map(n => String(n && (n.ip || n.current_ip || n.remote_host || "")).trim()).filter(Boolean)
   ).size;
+  const fullyLoaded = !totalNodeCount || loadedIpCount >= totalNodeCount;
+  const totalCount = hasOtherFilter ? filteredAllIps.size : (fullyLoaded ? loadedIpCount : totalNodeCount);
 
   const options = countries.map(country => {
     const count = hasOtherFilter ? countryIps[country].visible.size : countryIps[country].total.size;
     return `<option value="${esc(country)}">${esc(country)} · ${count} IP</option>`;
   }).join("");
 
-  select.innerHTML = `<option value="">全球国家 · ${totalCount} IP</option>` + options;
+  const globalLabel = fullyLoaded
+    ? `全球国家 · ${totalCount} IP`
+    : `全球国家 · 加载中 ${loadedIpCount}/${totalNodeCount} IP`;
+  select.innerHTML = `<option value="">${globalLabel}</option>` + options;
   if (countries.includes(selectedValue)) select.value = selectedValue;
   else select.value = "";
   renderCustomCountryFilter();
@@ -9766,28 +9863,28 @@ function renderManualAddAttempts(data, success) {
   const names = {openvpn:"OpenVPN",softether:"SSL-VPN","l2tp-ipsec":"L2TP/IPsec",sstp:"MS-SSTP"};
   const order = ["openvpn","softether","l2tp-ipsec","sstp"];
   const seen = {};
-  rawAttempts.forEach(function(item) { seen[String(item.protocol || "").toLowerCase()] = item; });
-  if (success) {
-    order.forEach(function(protocol) {
-      if (!seen[protocol]) {
-        seen[protocol] = {
-          protocol: protocol,
-          transport: protocol === "l2tp-ipsec" ? "udp" : "tcp",
-          port: 0,
-          skipped: true,
-          message: "已有其他接入方式通过，本次未继续测试"
-        };
-      }
-    });
-  }
-  const attempts = order.map(function(protocol) { return seen[protocol]; }).filter(Boolean);
+  rawAttempts.forEach(function(item) {
+    seen[String(item.protocol || "").toLowerCase()] = item;
+  });
+  const attempts = order.map(function(protocol) {
+    return seen[protocol] || {
+      protocol: protocol,
+      transport: protocol === "l2tp-ipsec" ? "udp" : "tcp",
+      port: 0,
+      ok: false,
+      skipped: true,
+      message: "未返回该协议检测结果"
+    };
+  });
+
+  const passedCount = attempts.filter(function(item) { return !!item.ok; }).length;
   const rows = attempts.map(function(item) {
     const protocol = String(item.protocol || "").toLowerCase();
     const name = names[protocol] || String(item.protocol || "未知协议");
     const transport = item.transport ? " " + String(item.transport).toUpperCase() : "";
     const port = Number(item.port || 0) ? " :" + String(item.port) : "";
     let icon = "•", stateText = "未检测", cls = "color:var(--text-secondary);";
-    if (item.skipped) { icon = "—"; stateText = "未继续"; }
+    if (item.skipped) { icon = "—"; stateText = "未公布 / 未检测"; }
     else if (item.ok) { icon = "✓"; stateText = "通过"; cls = "color:var(--success);"; }
     else { icon = "×"; stateText = "未通过"; cls = "color:var(--danger);"; }
     const detail = item.message ? String(item.message).slice(0, 180) : "";
@@ -9798,13 +9895,24 @@ function renderManualAddAttempts(data, success) {
       (detail ? '<span style="display:block;margin-top:2px;font-size:11px;color:var(--text-secondary);">' + esc(detail) + '</span>' : '') +
       '</span></div>';
   }).join("");
-  const title = success ? "✓ 直连验证通过，节点已加入资源池" : "4 种方式均未建立成功，节点未加入资源池";
+
+  const title = success
+    ? "✓ 直连验证完成 · " + passedCount + "/4 协议通过，节点已加入资源池"
+    : "4 种 VPN Gate 接入方式均未建立成功，节点未加入资源池";
   const color = success ? "var(--success)" : "var(--danger)";
   const border = success ? "rgba(34,197,94,.22)" : "rgba(244,63,94,.20)";
   const bg = success ? "rgba(34,197,94,.07)" : "rgba(244,63,94,.07)";
-  const message = success ? (data.message || "直连建立成功，已通过验证并加入资源池。") : (data.error || "节点未通过直连验证。");
+  const address = data && (data.hostname || data.ip)
+    ? String(data.hostname || data.ip) + (data.port ? ":" + String(data.port) : "")
+    : "";
+  const message = success
+    ? (data.message || "直连验证完成，所有可用协议结果均已写入资源池。")
+    : (data.error || "节点未通过直连验证。");
+
   return '<div style="padding:13px 14px;background:' + bg + ';border:1px solid ' + border + ';border-radius:9px;">' +
     '<div style="font-size:13px;font-weight:600;color:' + color + ';">' + title + '</div>' +
+    (address ? '<div style="margin-top:5px;font-size:12px;color:var(--text-secondary);">节点地址：<span class="mono" style="color:var(--text-primary);">' + esc(address) + '</span></div>' : '') +
+    '<div style="margin-top:6px;font-size:12px;color:var(--text-secondary);">' + esc(message) + '</div>' +
     '<div style="margin-top:8px;border-top:1px solid rgba(255,255,255,.05);">' + rows + '</div>' +
     '</div>';
 }
@@ -9826,7 +9934,7 @@ async function submitAddNode(){
     if (submit) { submit.disabled = true; submit.textContent = "正在直连..."; }
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在直连验证 4 种 VPN Gate 接入方式；任一方式建立成功即通过并入库...</div>';
+      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在直连验证 4 种 VPN Gate 接入方式；4 种方式都会完成独立检测，所有通过的协议都会写入资源池...</div>';
     }
     const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
@@ -9837,6 +9945,13 @@ async function submitAddNode(){
 
     if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
     if (data.ok) {
+      const addedNodes = Array.isArray(data.added_nodes) ? data.added_nodes.filter(Boolean) : [];
+      if (addedNodes.length) {
+        mergeLoadedNodePage(addedNodes);
+        currentPage = 1;
+        totalNodeCount = Math.max(totalNodeCount, nodes.length);
+        updateCountryFilter();
+      }
       state.last_check_message = data.message || "新增节点已入库 · 已通知可用性检测模块";
       state.availability_engine_message = "新增节点已入库 · 已通知可用性检测模块，正在立即复核";
       state.availability_engine_running = true;
@@ -9846,10 +9961,6 @@ async function submitAddNode(){
       submit.disabled = false;
       submit.textContent = data.ok ? "完成" : "重新识别";
       submit.onclick = data.ok ? closeAddNodeModal : submitAddNode;
-    }
-    if (data.ok) {
-      await new Promise(r => setTimeout(r, 120));
-      await load();
     }
   } catch (err) {
     if (resultBox) {
@@ -12130,9 +12241,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if effective_path in ("/", "/index.html"):
             self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
-        elif effective_path == "/footer-logo-clean.png":
+        elif effective_path in ("/footer-logo-clean.webp", "/footer-logo-clean.png"):
             try:
-                self.send_bytes((ROOT_DIR / "footer-logo-clean.png").read_bytes(), "image/png")
+                if effective_path.endswith(".webp"):
+                    self.send_bytes((ROOT_DIR / "footer-logo-clean.webp").read_bytes(), "image/webp")
+                else:
+                    self.send_bytes((ROOT_DIR / "footer-logo-clean.png").read_bytes(), "image/png")
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/link-test":
