@@ -999,7 +999,7 @@ def clear_active_connection_state(message: str) -> None:
         write_json(NODES_FILE, nodes)
     set_state(
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]        active_openvpn_node_id="",
+        active_openvpn_node_id="",
         active_pool_endpoint_id="",
         active_tunnel_protocol="",
         active_tunnel_interface="",
@@ -2000,7 +2000,7 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
 
 
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]def parse_manual_endpoint(value: str) -> tuple[str, int]:
+def parse_manual_endpoint(value: str) -> tuple[str, int]:
     """Parse a manual VPN Gate target.
     
     The port is optional for VPN Gate hostnames. When it is omitted, the
@@ -3001,7 +3001,7 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
         for endpoint in node_pool.list_endpoints(limit=5000):
             eid = str(endpoint.get("endpoint_id") or "")
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            status = str(endpoint.get("status") or "").upper()
+            status = str(endpoint.get("status") or "").upper()
             protocol = str(endpoint.get("protocol") or "").lower()
             if (
                 eid
@@ -4002,7 +4002,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
             error_message = str(res.get("error") or "网页出口检测失败")
             set_state(proxy_ok=False, proxy_ip="-", proxy_latency_ms=0, proxy_error=error_message)
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            node["probe_status"] = "unavailable"
+            node["probe_status"] = "unavailable"
             node["probe_message"] = error_message
             for item in nodes:
                 item["active"] = False
@@ -5003,7 +5003,7 @@ def collector_loop() -> None:
             print(f"[错误] {err_msg}", flush=True)
             log_to_json("ERROR", "Main", err_msg)
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
+            set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
 
         if not active_tunnel_running() and not success:
             sleep_time = 30
@@ -5863,12 +5863,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
-      width: 46px;
-      height: 48px;
-      max-width: 46px;
-      max-height: 48px;
+      width: 42px;
+      height: 44px;
+      max-width: 42px;
+      max-height: 44px;
       display: block;
-      flex: 0 0 46px;
+      flex: 0 0 42px;
       object-fit: contain;
       object-position: center;
       background: transparent;
@@ -6004,7 +6004,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]    .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
+    .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
     .official-links-title { margin-bottom: 12px; color: var(--text-primary); font-size: 14px; font-weight: 700; }
     .official-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .official-link { display:flex; align-items:center; justify-content:center; min-height:38px; padding:8px 10px; border-radius:9px; border:1px solid rgba(255,255,255,.08); background:rgba(255,255,255,.035); color:#dbe4ea; text-decoration:none; font-size:12px; font-weight:600; transition:all .2s ease; }
@@ -6158,8 +6158,11 @@ INDEX_HTML = r"""<!doctype html>
     }
     .unified-select .toolbar-custom-select-menu {
       position: fixed; left: 0; right: auto; top: auto; bottom: auto;
-      z-index: 120000; max-height: min(360px, calc(100vh - 24px));
+      z-index: 120000; width: 112px; min-width: 0; max-width: calc(100vw - 16px);
+      box-sizing: border-box; max-height: min(360px, calc(100vh - 24px));
     }
+    .unified-select-full .toolbar-custom-select-menu { width: 100%; }
+    .unified-select-log .toolbar-custom-select-menu { width: 156px; }
     .unified-select .toolbar-custom-option { min-height: 38px; font-size: 13px; }
     .unified-select-log .toolbar-custom-option { min-height: 34px; font-size: 12px; }
     .toolbar-custom-select.open {
@@ -7005,7 +7008,7 @@ INDEX_HTML = r"""<!doctype html>
       scrollbar-width: thin;
       scrollbar-color: rgba(20,184,166,.30) transparent;
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]      animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
     .modal-content {
@@ -8006,7 +8009,7 @@ INDEX_HTML = r"""<!doctype html>
         <button type="button" onclick="closeVpsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]        </button>
+        </button>
       </div>
 
       <div class="official-links" style="margin-top: 16px;">
@@ -8142,7 +8145,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="rs_share_notice" class="rs-share-notice" style="display:none;"></div>
 
       <div class="rs-local-card">
-        <div class="rs-card-label">本机资源接口地址</div>
+        <div class="rs-card-label">本机出口地址</div>
         <div class="rs-local-row">
           <input id="rs_local_url" class="input-field rs-local-input" readonly value="/resource-share">
           <button type="button" class="btn-primary rs-copy-btn" onclick="copyResourceShareUrl()">复制地址</button>
@@ -8152,25 +8155,40 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="rs-action-grid">
         <section class="rs-form-card">
-          <div class="rs-step-title"><span>①</span> 创建邀请码</div>
-          <div class="rs-help rs-form-help">邀请码长期有效。生成后会自动组合成本机 HTTPS 地址 + RS 邀请码，直接复制整条邀请链接给对方即可。</div>
+          <div class="rs-step-title"><span>①</span> 创建邀请链接</div>
+          <div class="rs-help rs-form-help">邀请链接长期有效。生成后系统会自动复制完整链接；对方只需粘贴这一条链接即可加入，无需单独处理邀请码。</div>
           <div class="rs-form-grid">
             <input id="rs_invite_peer_name" class="input-field" placeholder="邀请服务器名称，例如 日本资源库">
             <input id="rs_invite_allowed_cidrs" class="input-field" value="0.0.0.0/0, ::/0" placeholder="允许来源（可选，默认 IPv4/IPv6 全部允许）">
             <div class="rs-help">默认允许 IPv4 / IPv6 来源；如需限制来源，可填写单个 IP 或 CIDR。</div>
-            <button id="rs_generate_btn" type="button" class="btn-primary rs-full-btn" onclick="generateResourceInvite()">生成邀请链接</button>
+            <button id="rs_generate_btn" type="button" class="btn-primary rs-full-btn" onclick="generateResourceInvite()">生成并复制邀请链接</button>
           </div>
         </section>
 
         <section class="rs-form-card">
-          <div class="rs-step-title"><span>②</span> 添加公共服务器</div>
-          <div class="rs-help rs-form-help">把对方提供的“邀请链接”直接粘贴到这里即可。系统自动识别 HTTPS 地址和 RS 邀请码，无需再填写 IP、域名、邀请码或同步参数。</div>
+          <div class="rs-step-title"><span>②</span> 添加资源共享服务器</div>
+          <div class="rs-help rs-form-help">把对方提供的完整邀请链接直接粘贴到这里即可。系统自动识别地址和 RS 邀请码；下面设置自动同步时间。</div>
           <div class="rs-form-grid">
             <input id="rs_invite_link_input" class="input-field" placeholder="粘贴邀请链接，例如 https://example.com:8443/resource-share/RS-XXXX-XXXX-XXXX-XXXX">
             <input id="rs_remote_url" type="hidden" value="">
             <input id="rs_invite_input" type="hidden" value="">
             <input id="rs_sync_interval_value" type="hidden" value="6">
-            <select id="rs_sync_interval_unit" aria-hidden="true" tabindex="-1" style="display:none;"><option value="hours">小时</option></select>
+            <select id="rs_sync_interval_unit" aria-hidden="true" tabindex="-1" style="display:none;">
+              <option value="hours">小时</option>
+              <option value="days">天</option>
+              <option value="weeks">周</option>
+            </select>
+            <div class="rs-sync-row">
+              <input id="rs_sync_interval_value_display" class="input-field" type="number" min="1" max="84" value="6" placeholder="同步周期">
+              <div id="rs_sync_interval_unit_widget" class="toolbar-custom-select unified-select unified-select-sync" data-unified-select-id="rs_sync_interval_unit" aria-label="同步周期">
+                <button id="rs_sync_interval_unit_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                  <span id="rs_sync_interval_unit_label" class="toolbar-custom-select-label">小时</span>
+                  <span class="toolbar-custom-select-arrow">⌄</span>
+                </button>
+                <div id="rs_sync_interval_unit_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+              </div>
+            </div>
+            <div class="rs-help">自动同步周期：可选择小时、天、周。</div>
             <button id="rs_join_btn" type="button" class="btn-primary rs-full-btn" onclick="joinResourcePeer()">添加并立即同步</button>
           </div>
         </section>
@@ -8179,12 +8197,12 @@ INDEX_HTML = r"""<!doctype html>
       <section class="rs-list-card">
         <div class="rs-list-header">
           <div>
-            <div class="rs-list-title">③ 邀请共享服务器 <span id="rs_invite_count" class="rs-count-badge">0</span></div>
-            <div class="rs-help">已发出的长期邀请码。撤销=立即停止访问；删除=永久删除这条邀请码记录。</div>
+            <div class="rs-list-title">③ 已生成邀请链接 <span id="rs_invite_count" class="rs-count-badge">0</span></div>
+            <div class="rs-help">撤销=立即停止授权；永久删除=立即撤销并彻底删除邀请记录。</div>
           </div>
         </div>
         <div id="rs_invite_list" class="rs-list">
-          <div class="rs-empty">暂无邀请码</div>
+          <div class="rs-empty">暂无邀请链接</div>
         </div>
       </section>
 
@@ -8235,15 +8253,10 @@ INDEX_HTML = r"""<!doctype html>
           <div class="rs-edit-field-help">这是本机入站白名单。留空会拒绝所有来源。</div>
         </div>
 
-        <div id="rs_edit_remote_row" class="rs-edit-grid">
-          <div class="rs-edit-field">
-            <label for="rs_edit_remote_url">对方服务器 IP / 域名</label>
-            <input id="rs_edit_remote_url" class="input-field" placeholder="例如 203.0.113.10">
-          </div>
-          <div class="rs-edit-field">
-            <label for="rs_edit_remote_invite">对方邀请码</label>
-            <input id="rs_edit_remote_invite" class="input-field" placeholder="RS-XXXX-XXXX-XXXX-XXXX">
-          </div>
+        <div id="rs_edit_remote_row" class="rs-edit-field">
+          <label for="rs_edit_remote_link">对方邀请链接</label>
+          <input id="rs_edit_remote_link" class="input-field" placeholder="粘贴对方完整邀请链接">
+          <div class="rs-edit-field-help">不再单独管理 IP、域名或邀请码；直接粘贴完整邀请链接即可重新绑定。</div>
         </div>
 
         <div id="rs_edit_sync_row" class="rs-edit-field">
@@ -8381,7 +8394,7 @@ INDEX_HTML = r"""<!doctype html>
             <path d="M48 13 73 23v20c0 17-9 29-25 39-16-10-25-22-25-39V23l25-10Z"
                   fill="url(#brandInner)" stroke="#22d3ee" stroke-width="1.5" opacity=".98"/>
             <!-- Centered chip, aligned to the shield's visual center. -->
-            <g transform="translate(48 46) scale(.68)">
+            <g transform="translate(48 41) scale(.58)">
               <rect x="-19" y="-19" width="38" height="38" rx="8" fill="url(#brandMetal)" stroke="#f8fafc" stroke-width="1.5"/>
               <rect x="-11" y="-11" width="22" height="22" rx="4" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
               <path d="M-6 -5h12M-6 0h12M-6 5h12" stroke="#78350f" stroke-width="1.6" stroke-linecap="round"/>
@@ -8614,6 +8627,18 @@ function getLatencyClass(ms) {
   return 'latency-poor';
 }
 
+function displayNodePort(node) {
+  const actual = Number(node?.remote_port || 0);
+  if (actual > 0) return String(actual);
+  const protocol = String(node?.protocol || '').toLowerCase();
+  // Display protocol defaults only when the endpoint did not publish a
+  // concrete port. Connection logic continues to use the Master Pool port.
+  if (protocol === 'openvpn') return '1194';
+  if (protocol === 'softether' || protocol === 'sstp') return '443';
+  if (protocol === 'l2tp-ipsec') return '500/4500';
+  return '';
+}
+
 function matchesNodeFilters(n, ignoreCountry = false) {
   if (!n) return false;
   const selectedCountry = $("country_filter")?.value || "";
@@ -8689,7 +8714,13 @@ function closeUnifiedSelects(exceptId = "") {
     const menu = $(cfg.menu);
     if (widget) widget.classList.remove("open");
     if (button) button.setAttribute("aria-expanded", "false");
-    if (menu) { menu.style.top=""; menu.style.left=""; menu.style.bottom=""; }
+    if (menu) {
+      menu.style.top="";
+      menu.style.left="";
+      menu.style.bottom="";
+      menu.style.width="";
+      menu.style.display="none";
+    }
   });
 }
 
@@ -8707,6 +8738,13 @@ function toggleUnifiedSelect(selectId, event) {
   widget.classList.toggle("open", opening);
   if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
   if (opening) {
+    // Unified menus must escape modal/scroll containers. The logs modal has
+    // an overflow-y scroll container and backdrop-filter, which can otherwise
+    // clip a fixed dropdown and make its options appear but not receive clicks.
+    if (menu.parentElement !== document.body) {
+      document.body.appendChild(menu);
+    }
+    menu.style.display = "block";
     requestAnimationFrame(() => {
       const rect = widget.getBoundingClientRect();
       const menuHeight = Math.min(menu.scrollHeight || 280, Math.min(360, window.innerHeight - 24));
@@ -8715,10 +8753,16 @@ function toggleUnifiedSelect(selectId, event) {
       const openUp = menuHeight > spaceBelow && spaceAbove >= menuHeight;
       const top = openUp ? Math.max(8, rect.top - menuHeight - 8) : Math.min(window.innerHeight - menuHeight - 8, rect.bottom + 8);
       const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - rect.width - 8));
-      menu.style.left = left + "px";
-      menu.style.width = rect.width + "px";
+      menu.style.position = "fixed";
+      const menuWidth = Math.min(rect.width, window.innerWidth - 16);
+      const safeLeft = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - menuWidth - 8));
+      menu.style.left = safeLeft + "px";
+      menu.style.width = menuWidth + "px";
+      menu.style.minWidth = "0";
+      menu.style.maxWidth = (window.innerWidth - 16) + "px";
       menu.style.top = top + "px";
       menu.style.bottom = "auto";
+      menu.style.zIndex = "120000";
     });
   }
 }
@@ -8768,7 +8812,7 @@ const COUNTRY_FLAG_CODES = {
   "缅甸":"MM","尼泊尔":"NP","巴基斯坦":"PK","巴拉圭":"PY","马达加斯加":"MG","斯里兰卡":"LK","乌干达":"UG","乌兹别克斯坦":"UZ","津巴布韦":"ZW",
   "巴哈马":"BS","玻利维亚":"BO","洪都拉斯":"HN","尼加拉瓜":"NI","特立尼达和多巴哥":"TT","圭亚那":"GY","苏里南":"SR","马尔代夫":"MV",
   "巴勒斯坦":"PS","百慕大":"BM","直布罗陀":"GI","马恩岛":"IM","泽西岛":"JE","根西岛":"GG","新喀里多尼亚":"NC","塞舌尔":"SC",
-  "卢森堡":"LU","毛里塔尼亚":"MR","纳米比亚":"NA","刚果共和国":"CG","刚果民主共和国":"CD","加纳":"GH","坦桑尼亚":"TZ","赞比亚":"ZM",
+  "卢森堡":"LU","毛里塔尼亚":"MR","纳米比亚":"NA","也门":"YE","刚果共和国":"CG","刚果民主共和国":"CD","加纳":"GH","坦桑尼亚":"TZ","赞比亚":"ZM",
   "塞内加尔":"SN","科特迪瓦":"CI","佛得角":"CV","莫桑比克":"MZ","马拉维":"MW","科索沃":"XK"
 };
 
@@ -8779,14 +8823,36 @@ const COUNTRY_FLAG_ALIASES = {
   "Lao People's Democratic Republic":"LA","Laos":"LA","Côte d'Ivoire":"CI","Ivory Coast":"CI","Eswatini":"SZ","Swaziland":"SZ",
   "Moldova, Republic of":"MD","Palestine, State of":"PS","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ",
   "Bolivia, Plurinational State of":"BO","Venezuela, Bolivarian Republic of":"VE","Cabo Verde":"CV","Cape Verde":"CV",
-  "Curacao":"CW","Curaçao":"CW","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK"
+  "Curacao":"CW","Curaçao":"CW","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK","Yemen":"YE"
 };
+
+const REGION_DISPLAY_NAMES_ZH = typeof Intl !== "undefined" && Intl.DisplayNames
+  ? new Intl.DisplayNames(["zh-CN"], {type:"region"}) : null;
+const REGION_DISPLAY_NAMES_EN = typeof Intl !== "undefined" && Intl.DisplayNames
+  ? new Intl.DisplayNames(["en"], {type:"region"}) : null;
+
+function dynamicIsoCountryCode(country) {
+  const raw = String(country || "").trim();
+  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
+  const target = translateCountry(raw);
+  for (let a = 65; a <= 90; a++) {
+    for (let b = 65; b <= 90; b++) {
+      const code = String.fromCharCode(a, b);
+      try {
+        const zh = REGION_DISPLAY_NAMES_ZH?.of(code) || "";
+        const en = REGION_DISPLAY_NAMES_EN?.of(code) || "";
+        if (zh === target || zh === raw || en === raw || en === target) return code;
+      } catch (_) {}
+    }
+  }
+  return "";
+}
 
 function countryFlagCode(country) {
   const raw = String(country || "").trim();
   const name = translateCountry(raw);
   if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
-  return COUNTRY_FLAG_CODES[name] || COUNTRY_FLAG_ALIASES[raw] || COUNTRY_FLAG_ALIASES[name] || "";
+  return COUNTRY_FLAG_CODES[name] || COUNTRY_FLAG_ALIASES[raw] || COUNTRY_FLAG_ALIASES[name] || dynamicIsoCountryCode(raw);
 }
 
 function countryFlagEmoji(code) {
@@ -9007,8 +9073,10 @@ let scopeLoadGeneration = 0;
 
 function currentFilterKey() {
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]  return [
-    $("status_filter")?.value || "",
+  // "all" is a UI label, not a backend filter.
+  const status = $("status_filter")?.value || "";
+  return [
+    status === "all" ? "" : status,
     $("protocol_filter")?.value || "",
     $("ip_type_filter")?.value || ""
   ].join("|");
@@ -9055,6 +9123,21 @@ function updateCountryFilter() {
     current.server_count += Number(item?.server_count || 0);
     merged.set(country, current);
   });
+
+  // Always expose the complete ISO-3166-1 region set. Countries not yet
+  // represented in Master Pool remain visible at 0 IP, and any newly added
+  // country is automatically paired with its ISO flag through Intl.
+  if (REGION_DISPLAY_NAMES_ZH) {
+    for (let a = 65; a <= 90; a++) {
+      for (let b = 65; b <= 90; b++) {
+        const code = String.fromCharCode(a, b);
+        try {
+          const label = REGION_DISPLAY_NAMES_ZH.of(code);
+          if (label && label !== code && !merged.has(label)) merged.set(label, {ip_count:0, server_count:0});
+        } catch (_) {}
+      }
+    }
+  }
 
   const countries = Array.from(merged.entries()).sort((a,b) => {
     const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
@@ -9469,7 +9552,8 @@ function render(){
       const displayLocationFlag = countryFlag(n.country || displayLocation, translateCountry(n.country) || displayLocation, "lazy");
       const protocolName = translateProtocol(n.protocol || "openvpn");
       const nodeHost = n.ip || n.remote_host || "-";
-      const nodePort = Number(n.remote_port || 0) > 0 ? ":" + String(n.remote_port) : "";
+      const displayPort = displayNodePort(n);
+      const nodePort = displayPort ? ":" + displayPort : "";
       const nodeAddress = nodeHost + nodePort;
 
       const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
@@ -10008,7 +10092,7 @@ async function connectNode(id){
   state.manual_switch_started_at = Date.now() / 1000;
   state.pending_connection_id = id;
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]  state.pending_connection_protocol = selectedNode?.protocol || "";
+  state.pending_connection_protocol = selectedNode?.protocol || "";
   state.pending_connection_country = selectedNode?.country || "";
   state.active_node_latency = "正在切换";
   state.manual_switch_message = "正在发送连接请求…";
@@ -10331,16 +10415,19 @@ async function loadLegacy(){
 async function applyNodeFilterChange() {
   currentPage = 1;
 
-  // Any non-country filter inherits the currently selected country scope.
-  // If that country has no rows under the new filter, the catalog clears it
-  // and the query automatically falls back to the global scope.
-  activeCountryScope = String($("country_filter")?.value || "").trim();
-  try {
-    await refreshCountryCatalog(true);
-  } catch (_) {}
-
+  // Filters are independent dimensions. The currently selected country is
+  // only a scope; when it is "全球国家" (empty), keep the query global.
+  // IMPORTANT: do not wait for the country catalog here. The catalog is a
+  // secondary display/index request and must never block node data.
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
+
+  refreshCountryCatalog(true).catch(e => {
+    console.warn("筛选后的国家目录后台刷新失败", e);
+  });
+
+  // Immediately query the Master Pool with the selected filter(s). This lets
+  // "移动网 / 住宅IP / 机房IP" work directly while country remains global.
   await loadScope(country, {preserveState:true});
 }
 
@@ -10715,6 +10802,17 @@ function populateRoutingCountries() {
     const count = Number(item?.ip_count || 0);
     if (country) countMap[country] = Math.max(Number(countMap[country] || 0), count);
   });
+  if (REGION_DISPLAY_NAMES_ZH) {
+    for (let a = 65; a <= 90; a++) {
+      for (let b = 65; b <= 90; b++) {
+        const code = String.fromCharCode(a, b);
+        try {
+          const label = REGION_DISPLAY_NAMES_ZH.of(code);
+          if (label && label !== code && !(label in countMap)) countMap[label] = 0;
+        } catch (_) {}
+      }
+    }
+  }
   const countries = Object.keys(countMap).sort((a,b) => {
     const diff = countMap[b] - countMap[a];
     return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
@@ -11009,7 +11107,7 @@ async function saveNetwork(e) {
   const errorDivEl = $("network_error");
   const successDiv = $("network_success");
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]  const submitBtn = $("network_submit_btn");
+  const submitBtn = $("network_submit_btn");
 
   errorDivEl.style.display = "none";
   successDiv.style.display = "none";
@@ -11273,35 +11371,34 @@ function renderResourceShareInvites(invites) {
   if (count) count.textContent = invites.length;
   if (!box) return;
   if (!invites.length) {
-    box.innerHTML = '<div class="rs-empty">暂无邀请码。创建第一个长期邀请码后，会一直显示在这里。</div>';
+    box.innerHTML = '<div class="rs-empty">暂无邀请链接。创建第一条长期邀请链接后，会一直显示在这里。</div>';
     return;
   }
   box.innerHTML = invites.map(function(invite) {
-    const code = String(invite.invite_code || "");
     const inviteUrl = String(invite.invite_url || "");
     const linked = Number(invite.linked_peer_count || 0);
     const scope = Array.isArray(invite.allowed_cidrs) ? invite.allowed_cidrs.join(", ") : "—";
-    const legacy = invite.legacy_code_unavailable || !code;
+    const revoked = !!invite.revoked;
+    const safeUrl = esc(inviteUrl);
     return '<div class="rs-invite-item">' +
       '<div class="rs-item-head">' +
         '<div class="rs-item-main">' +
           '<div class="rs-item-name">' +
             esc(invite.peer_name || "共享服务器") +
-            '<span class="rs-direction">长期邀请码</span>' +
+            '<span class="rs-direction">长期邀请链接</span>' +
             (linked ? '<span class="rs-direction bidir">已关联 ' + linked + ' 台</span>' : '') +
+            (revoked ? '<span class="rs-direction" style="color:var(--danger);border-color:rgba(244,63,94,.22);background:rgba(244,63,94,.08);">已撤销</span>' : '') +
           '</div>' +
-          (legacy
-            ? '<div class="rs-item-meta" style="color:var(--warning);">历史邀请码未保存明文，不能在页面恢复显示；可以重新创建一个长期邀请码。</div>'
-            : '<div class="rs-item-code">' + esc(code) + '</div>' +
-              (inviteUrl ? '<div class="rs-item-link"><span>' + esc(inviteUrl) + '</span><button class="test-btn" data-invite-url="' + esc(inviteUrl) + '" onclick="copyResourceShareInviteLink(this.dataset.inviteUrl)">复制链接</button></div>' : '')) +
-          '<div class="rs-item-meta">允许来源：' + esc(scope) + ' · 创建时间：' + esc(resourceShareTime(invite.created_at)) + ' · 有效期：永不过期' + (invite.revoked ? ' · <span style="color:var(--danger);">已撤销</span>' : '') + '</div>' +
-          (invite.revoked ? '<div class="rs-item-meta" style="color:var(--text-secondary);">此邀请码已停止授权。删除后将不再保留该邀请码记录。</div>' : '') +
+          (inviteUrl
+            ? '<div class="rs-item-link rs-item-link-primary"><span>' + safeUrl + '</span><button class="test-btn" data-invite-url="' + safeUrl + '" onclick="copyResourceShareInviteLink(this.dataset.inviteUrl)">复制链接</button></div>'
+            : '<div class="rs-item-meta" style="color:var(--warning);">该历史邀请未能恢复完整链接，请重新创建邀请链接。</div>') +
+          '<div class="rs-item-meta">允许来源：' + esc(scope) + ' · 创建时间：' + esc(resourceShareTime(invite.created_at)) + ' · 有效期：永不过期</div>' +
+          (revoked ? '<div class="rs-item-meta" style="color:var(--text-secondary);">此链接已停止授权；永久删除后将不再保留该邀请记录。</div>' : '') +
         '</div>' +
         '<div class="rs-item-actions">' +
-          (!legacy ? '<button class="test-btn" onclick="copyResourceShareCode(\'' + esc(code) + '\')">复制</button>' : '') +
-          (!invite.revoked ? '<button class="test-btn" onclick="editResourceInvite(\'' + esc(invite.invite_id) + '\')">修改</button>' : '') +
-          (!invite.revoked ? '<button class="test-btn" style="color:var(--danger);border-color:rgba(244,63,94,.3);" onclick="revokeResourceInvite(\'' + esc(invite.invite_id) + '\')">撤销</button>' : '<button class="test-btn" disabled>已撤销</button>') +
-          (invite.revoked ? '<button class="test-btn" style="color:var(--danger);border-color:rgba(244,63,94,.3);" onclick="deleteResourceInvite(\'' + esc(invite.invite_id) + '\')">删除</button>' : '') +
+          (!revoked ? '<button class="test-btn" onclick="editResourceInvite(\'' + esc(invite.invite_id) + '\')">修改</button>' : '') +
+          (!revoked ? '<button class="test-btn" style="color:var(--warning);border-color:rgba(245,158,11,.3);" onclick="revokeResourceInvite(\'' + esc(invite.invite_id) + '\')">撤销</button>' : '') +
+          '<button class="test-btn" style="color:var(--danger);border-color:rgba(244,63,94,.3);" onclick="deleteResourceInvite(\'' + esc(invite.invite_id) + '\')">永久删除</button>' +
         '</div>' +
       '</div>' +
     '</div>';
@@ -11326,8 +11423,6 @@ function renderResourceShareRelationships(relations) {
       : "—";
     const allowed = Array.isArray(relation.allowed_cidrs) && relation.allowed_cidrs.length ? relation.allowed_cidrs.join(", ") : "本机未开放白名单";
     const nextText = relation.next_sync_at ? resourceShareTime(relation.next_sync_at) : (relation.outbound_peer_id ? "待同步" : "无本机主动拉取");
-    const localInvite = relation.local_invite_code || "—";
-    const remoteInvite = relation.remote_invite_code || "—";
     const syncBtn = relation.outbound_peer_id
       ? '<button class="test-btn" onclick="syncResourcePeer(\'' + esc(relation.outbound_peer_id) + '\')">同步</button>'
       : '';
@@ -11342,7 +11437,6 @@ function renderResourceShareRelationships(relations) {
           '<div class="rs-item-meta">服务器 IP：<strong>' + esc(relation.remote_ip || "—") + '</strong>' +
             (relation.remote_url ? ' · 地址：' + esc(relation.remote_url) : '') +
           '</div>' +
-          '<div class="rs-item-meta">本机邀请码：' + esc(localInvite) + ' · 对方邀请码：' + esc(remoteInvite) + '</div>' +
           '<div class="rs-item-meta">本机允许来源：' + esc(allowed) + ' · 自动同步：' + esc(intervalText) + ' · 下次同步：' + esc(nextText) + '</div>' +
           (relation.last_sync_error ? '<div class="rs-item-meta" style="color:var(--danger);">最近错误：' + esc(relation.last_sync_error) + '</div>' : '') +
         '</div>' +
@@ -11363,8 +11457,8 @@ function copyResourceShareCode(code) {
   const value = String(code || "");
   if (!value) return;
   navigator.clipboard?.writeText(value).then(
-    () => alert("邀请码已复制。"),
-    () => alert("复制失败，请手动复制邀请码。")
+    () => showResourceShareNotice("邀请链接已复制。"),
+    () => showResourceShareNotice("复制失败，请手动复制邀请链接。", true)
   );
 }
 
@@ -11402,7 +11496,7 @@ async function generateResourceInvite() {
       try { await navigator.clipboard?.writeText(inviteUrl); } catch (_) {}
       showResourceShareNotice("邀请链接已生成并复制：\n" + inviteUrl);
     } else {
-      showResourceShareNotice("邀请码已创建：\n" + (data.invite_code || "—"));
+      showResourceShareNotice("邀请链接已创建，请复制页面中的完整链接。", false);
     }
   } catch (err) {
     showResourceShareNotice("创建邀请码失败：\n" + (err.message || err), true);
@@ -11438,15 +11532,18 @@ async function openResourceShareEditModal(type, id) {
 
     $("rs_edit_type").value = type;
     $("rs_edit_id").value = id;
-    $("rs_edit_title").textContent = type === "invite" ? "修改邀请码" : "修改共享服务器";
+    $("rs_edit_title").textContent = type === "invite" ? "修改邀请链接" : "修改共享服务器";
     $("rs_edit_help").textContent = type === "invite"
       ? "修改服务器名称或允许来源 IP/CIDR。修改后立即生效。"
-      : "一次修改对方地址、邀请码、同步周期和本机允许来源。保存后立即生效。";
+      : "直接粘贴新的对方邀请链接，并修改同步周期和本机允许来源。保存后立即生效。";
 
     $("rs_edit_name").value = payload.peer_name || payload.name || "共享服务器";
     $("rs_edit_local_scope").value = Array.isArray(payload.allowed_cidrs) ? payload.allowed_cidrs.join(", ") : "";
-    $("rs_edit_remote_url").value = payload.remote_ip || payload.remote_url || "";
-    $("rs_edit_remote_invite").value = payload.remote_invite_code || "";
+    const editRemoteUrl = String(payload.remote_url || "").trim();
+    const editRemoteCode = String(payload.remote_invite_code || "").trim();
+    $("rs_edit_remote_link").value = (editRemoteUrl && editRemoteCode)
+      ? editRemoteUrl.replace(/\/$/, "") + "/" + editRemoteCode
+      : "";
     $("rs_edit_sync_value").value = Number(payload.sync_interval_value || 6);
     $("rs_edit_sync_unit").value = payload.sync_interval_unit || "hours";
     syncUnifiedSelect("rs_edit_sync_unit");
@@ -11457,8 +11554,7 @@ async function openResourceShareEditModal(type, id) {
     $("rs_edit_remote_row").style.display = hasOutbound ? "grid" : "none";
     $("rs_edit_sync_row").style.display = hasOutbound ? "grid" : "none";
     $("rs_edit_local_scope").disabled = false;
-    $("rs_edit_remote_url").disabled = false;
-    $("rs_edit_remote_invite").disabled = false;
+    $("rs_edit_remote_link").disabled = false;
     $("rs_edit_sync_value").disabled = false;
     $("rs_edit_sync_unit").disabled = false;
 
@@ -11486,8 +11582,9 @@ async function submitResourceShareEdit(event) {
 
   const name = ($("rs_edit_name").value || "").trim();
   const localScope = ($("rs_edit_local_scope").value || "").trim();
-  const remoteUrl = normalizeResourceRemoteInput($("rs_edit_remote_url").value);
-  const remoteInvite = ($("rs_edit_remote_invite").value || "").trim();
+  const remoteParsed = parseResourceShareInviteLink($("rs_edit_remote_link").value || "");
+  const remoteUrl = remoteParsed.remoteUrl;
+  const remoteInvite = remoteParsed.inviteCode;
   const syncValue = Math.max(1, Number($("rs_edit_sync_value").value || 6));
   const syncUnit = $("rs_edit_sync_unit").value || "hours";
 
@@ -11506,7 +11603,7 @@ async function submitResourceShareEdit(event) {
       const relation = context.payload;
       if (relation.outbound_peer_id) {
         if (!remoteUrl || !remoteInvite) {
-          throw new Error("双向/主动拉取关系必须填写对方服务器地址和邀请码。");
+          throw new Error("双向/主动拉取关系必须粘贴完整的对方邀请链接。");
         }
         await resourceShareAdminPost("rebind", {
           peer_id: relation.outbound_peer_id,
@@ -11563,12 +11660,13 @@ async function revokeResourceInvite(inviteId) {
 
 async function deleteResourceInvite(inviteId) {
   if (!inviteId) return;
-  if (!confirm("确定永久删除这个已撤销的邀请码？删除后邀请码记录和对应入站共享记录都将消失，无法恢复。")) return;
+  if (!confirm("确定永久删除这条邀请链接？\n删除会立即停止该链接的授权，并永久删除邀请记录及关联入站共享关系，无法恢复。")) return;
   try {
     await resourceShareAdminPost("delete_invite", { invite_id: inviteId });
+    showResourceShareNotice("邀请链接已永久删除。", false);
     await loadResourceShareStatus();
   } catch (err) {
-    alert("永久删除邀请码失败：\n" + (err.message || err));
+    alert("永久删除邀请链接失败：\n" + (err.message || err));
   }
 }
 
@@ -11723,16 +11821,19 @@ async function joinResourcePeer() {
   const btn = $("rs_join_btn");
   const parsed = parseResourceShareInviteLink($("rs_invite_link_input")?.value || "");
   if (!parsed.remoteUrl || !parsed.inviteCode) {
-    showResourceShareNotice("请粘贴完整的邀请链接，例如 https://example.com:8443/resource-share/RS-XXXX-XXXX-XXXX-XXXX", true);
+    showResourceShareNotice("请粘贴完整的邀请链接，例如 https://example.com:8443/resource-share/邀请标识", true);
     return;
   }
   try {
     if (btn) { btn.disabled = true; btn.textContent = "正在加入并同步..."; }
+    const intervalValue = Math.max(1, Number($("rs_sync_interval_value_display")?.value || 6));
+    const intervalUnit = String($("rs_sync_interval_unit")?.value || "hours");
+    if ($("rs_sync_interval_value")) $("rs_sync_interval_value").value = String(intervalValue);
     const data = await resourceShareAdminPost("join", {
       remote_url: parsed.remoteUrl,
       invite_code: parsed.inviteCode,
-      sync_interval_value: 6,
-      sync_interval_unit: "hours"
+      sync_interval_value: intervalValue,
+      sync_interval_unit: intervalUnit
     });
     const first = data.first_sync || {};
     showResourceShareNotice(first.ok
@@ -12010,7 +12111,7 @@ def local_proxy_port_reachable(timeout: float = 0.4) -> bool:
             s.connect((target, LOCAL_PROXY_PORT))
             return True
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]        except Exception:
+        except Exception:
             pass
         finally:
             if s is not None:
@@ -12499,14 +12600,38 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def resource_share_local_url(self) -> str:
-        scheme = str(self.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip() or "https"
-        host = str(self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").strip()
-        forwarded_port = str(self.headers.get("X-Forwarded-Port") or "").split(",")[0].strip()
-        if host and forwarded_port and ":" not in host:
-            default_port = "443" if scheme == "https" else "80"
-            if forwarded_port != default_port:
-                host = f"{host}:{forwarded_port}"
-        return f"{scheme}://{host}/resource-share" if host else "/resource-share"
+        """Return the public invitation base, never an internal proxy hostname.
+
+        Priority: configured HTTPS domain -> detected public egress IP ->
+        forwarded/public Host as a last-resort compatibility fallback.
+        """
+        cfg = load_ui_config()
+        domain = str(cfg.get("web_domain") or "").strip()
+        if domain:
+            host = domain
+        else:
+            host = ""
+            try:
+                bootstrap = _read_bootstrap_state()
+                host = str(bootstrap.get("local_server_public_ip") or "").strip()
+            except Exception:
+                host = ""
+            if not host:
+                try:
+                    host = (DATA_DIR / "public_ip.txt").read_text(encoding="utf-8").strip() if (DATA_DIR / "public_ip.txt").exists() else ""
+                except Exception:
+                    host = ""
+            if not host:
+                try:
+                    host = str(self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").strip()
+                except Exception:
+                    host = ""
+        if not host:
+            return "/resource-share"
+        # Keep the management HTTPS endpoint explicit for invitation links.
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"https://{host}:8443/resource-share"
 
     def handle_resource_share_get(self, effective_path: str) -> bool:
         try:
@@ -12536,7 +12661,7 @@ class Handler(BaseHTTPRequestHandler):
                         "service": "AimiliVPN Resource Share Invitation",
                         "invite_code": code,
                         "invite_url": self.resource_share_local_url().rstrip("/") + "/" + code,
-                        "message": "这是资源共享邀请链接。请在 AimiliVPN 管理后台“资源共享 → 添加公共服务器”中直接粘贴此完整链接。",
+                        "message": "这是资源共享邀请链接。请在 AimiliVPN 管理后台“资源共享 → 添加资源共享服务器”中直接粘贴此完整链接。",
                     })
                     return True
             if effective_path == "/resource-share/ping":
@@ -13011,7 +13136,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            return
+            return
 
         if effective_path == "/api/github_update":
             try:
@@ -14012,7 +14137,7 @@ def _read_bootstrap_state():
 def _write_bootstrap_state(**updates):
     state = _read_bootstrap_state()
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]    state.update(updates)
+    state.update(updates)
     write_json(BOOTSTRAP_STATE_FILE, state)
     return state
 
@@ -14947,5 +15072,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
