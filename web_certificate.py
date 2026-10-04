@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -88,9 +89,9 @@ class WebCertificateManager:
     def snapshot(self) -> dict[str, Any]:
         state = self._read_state()
         state["running"] = bool(self.running)
-        if state.get("status") == "issuing" and not self.running:
-            state["status"] = "interrupted"
-            state["message"] = "上一次证书申请任务在服务重启时中断，请重新保存域名。"
+        # Issuing/installing is persisted across service restarts. A temporarily
+        # stopped worker must not be converted to "interrupted", otherwise a
+        # harmless "保存修改" for the same domain would start a second ACME order.
         if not state.get("domain"):
             state["status"] = "not_configured"
         return state
@@ -253,23 +254,51 @@ server {{
         if result.returncode != 0:
             self._log(f"acme.sh 自动续期任务安装失败：{self._tail_output(result, 700)}")
 
-    def start(self, domain: str) -> dict[str, Any]:
+    def start(self, domain: str, resume: bool = False) -> dict[str, Any]:
         domain = self.normalize_domain(domain)
         if not domain:
             return self.disable()
 
+        persisted = self._read_state()
+        persisted_domain = str(persisted.get("domain") or "").strip().lower()
+        persisted_status = str(persisted.get("status") or "").strip().lower()
+
+        # Idempotency guard: saving the same domain while an ACME order is
+        # issuing/installing must never launch another order. Only the explicit
+        # startup-resume path may restart a worker for the same persisted task.
+        same_domain = persisted_domain == domain and bool(persisted_domain)
+        same_domain_busy = same_domain and persisted_status in ("issuing", "installing")
+        if same_domain and not resume:
+            # A normal settings save is never an ACME retry. The same domain
+            # returns its current persisted certificate state regardless of
+            # whether it is active, issuing, installing, or previously failed.
+            persisted["running"] = bool(self.running)
+            persisted["ok"] = True
+            if same_domain_busy:
+                persisted["message"] = persisted.get("message") or "HTTPS 证书正在申请/安装，本次保存不会重复申请。"
+            return persisted
+
         with self.lock:
             if self.running:
                 current = self.snapshot()
-                current.update({"ok": True, "status": "running", "message": "已有 HTTPS 证书申请任务正在执行"})
+                current.update({"ok": True, "status": current.get("status") or "running", "message": current.get("message") or "已有 HTTPS 证书申请任务正在执行"})
                 return current
+
             self.running = True
-            self._write_state(
-                status="issuing",
-                domain=domain,
-                message="正在校验域名并准备申请 90 天 HTTPS 证书…",
-                last_error="",
-            )
+            if resume and same_domain_busy:
+                self._write_state(
+                    status=persisted_status,
+                    domain=domain,
+                    message=persisted.get("message") or "正在恢复上一次 HTTPS 证书任务…",
+                    last_error="",
+                )
+            else:
+                self._write_state(
+                    status="issuing",
+                    domain=domain,
+                    message="正在校验域名并准备申请 90 天 HTTPS 证书…",
+                    last_error="",
+                )
         thread = threading.Thread(
             target=self._worker,
             args=(domain,),
@@ -280,8 +309,8 @@ server {{
         result = self.snapshot()
         result.update({
             "ok": True,
-            "status": "issuing",
-            "message": "证书申请已启动：正在验证域名、申请 Let's Encrypt 证书并更新 Nginx。",
+            "status": result.get("status") or "issuing",
+            "message": result.get("message") or "证书申请已启动：正在验证域名、申请 Let's Encrypt 证书并更新 Nginx。",
         })
         return result
 

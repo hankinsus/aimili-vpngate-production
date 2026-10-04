@@ -1,3 +1,4 @@
+
 name: aimilivpn-production-ci
 
 on:
@@ -81,8 +82,8 @@ jobs:
                           {"protocol": "softether", "transport": "tcp", "port": 443},
                       ],
                       "trusted_observation": True,
-                      "source_count": 2,
-                      "_sources": ["https://www.vpngate.net/en/", "https://mirror.example/en/"],
+                      "source_count": 1,
+                      "_sources": ["https://www.vpngate.net/en/"],
                   },
                   {
                       "hostname": "vpn200.opengw.net",
@@ -112,7 +113,7 @@ jobs:
                       ],
                       "trusted_observation": False,
                       "source_count": 1,
-                      "_sources": ["https://mirror-only.example/en/"],
+                      "_sources": ["https://www.vpngate.net/en/"],
                   },
               ])
 

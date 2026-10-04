@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -4032,44 +4033,28 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         protocol_probe_lock.release()
 
 def protocol_probe_loop() -> None:
-    # Give the production gateway time to establish its first route before
-    # starting low-priority standby validation.
-    time.sleep(90)
+    """Continuous availability engine for every pending endpoint.
+
+    The previous loop only touched SoftEther/SSTP/L2TP and could leave dozens or
+    hundreds of new OpenVPN endpoints permanently in NOT_CHECKED. The availability
+    sweep is the single scheduler for both OpenVPN and multi-protocol resources.
+    It consumes only due endpoints, prioritises NEW entries, and backs off to the
+    normal recheck window after a successful probe.
+    """
+    time.sleep(15)
     while True:
         try:
             if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active:
-                time.sleep(15)
+                time.sleep(5)
                 continue
-            current_hot = node_pool.ranked_hot_pool(limit=HOT_POOL_TARGET, per_server_limit=2)
-            deficit = max(0, HOT_POOL_TARGET - len(current_hot))
-            if deficit > 0:
-                desired = min(PROTOCOL_PROBE_BATCH, max(1, deficit))
-                limit = 1 if active_tunnel_running() else desired
-            else:
-                # Pool is healthy: still walk several due endpoints each cycle so
-                # the persistent pool receives a complete periodic availability pass.
-                limit = PROTOCOL_PROBE_BATCH
-            due = node_pool.due_endpoints(("softether", "sstp", "l2tp-ipsec"), limit=limit)
-            set_state(hot_pool_size=len(current_hot), hot_pool_target=HOT_POOL_TARGET)
-            if due:
-                log_to_json(
-                    "INFO",
-                    "Probe",
-                    f"多协议热备低频探测，本轮 {len(due)} 个端点，Hot Pool {len(current_hot)}/{HOT_POOL_TARGET}",
-                )
-            for endpoint in due:
-                if is_connecting:
-                    break
-                endpoint_id = str(endpoint.get("endpoint_id") or "")
-                result = probe_pool_endpoint(endpoint_id)
-                if result.get("ok"):
-                    log_to_json("INFO", "Probe", f"热备端点可用 {endpoint_id}: {result}")
-                elif not result.get("skipped"):
-                    log_to_json("WARNING", "Probe", f"热备端点不可用 {endpoint_id}: {result.get('error')}")
-                time.sleep(2)
+            priority = country_priority_request if country_priority_explicit else coverage_country
+            result = availability_sweep_once(priority)
+            if result.get("skipped"):
+                time.sleep(3)
+                continue
         except Exception as exc:
-            log_to_json("ERROR", "Probe", f"多协议热备探测循环异常: {exc}")
-        time.sleep(PROTOCOL_PROBE_INTERVAL_SECONDS)
+            log_to_json("ERROR", "Probe", f"可用性检测循环异常: {exc}")
+        time.sleep(AVAILABILITY_TICK_SECONDS)
 
 def openvpn_pool_endpoint_id(node: dict[str, Any] | None) -> str:
     if not node:
@@ -5587,6 +5572,130 @@ INDEX_HTML = r"""<!doctype html>
       color: #a5b4fc;
       text-decoration: underline;
     }
+    .site-footer {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-secondary);
+      padding: 26px 0 34px;
+      margin-top: 18px;
+    }
+    .footer-brand {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-width: 0;
+    }
+    .footer-brand-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      color: var(--text-primary);
+      text-decoration: none;
+      font-weight: 750;
+    }
+    .footer-brand-link:hover { color: #ffffff; }
+    .footer-brand-logo {
+      width: 36px;
+      height: 36px;
+      display: block;
+      flex: 0 0 auto;
+    }
+    .footer-brand strong {
+      color: var(--text-primary);
+      font-size: 14.5px;
+      font-weight: 750;
+      line-height: 1.2;
+    }
+    .footer-brand span { overflow-wrap: anywhere; line-height: 1.5; }
+    .footer-channels {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin: 1px 0 0;
+    }
+    .footer-channel {
+      min-height: 40px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 14px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 999px;
+      background: rgba(255,255,255,.96);
+      box-shadow: 0 3px 12px rgba(0,0,0,.18);
+      color: #162033;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: transform .16s ease,border-color .16s ease,box-shadow .16s ease,background .16s ease;
+    }
+    .footer-channel:hover {
+      transform: translateY(-1px);
+      border-color: rgba(20,184,166,.42);
+      background: #ffffff;
+      box-shadow: 0 6px 18px rgba(0,0,0,.24);
+    }
+    .footer-channel:active { transform: translateY(0); }
+    .footer-channel:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+    .footer-channel-icon {
+      width: 18px;
+      height: 18px;
+      display: grid;
+      place-items: center;
+      flex: 0 0 18px;
+    }
+    .footer-channel-icon svg {
+      width: 18px;
+      height: 18px;
+      display: block;
+      fill: currentColor;
+    }
+    .footer-channel-youtube .footer-channel-icon { color: #ff0033; }
+    .footer-channel-telegram .footer-channel-icon { color: #229ed9; }
+    .footer-channel-label {
+      display: inline-block;
+      transform: translateY(.2px);
+    }
+    .footer-legal {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 10px;
+      line-height: 1.5;
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .footer-legal a {
+      color: var(--text-secondary);
+      text-decoration: none;
+    }
+    .footer-legal a:hover { color: var(--text-primary); text-decoration: underline; }
+    @media (max-width:699px) {
+      .site-footer { padding: 20px 12px 28px; gap: 10px; }
+      .footer-brand { max-width: 100%; gap: 5px; }
+      .footer-brand-logo { width: 32px; height: 32px; }
+      .footer-brand strong { font-size: 13.5px; }
+      .footer-brand span { flex-basis: 100%; font-size: 11.5px; }
+      .footer-channels { width: 100%; gap: 8px; }
+      .footer-channel { min-height: 44px; padding: 9px 12px; font-size: 12.5px; }
+    }
+
     .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
     .official-links-title { margin-bottom: 12px; color: var(--text-primary); font-size: 14px; font-weight: 700; }
     .official-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
@@ -6934,6 +7043,55 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
       background: rgba(15, 23, 42, 0.6);
     }
+    /* Long labels/placeholders and resource-sharing fields must never be clipped. */
+    .form-group,
+    .form-label,
+    .rs-edit-field,
+    .rs-edit-field label,
+    .rs-card-label,
+    .rs-step-title,
+    .rs-list-title,
+    .field-label,
+    .rs-item-main {
+      min-width: 0;
+      max-width: 100%;
+    }
+    .form-label,
+    .rs-edit-field label,
+    .field-label,
+    .rs-card-label,
+    .rs-step-title,
+    .rs-list-title {
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      line-height: 1.45;
+    }
+    .input-field,
+    textarea,
+    input[type="text"],
+    input[type="password"],
+    input[type="number"],
+    input[type="url"],
+    input[type="email"] {
+      min-width: 0;
+      max-width: 100%;
+      text-overflow: ellipsis;
+    }
+    .input-field::placeholder,
+    textarea::placeholder {
+      color: var(--text-secondary);
+      opacity: .78;
+      overflow-wrap: anywhere;
+    }
+    .rs-sync-row,
+    .rs-edit-sync-row {
+      min-width: 0;
+    }
+    .rs-item-actions {
+      min-width: 0;
+      flex-wrap: wrap;
+    }
     select option {
       background-color: #0f172a;
       color: #f8fafc;
@@ -7087,6 +7245,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="status_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
+      <option value="not_checked">待检测</option>
       <option value="testing">检测中</option>
       <option value="unavailable">失效节点</option>
     </select>
@@ -7251,7 +7410,10 @@ INDEX_HTML = r"""<!doctype html>
           <label class="form-label" for="cred_domain">HTTPS 域名（可选）</label>
           <input type="text" id="cred_domain" class="input-field" placeholder="例如 vpn.example.com" autocomplete="url" spellcheck="false">
           <div id="cred_cert_status" style="margin-top:8px; padding:9px 11px; border:1px solid var(--border-color); border-radius:8px; color:var(--text-secondary); font-size:12px; line-height:1.55; background:rgba(15,23,42,.24);">
-            填写已解析到本服务器的域名，保存后自动申请约 90 天 HTTPS 证书并自动续期。
+            填写已解析到本服务器的域名；首次绑定时自动申请 HTTPS 证书，后续同域名保存不会重复申请。
+          </div>
+          <div id="cred_access_url" style="margin-top:8px; padding:9px 11px; border:1px solid rgba(20,184,166,.16); border-radius:8px; color:var(--text-secondary); font-size:12px; line-height:1.55; background:rgba(20,184,166,.045); word-break:break-all;">
+            当前访问地址：读取中…
           </div>
         </div>
 
@@ -7707,6 +7869,45 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+  <footer class="site-footer" aria-label="我爱研究官方入口">
+    <div class="footer-brand">
+      <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
+        <svg class="footer-brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="footer-shield-g" x1="8" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#6d78ff"/><stop offset=".55" stop-color="#26386e"/><stop offset="1" stop-color="#13b9a6"/>
+            </linearGradient>
+          </defs>
+          <path d="M32 4 53 12v16c0 13.8-8.7 25.2-21 31C19.7 53.2 11 41.8 11 28V12L32 4Z" fill="url(#footer-shield-g)" stroke="#172554" stroke-width="2"/>
+          <path d="M24.5 23.5h15a4 4 0 0 1 4 4v13h-23v-13a4 4 0 0 1 4-4Z" fill="#0b1020" stroke="#d9e4ff" stroke-width="2"/>
+          <path d="M28 23.5v-3.2a4 4 0 0 1 8 0v3.2" stroke="#d9e4ff" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="32.5" cy="32.5" r="2" fill="#14b8a6"/><path d="M32.5 34.5v3" stroke="#14b8a6" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <strong>我爱研究.ILovestudy</strong>
+      </a>
+      <span>· 多协议节点管理系统 · V9.0.6</span>
+    </div>
+    <div class="footer-channels">
+      <a class="footer-channel footer-channel-youtube" href="https://www.youtube.com/@ILovestudycn" target="_blank" rel="noopener noreferrer" aria-label="打开 YouTube 频道">
+        <span class="footer-channel-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8ZM9.6 15.6V8.4l6.2 3.6-6.2 3.6Z"/></svg>
+        </span>
+        <span class="footer-channel-label">YouTube 频道</span>
+      </a>
+      <a class="footer-channel footer-channel-telegram" href="https://t.me/ILovestudyus" target="_blank" rel="noopener noreferrer" aria-label="打开 Telegram 频道">
+        <span class="footer-channel-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M21.6 3.4 2.9 10.6c-1.3.5-1.3 1.2-.2 1.5l4.8 1.5 1.8 5.5c.2.6.1.8.7.8.5 0 .7-.2 1-.5l2.3-2.2 4.8 3.6c.9.5 1.5.3 1.7-.8l3.1-14.7c.4-1.4-.5-2-1.5-1.4ZM9.1 13.3l10.5-6.6c.5-.3 1-.1.6.2l-8.8 7.9-.3 3.2-1.4-4.7-.6-.2Z"/></svg>
+        </span>
+        <span class="footer-channel-label">Telegram 频道</span>
+      </a>
+    </div>
+    <div class="footer-legal">
+      <a href="https://ilovestudycn.com" target="_blank" rel="noopener noreferrer">官网</a>
+      <a href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer">IP 节点检测</a>
+      <a href="#privacy">隐私</a>
+      <a href="#disclaimer">免责声明</a>
+    </div>
+  </footer>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
@@ -7896,6 +8097,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedIpType === "mobile" && ipType !== "mobile") return false;
 
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
+  if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
   if (selectedStatus === "testing" && n.probe_status !== "testing") return false;
   if (selectedStatus === "unavailable" && (n.probe_status !== "unavailable" || n.active)) return false;
 
@@ -9613,6 +9815,7 @@ let certificatePollInterval = null;
 
 function renderCertificateStatus(certState) {
   const el = $("cred_cert_status");
+  const accessEl = $("cred_access_url");
   if (!el) return;
   const cert = certState || state?.web_certificate || {};
   const status = String(cert.status || "not_configured");
@@ -9650,6 +9853,17 @@ function renderCertificateStatus(certState) {
     <span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:${badgeBg};color:${badgeColor};font-weight:600;">${esc(badgeText)}</span>
     <span>${esc(detail)}</span>
   </div>`;
+
+  if (accessEl) {
+    const secretPath = String(state?.secret_path || "Admin").replace(/^\/+|\/+$/g, "");
+    const preferredHost = domain || String(window.location.hostname || "").trim() || "服务器IP";
+    const preferredUrl = `https://${preferredHost}:8443/${secretPath}/`;
+    accessEl.innerHTML = `<div style="display:flex;flex-direction:column;gap:4px;">
+      <span style="color:var(--text-secondary);">推荐访问地址</span>
+      <a href="${esc(preferredUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--primary);font-weight:650;text-decoration:none;overflow-wrap:anywhere;">${esc(preferredUrl)}</a>
+      <span style="font-size:11px;">${domain ? "已绑定域名，优先使用域名访问；IP 仍可作为回退入口。" : "未绑定域名，使用服务器 IP 通过 HTTPS:8443 访问。"}</span>
+    </div>`;
+  }
 }
 
 async function startCertificatePolling() {
@@ -9773,12 +9987,13 @@ async function saveCredentials(e) {
         inputs.forEach(el => el.disabled = true);
 
         setTimeout(() => {
-          const protocol = window.location.protocol;
-          const host = window.location.hostname;
-          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+          const protocol = "https:";
+          const currentHost = window.location.hostname;
+          const preferredHost = domain || currentHost;
+          window.location.href = `${protocol}//${preferredHost}:${port}/${suffix}/`;
         }, 4000);
       } else {
-        const certBusy = !!data.certificate?.running && ["issuing", "installing"].includes(String(data.certificate?.status || ""));
+        const certBusy = ["issuing", "installing"].includes(String(data.certificate?.status || ""));
         if (certBusy) {
           successDiv.textContent = data.reauth_required
             ? "账号密码保存成功，HTTPS 证书正在后台申请；完成后会自动更新状态。"
@@ -11985,8 +12200,8 @@ class Handler(BaseHTTPRequestHandler):
                 old_domain = str(ui_cfg.get("web_domain") or "").strip()
                 cert_before = web_certificate.snapshot()
 
-                # Do not let a second domain overwrite an in-flight ACME order.
-                # The user can retry the same domain while a job is running.
+                # Do not let a different domain overwrite an in-flight ACME order.
+                # Saving the same domain is allowed and remains idempotent.
                 cert_running_domain = str(cert_before.get("domain") or "").strip()
                 if cert_before.get("running") and new_domain != cert_running_domain:
                     self.send_json(
@@ -12016,7 +12231,11 @@ class Handler(BaseHTTPRequestHandler):
                 domain_changed = new_domain != old_domain
 
                 if new_domain:
-                    if restart_needed:
+                    if domain_changed and not restart_needed:
+                        # A changed hostname is the only normal settings action
+                        # that is allowed to start a fresh ACME issuance.
+                        certificate_result = web_certificate.start(new_domain)
+                    elif restart_needed:
                         # Persist a resumable state marker without starting the
                         # ACME child process inside a process that is about to exit.
                         web_certificate._write_state(
@@ -12026,8 +12245,6 @@ class Handler(BaseHTTPRequestHandler):
                             last_error="",
                         )
                         certificate_result = web_certificate.snapshot()
-                    elif domain_changed or str(cert_before.get("domain") or "") != new_domain or str(cert_before.get("status") or "") in ("error", "interrupted", "not_configured"):
-                        certificate_result = web_certificate.start(new_domain)
                     else:
                         certificate_result = web_certificate.snapshot()
                 elif old_domain:
@@ -13341,7 +13558,7 @@ def resume_web_certificate_if_needed() -> None:
 
         def resume() -> None:
             try:
-                web_certificate.start(domain)
+                web_certificate.start(domain, resume=True)
             except Exception as exc:
                 log_to_json("ERROR", "WebSSL", f"HTTPS 证书任务自动恢复失败：{domain} · {exc}")
 
