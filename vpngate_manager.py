@@ -2047,6 +2047,15 @@ def _build_manual_openvpn_node(host: str, ip: str, port: int, transport: str = "
         pass
     try:
         vpn_utils.enrich_ip_info([node])
+        # Manual nodes used to keep country="" even after IP enrichment. That
+        # made the UI fall back to 🌐 and made the country filter unable to
+        # include the manually-added endpoint. Persist the first location token
+        # as the canonical country and keep the translated Chinese label.
+        if not str(node.get("country") or "").strip():
+            location = str(node.get("location") or "").strip()
+            country_token = location.split()[0] if location else ""
+            if country_token:
+                node["country"] = vpn_utils.COUNTRY_TRANSLATIONS.get(country_token, country_token)
     except Exception:
         pass
     return node
