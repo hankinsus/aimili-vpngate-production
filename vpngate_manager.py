@@ -5848,7 +5848,7 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 11px;
+      gap: 9px;
       width: 100%;
       min-width: 0;
       padding-top: 3px;
@@ -5863,12 +5863,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
-      width: 42px;
-      height: 44px;
-      max-width: 42px;
-      max-height: 44px;
+      width: 36px;
+      height: 38px;
+      max-width: 36px;
+      max-height: 38px;
       display: block;
-      flex: 0 0 42px;
+      flex: 0 0 36px;
       object-fit: contain;
       object-position: center;
       background: transparent;
@@ -5983,14 +5983,15 @@ INDEX_HTML = r"""<!doctype html>
       .footer-disclaimer-title { font-size: 12.5px; margin-bottom: 7px; }
       .footer-disclaimer-list { font-size: 10px; line-height: 1.7; padding-left: 18px; }
       .footer-brand { align-items: center; }
-      .footer-brand-logo-image { width: 44px; height: 44px; flex-basis: 44px; }
+      .footer-brand-logo-image { width: 34px; height: 36px; flex-basis: 34px; }
       .footer-brand-copy {
         justify-content: flex-start;
         align-items: flex-start;
         flex-direction: column;
         gap: 2px;
       }
-      .footer-brand strong { font-size: 16.5px; }\n      .footer-brand-logo-image { width: 40px; max-height: 49px; }
+      .footer-brand strong { font-size: 16.5px; }
+      .footer-brand-logo-image { width: 34px; height: 36px; max-height: 36px; }
       .footer-brand-version { font-size: 11px; }
       .footer-channels { width: 100%; gap: 7px; }
       .footer-channel { width: 100%; min-height: 44px; padding: 9px 12px; font-size: 12.5px; border-radius: 12px; }
@@ -9541,9 +9542,16 @@ function render(){
   const endIndex = Math.min(startIndex + shown.length, Number(totalNodeCount || 0));
   currentPageNodes = shown;
 
-  // Render table rows
+  // Render table rows. A non-zero Master Pool inventory with zero loaded rows
+  // means the resource details are still being fetched; do not present it as
+  // a false "no matching nodes" result.
   if (currentPageNodes.length === 0) {
-    $("rows").innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">未找到符合过滤条件的备选节点。</td></tr>`;
+    const hasServerInventory = Number(totalNodeCount || 0) > 0;
+    const resourceLoading = hasServerInventory && nodes.length === 0;
+    const emptyText = resourceLoading
+      ? `<span class="badge not_checked"><span class="badge-pulse"></span>资源获取中</span><div style="margin-top:8px;">已发现 ${Number(totalNodeCount || 0)} 个资源记录，正在从 Master Pool 获取节点详情，请稍候...</div>`
+      : "未找到符合过滤条件的备选节点。";
+    $("rows").innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyText}</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
@@ -9900,7 +9908,13 @@ async function loadScopedNodes(country, generation) {
   if (firstNodes.length) mergeLoadedNodePage(firstNodes);
 
   updateCountryFilter();
-  updateNodeLoadProgress(firstNodes.length, totalNodeCount, true);
+  if (totalNodeCount > 0 && firstNodes.length === 0) {
+    updateNodeLoadProgress(0, totalNodeCount, false);
+    state.last_check_message = "资源获取中 · 已发现资源记录，正在读取节点详情";
+    state.availability_engine_message = "资源获取中 · Master Pool 正在准备节点详情";
+  } else {
+    updateNodeLoadProgress(firstNodes.length, totalNodeCount, true);
+  }
   render();
 }
 

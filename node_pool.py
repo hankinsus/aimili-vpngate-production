@@ -264,6 +264,68 @@ class NodePool:
                 result.append(item)
             return result
 
+    def list_endpoints_scoped(self, country="", status="", protocol="", ip_type="", offset=0, limit=100):
+        """Server-side Master Pool scope query; never depends on browser cache."""
+        country = str(country or "").strip()
+        status = str(status or "").strip().lower()
+        protocol = str(protocol or "").strip().lower()
+        ip_type = str(ip_type or "").strip().lower()
+        variants = {country} if country else set()
+        if country:
+            for code, name in COUNTRY_TRANSLATIONS.items():
+                if str(name or "").strip() == country:
+                    variants.add(str(code))
+        rows = self.list_endpoints(limit=5000)
+        def match(row):
+            if variants and str(row.get("country") or "").strip() not in variants:
+                return False
+            if protocol and protocol != "all" and str(row.get("protocol") or "").lower() != protocol:
+                return False
+            if ip_type and ip_type != "all":
+                meta = row.get("server_metadata") or {}
+                if str(meta.get("ip_type") or "").lower() != ip_type:
+                    return False
+            if status and status != "all":
+                s = str(row.get("status") or "").upper()
+                groups = {
+                    "available": {"HOT", "AVAILABLE"},
+                    "not_checked": {"NEW"},
+                    "testing": {"TESTING"},
+                    "unavailable": {"DEGRADED", "COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"},
+                }
+                allowed = groups.get(status)
+                if allowed is not None and s not in allowed:
+                    return False
+            return True
+        filtered = [row for row in rows if match(row)]
+        total = len(filtered)
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(int(limit or 100), 5000))
+        return filtered[offset:offset + limit], total
+
+    def country_catalog(self, status="", protocol="", ip_type=""):
+        """Lightweight country/IP catalog computed from the persistent Master Pool."""
+        rows, _ = self.list_endpoints_scoped(status=status, protocol=protocol, ip_type=ip_type, offset=0, limit=5000)
+        countries = {}
+        ips = set()
+        for row in rows:
+            country = str(row.get("country") or "").strip()
+            ip = str(row.get("current_ip") or "").strip()
+            if not country:
+                continue
+            item = countries.setdefault(country, {"ip_count": 0, "server_count": 0, "_ips": set()})
+            item["server_count"] += 1
+            if ip and ip not in item["_ips"]:
+                item["_ips"].add(ip)
+                item["ip_count"] += 1
+            if ip:
+                ips.add(ip)
+        clean = {
+            country: {"ip_count": int(item["ip_count"]), "server_count": int(item["server_count"])}
+            for country, item in countries.items()
+        }
+        return {"total_ip_count": len(ips), "countries": clean}
+
     def upsert_openvpn_snapshot(self, nodes: list[dict[str, Any]], source: str = "official_csv") -> None:
         now = time.time()
         seen_keys: set[str] = set()
