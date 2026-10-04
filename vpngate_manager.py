@@ -8337,7 +8337,7 @@ INDEX_HTML = r"""<!doctype html>
             <path d="M48 13 73 23v20c0 17-9 29-25 39-16-10-25-22-25-39V23l25-10Z"
                   fill="url(#brandInner)" stroke="#22d3ee" stroke-width="1.5" opacity=".98"/>
             <!-- Centered chip, aligned to the shield's visual center. -->
-            <g transform="translate(48 49)">
+            <g transform="translate(48 49) scale(.82)">
               <rect x="-19" y="-19" width="38" height="38" rx="8" fill="url(#brandMetal)" stroke="#f8fafc" stroke-width="1.5"/>
               <rect x="-11" y="-11" width="22" height="22" rx="4" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
               <path d="M-6 -5h12M-6 0h12M-6 5h12" stroke="#78350f" stroke-width="1.6" stroke-linecap="round"/>
