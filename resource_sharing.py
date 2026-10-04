@@ -316,6 +316,25 @@ class ResourceShareManager:
             self._write(data)
         return {"ok": True, "invite_id": invite_id, "affected_peer_ids": affected, "message": "邀请码已撤销；关联的入站共享访问已停止。"}
 
+    def restore_invite(self, invite_id: str) -> dict[str, Any]:
+        invite_id = str(invite_id or "").strip()
+        if not invite_id:
+            raise ValueError("invite_id 不能为空")
+        affected: list[str] = []
+        with self.lock:
+            data = self._read()
+            invite = data["invites"].get(invite_id)
+            if not isinstance(invite, dict):
+                raise KeyError("邀请码不存在")
+            invite["revoked"] = False
+            invite["revoked_at"] = 0
+            for peer_id, peer in data["peers"].items():
+                if isinstance(peer, dict) and str(peer.get("invite_id") or "") == invite_id:
+                    peer["enabled"] = True
+                    affected.append(str(peer_id))
+            self._write(data)
+        return {"ok": True, "invite_id": invite_id, "affected_peer_ids": affected, "message": "邀请链接已恢复，关联入站共享访问已重新启用。"}
+
     def delete_invite(self, invite_id: str) -> dict[str, Any]:
         invite_id = str(invite_id or "").strip()
         if not invite_id:
@@ -325,12 +344,10 @@ class ResourceShareManager:
             invite = data["invites"].get(invite_id)
             if not isinstance(invite, dict):
                 raise KeyError("邀请码不存在")
-            # Permanent deletion is an explicit destructive action. If the
-            # invite is still active, revoke it atomically first so the link
-            # cannot authorize any new enrollment during deletion.
+            # Destructive deletion is only allowed after an explicit revoke.
+            # This prevents accidental deletion of a currently active share.
             if not invite.get("revoked"):
-                invite["revoked"] = True
-                invite["revoked_at"] = time.time()
+                raise ValueError("必须先撤销邀请链接，撤销后才能永久删除。")
             linked = [
                 peer_id for peer_id, peer in data["peers"].items()
                 if isinstance(peer, dict) and str(peer.get("invite_id") or "") == invite_id
