@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import hashlib
@@ -182,7 +181,8 @@ class NodePool:
                         ON CONFLICT(endpoint_id) DO UPDATE SET
                           last_seen=excluded.last_seen,
                           metadata_json=excluded.metadata_json,
-                          status=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 'NEW' ELSE endpoints.status END
+                          status=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 'NEW' ELSE endpoints.status END,
+                      next_test=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 0 ELSE endpoints.next_test END
                         """,
                         (eid, key, protocol, transport, port, "NEW", now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
                     )
@@ -336,7 +336,8 @@ class NodePool:
                       last_seen=excluded.last_seen,
                       config_ref=excluded.config_ref,
                       metadata_json=excluded.metadata_json,
-                      status=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 'NEW' ELSE endpoints.status END
+                      status=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 'NEW' ELSE endpoints.status END,
+                      next_test=CASE WHEN endpoints.status IN ('RETIRED','STALE') THEN 0 ELSE endpoints.next_test END
                     """,
                     (eid, key, protocol, transport, port, str(node.get("config_file") or ""), "NEW", now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
                 )
@@ -601,7 +602,7 @@ class NodePool:
                     UPDATE endpoints SET status=?, last_success=?, success_count=?, success_streak=?,
                     fail_streak=0, next_test=?, latency_ewma=?, jitter_ewma=? WHERE endpoint_id=?
                     """,
-                    (status, now, success_count, success_streak, now + 900, latency_ewma, jitter_ewma, eid),
+                    (status, now, success_count, success_streak, now + 4 * 3600, latency_ewma, jitter_ewma, eid),
                 )
                 db.execute("UPDATE servers SET state=?, last_seen=? WHERE server_key=?", (status, now, key))
             else:
@@ -875,7 +876,7 @@ class NodePool:
                     UPDATE endpoints SET status=?, last_success=?, success_count=?, success_streak=?,
                     fail_streak=0, next_test=?, latency_ewma=?, jitter_ewma=? WHERE endpoint_id=?
                     """,
-                    (status, now, success_count, success_streak, now + 900, latency_ewma, jitter_ewma, endpoint_id),
+                    (status, now, success_count, success_streak, now + 4 * 3600, latency_ewma, jitter_ewma, endpoint_id),
                 )
                 db.execute("UPDATE servers SET state=?, last_seen=? WHERE server_key=?", (status, now, row["server_key"]))
             else:
@@ -979,3 +980,5 @@ class NodePool:
                 for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
             }
             return {"servers": servers, "endpoints": endpoints, "states": states}
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
