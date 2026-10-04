@@ -11,6 +11,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from vpn_utils import COUNTRY_TRANSLATIONS
+
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -49,7 +51,11 @@ CREATE TABLE IF NOT EXISTS endpoints (
     FOREIGN KEY(server_key) REFERENCES servers(server_key)
 );
 CREATE INDEX IF NOT EXISTS idx_endpoints_sched ON endpoints(status, next_test, last_success);
+CREATE INDEX IF NOT EXISTS idx_endpoints_server ON endpoints(server_key);
+CREATE INDEX IF NOT EXISTS idx_endpoints_protocol_status ON endpoints(protocol, status, server_key);
 CREATE INDEX IF NOT EXISTS idx_servers_seen ON servers(last_seen, state);
+CREATE INDEX IF NOT EXISTS idx_servers_country_ip ON servers(country, current_ip);
+CREATE INDEX IF NOT EXISTS idx_servers_country_ip_state ON servers(country, current_ip, state);
 CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_key TEXT NOT NULL,
@@ -992,6 +998,7 @@ class NodePool:
                   AND e.status NOT IN ('RETIRED')
                 ORDER BY
                   CASE e.protocol
+
                     {" ".join(
                         f"WHEN '{protocol}' THEN {deficit[protocol]:.12f}"
                         for protocol in wanted
@@ -1032,7 +1039,9 @@ class NodePool:
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         offset = max(0, int(offset or 0))
-        limit = max(1, min(int(limit or 100), 200))
+        # Server-side scoped reads may materialize the selected scope for UI de-duplication.
+        # This never sends the full pool to the browser; the HTTP layer still paginates.
+        limit = max(1, min(int(limit or 100), 10000))
 
         where = [
             "TRIM(COALESCE(s.country, '')) <> ''",
@@ -1040,30 +1049,17 @@ class NodePool:
         ]
         params: list[Any] = []
         if country:
-            aliases = {
-                "美国": "United States", "日本": "Japan", "韩国": "Korea Republic of",
-                "加拿大": "Canada", "德国": "Germany", "英国": "United Kingdom",
-                "法国": "France", "澳大利亚": "Australia", "新西兰": "New Zealand",
-                "新加坡": "Singapore", "中国": "China", "中国香港": "Hong Kong", "香港": "Hong Kong",
-                "台湾": "Taiwan", "俄罗斯": "Russian Federation", "荷兰": "Netherlands",
-                "瑞典": "Sweden", "挪威": "Norway", "西班牙": "Spain", "意大利": "Italy",
-                "瑞士": "Switzerland", "比利时": "Belgium", "奥地利": "Austria",
-                "丹麦": "Denmark", "芬兰": "Finland", "葡萄牙": "Portugal",
-                "爱尔兰": "Ireland", "波兰": "Poland", "捷克": "Czech Republic",
-                "匈牙利": "Hungary", "土耳其": "Turkey", "印度": "India",
-                "泰国": "Thailand", "越南": "Vietnam", "马来西亚": "Malaysia",
-                "印度尼西亚": "Indonesia", "菲律宾": "Philippines", "墨西哥": "Mexico",
-                "巴西": "Brazil", "阿根廷": "Argentina", "智利": "Chile",
-                "南非": "South Africa", "以色列": "Israel", "阿联酋": "United Arab Emirates",
-                "罗马尼亚": "Romania", "乌克兰": "Ukraine", "柬埔寨": "Cambodia",
-                "哈萨克斯坦": "Kazakhstan", "格鲁吉亚": "Georgia", "蒙古": "Mongolia",
-                "伊朗": "Iran", "伊拉克": "Iraq", "哥伦比亚": "Colombia",
-                "沙特阿拉伯": "Saudi Arabia", "希腊": "Greece", "冰岛": "Iceland",
-                "卢森堡": "Luxembourg", "澳门": "Macao",
-            }
-            alias = aliases.get(country, country)
-            where.append("(s.country=? OR s.country=?)")
-            params.extend([country, alias])
+            # The UI uses the canonical Chinese country name, while the Master
+            # Pool may contain either the Chinese or source-language country.
+            # Match every known source-language variant so a country selection
+            # returns the same inventory shown in the country catalog.
+            variants = {country}
+            for raw_country, zh_country in COUNTRY_TRANSLATIONS.items():
+                if zh_country == country:
+                    variants.add(raw_country)
+            placeholders = ",".join("?" for _ in variants)
+            where.append(f"s.country IN ({placeholders})")
+            params.extend(sorted(variants))
         if protocol:
             where.append("e.protocol=?")
             params.append(protocol)
@@ -1153,12 +1149,17 @@ class NodePool:
         with self.lock, closing(self._connect()) as db:
             rows = db.execute(sql, params).fetchall()
 
-        result: dict[str, dict[str, Any]] = {}
+        # Canonicalize country names at the inventory boundary. The same
+        # server pool can contain "Japan"/"日本", "United States"/"美国", etc.
+        # The UI must expose one country and one real IP count, not duplicate
+        # source-language buckets.
+        result: dict[str, dict[str, set[str]]] = {}
         for row in rows:
-            country = str(row["country"] or "").strip()
+            raw_country = str(row["country"] or "").strip()
             ip = str(row["current_ip"] or "").strip()
-            if not country or not ip:
+            if not raw_country or not ip:
                 continue
+            country = COUNTRY_TRANSLATIONS.get(raw_country, raw_country)
             item = result.setdefault(country, {"ips": set(), "servers": set()})
             item["ips"].add(ip)
             item["servers"].add(str(row["hostname"] or ip).strip().lower())
@@ -1171,7 +1172,11 @@ class NodePool:
             for country, item in result.items()
         }
         return {
-            "total_ip_count": sum(int(item["ip_count"]) for item in countries.values()),
+            "total_ip_count": len({
+                ip
+                for item in result.values()
+                for ip in item["ips"]
+            }),
             "countries": countries,
             "status": status,
             "protocol": protocol,
