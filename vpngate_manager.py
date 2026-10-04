@@ -7775,12 +7775,12 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: flex-start; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条已加载节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
+        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
         <span id="pool_summary" style="margin-left: 14px; color: var(--text-secondary);">Master Pool：—</span>
         <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
       </div>
       <div class="pagination-controls-right" style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
-        <button id="btn_first_page class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
+        <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
         <button id="btn_prev_page" class="connect-btn" style="height: 32px; padding: 0 10px;">上一页</button>
         <span style="font-size: 13px; color: var(--text-secondary); margin: 0 8px;">
           页码 <strong id="current_page_val" style="color: var(--primary);">1</strong> / <strong id="total_pages_val">1</strong>
@@ -9393,14 +9393,14 @@ function render(){
 
   updateFavPanelUI();
 
-  // Pagination calculation
-  const totalPages = Math.ceil(shown.length / pageSize) || 1;
+  // Pagination is server-side; the Master Pool total is authoritative.
+  const totalPages = Math.ceil(Number(totalNodeCount || 0) / pageSize) || 1;
   if (currentPage > totalPages) currentPage = totalPages;
   if (currentPage < 1) currentPage = 1;
 
-  const startIndex = (currentPage - 1) * pageSize;
-  const endIndex = Math.min(startIndex + pageSize, shown.length);
-  currentPageNodes = shown.slice(startIndex, endIndex);
+  const startIndex = totalNodeCount > 0 ? (currentPage - 1) * pageSize : 0;
+  const endIndex = Math.min(startIndex + shown.length, Number(totalNodeCount || 0));
+  currentPageNodes = shown;
 
   // Render table rows
   if (currentPageNodes.length === 0) {
@@ -9481,9 +9481,9 @@ function render(){
   }
 
   // Render pagination controls
-  $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
+  $("page_start").textContent = totalNodeCount > 0 && shown.length > 0 ? startIndex + 1 : 0;
   $("page_end").textContent = endIndex;
-  $("filtered_count").textContent = shown.length;
+  $("filtered_count").textContent = totalNodeCount;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
   const poolSummary = $("pool_summary");
@@ -9502,18 +9502,12 @@ function render(){
 }
 
 // Hook up page buttons events
-$("btn_first_page").onclick = () => { currentPage = 1; render(); };
-$("btn_prev_page").onclick = () => { if (currentPage > 1) { currentPage--; render(); } };
-$("btn_next_page").onclick = () => {
-  const shown = getFilteredNodes();
-  const totalPages = Math.ceil(shown.length / pageSize) || 1;
-  if (currentPage < totalPages) { currentPage++; render(); }
-};
+$("btn_first_page").onclick = () => loadServerPage(1);
+$("btn_prev_page").onclick = () => loadServerPage(currentPage - 1);
+$("btn_next_page").onclick = () => loadServerPage(currentPage + 1);
 $("btn_last_page").onclick = () => {
-  const shown = getFilteredNodes();
-  const totalPages = Math.ceil(shown.length / pageSize) || 1;
-  currentPage = totalPages;
-  render();
+  const totalPages = Math.max(1, Math.ceil(Number(totalNodeCount || 0) / pageSize));
+  loadServerPage(totalPages);
 };
 
 async function prioritizeCountry(country){
@@ -9756,46 +9750,52 @@ async function loadScopedNodes(country, generation) {
   nodeCacheBuilding = false;
   activeCountryScope = String(country || "").trim();
 
-  let first = await fetchScopedNodePage(0, 100, 12000);
+  // First-screen rule: one authoritative Master Pool page only.
+  const first = await fetchScopedNodePage(0, pageSize, 12000);
   if (myGeneration !== scopeLoadGeneration) return;
 
-  // The first page is already an authoritative SQLite/Master Pool scope
-  // query. Do not wait for the heavyweight global UI snapshot and do not
-  // compare the page row count with country IP inventory; protocol/status/IP
-  // type filters can legitimately make those numbers different.
   totalNodeCount = Number(first?.total || 0);
   nodeCacheBuilding = !!first?.cache_building;
   const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
   if (firstNodes.length) mergeLoadedNodePage(firstNodes);
 
   updateCountryFilter();
-  updateNodeLoadProgress(nodes.length, totalNodeCount);
+  updateNodeLoadProgress(firstNodes.length, totalNodeCount, true);
   render();
+}
 
-  let offset = nodes.length;
-  while (myGeneration === scopeLoadGeneration && offset < totalNodeCount) {
-    await nodeLoadYield();
-    if (myGeneration !== scopeLoadGeneration) return;
-    const page = await fetchScopedNodePage(offset, 100, 12000);
-    if (myGeneration !== scopeLoadGeneration) return;
-    const pageNodes = Array.isArray(page?.nodes) ? page.nodes : [];
-    if (!pageNodes.length) break;
-    mergeLoadedNodePage(pageNodes);
-    offset += pageNodes.length;
-    totalNodeCount = Number(page?.total || totalNodeCount);
-    nodeCacheBuilding = !!page?.cache_building;
-    updateNodeLoadProgress(nodes.length, totalNodeCount);
-    render();
-  }
+let pageLoadBusy = false;
+async function loadServerPage(page) {
+  if (pageLoadBusy) return;
+  const totalPages = Math.max(1, Math.ceil(Number(totalNodeCount || 0) / pageSize));
+  const targetPage = Math.max(1, Math.min(totalPages, Number(page) || 1));
+  if (targetPage === currentPage && nodes.length) return;
 
-  updateNodeLoadProgress(nodes.length, totalNodeCount, true);
+  const generation = ++scopeLoadGeneration;
+  pageLoadBusy = true;
+  currentPage = targetPage;
+  nodes = [];
+  render();
+  updateNodeLoadProgress(0, totalNodeCount);
+
   try {
-    sessionStorage.setItem("aimili_last_nodes_snapshot", JSON.stringify({
-      nodes: nodes.slice(0, 1000),
-      saved_at: Date.now(),
-      country: activeCountryScope
-    }));
-  } catch (_) {}
+    const offset = (targetPage - 1) * pageSize;
+    const data = await fetchScopedNodePage(offset, pageSize, 12000);
+    if (generation !== scopeLoadGeneration) return;
+    totalNodeCount = Number(data?.total || totalNodeCount || 0);
+    nodeCacheBuilding = !!data?.cache_building;
+    const pageNodes = Array.isArray(data?.nodes) ? data.nodes : [];
+    mergeLoadedNodePage(pageNodes);
+    updateNodeLoadProgress(pageNodes.length, totalNodeCount, true);
+    render();
+  } catch (e) {
+    if (generation !== scopeLoadGeneration) return;
+    console.warn("分页节点读取失败", e);
+    updateNodeLoadProgress(0, totalNodeCount, true);
+    render();
+  } finally {
+    pageLoadBusy = false;
+  }
 }
 
 async function loadScope(country, {preserveState = true} = {}) {
@@ -9827,40 +9827,41 @@ async function loadScope(country, {preserveState = true} = {}) {
 async function load(){
   const generation = ++scopeLoadGeneration;
 
-  // Phase 1: state only. The active connection/switch status is rendered
-  // before any multi-hundred/multi-thousand node payload is requested.
+  // Phase 1: current connection/status MUST render first.
   try {
     const stateData = await fetchUiStateOnly(5000);
     if (stateData?.state) state = stateData.state;
   } catch (e) {
     console.warn("状态读取失败，继续尝试读取节点范围", e);
   }
-
+  if (generation !== scopeLoadGeneration) return;
   render();
 
-  // Phase 2: lightweight global catalog, never the global node rows.
-  try {
-    await refreshCountryCatalog(true);
-  } catch (e) {
+  // Phase 2: country catalog is independent and must never block the first page.
+  const catalogPromise = refreshCountryCatalog(true).catch(e => {
     console.warn("国家目录读取失败", e);
-  }
+    return countryCatalogData || {server_country:"", countries:{}, total_ip_count:0};
+  });
 
-  if (generation !== scopeLoadGeneration) return;
-
-  // Existing installs keep their detected server country in bootstrap_state.
-  // Default scope is that country; only the explicit 全球国家 option loads all.
-  const serverCountry = String(
+  let serverCountry = String(
     state.server_country ||
-    countryCatalogData?.server_country ||
     state.initial_bootstrap_country ||
+    countryCatalogData?.server_country ||
     ""
   ).trim();
 
+  if (!serverCountry) {
+    const catalog = await catalogPromise;
+    if (generation !== scopeLoadGeneration) return;
+    serverCountry = String(catalog?.server_country || "").trim();
+  }
+
+  if (generation !== scopeLoadGeneration) return;
   activeCountryScope = serverCountry;
   const select = $("country_filter");
   if (select && serverCountry) select.value = serverCountry;
 
-  // Phase 3: load only the selected scope.
+  // Phase 3: one scoped page only. Subsequent pages are fetched on demand.
   try {
     await loadScopedNodes(serverCountry, generation);
   } catch (e) {
