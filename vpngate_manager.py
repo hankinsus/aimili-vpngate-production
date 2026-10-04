@@ -7292,6 +7292,16 @@ INDEX_HTML = r"""<!doctype html>
     .rs-item-link .test-btn {
       flex: 0 0 auto;
     }
+    .rs-invite-management-actions {
+      width: 100%;
+      justify-content: flex-end;
+      margin-top: 9px;
+      padding-top: 9px;
+      border-top: 1px solid rgba(148,163,184,.10);
+    }
+    .rs-copy-link-btn {
+      min-width: 92px;
+    }
     .rs-item-actions {
       display: flex;
       align-items: center;
@@ -8646,7 +8656,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   const selectedIpType = $("ip_type_filter")?.value || "";
   const selectedStatus = $("status_filter")?.value || "";
 
-  if (!ignoreCountry && selectedCountry && getNodeCountry(n) !== selectedCountry) return false;
+  if (!ignoreCountry && selectedCountry && getNodeCountry(n) !== translateCountry(selectedCountry)) return false;
   if (selectedProtocol && String(n.protocol || "openvpn").toLowerCase() !== selectedProtocol) return false;
 
   const ipType = String(n.ip_type || "").toLowerCase();
@@ -9148,7 +9158,8 @@ function updateCountryFilter() {
   const globalLabel = "全球国家 · " + total + " IP";
   const options = countries.map(([country, item]) => {
     const count = Number(item?.ip_count || 0);
-    return '<option value="' + esc(country) + '">' + esc(country) + ' · ' + count + ' IP</option>';
+    const label = translateCountry(country) || country;
+    return '<option value="' + esc(country) + '">' + esc(label) + ' · ' + count + ' IP</option>';
   }).join("");
 
   select.innerHTML = '<option value="">' + globalLabel + '</option>' + options;
@@ -9157,7 +9168,7 @@ function updateCountryFilter() {
   renderCustomCountryFilter();
   const normalizedSelected = translateCountry(selectedValue);
   const selectedCountry = countries.find(([country]) =>
-    country === selectedValue || country === normalizedSelected
+    country === selectedValue || translateCountry(country) === normalizedSelected
   );
   if (selectedCountry) {
     select.value = selectedCountry[0];
@@ -9984,9 +9995,13 @@ async function load(){
   ).trim();
 
   if (generation !== scopeLoadGeneration) return;
-  activeCountryScope = serverCountry;
+  const catalogCountries = Object.keys(countryCatalogData?.countries || {});
+  const resolvedServerCountry = serverCountry
+    ? (catalogCountries.find(raw => raw === serverCountry || translateCountry(raw) === translateCountry(serverCountry)) || serverCountry)
+    : "";
+  activeCountryScope = resolvedServerCountry;
   const select = $("country_filter");
-  if (select && serverCountry) select.value = serverCountry;
+  if (select && resolvedServerCountry) select.value = resolvedServerCountry;
 
   // Phase 3: one scoped page only. Subsequent pages are fetched on demand.
   try {
@@ -11390,16 +11405,16 @@ function renderResourceShareInvites(invites) {
             (revoked ? '<span class="rs-direction" style="color:var(--danger);border-color:rgba(244,63,94,.22);background:rgba(244,63,94,.08);">已撤销</span>' : '') +
           '</div>' +
           (inviteUrl
-            ? '<div class="rs-item-link rs-item-link-primary"><span>' + safeUrl + '</span><button class="test-btn" data-invite-url="' + safeUrl + '" onclick="copyResourceShareInviteLink(this.dataset.inviteUrl)">复制链接</button></div>'
+            ? '<div class="rs-item-link rs-item-link-primary"><span>' + safeUrl + '</span><button class="test-btn rs-copy-link-btn" data-invite-url="' + safeUrl + '" onclick="copyResourceShareInviteLink(this.dataset.inviteUrl)">复制链接</button></div>'
             : '<div class="rs-item-meta" style="color:var(--warning);">该历史邀请未能恢复完整链接，请重新创建邀请链接。</div>') +
           '<div class="rs-item-meta">允许来源：' + esc(scope) + ' · 创建时间：' + esc(resourceShareTime(invite.created_at)) + ' · 有效期：永不过期</div>' +
-          (revoked ? '<div class="rs-item-meta" style="color:var(--text-secondary);">此链接已停止授权；永久删除后将不再保留该邀请记录。</div>' : '') +
-        '</div>' +
-        '<div class="rs-item-actions">' +
-          (!revoked ? '<button class="test-btn" onclick="editResourceInvite(\'' + esc(invite.invite_id) + '\')">修改</button>' : '') +
-          (!revoked ? '<button class="test-btn" style="color:var(--warning);border-color:rgba(245,158,11,.3);" onclick="revokeResourceInvite(\'' + esc(invite.invite_id) + '\')">撤销</button>' : '') +
-          '<button class="test-btn" style="color:var(--danger);border-color:rgba(244,63,94,.3);" onclick="deleteResourceInvite(\'' + esc(invite.invite_id) + '\')">永久删除</button>' +
-        '</div>' +
+          (revoked ? '<div class="rs-item-meta" style="color:var(--warning);">此链接已撤销，不再授权新的共享访问。你可以恢复，或永久删除。</div>' : '') +
+          '<div class="rs-item-actions rs-invite-management-actions">' +
+            (!revoked ? '<button class="test-btn" onclick="editResourceInvite(\'' + esc(invite.invite_id) + '\')">修改</button>' : '') +
+            (!revoked ? '<button class="test-btn" style="color:var(--warning);border-color:rgba(245,158,11,.3);" onclick="revokeResourceInvite(\'' + esc(invite.invite_id) + '\')">撤销</button>' : '') +
+            (revoked ? '<button class="test-btn" style="color:var(--primary);border-color:rgba(20,184,166,.3);" onclick="restoreResourceInvite(\'' + esc(invite.invite_id) + '\')">恢复</button>' : '') +
+            (revoked ? '<button class="test-btn" style="color:var(--danger);border-color:rgba(244,63,94,.3);" onclick="deleteResourceInvite(\'' + esc(invite.invite_id) + '\')">永久删除</button>' : '') +
+          '</div>' +
       '</div>' +
     '</div>';
   }).join("");
@@ -11658,9 +11673,21 @@ async function revokeResourceInvite(inviteId) {
   }
 }
 
+async function restoreResourceInvite(inviteId) {
+  if (!inviteId) return;
+  if (!confirm("恢复这条邀请链接？恢复后该链接将重新允许共享服务器访问。")) return;
+  try {
+    await resourceShareAdminPost("restore_invite", {invite_id: inviteId});
+    showResourceShareNotice("邀请链接已恢复。", false);
+    await loadResourceShareStatus();
+  } catch (err) {
+    alert("恢复邀请链接失败：\n" + (err.message || err));
+  }
+}
+
 async function deleteResourceInvite(inviteId) {
   if (!inviteId) return;
-  if (!confirm("确定永久删除这条邀请链接？\n删除会立即停止该链接的授权，并永久删除邀请记录及关联入站共享关系，无法恢复。")) return;
+  if (!confirm("确定永久删除这条已撤销的邀请链接？\n该操作将永久删除邀请记录及关联入站共享关系，无法恢复。")) return;
   try {
     await resourceShareAdminPost("delete_invite", { invite_id: inviteId });
     showResourceShareNotice("邀请链接已永久删除。", false);
@@ -13293,6 +13320,23 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("invite_id 不能为空")
                 result = resource_share.revoke_invite(invite_id)
                 log_to_json("INFO", "Share", f"已撤销资源共享邀请码: {invite_id}")
+                self.send_json(result)
+            except KeyError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND)
+            except ValueError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/resource_share/restore_invite":
+            try:
+                payload = self.read_json_body(max_bytes=8192)
+                invite_id = str(payload.get("invite_id") or "").strip()
+                if not invite_id:
+                    raise ValueError("invite_id 不能为空")
+                result = resource_share.restore_invite(invite_id)
+                log_to_json("INFO", "Share", f"已恢复资源共享邀请码: {invite_id}")
                 self.send_json(result)
             except KeyError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND)
