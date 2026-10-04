@@ -9547,87 +9547,56 @@ let countryPriorityPollBusy = false;
 let manualConnectionUiBusy = false;
 
 let nodesFetchPromise = null;
-let nodeProgressivePromise = null;
-let nodeLoadGeneration = 0;
+let lastGoodNodesState = null;
 let totalNodeCount = 0;
 let nodeCacheBuilding = false;
 
-async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
-  try {
-    const response = await fetch(url, Object.assign({}, options, {
-      cache:"no-store",
-      signal:controller.signal
-    }));
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const error = new Error(
-        response.status === 401
-          ? "管理员会话已失效，请刷新页面并重新登录"
-          : (data.error || ("HTTP " + response.status))
-      );
-      error.status = response.status;
-      throw error;
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchUiStateOnly(timeoutMs = 5000) {
+  return fetchJsonWithTimeout("./api/ui/state", {}, timeoutMs);
 }
 
-let lastGoodNodesState = null;
+async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
+  const params = new URLSearchParams();
+  params.set("offset", String(Math.max(0, Number(offset) || 0)));
+  params.set("limit", String(Math.max(1, Math.min(200, Number(limit) || 100))));
+  if (activeCountryScope) params.set("country", activeCountryScope);
+  const status = $("status_filter")?.value || "";
+  const protocol = $("protocol_filter")?.value || "";
+  const ipType = $("ip_type_filter")?.value || "";
+  if (status) params.set("status", status);
+  if (protocol) params.set("protocol", protocol);
+  if (ipType) params.set("ip_type", ipType);
+  return fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
+}
+
 async function fetchNodesState(timeoutMs = 8000) {
-  if (nodesFetchPromise) return nodesFetchPromise;
-  nodesFetchPromise = Promise.all([
-    fetchJsonWithTimeout("./api/ui/nodes?offset=0&limit=100", {}, timeoutMs),
-    fetchJsonWithTimeout("./api/ui/state", {}, Math.min(timeoutMs, 4000))
-  ]).then(([nodeData, stateData]) => {
-    const data = {
-      nodes: Array.isArray(nodeData?.nodes) ? nodeData.nodes : [],
-      state: stateData?.state || {},
-      total: Number(nodeData?.total || 0),
-      cache_building: !!nodeData?.cache_building
-    };
-    const poolEndpoints = Number(data?.state?.pool_endpoints || data?.state?.pool_servers || 0);
-    totalNodeCount = Math.max(data.total, Number(data?.state?.pool_endpoints || 0), 0);
-    nodeCacheBuilding = data.cache_building;
-    if (data.nodes.length > 0 || poolEndpoints <= 0) {
-      lastGoodNodesState = data;
-    } else if (lastGoodNodesState && Array.isArray(lastGoodNodesState.nodes) && lastGoodNodesState.nodes.length > 0) {
-      data.nodes = lastGoodNodesState.nodes;
-      data.total = lastGoodNodesState.total || data.total;
-    }
-    return data;
-  }).catch(err => {
-    if (lastGoodNodesState) {
-      console.warn("UI 首屏节点读取暂时失败，继续使用最近一次成功快照", err);
-      return lastGoodNodesState;
-    }
-    throw err;
-  }).finally(() => { nodesFetchPromise = null; });
-  return nodesFetchPromise;
-}
-
-async function fetchNodePage(offset, limit = 100, timeoutMs = 10000) {
-  const safeOffset = Math.max(0, Number(offset) || 0);
-  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
-  return fetchJsonWithTimeout(`./api/ui/nodes?offset=${safeOffset}&limit=${safeLimit}`, {}, timeoutMs);
+  const [nodeData, stateData] = await Promise.all([
+    fetchScopedNodePage(0, 100, timeoutMs),
+    fetchUiStateOnly(Math.min(timeoutMs, 4000))
+  ]);
+  return {
+    nodes: Array.isArray(nodeData?.nodes) ? nodeData.nodes : [],
+    state: stateData?.state || {},
+    total: Number(nodeData?.total || 0),
+    cache_building: !!nodeData?.cache_building
+  };
 }
 
 function nodeLoadYield() {
   return new Promise(resolve => {
     if (typeof window.requestIdleCallback === "function") {
-      window.requestIdleCallback(() => resolve(), { timeout: 150 });
+      window.requestIdleCallback(() => resolve(), {timeout: 150});
     } else {
-      setTimeout(resolve, 35);
+      setTimeout(resolve, 20);
     }
   });
 }
 
 function mergeLoadedNodePage(pageNodes) {
   if (!Array.isArray(pageNodes) || !pageNodes.length) return;
-  const incoming = new Map(pageNodes.map((n, idx) => [String(n?.id || n?.pool_endpoint_id || '__page_' + idx), n]));
+  const incoming = new Map(pageNodes.map((n, idx) => [
+    String(n?.id || n?.pool_endpoint_id || "__page_" + idx), n
+  ]));
   nodes = nodes.filter(n => !incoming.has(String(n?.id || n?.pool_endpoint_id || "")));
   nodes.push(...pageNodes);
   stableSortNodes();
@@ -9636,72 +9605,144 @@ function mergeLoadedNodePage(pageNodes) {
 function updateNodeLoadProgress(done, total, finished = false) {
   const el = $("nodes_load_progress");
   if (!el) return;
-  if (!total || total <= done) {
-    el.textContent = total ? `全球节点已全部加载 · 共 ${total} 条` : "";
+  const scopeName = activeCountryScope ? translateCountry(activeCountryScope) : "全球节点";
+  if (!total) {
+    el.textContent = scopeName + "暂无可加载节点";
+    return;
+  }
+  if (done >= total) {
+    el.textContent = activeCountryScope
+      ? scopeName + "节点已全部加载 · 共 " + total + " 条"
+      : "全球节点已全部加载 · 共 " + total + " 条";
     return;
   }
   el.textContent = finished
-    ? `已加载 ${done}/${total} 条`
-    : `首页 ${Math.min(done, 100)} 条已就绪 · 后台继续加载 ${Math.max(0, total - done)} 条`;
+    ? "已加载 " + done + "/" + total + " 条"
+    : scopeName + "首页已就绪 · 后台继续加载 " + Math.max(0, total - done) + " 条";
 }
 
-async function progressivelyLoadNodes(total, generation) {
-  if (nodeProgressivePromise) return nodeProgressivePromise;
-  nodeProgressivePromise = (async () => {
-    let offset = Math.min(100, nodes.length);
-    let emptyBuildingRetries = 0;
+async function loadScopedNodes(country, generation) {
+  const myGeneration = generation;
+  nodes = [];
+  currentPage = 1;
+  totalNodeCount = 0;
+  nodeCacheBuilding = false;
+  activeCountryScope = String(country || "").trim();
+
+  const first = await fetchScopedNodePage(0, 100, 12000);
+  if (myGeneration !== scopeLoadGeneration) return;
+  totalNodeCount = Number(first?.total || 0);
+  nodeCacheBuilding = !!first?.cache_building;
+  const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
+  if (firstNodes.length) mergeLoadedNodePage(firstNodes);
+
+  updateCountryFilter();
+  updateNodeLoadProgress(nodes.length, totalNodeCount);
+  render();
+
+  let offset = nodes.length;
+  while (myGeneration === scopeLoadGeneration && offset < totalNodeCount) {
+    await nodeLoadYield();
+    if (myGeneration !== scopeLoadGeneration) return;
+    const page = await fetchScopedNodePage(offset, 100, 12000);
+    if (myGeneration !== scopeLoadGeneration) return;
+    const pageNodes = Array.isArray(page?.nodes) ? page.nodes : [];
+    if (!pageNodes.length) break;
+    mergeLoadedNodePage(pageNodes);
+    offset += pageNodes.length;
+    totalNodeCount = Number(page?.total || totalNodeCount);
+    nodeCacheBuilding = !!page?.cache_building;
+    updateNodeLoadProgress(nodes.length, totalNodeCount);
+    render();
+  }
+
+  updateNodeLoadProgress(nodes.length, totalNodeCount, true);
+  try {
+    sessionStorage.setItem("aimili_last_nodes_snapshot", JSON.stringify({
+      nodes: nodes.slice(0, 1000),
+      saved_at: Date.now(),
+      country: activeCountryScope
+    }));
+  } catch (_) {}
+}
+
+async function loadScope(country, {preserveState = true} = {}) {
+  const generation = ++scopeLoadGeneration;
+  const scope = String(country || "").trim();
+  activeCountryScope = scope;
+  nodes = [];
+  totalNodeCount = 0;
+  currentPage = 1;
+
+  if (!preserveState) {
     try {
-      while (generation === nodeLoadGeneration && offset < Math.max(total, 0)) {
-        await nodeLoadYield();
-        if (generation !== nodeLoadGeneration) return;
-        const page = await fetchNodePage(offset, 100, 12000);
-        if (generation !== nodeLoadGeneration) return;
+      const stateData = await fetchUiStateOnly(5000);
+      if (stateData?.state) state = stateData.state;
+    } catch (_) {}
+  }
 
-        const pageTotal = Number(page?.total || total || 0);
-        nodeCacheBuilding = !!page?.cache_building;
-        // Once the server-side UI snapshot is fully built, its deduplicated
-        // total is authoritative. While it is still building, keep the larger
-        // pool estimate so the loader waits for the complete snapshot.
-        if (pageTotal > 0 && (!nodeCacheBuilding || pageTotal > totalNodeCount || totalNodeCount === 0)) {
-          totalNodeCount = pageTotal;
-          total = pageTotal;
-        }
+  render();
+  try {
+    await loadScopedNodes(scope, generation);
+  } catch (e) {
+    if (generation !== scopeLoadGeneration) return;
+    console.warn("按范围加载节点失败", e);
+    updateNodeLoadProgress(nodes.length, totalNodeCount, true);
+    render();
+  }
+}
 
-        const pageNodes = Array.isArray(page?.nodes) ? page.nodes : [];
-        if (!pageNodes.length) {
-          if (nodeCacheBuilding && emptyBuildingRetries < 20) {
-            emptyBuildingRetries += 1;
-            await new Promise(r => setTimeout(r, 450));
-            continue;
-          }
-          break;
-        }
-        emptyBuildingRetries = 0;
-        mergeLoadedNodePage(pageNodes);
-        offset += pageNodes.length;
-        updateCountryFilter();
-        updateNodeLoadProgress(nodes.length, totalNodeCount);
-        render();
-      }
-      if (generation === nodeLoadGeneration) {
-        updateNodeLoadProgress(nodes.length, totalNodeCount, true);
-        try {
-          sessionStorage.setItem("aimili_last_nodes_snapshot", JSON.stringify({
-            nodes: nodes.slice(0, 1000),
-            saved_at: Date.now()
-          }));
-        } catch (_) {}
-      }
-    } catch (e) {
-      if (generation === nodeLoadGeneration) {
-        console.warn("后台分批加载节点失败，首屏继续可用", e);
-        updateNodeLoadProgress(nodes.length, totalNodeCount, true);
-      }
-    } finally {
-      if (generation === nodeLoadGeneration) nodeProgressivePromise = null;
-    }
-  })();
-  return nodeProgressivePromise;
+async function load(){
+  const generation = ++scopeLoadGeneration;
+
+  // Phase 1: state only. The active connection/switch status is rendered
+  // before any multi-hundred/multi-thousand node payload is requested.
+  try {
+    const stateData = await fetchUiStateOnly(5000);
+    if (stateData?.state) state = stateData.state;
+  } catch (e) {
+    console.warn("状态读取失败，继续尝试读取节点范围", e);
+  }
+
+  render();
+
+  // Phase 2: lightweight global catalog, never the global node rows.
+  try {
+    await refreshCountryCatalog(true);
+  } catch (e) {
+    console.warn("国家目录读取失败", e);
+  }
+
+  if (generation !== scopeLoadGeneration) return;
+
+  // Existing installs keep their detected server country in bootstrap_state.
+  // Default scope is that country; only the explicit 全球国家 option loads all.
+  const serverCountry = String(
+    state.server_country ||
+    countryCatalogData?.server_country ||
+    state.initial_bootstrap_country ||
+    ""
+  ).trim();
+
+  activeCountryScope = serverCountry;
+  const select = $("country_filter");
+  if (select && serverCountry) select.value = serverCountry;
+
+  // Phase 3: load only the selected scope.
+  try {
+    await loadScopedNodes(serverCountry, generation);
+  } catch (e) {
+    if (generation !== scopeLoadGeneration) return;
+    console.warn("首屏节点范围读取失败", e);
+    updateNodeLoadProgress(nodes.length, totalNodeCount, true);
+    render();
+  }
+
+  if (state.global_pool_refresh_running || state.maintenance_running) {
+    startRefreshPolling();
+  } else if (state.is_connecting || state.manual_switch_active) {
+    startConnectionPolling();
+  }
 }
 
 function refreshButtonBusy(message = "正在后台更新...") {
