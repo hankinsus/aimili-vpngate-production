@@ -2289,8 +2289,12 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 p = str(item.get("protocol") or "").lower()
                 t = str(item.get("transport") or "tcp").lower()
                 pport = int(item.get("port") or 0)
-                if p and pport > 0:
-                    official_protocols.setdefault(p, []).append((t, pport))
+                # L2TP/IPsec is an exception: VPN Gate advertises it as a
+                # supported protocol but there is no TCP/UDP service port to
+                # parse from the table. The adapter handles it as IKE/UDP 500
+                # + NAT-T/UDP 4500 internally, so keep a zero-port marker.
+                if p and (pport > 0 or p == "l2tp-ipsec"):
+                    official_protocols.setdefault(p, []).append((t if p != "l2tp-ipsec" else "udp", pport))
 
         attempts: list[dict[str, Any]] = []
         added_nodes: list[dict[str, Any]] = []
@@ -2316,9 +2320,10 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 })
                 continue
 
-            candidates = offered if official else (
-                [("udp", 0)] if protocol == "l2tp-ipsec" and not port else [(default_transport, int(port))]
-            )
+            if protocol == "l2tp-ipsec":
+                candidates = [("udp", 0)]
+            else:
+                candidates = offered if official else [(default_transport, int(port))]
             protocol_passed = False
             for transport, test_port in candidates:
                 result = _manual_probe_protocol(host, resolved_ip, protocol, int(test_port), transport)
@@ -2350,7 +2355,11 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 })
 
         if successful_protocols:
-            primary = attempts[[str(item.get("protocol") or "").lower() for item in attempts].index(successful_protocols[0])]
+            primary = next(
+                (item for item in reversed(attempts)
+                 if str(item.get("protocol") or "").lower() == successful_protocols[0] and item.get("ok")),
+                {}
+            )
             return {
                 "ok": True,
                 "mode": "direct_connection",
