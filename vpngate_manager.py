@@ -13969,6 +13969,43 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     if not snapshot:
         snapshot = _sanitize_ui_nodes(read_nodes())
 
+    # If the full snapshot is still building, do not expose the tiny legacy
+    # nodes.json fallback as if it were the real scope. Query the persistent
+    # Master Pool directly for the requested page. This makes the default
+    # server-country view usable immediately and also guarantees that explicit
+    # 全球国家 loading can progress past the old 98/100-row ceiling.
+    if building and not ui_nodes_cache:
+        try:
+            scoped_endpoints, scoped_total = node_pool.list_endpoints_scoped(
+                country=country,
+                status=status,
+                protocol=protocol,
+                ip_type=ip_type,
+                offset=offset,
+                limit=limit,
+            )
+            scoped_nodes = []
+            for endpoint in scoped_endpoints:
+                node = protocol_endpoint_to_ui_node(endpoint)
+                if node:
+                    scoped_nodes.append(node)
+            if country:
+                # Keep any manually-added node that is not yet represented by
+                # the persistent pool in the selected country scope.
+                manual = [
+                    n for n in _sanitize_ui_nodes(read_nodes())
+                    if _node_matches_ui_scope(n, country, status, protocol, ip_type)
+                ]
+                seen = {str(n.get("id") or n.get("pool_endpoint_id") or "") for n in scoped_nodes}
+                for n in manual:
+                    key = str(n.get("id") or n.get("pool_endpoint_id") or "")
+                    if key and key not in seen:
+                        scoped_nodes.append(n)
+                        seen.add(key)
+            return _sort_ui_nodes_for_page(scoped_nodes), max(scoped_total, len(scoped_nodes)), True
+        except Exception as exc:
+            log_to_json("WARNING", "Main", f"按范围快速读取 Master Pool 失败，回退 nodes.json: {exc}")
+
     filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type)]
     ordered = _sort_ui_nodes_for_page(filtered)
     total = len(ordered)
