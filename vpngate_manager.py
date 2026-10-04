@@ -12340,7 +12340,11 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif effective_path == "/api/ui/country_catalog":
             try:
-                self.send_json({"ok": True, **_get_ui_country_catalog()})
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                status = str((query.get("status") or [""])[0]).strip().lower()
+                protocol = str((query.get("protocol") or [""])[0]).strip().lower()
+                ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
+                self.send_json({"ok": True, **_get_ui_country_catalog(status, protocol, ip_type)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/protocol_capabilities":
@@ -13792,55 +13796,57 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     return ordered[offset:offset + limit], total, building
 
 
-def _get_ui_country_catalog():
-    """Return global country/IP totals without loading global rows into the UI."""
+def _get_ui_country_catalog(status="", protocol="", ip_type=""):
+    """Return global country/IP totals without transferring global node rows."""
+    status = str(status or "").strip().lower()
+    protocol = str(protocol or "").strip().lower()
+    ip_type = str(ip_type or "").strip().lower()
     try:
-        catalog = node_pool.country_catalog()
+        catalog = node_pool.country_catalog(status=status, protocol=protocol, ip_type=ip_type)
     except Exception:
         catalog = {"total_ip_count": 0, "countries": {}}
 
     countries = dict(catalog.get("countries") or {})
-    # Include manually-added or otherwise non-pool OpenVPN nodes.
+    # Include manually-added OpenVPN nodes that are not yet in Master Pool.
     try:
+        extras: dict[str, set[str]] = {}
         for node in read_nodes():
             ip = str(node.get("ip") or node.get("remote_host") or "").strip()
             country = str(node.get("country") or "").strip()
             if not ip or not country:
                 continue
-            item = countries.setdefault(country, {
-                "ip_count": 0, "server_count": 0, "available_ip_count": 0,
-                "hosting_ip_count": 0, "residential_ip_count": 0, "mobile_ip_count": 0,
-            })
-            # Pool is authoritative for persistent IP counts. Only add an IP
-            # when it is not already represented there.
-            if item.get("_extra_ips") is None:
-                item["_extra_ips"] = set()
-            item["_extra_ips"].add(ip)
-            if str(node.get("probe_status") or "").lower() == "available":
-                item.setdefault("_extra_available_ips", set()).add(ip)
-            if str(node.get("ip_type") or "").lower() == "hosting":
-                item.setdefault("_extra_hosting_ips", set()).add(ip)
-            elif str(node.get("ip_type") or "").lower() == "mobile":
-                item.setdefault("_extra_mobile_ips", set()).add(ip)
-            elif str(node.get("ip_type") or "").lower() == "residential":
-                item.setdefault("_extra_residential_ips", set()).add(ip)
+            if protocol and str(node.get("protocol") or "openvpn").lower() != protocol:
+                continue
+            if status == "available" and str(node.get("probe_status") or "").lower() != "available" and not node.get("active"):
+                continue
+            if status == "testing" and str(node.get("probe_status") or "").lower() != "testing":
+                continue
+            if status == "unavailable" and (str(node.get("probe_status") or "").lower() != "unavailable" or node.get("active")):
+                continue
+            if ip_type and str(node.get("ip_type") or "").lower() != ip_type:
+                continue
+            extras.setdefault(country, set()).add(ip)
+        for country, ips in extras.items():
+            item = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
+            item["ip_count"] = int(item.get("ip_count") or 0) + len(ips)
     except Exception:
         pass
 
-    total_ips = set()
-    for country, item in countries.items():
-        extra = item.pop("_extra_ips", set())
-        item["ip_count"] = int(item.get("ip_count") or 0) + len(extra)
-        item["available_ip_count"] = int(item.get("available_ip_count") or 0) + len(item.pop("_extra_available_ips", set()))
-        item["hosting_ip_count"] = int(item.get("hosting_ip_count") or 0) + len(item.pop("_extra_hosting_ips", set()))
-        item["residential_ip_count"] = int(item.get("residential_ip_count") or 0) + len(item.pop("_extra_residential_ips", set()))
-        item["mobile_ip_count"] = int(item.get("mobile_ip_count") or 0) + len(item.pop("_extra_mobile_ips", set()))
-        total_ips.update(range(int(item["ip_count"])))
+    bootstrap = _read_bootstrap_state()
+    server_country = str(
+        bootstrap.get("local_server_country")
+        or read_json(STATE_FILE, {}).get("initial_bootstrap_country")
+        or ""
+    ).strip()
     return {
-        "total_ip_count": sum(int(x.get("ip_count") or 0) for x in countries.values()),
+        "total_ip_count": sum(int(item.get("ip_count") or 0) for item in countries.values()),
         "countries": countries,
-        "server_country": str(_read_bootstrap_state().get("local_server_country") or "").strip(),
+        "server_country": server_country,
+        "status": status,
+        "protocol": protocol,
+        "ip_type": ip_type,
     }
+
 
 def _get_fast_nodes_state():
     state = read_json(STATE_FILE, {})
