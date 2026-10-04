@@ -1,3 +1,5 @@
+[Reading 287 lines from start (total: 287 lines, 0 remaining)]
+
 
 # Aimili VPN 多协议节点管理系统 🌐
 
@@ -5,9 +7,10 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本项目用于在 Linux VPS 上统一管理 OpenVPN、SoftEther、SSTP、L2TP/IPsec 等多协议节点，提供节点资源采集、持续可用性检测、真实连接延迟、自动故障切换、HTTP/SOCKS5 出站代理与 Web 管理。
 
-
 [🎁 专线流媒体｜顶级三网优化](https://yiy.one/register?codes=98BA33)
+
 [📢 无限流量住宅 IP](https://www.miyaip.com/?invitecode=2955039)
+
 <a name="中文"></a>
 
 ## 中文
@@ -130,7 +133,7 @@ export https_proxy="http://服务器IP:8500"
 
 ### 10. 项目链接清理
 
-仓库文档中的项目入口统一使用可点击 Markdown 链接。已移除与系统功能无关的第三方 VPS/代理购买推广链接，不再保留对应的推荐码、邀请链接和相关商务文案。
+仓库文档中的项目入口统一使用可点击 Markdown 链接。已移除与系统功能无关的第三方 VPS/代理购买推广链接及相关商务文案。
 
 系统运行所需的官方技术资料、开源许可证链接、GitHub 自身链接以及必要的检测服务地址保留不变。
 
@@ -150,13 +153,14 @@ export https_proxy="http://服务器IP:8500"
 
 ### 1. System name and scope
 
-**ILovestudy｜Multi-Protocol Node Management System**
+**Aimili VPN Multi-Protocol Node Management System**
 
 The system is designed for Linux VPS deployments and manages OpenVPN, SoftEther, SSTP, and L2TP/IPsec resources from one web console. It provides resource collection, continuous availability testing, real connection latency, automatic failover, an HTTP/SOCKS5 egress proxy, and web administration.
 
-
 [🎁 Dedicated Streaming Media｜Top 3-Network Optimization](https://yiy.one/register?codes=98BA33)
+
 [📢 Unlimited Traffic Residential IP](https://www.miyaip.com/?invitecode=2955039)
+
 ### 2. Port architecture
 
 | Purpose | Port | Binding |
@@ -268,7 +272,7 @@ Confirm that the domain DNS records point to this server and that public TCP por
 
 ### 10. Repository link cleanup
 
-Project documentation now uses clickable Markdown links for project entry points. Unrelated third-party VPS/proxy promotion links, invitation codes, referral links, and associated promotional copy have been removed.
+Project documentation uses clickable Markdown links for project entry points. Unrelated third-party VPS/proxy promotion links and associated promotional copy have been removed.
 
 Official technical references, open-source license links, required GitHub links, and required network-diagnostic service endpoints remain because they are part of the system or its legal/technical dependencies.
 
@@ -283,3 +287,5 @@ Thank you for using and reporting issues. The official project entry point is [I
 ---
 
 **Version: V1.0.7**
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
