@@ -3265,7 +3265,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
-            node["latency_ms"] = latency
+            node["latency_ms"] = latency if ok else 0
             node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
@@ -4119,9 +4119,10 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
             Path(config_file).write_text(config_text, encoding="utf-8")
         except Exception:
             pass
+    endpoint_status = str(endpoint.get("status") or "").upper()
     real_probe_at = float(endpoint.get("last_success") or 0)
     real_latency = int(endpoint.get("latency_ewma") or 0)
-    is_realtime_verified = real_probe_at > 0 and real_latency > 0
+    is_realtime_verified = endpoint_status in ("HOT", "AVAILABLE") and real_probe_at > 0 and real_latency > 0
     node = {
         "id": node_id,
         "country": endpoint.get("country") or "",
@@ -8582,7 +8583,9 @@ function render(){
 
       const badgeClass = isCurrentlyActive ? 'available' : displayProbeStatus;
       const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(displayProbeStatus);
-      const rowLatencyValue = isCurrentlyActive ? Number(state.proxy_latency_ms || 0) : Number(n.latency_ms || 0);
+      const rowLatencyValue = isCurrentlyActive
+        ? Number(state.proxy_latency_ms || 0)
+        : (n.probe_status === "available" ? Number(n.latency_ms || 0) : 0);
       const latencyClass = getLatencyClass(rowLatencyValue);
       const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}">${rowLatencyValue} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
@@ -13269,30 +13272,43 @@ OPENVPN_LATENCY_MIGRATION_MARKER = DATA_DIR / "openvpn_latency_metrics_v2.json"
 
 def migrate_openvpn_latency_metrics() -> None:
     """Remove persisted OpenVPN latency values that were not proven by a live tunnel."""
-    if OPENVPN_LATENCY_MIGRATION_MARKER.exists():
-        return
     try:
-        reset_count = node_pool.reset_openvpn_latency_metrics()
+        marker = read_json(OPENVPN_LATENCY_MIGRATION_MARKER, {})
+        marker_version = int(marker.get("version") or 0) if isinstance(marker, dict) else 0
+        if marker_version >= 3:
+            return
+
+        reset_count = 0
+        if marker_version < 2:
+            reset_count = node_pool.reset_openvpn_latency_metrics()
+
         nodes = read_nodes()
         changed = 0
         for node in nodes:
             if str(node.get("protocol") or "openvpn").lower() != "openvpn":
                 continue
-            # pool_rehydrated rows can carry the old Master-Pool latency into the UI.
-            # Clear that value unless it has been re-created by the current real probe path.
-            if node.get("pool_rehydrated"):
+
+            status = str(node.get("probe_status") or "not_checked").lower()
+            # Any non-available OpenVPN row must never display or retain a latency.
+            # In particular, failed AUTH/TLS attempts can have an elapsed duration,
+            # but that duration is not a usable latency metric.
+            if status != "available" and parse_int(node.get("latency_ms")) != 0:
                 node["latency_ms"] = 0
-                if not node.get("active"):
-                    node["probe_status"] = "not_checked"
-                    node["probe_message"] = "历史资源已重置，等待真实 OpenVPN 隧道测速"
-                    node["probed_at"] = 0
                 changed += 1
+
+            # pool_rehydrated rows can carry the old Master-Pool latency into the UI.
+            if node.get("pool_rehydrated") and status != "available":
+                node["latency_ms"] = 0
+                node["probe_message"] = "历史资源已重置，等待真实 OpenVPN 隧道测速"
+                node["probed_at"] = 0
+
         if changed:
             write_json(NODES_FILE, sort_all_nodes(nodes))
+
         write_json(
             OPENVPN_LATENCY_MIGRATION_MARKER,
             {
-                "version": 2,
+                "version": 3,
                 "completed_at": time.time(),
                 "db_rows_reset": reset_count,
                 "nodes_reset": changed,
@@ -13301,7 +13317,7 @@ def migrate_openvpn_latency_metrics() -> None:
         log_to_json(
             "INFO",
             "Main",
-            f"已完成 OpenVPN 延迟可信度迁移：重置 {reset_count} 个 Master Pool 端点、{changed} 个本地缓存节点；后续延迟只采用真实隧道测速。",
+            f"已完成 OpenVPN 延迟可信度迁移：重置 {reset_count} 个 Master Pool 端点、清理 {changed} 个非可用节点的延迟值；后续延迟只采用真实隧道测速。",
         )
     except Exception as exc:
         log_to_json("ERROR", "Main", f"OpenVPN 延迟可信度迁移失败：{exc}")
