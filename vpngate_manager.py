@@ -370,7 +370,10 @@ def check_github_update() -> dict[str, Any]:
     except Exception:
         pass
 
-    has_update = relation == "remote_ahead"
+    # 生产服务器以 GitHub main 为唯一代码源。只要远端提交不同且不是
+    # “服务器单独领先”的情形，就允许从 GitHub 正式版同步，解决服务器与
+    # GitHub 历史提交号不同导致“已分叉、无法更新”的问题。
+    has_update = relation in ("remote_ahead", "diverged", "different") and remote != local
     result = {
         "ok": True,
         "repository": GITHUB_REPOSITORY,
@@ -386,10 +389,9 @@ def check_github_update() -> dict[str, Any]:
     if relation == "local_ahead":
         result["message"] = "当前服务器版本高于 GitHub 正式版，不执行降级更新。"
     elif relation == "diverged":
-        result["ok"] = False
-        result["error"] = "当前服务器与 GitHub 正式版 main 已分叉，为避免误覆盖本地版本，暂不自动更新。"
+        result["message"] = "服务器与 GitHub 正式版存在本地提交差异；更新时将以 GitHub main 为准同步。"
     elif relation == "different":
-        result["message"] = "已获取 GitHub 远端版本，但暂时无法确认提交关系；为避免误降级，不执行自动更新。"
+        result["message"] = "已获取 GitHub 正式版，将以 GitHub main 为准同步。"
     return result
 
 
@@ -7714,8 +7716,8 @@ INDEX_HTML = r"""<!doctype html>
 
       <form id="network_form" onsubmit="saveNetwork(event)">
         <div class="form-group" style="margin-bottom: 16px;">
-          <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 八合一端口</label>
-          <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" value="8500" disabled title="八合一端口固定为 8500">
+          <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理端口</label>
+          <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" value="8500" disabled title="代理端口固定为 8500">
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
@@ -12858,10 +12860,10 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     new_proxy_port_int = int(new_proxy_port)
                 except (TypeError, ValueError):
-                    self.send_json({"ok": False, "error": "HTTP/SOCKS5 八合一端口固定为 8500"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "HTTP/SOCKS5 代理端口固定为 8500"}, HTTPStatus.BAD_REQUEST)
                     return
                 if new_proxy_port_int != 8500:
-                    self.send_json({"ok": False, "error": "HTTP/SOCKS5 八合一端口固定为 8500"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "HTTP/SOCKS5 代理端口固定为 8500"}, HTTPStatus.BAD_REQUEST)
                     return
 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
@@ -12879,7 +12881,7 @@ class Handler(BaseHTTPRequestHandler):
                 fixed_node_id = current_fixed_node_id(ui_cfg) if routing_mode == "fixed_ip" else ""
 
                 if new_proxy_port_int != 8500:
-                    self.send_json({"ok": False, "error": "HTTP/SOCKS5 八合一端口固定为 8500"}, HTTPStatus.BAD_REQUEST)
+                    self.send_json({"ok": False, "error": "HTTP/SOCKS5 代理端口固定为 8500"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_mode == "fixed_ip" and not fixed_node_id:
                     self.send_json({"ok": False, "error": "启用固定 IP 前，请先连接一个要锁定的节点"}, HTTPStatus.BAD_REQUEST)
