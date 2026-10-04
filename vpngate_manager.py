@@ -8956,28 +8956,39 @@ function updateCountryFilter() {
   if (!select) return;
   const selectedValue = String(select.value || "");
   const catalog = countryCatalogData || {countries:{}, total_ip_count:0};
-  const countries = Object.entries(catalog.countries || {})
-    .filter(([, item]) => Number(item?.ip_count || 0) > 0)
-    .sort((a,b) => {
-      const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
-      return diff || a[0].localeCompare(b[0], "zh-CN");
-    });
+  const merged = new Map();
 
-  const total = Number(catalog.total_ip_count || 0);
-  const globalLabel = activeCountryScope
-    ? "全球国家 · " + total + " IP"
-    : "全球国家 · " + total + " IP";
+  Object.entries(catalog.countries || {}).forEach(([rawCountry, item]) => {
+    const country = translateCountry(rawCountry) || rawCountry;
+    const current = merged.get(country) || {ip_count:0, server_count:0};
+    current.ip_count += Number(item?.ip_count || 0);
+    current.server_count += Number(item?.server_count || 0);
+    merged.set(country, current);
+  });
 
+  const countries = Array.from(merged.entries()).sort((a,b) => {
+    const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
+    return diff || a[0].localeCompare(b[0], "zh-CN");
+  });
+
+  const total = countries.reduce((sum, [, item]) => sum + Number(item?.ip_count || 0), 0);
+  const globalLabel = "全球国家 · " + total + " IP";
   const options = countries.map(([country, item]) => {
     const count = Number(item?.ip_count || 0);
     return '<option value="' + esc(country) + '">' + esc(country) + ' · ' + count + ' IP</option>';
   }).join("");
 
   select.innerHTML = '<option value="">' + globalLabel + '</option>' + options;
-  if (selectedValue && countries.some(([country]) => country === selectedValue)) {
-    select.value = selectedValue;
-  } else if (activeCountryScope && countries.some(([country]) => country === activeCountryScope)) {
-    select.value = activeCountryScope;
+  const normalizedSelected = translateCountry(selectedValue);
+  const selectedCountry = countries.find(([country]) =>
+    country === selectedValue || country === normalizedSelected
+  );
+  if (selectedCountry) {
+    select.value = selectedCountry[0];
+  } else if (activeCountryScope) {
+    const scopeLabel = translateCountry(activeCountryScope);
+    const scopeCountry = countries.find(([country]) => country === scopeLabel);
+    select.value = scopeCountry ? scopeCountry[0] : "";
   } else {
     select.value = "";
   }
