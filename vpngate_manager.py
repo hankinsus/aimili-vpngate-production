@@ -164,7 +164,7 @@ ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.7"
+APP_VERSION = "V1.0.8"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -998,7 +998,8 @@ def clear_active_connection_state(message: str) -> None:
             item["active"] = False
         write_json(NODES_FILE, nodes)
     set_state(
-        active_openvpn_node_id="",
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]        active_openvpn_node_id="",
         active_pool_endpoint_id="",
         active_tunnel_protocol="",
         active_tunnel_interface="",
@@ -1998,7 +1999,8 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         protocol_discovery_lock.release()
 
 
-def parse_manual_endpoint(value: str) -> tuple[str, int]:
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]def parse_manual_endpoint(value: str) -> tuple[str, int]:
     """Parse a manual VPN Gate target.
     
     The port is optional for VPN Gate hostnames. When it is omitted, the
@@ -2914,12 +2916,18 @@ def routing_web_health_rank(endpoint: dict[str, Any]) -> int:
 def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
     if ui_cfg.get("routing_mode") == "fixed_ip":
         return 99
+
+    # All routing preferences are soft priorities. The ordering is deliberate:
+    # 1) server-local country, 2) favorite/custom preference group,
+    # 3) mobile -> residential -> hosting -> proxy/other,
+    # 4) >=500 Mbps -> >=50 Mbps -> slower fallback.
+    # Latency and real web usability remain the final service-quality sort keys.
     target_country = routing_target_country(ui_cfg)
-    country_rank = 0 if target_country and normalized_country_name(endpoint.get("country")) == target_country else 2
+    country_rank = 0 if target_country and normalized_country_name(endpoint.get("country")) == target_country else 1
     favorite_rank = routing_favorite_rank(endpoint, ui_cfg)
     ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
     speed_gate = routing_speed_gate(endpoint)
-    return country_rank * 1000 + favorite_rank * 100 + ip_rank * 20 + speed_gate * 5
+    return country_rank * 10000 + favorite_rank * 1000 + ip_rank * 100 + speed_gate * 10
 
 def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple:
     latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 999999)
@@ -2931,9 +2939,12 @@ def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tup
     return (
         routing_preference_tier(endpoint, ui_cfg),
         routing_speed_gate(endpoint),
-        -speed,
+        # Within the same country/IP/speed tier, measured latency is preferred.
         latency,
+        # Real web usability is the next quality gate; raw speed is only a
+        # tie-breaker after the service is already in the preferred speed tier.
         routing_web_health_rank(endpoint),
+        -speed,
         -float(endpoint.get("last_success") or 0),
         jitter,
         -success_streak,
@@ -2989,7 +3000,8 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
     try:
         for endpoint in node_pool.list_endpoints(limit=5000):
             eid = str(endpoint.get("endpoint_id") or "")
-            status = str(endpoint.get("status") or "").upper()
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            status = str(endpoint.get("status") or "").upper()
             protocol = str(endpoint.get("protocol") or "").lower()
             if (
                 eid
@@ -3989,7 +4001,8 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         else:
             error_message = str(res.get("error") or "网页出口检测失败")
             set_state(proxy_ok=False, proxy_ip="-", proxy_latency_ms=0, proxy_error=error_message)
-            node["probe_status"] = "unavailable"
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            node["probe_status"] = "unavailable"
             node["probe_message"] = error_message
             for item in nodes:
                 item["active"] = False
@@ -4989,7 +5002,8 @@ def collector_loop() -> None:
             err_msg = f"周期节点同步任务执行异常: {exc}"
             print(f"[错误] {err_msg}", flush=True)
             log_to_json("ERROR", "Main", err_msg)
-            set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
 
         if not active_tunnel_running() and not success:
             sleep_time = 30
@@ -5989,7 +6003,8 @@ INDEX_HTML = r"""<!doctype html>
       .footer-brand-version { font-size: 11px; }
     }
 
-    .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]    .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
     .official-links-title { margin-bottom: 12px; color: var(--text-primary); font-size: 14px; font-weight: 700; }
     .official-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
     .official-link { display:flex; align-items:center; justify-content:center; min-height:38px; padding:8px 10px; border-radius:9px; border:1px solid rgba(255,255,255,.08); background:rgba(255,255,255,.035); color:#dbe4ea; text-decoration:none; font-size:12px; font-weight:600; transition:all .2s ease; }
@@ -6989,7 +7004,8 @@ INDEX_HTML = r"""<!doctype html>
       scrollbar-gutter: stable;
       scrollbar-width: thin;
       scrollbar-color: rgba(20,184,166,.30) transparent;
-      animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]      animation: modalFadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
     .modal-content {
@@ -7055,6 +7071,22 @@ INDEX_HTML = r"""<!doctype html>
     .rs-close-btn:hover {
       color: var(--text-primary);
       background: rgba(255,255,255,.06);
+    }
+    .rs-share-notice {
+      margin-bottom: 14px;
+      padding: 11px 13px;
+      border-radius: 10px;
+      border: 1px solid rgba(20,184,166,.22);
+      background: rgba(20,184,166,.07);
+      color: #99f6e4;
+      font-size: 12px;
+      line-height: 1.55;
+      word-break: break-word;
+    }
+    .rs-share-notice.error {
+      border-color: rgba(244,63,94,.24);
+      background: rgba(244,63,94,.07);
+      color: #fda4af;
     }
     .rs-local-card,
     .rs-form-card,
@@ -7234,6 +7266,28 @@ INDEX_HTML = r"""<!doctype html>
       font: 700 13px/1.2 Consolas, monospace;
       letter-spacing: .45px;
       overflow-wrap: anywhere;
+    }
+    .rs-item-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 7px;
+      padding: 7px 9px;
+      border: 1px solid rgba(20,184,166,.18);
+      border-radius: 8px;
+      background: rgba(20,184,166,.045);
+      color: #99f6e4;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .rs-item-link > span {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }
+    .rs-item-link .test-btn {
+      flex: 0 0 auto;
     }
     .rs-item-actions {
       display: flex;
@@ -7707,9 +7761,9 @@ INDEX_HTML = r"""<!doctype html>
 
     <select id="ip_type_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="">所有IP类型</option>
+      <option value="mobile">移动网</option>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
-      <option value="mobile">移动网</option>
     </select>
     <div id="ip_type_filter_widget" class="toolbar-custom-select" data-filter-id="ip_type_filter" aria-label="IP 类型筛选">
       <button id="ip_type_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -7773,7 +7827,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <!-- 分页控制栏 -->
-    <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: flex-start; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
+    <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
         <span id="pool_summary" style="margin-left: 14px; color: var(--text-secondary);">Master Pool：—</span>
@@ -7951,7 +8005,8 @@ INDEX_HTML = r"""<!doctype html>
         </h3>
         <button type="button" onclick="closeVpsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]        </button>
       </div>
 
       <div class="official-links" style="margin-top: 16px;">
@@ -8084,49 +8139,38 @@ INDEX_HTML = r"""<!doctype html>
         <button type="button" onclick="closeResourceShareModal()" class="rs-close-btn">✕</button>
       </div>
 
+      <div id="rs_share_notice" class="rs-share-notice" style="display:none;"></div>
+
       <div class="rs-local-card">
         <div class="rs-card-label">本机资源接口地址</div>
         <div class="rs-local-row">
           <input id="rs_local_url" class="input-field rs-local-input" readonly value="/resource-share">
           <button type="button" class="btn-primary rs-copy-btn" onclick="copyResourceShareUrl()">复制地址</button>
         </div>
-        <div class="rs-help">对方使用“本机地址 + 邀请码”即可加入。邀请码决定谁可以访问本机资源。</div>
+        <div class="rs-help">生成邀请码后会自动得到完整邀请链接；对方只需粘贴这一条链接即可加入。</div>
       </div>
 
       <div class="rs-action-grid">
         <section class="rs-form-card">
           <div class="rs-step-title"><span>①</span> 创建邀请码</div>
-          <div class="rs-help rs-form-help">邀请码不会自动过期，可以创建多个；需要停止某台服务器访问时，直接撤销对应邀请码。</div>
+          <div class="rs-help rs-form-help">邀请码长期有效。生成后会自动组合成本机 HTTPS 地址 + RS 邀请码，直接复制整条邀请链接给对方即可。</div>
           <div class="rs-form-grid">
             <input id="rs_invite_peer_name" class="input-field" placeholder="邀请服务器名称，例如 日本资源库">
-            <input id="rs_invite_allowed_cidrs" class="input-field" placeholder="对方 IP/CIDR，例如 1.2.3.4/32；全部 IPv4：0.0.0.0/0">
-            <div class="rs-help">单个 IP 自动转换为 /32 或 /128；全部 IPv6 可填写 ::/0。</div>
-            <button id="rs_generate_btn" type="button" class="btn-primary rs-full-btn" onclick="generateResourceInvite()">生成邀请码</button>
+            <input id="rs_invite_allowed_cidrs" class="input-field" value="0.0.0.0/0, ::/0" placeholder="允许来源（可选，默认 IPv4/IPv6 全部允许）">
+            <div class="rs-help">默认允许 IPv4 / IPv6 来源；如需限制来源，可填写单个 IP 或 CIDR。</div>
+            <button id="rs_generate_btn" type="button" class="btn-primary rs-full-btn" onclick="generateResourceInvite()">生成邀请链接</button>
           </div>
         </section>
 
         <section class="rs-form-card">
-          <div class="rs-step-title"><span>②</span> 添加共享服务器</div>
-          <div class="rs-help rs-form-help">这里填写对方服务器 IP/域名 + 对方给你的邀请码。系统自动判断最终是“单向共享”还是“双方双向共享”。</div>
+          <div class="rs-step-title"><span>②</span> 添加公共服务器</div>
+          <div class="rs-help rs-form-help">把对方提供的“邀请链接”直接粘贴到这里即可。系统自动识别 HTTPS 地址和 RS 邀请码，无需再填写 IP、域名、邀请码或同步参数。</div>
           <div class="rs-form-grid">
-            <input id="rs_remote_url" class="input-field" placeholder="对方服务器 IP 或域名，例如 203.0.113.10">
-            <input id="rs_invite_input" class="input-field" placeholder="对方邀请码 RS-XXXX-XXXX-XXXX-XXXX">
-            <div class="rs-sync-row">
-              <input id="rs_sync_interval_value" class="input-field" type="number" min="1" max="84" value="6" placeholder="同步周期">
-              <select id="rs_sync_interval_unit" aria-hidden="true" tabindex="-1" style="display:none;">
-                <option value="hours">小时</option>
-                <option value="days">天</option>
-                <option value="weeks">周</option>
-              </select>
-              <div id="rs_sync_interval_unit_widget" class="toolbar-custom-select unified-select unified-select-sync" data-unified-select-id="rs_sync_interval_unit" aria-label="同步周期单位">
-                <button id="rs_sync_interval_unit_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-                  <span id="rs_sync_interval_unit_label" class="toolbar-custom-select-label">小时</span>
-                  <span class="toolbar-custom-select-arrow">⌄</span>
-                </button>
-                <div id="rs_sync_interval_unit_menu" class="toolbar-custom-select-menu" role="listbox"></div>
-              </div>
-            </div>
-            <div class="rs-help">自动同步仅用于本机拉取对方资源；“立即同步”始终可以手动执行。</div>
+            <input id="rs_invite_link_input" class="input-field" placeholder="粘贴邀请链接，例如 https://example.com:8443/resource-share/RS-XXXX-XXXX-XXXX-XXXX">
+            <input id="rs_remote_url" type="hidden" value="">
+            <input id="rs_invite_input" type="hidden" value="">
+            <input id="rs_sync_interval_value" type="hidden" value="6">
+            <select id="rs_sync_interval_unit" aria-hidden="true" tabindex="-1" style="display:none;"><option value="hours">小时</option></select>
             <button id="rs_join_btn" type="button" class="btn-primary rs-full-btn" onclick="joinResourcePeer()">添加并立即同步</button>
           </div>
         </section>
@@ -8337,7 +8381,7 @@ INDEX_HTML = r"""<!doctype html>
             <path d="M48 13 73 23v20c0 17-9 29-25 39-16-10-25-22-25-39V23l25-10Z"
                   fill="url(#brandInner)" stroke="#22d3ee" stroke-width="1.5" opacity=".98"/>
             <!-- Centered chip, aligned to the shield's visual center. -->
-            <g transform="translate(48 49) scale(.82)">
+            <g transform="translate(48 46) scale(.68)">
               <rect x="-19" y="-19" width="38" height="38" rx="8" fill="url(#brandMetal)" stroke="#f8fafc" stroke-width="1.5"/>
               <rect x="-11" y="-11" width="22" height="22" rx="4" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
               <path d="M-6 -5h12M-6 0h12M-6 5h12" stroke="#78350f" stroke-width="1.6" stroke-linecap="round"/>
@@ -8962,7 +9006,8 @@ let activeCountryScope = "";
 let scopeLoadGeneration = 0;
 
 function currentFilterKey() {
-  return [
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]  return [
     $("status_filter")?.value || "",
     $("protocol_filter")?.value || "",
     $("ip_type_filter")?.value || ""
@@ -9843,18 +9888,16 @@ async function load(){
     return countryCatalogData || {server_country:"", countries:{}, total_ip_count:0};
   });
 
-  let serverCountry = String(
+  // Never wait for the country catalog before rendering the first node page.
+  // If the fast state endpoint already knows the server country, use it;
+  // otherwise start from the global scope and let the catalog arrive in the
+  // background. This guarantees connection state -> node list -> filters.
+  const serverCountry = String(
     state.server_country ||
     state.initial_bootstrap_country ||
     countryCatalogData?.server_country ||
     ""
   ).trim();
-
-  if (!serverCountry) {
-    const catalog = await catalogPromise;
-    if (generation !== scopeLoadGeneration) return;
-    serverCountry = String(catalog?.server_country || "").trim();
-  }
 
   if (generation !== scopeLoadGeneration) return;
   activeCountryScope = serverCountry;
@@ -9964,7 +10007,8 @@ async function connectNode(id){
   state.manual_switch_active = true;
   state.manual_switch_started_at = Date.now() / 1000;
   state.pending_connection_id = id;
-  state.pending_connection_protocol = selectedNode?.protocol || "";
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]  state.pending_connection_protocol = selectedNode?.protocol || "";
   state.pending_connection_country = selectedNode?.country || "";
   state.active_node_latency = "正在切换";
   state.manual_switch_message = "正在发送连接请求…";
@@ -10286,10 +10330,17 @@ async function loadLegacy(){
 }
 async function applyNodeFilterChange() {
   currentPage = 1;
+
+  // Any non-country filter inherits the currently selected country scope.
+  // If that country has no rows under the new filter, the catalog clears it
+  // and the query automatically falls back to the global scope.
+  activeCountryScope = String($("country_filter")?.value || "").trim();
   try {
     await refreshCountryCatalog(true);
   } catch (_) {}
-  const country = activeCountryScope;
+
+  const country = String($("country_filter")?.value || "").trim();
+  activeCountryScope = country;
   await loadScope(country, {preserveState:true});
 }
 
@@ -10957,7 +11008,8 @@ async function saveNetwork(e) {
   e.preventDefault();
   const errorDivEl = $("network_error");
   const successDiv = $("network_success");
-  const submitBtn = $("network_submit_btn");
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]  const submitBtn = $("network_submit_btn");
 
   errorDivEl.style.display = "none";
   successDiv.style.display = "none";
@@ -11226,6 +11278,7 @@ function renderResourceShareInvites(invites) {
   }
   box.innerHTML = invites.map(function(invite) {
     const code = String(invite.invite_code || "");
+    const inviteUrl = String(invite.invite_url || "");
     const linked = Number(invite.linked_peer_count || 0);
     const scope = Array.isArray(invite.allowed_cidrs) ? invite.allowed_cidrs.join(", ") : "—";
     const legacy = invite.legacy_code_unavailable || !code;
@@ -11239,7 +11292,8 @@ function renderResourceShareInvites(invites) {
           '</div>' +
           (legacy
             ? '<div class="rs-item-meta" style="color:var(--warning);">历史邀请码未保存明文，不能在页面恢复显示；可以重新创建一个长期邀请码。</div>'
-            : '<div class="rs-item-code">' + esc(code) + '</div>') +
+            : '<div class="rs-item-code">' + esc(code) + '</div>' +
+              (inviteUrl ? '<div class="rs-item-link"><span>' + esc(inviteUrl) + '</span><button class="test-btn" data-invite-url="' + esc(inviteUrl) + '" onclick="copyResourceShareInviteLink(this.dataset.inviteUrl)">复制链接</button></div>' : '')) +
           '<div class="rs-item-meta">允许来源：' + esc(scope) + ' · 创建时间：' + esc(resourceShareTime(invite.created_at)) + ' · 有效期：永不过期' + (invite.revoked ? ' · <span style="color:var(--danger);">已撤销</span>' : '') + '</div>' +
           (invite.revoked ? '<div class="rs-item-meta" style="color:var(--text-secondary);">此邀请码已停止授权。删除后将不再保留该邀请码记录。</div>' : '') +
         '</div>' +
@@ -11314,14 +11368,27 @@ function copyResourceShareCode(code) {
   );
 }
 
+function showResourceShareNotice(message, isError=false) {
+  const box = $("rs_share_notice");
+  if (!box) return;
+  box.className = "rs-share-notice" + (isError ? " error" : "");
+  box.textContent = String(message || "");
+  box.style.display = "block";
+}
+
+function copyResourceShareInviteLink(url) {
+  const value = String(url || "");
+  if (!value) return;
+  navigator.clipboard?.writeText(value).then(
+    () => showResourceShareNotice("邀请链接已复制：\n" + value),
+    () => showResourceShareNotice("复制失败，请手动复制：\n" + value, true)
+  );
+}
+
 async function generateResourceInvite() {
   const btn = $("rs_generate_btn");
   const peerName = ($("rs_invite_peer_name")?.value || "").trim();
-  const cidrs = ($("rs_invite_allowed_cidrs")?.value || "").trim();
-  if (!cidrs) {
-    alert("请填写允许 IP/CIDR，例如 1.2.3.4/32；全部 IPv4 可填写 0.0.0.0/0。");
-    return;
-  }
+  const cidrs = ($("rs_invite_allowed_cidrs")?.value || "0.0.0.0/0, ::/0").trim();
   try {
     if (btn) { btn.disabled = true; btn.textContent = "正在创建..."; }
     const data = await resourceShareAdminPost("invite", {
@@ -11329,13 +11396,18 @@ async function generateResourceInvite() {
       allowed_cidrs: cidrs
     });
     if ($("rs_invite_peer_name")) $("rs_invite_peer_name").value = "";
-    if ($("rs_invite_allowed_cidrs")) $("rs_invite_allowed_cidrs").value = "";
     await loadResourceShareStatus();
-    alert("邀请码已创建并保存为长期邀请码：\n\n" + (data.invite_code || "—"));
+    const inviteUrl = String(data.invite_url || "").trim();
+    if (inviteUrl) {
+      try { await navigator.clipboard?.writeText(inviteUrl); } catch (_) {}
+      showResourceShareNotice("邀请链接已生成并复制：\n" + inviteUrl);
+    } else {
+      showResourceShareNotice("邀请码已创建：\n" + (data.invite_code || "—"));
+    }
   } catch (err) {
-    alert("创建邀请码失败：\n" + (err.message || err));
+    showResourceShareNotice("创建邀请码失败：\n" + (err.message || err), true);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "生成邀请码"; }
+    if (btn) { btn.disabled = false; btn.textContent = "生成邀请链接"; }
   }
 }
 
@@ -11623,37 +11695,56 @@ function normalizeResourceRemoteInput(value) {
   }
 }
 
-async function joinResourcePeerLegacy() {
+function parseResourceShareInviteLink(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return {remoteUrl:"", inviteCode:""};
+  const match = raw.match(/RS-[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}/i);
+  if (!match) return {remoteUrl:"", inviteCode:""};
+
+  const inviteCode = match[0].toUpperCase();
+  let remoteUrl = "";
+  try {
+    const urlText = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : "https://" + raw;
+    const parsed = new URL(urlText);
+    const marker = parsed.pathname.toUpperCase().indexOf("/" + inviteCode);
+    if (marker >= 0) {
+      parsed.pathname = parsed.pathname.slice(0, marker) || "/resource-share";
+    } else if (!parsed.pathname || parsed.pathname === "/") {
+      parsed.pathname = "/resource-share";
+    }
+    remoteUrl = parsed.toString().replace(/\/$/, "");
+  } catch (_) {
+    remoteUrl = "";
+  }
+  return {remoteUrl, inviteCode};
+}
+
+async function joinResourcePeer() {
   const btn = $("rs_join_btn");
-  const remoteUrl = normalizeResourceRemoteInput($("rs_remote_url").value);
-  const invite = ($("rs_invite_input").value || "").trim();
-  const syncMode = $("rs_sync_mode").value || "pull";
-  const intervalValue = Number($("rs_sync_interval_value").value || 6);
-  const intervalUnit = $("rs_sync_interval_unit").value || "hours";
-  if (!remoteUrl || !invite) {
-    alert("请填写对方服务器 IP/域名和邀请码。");
+  const parsed = parseResourceShareInviteLink($("rs_invite_link_input")?.value || "");
+  if (!parsed.remoteUrl || !parsed.inviteCode) {
+    showResourceShareNotice("请粘贴完整的邀请链接，例如 https://example.com:8443/resource-share/RS-XXXX-XXXX-XXXX-XXXX", true);
     return;
   }
   try {
     if (btn) { btn.disabled = true; btn.textContent = "正在加入并同步..."; }
     const data = await resourceShareAdminPost("join", {
-      remote_url: remoteUrl,
-      invite_code: invite,
-      sync_mode: syncMode,
-      sync_interval_value: intervalValue,
-      sync_interval_unit: intervalUnit
+      remote_url: parsed.remoteUrl,
+      invite_code: parsed.inviteCode,
+      sync_interval_value: 6,
+      sync_interval_unit: "hours"
     });
     const first = data.first_sync || {};
-    alert(first.ok
+    showResourceShareNotice(first.ok
       ? "资源共享已建立，首次同步成功，共导入 " + (first.imported || first.received || 0) + " 条资源。"
-      : "资源共享已建立，但首次同步失败：\n" + (first.error || "远端暂不可用") + "\n可以点击“同步”重新尝试。");
-    $("rs_invite_input").value = "";
+      : "资源共享已建立，但首次同步失败：\n" + (first.error || "远端暂不可用") + "\n可以点击“同步”重新尝试。", !first.ok);
+    if ($("rs_invite_link_input")) $("rs_invite_link_input").value = "";
     await loadResourceShareStatus();
     await load();
   } catch (err) {
-    alert("加入共享失败：\n" + (err.message || err));
+    showResourceShareNotice("加入共享失败：\n" + (err.message || err), true);
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "加入并立即同步"; }
+    if (btn) { btn.disabled = false; btn.textContent = "添加并立即同步"; }
   }
 }
 
@@ -11918,7 +12009,8 @@ def local_proxy_port_reachable(timeout: float = 0.4) -> bool:
             s.settimeout(timeout)
             s.connect((target, LOCAL_PROXY_PORT))
             return True
-        except Exception:
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]        except Exception:
             pass
         finally:
             if s is not None:
@@ -12432,6 +12524,21 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 })
                 return True
+
+            # A generated invitation link is directly visitable. It exposes no
+            # resource data or token; it only confirms the invitation code and
+            # tells the recipient to paste this same link into the admin UI.
+            if effective_path.startswith("/resource-share/"):
+                code = urllib.parse.unquote(effective_path.rsplit("/", 1)[-1]).strip().upper()
+                if re.fullmatch(r"RS-[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}", code):
+                    self.send_json({
+                        "ok": True,
+                        "service": "AimiliVPN Resource Share Invitation",
+                        "invite_code": code,
+                        "invite_url": self.resource_share_local_url().rstrip("/") + "/" + code,
+                        "message": "这是资源共享邀请链接。请在 AimiliVPN 管理后台“资源共享 → 添加公共服务器”中直接粘贴此完整链接。",
+                    })
+                    return True
             if effective_path == "/resource-share/ping":
                 self.send_json(resource_share.ping(self.headers, self.client_address))
                 return True
@@ -12757,6 +12864,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 status = resource_share.status()
                 status["local_url"] = self.resource_share_local_url()
+                invite_base = str(status["local_url"] or "").rstrip("/")
+                for invite in status.get("invites", []):
+                    code = str(invite.get("invite_code") or "").strip()
+                    if code and not invite.get("legacy_code_unavailable"):
+                        invite["invite_url"] = invite_base + "/" + code
                 status["pool"] = node_pool.stats()
                 self.send_json(status)
             except Exception as exc:
@@ -12898,7 +13010,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(check_github_update())
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
-            return
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]            return
 
         if effective_path == "/api/github_update":
             try:
@@ -12932,8 +13045,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body(max_bytes=8192)
                 result = resource_share.create_invite(
                     peer_name=str(payload.get("peer_name") or "").strip(),
-                    allowed_cidrs=payload.get("allowed_cidrs", ""),
+                    allowed_cidrs=payload.get("allowed_cidrs", "0.0.0.0/0, ::/0"),
                 )
+                invite_code = str(result.get("invite_code") or "").strip()
+                if invite_code:
+                    result["invite_url"] = self.resource_share_local_url().rstrip("/") + "/" + invite_code
                 self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -13895,7 +14011,8 @@ def _read_bootstrap_state():
 
 def _write_bootstrap_state(**updates):
     state = _read_bootstrap_state()
-    state.update(updates)
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]    state.update(updates)
     write_json(BOOTSTRAP_STATE_FILE, state)
     return state
 
@@ -14830,3 +14947,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
