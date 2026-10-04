@@ -208,8 +208,10 @@ if ! grep -q '^LOCAL_PROXY_HOST=' "$PROXY_ENV_FILE"; then
     echo 'LOCAL_PROXY_HOST="127.0.0.1"' >> "$PROXY_ENV_FILE"
 fi
 if ! grep -q '^LOCAL_PROXY_PORT=' "$PROXY_ENV_FILE"; then
-    echo 'LOCAL_PROXY_PORT="8500"
-LOCAL_PROXY_DEFAULT_SCHEME="socks5"' >> "$PROXY_ENV_FILE"
+    echo 'LOCAL_PROXY_PORT="8500"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^LOCAL_PROXY_DEFAULT_SCHEME=' "$PROXY_ENV_FILE"; then
+    echo 'LOCAL_PROXY_DEFAULT_SCHEME="socks5"' >> "$PROXY_ENV_FILE"
 fi
 chmod 600 "$PROXY_ENV_FILE"
 echo -e "${GREEN}  -> 本地代理默认: SOCKS5 127.0.0.1:8500${PLAIN}"
