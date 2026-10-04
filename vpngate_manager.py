@@ -5828,7 +5828,7 @@ INDEX_HTML = r"""<!doctype html>
         flex-direction: column;
         gap: 2px;
       }
-      .footer-brand strong { font-size: 16.5px; }
+      .footer-brand strong { font-size: 16.5px; }\n      .footer-brand-logo-image { width: 40px; max-height: 49px; }
       .footer-brand-version { font-size: 11px; }
       .footer-channels { width: 100%; gap: 7px; }
       .footer-channel { width: 100%; min-height: 44px; padding: 9px 12px; font-size: 12.5px; border-radius: 12px; }
@@ -8157,7 +8157,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer-brand">
         <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
-          <img class="footer-brand-logo-image" src="./footer-logo-clean.png?v=1.0.7" alt="我爱研究.ILovestudy 标志" width="48" height="48" decoding="async" loading="eager" />
+          <img class="footer-brand-logo-image" src="./footer-logo-clean.png?v=1.0.7" alt="我爱研究.ILovestudy 标志" width="50" decoding="async" loading="eager" />
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
             <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.7</span></span>
