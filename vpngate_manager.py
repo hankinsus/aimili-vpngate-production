@@ -4937,7 +4937,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 
     .form-label {
       display: block;
-      font-size: 13px;
+      font-size: 12.5px;
       font-weight: 500;
       color: var(--text-secondary);
       margin-bottom: 8px;
@@ -5580,28 +5580,11 @@ INDEX_HTML = r"""<!doctype html>
     }
     .site-footer {
       position: relative;
-      margin-top: 30px;
-      padding: 34px 20px 24px;
+      margin-top: 10px;
+      padding: 16px 18px 20px;
       overflow: hidden;
-      background:
-        radial-gradient(900px 260px at 50% 0%, rgba(20,184,166,.09), transparent 72%),
-        linear-gradient(180deg, rgba(10,18,34,.12), rgba(7,12,24,.72));
-      border-top: 1px solid rgba(99,102,241,.13);
-    }
-    .site-footer::before {
-      content: "";
-      position: absolute;
-      left: -8%;
-      right: -8%;
-      top: -26px;
-      height: 78px;
-      pointer-events: none;
-      background:
-        radial-gradient(42% 70px at 22% 100%, rgba(20,184,166,.08), transparent 72%),
-        radial-gradient(46% 78px at 78% 100%, rgba(99,102,241,.09), transparent 72%);
-      border-top: 1px solid rgba(20,184,166,.08);
-      transform: rotate(-.8deg);
-      opacity: .8;
+      background: linear-gradient(180deg, rgba(10,18,34,.05), rgba(7,12,24,.32));
+      border-top: 0;
     }
     .site-footer-inner {
       position: relative;
@@ -5609,13 +5592,13 @@ INDEX_HTML = r"""<!doctype html>
       width: min(1180px, 100%);
       margin: 0 auto;
       display: grid;
-      gap: 15px;
+      gap: 14px;
       justify-items: center;
     }
     .footer-disclaimer {
       width: min(1080px, 100%);
       box-sizing: border-box;
-      padding: 16px 20px 14px;
+      padding: 17px 22px 15px;
       border: 1px solid rgba(99,102,241,.15);
       border-radius: 15px;
       background: linear-gradient(135deg, rgba(14,23,42,.78), rgba(9,16,30,.66));
@@ -5626,7 +5609,7 @@ INDEX_HTML = r"""<!doctype html>
       margin-bottom: 8px;
       text-align: center;
       color: var(--text-primary);
-      font-size: 14px;
+      font-size: 14.5px;
       font-weight: 720;
       letter-spacing: .1px;
     }
@@ -5634,7 +5617,7 @@ INDEX_HTML = r"""<!doctype html>
       margin: 0;
       padding-left: 20px;
       color: rgba(156,163,175,.92);
-      font-size: 10.8px;
+      font-size: 11.7px;
       line-height: 1.72;
     }
     .footer-disclaimer-list li {
@@ -5660,13 +5643,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
-      width: 50px;
-      height: 50px;
+      width: 48px;
+      height: 48px;
       display: block;
-      flex: 0 0 50px;
+      flex: 0 0 48px;
       object-fit: contain;
       object-position: center;
-      filter: drop-shadow(0 5px 14px rgba(20,184,166,.15));
+      filter: brightness(.82) contrast(1.10) saturate(1.08) drop-shadow(0 4px 11px rgba(20,184,166,.11));
     }
     .footer-brand-copy {
       display: flex;
@@ -5678,14 +5661,14 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand strong {
       color: var(--text-primary);
-      font-size: 18px;
+      font-size: 19px;
       font-weight: 740;
-      line-height: 1.2;
+      line-height: 1.22;
       letter-spacing: -.15px;
     }
     .footer-brand-version {
-      color: rgba(156,163,175,.9);
-      font-size: 11.5px;
+      color: rgba(170,179,192,.94);
+      font-size: 12.5px;
       font-weight: 500;
       line-height: 1.4;
       overflow-wrap: anywhere;
@@ -5698,20 +5681,21 @@ INDEX_HTML = r"""<!doctype html>
       gap: 9px;
     }
     .footer-channel {
-      min-width: 176px;
-      min-height: 42px;
+      width: 206px;
+      min-height: 48px;
+      box-sizing: border-box;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
       padding: 8px 15px;
       border: 1px solid rgba(255,255,255,.095);
-      border-radius: 999px;
-      background: rgba(17,26,45,.72);
+      border-radius: 13px;
+      background: linear-gradient(180deg, rgba(18,28,49,.90), rgba(12,21,38,.82));
       box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 6px 18px rgba(0,0,0,.15);
       color: #e8edf5;
-      font-size: 12.5px;
-      font-weight: 680;
+      font-size: 13.5px;
+      font-weight: 700;
       line-height: 1;
       text-decoration: none;
       white-space: nowrap;
@@ -5747,8 +5731,8 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       gap: 9px;
-      color: rgba(156,163,175,.74);
-      font-size: 10.5px;
+      color: rgba(170,179,192,.82);
+      font-size: 12px;
     }
     .footer-bottom a {
       color: inherit;
@@ -5759,24 +5743,24 @@ INDEX_HTML = r"""<!doctype html>
     .footer-bottom a:hover { color: var(--text-primary); text-decoration: underline; }
     .footer-divider { opacity: .28; }
     @media (max-width:699px) {
-      .site-footer { margin-top: 22px; padding: 24px 10px 18px; }
+      .site-footer { margin-top: 9px; padding: 15px 9px 18px; }
       .site-footer-inner { gap: 12px; }
       .footer-disclaimer { padding: 13px 13px 11px; border-radius: 13px; }
       .footer-disclaimer-title { font-size: 12.5px; margin-bottom: 7px; }
       .footer-disclaimer-list { font-size: 10px; line-height: 1.7; padding-left: 18px; }
-      .footer-brand { align-items: flex-start; text-align: left; }
-      .footer-brand-logo-image { width: 46px; height: 46px; flex-basis: 46px; }
+      .footer-brand { align-items: center; }
+      .footer-brand-logo-image { width: 44px; height: 44px; flex-basis: 44px; }
       .footer-brand-copy {
         justify-content: flex-start;
         align-items: flex-start;
         flex-direction: column;
-        gap: 3px;
+        gap: 2px;
       }
-      .footer-brand strong { font-size: 16px; }
-      .footer-brand-version { font-size: 10.5px; }
+      .footer-brand strong { font-size: 16.5px; }
+      .footer-brand-version { font-size: 11px; }
       .footer-channels { width: 100%; gap: 7px; }
-      .footer-channel { min-width: 0; width: 100%; min-height: 43px; padding: 8px 12px; font-size: 12px; }
-      .footer-bottom { gap: 7px; font-size: 10px; }
+      .footer-channel { width: 100%; min-height: 44px; padding: 9px 12px; font-size: 12.5px; border-radius: 12px; }
+      .footer-bottom { gap: 7px; font-size: 11px; }
     }
     @media (min-width:700px) and (max-width:1024px) {
       .site-footer { padding-left: 16px; padding-right: 16px; }
@@ -5845,21 +5829,33 @@ INDEX_HTML = r"""<!doctype html>
     .country-priority {
       display: flex;
       align-items: center;
-      gap: 10px;
-      margin: -12px 0 20px;
-      padding: 10px 14px;
-      border: 1px solid rgba(20,184,166,.18);
-      border-radius: 10px;
-      background: rgba(20,184,166,.05);
+      gap: 9px;
+      margin: 0 0 10px;
+      padding: 8px 12px;
+      min-height: 34px;
+      box-sizing: border-box;
+      border: 1px solid rgba(20,184,166,.14);
+      border-radius: 9px;
+      background: rgba(20,184,166,.035);
       color: var(--text-secondary);
-      font-size: 13px;
+      font-size: 12px;
+      line-height: 1.45;
     }
     .country-priority.running {
-      border-color: rgba(245,158,11,.25);
-      background: rgba(245,158,11,.06);
+      border-color: rgba(245,158,11,.20);
+      background: rgba(245,158,11,.045);
+    }
+    .country-priority .badge {
+      flex: 0 0 auto;
+      white-space: nowrap;
     }
     @media (max-width: 768px) {
-      .country-priority { flex-wrap: wrap; }
+      .country-priority {
+        flex-wrap: wrap;
+        gap: 7px;
+        padding: 8px 10px;
+        font-size: 11px;
+      }
     }
 
     .toolbar {
@@ -7399,12 +7395,11 @@ INDEX_HTML = r"""<!doctype html>
     <section class="active-node-section" id="active_node_card" style="margin-bottom: 14px;">
       <!-- Rendered dynamically by render() -->
     </section>
-    <div id="background_activity_status" class="background-task-strip" style="display:none;margin-bottom:24px;">
+    <div id="background_activity_status" class="background-task-strip" style="display:none;margin-bottom:10px;">
       <span class="background-task-dot"></span>
       <span id="background_activity_text"></span>
     </div>
-
-
+    <div id="country_priority_status" class="country-priority" style="display:none;"></div>
 
   <section class="toolbar">
     <select id="status_filter" aria-hidden="true" tabindex="-1" style="display:none;">
@@ -7423,11 +7418,11 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <select id="country_filter" aria-hidden="true" tabindex="-1" style="display:none;">
-      <option value="">所有国家</option>
+      <option value="">全球国家</option>
     </select>
     <div id="country_filter_widget" class="toolbar-custom-select" data-filter-id="country_filter" aria-label="国家筛选">
       <button id="country_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
-        <span id="country_filter_label" class="toolbar-custom-select-label">所有国家</span>
+        <span id="country_filter_label" class="toolbar-custom-select-label">🌐 全球国家</span>
         <span class="toolbar-custom-select-arrow">⌄</span>
       </button>
       <div id="country_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
@@ -7470,7 +7465,6 @@ INDEX_HTML = r"""<!doctype html>
     </button>
   </section>
   <div id="global_refresh_status" class="country-priority" style="display:none;"></div>
-  <div id="country_priority_status" class="country-priority" style="display:none;"></div>
   <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
     <div style="display: flex; flex-direction: column; gap: 16px;">
       <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
@@ -8051,10 +8045,10 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer-brand">
         <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
-          <img class="footer-brand-logo-image" src="https://ilovestudyip.com/v1/assets/ilovestudy-logo-hd.png?v=9.0.0-logo-r1" alt="我爱研究.ILovestudy 标志" width="50" height="50" decoding="async" loading="lazy" />
+          <img class="footer-brand-logo-image" src="https://ilovestudyip.com/v1/assets/ilovestudy-logo-hd.png?v=9.0.0-logo-r1" alt="我爱研究.ILovestudy 标志" width="48" height="48" decoding="async" loading="eager" />
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version">· 多协议节点管理系统 · <span id="footer_app_version">V1.0.6</span> · <span id="footer_commit_version">读取版本中...</span></span>
+            <span class="footer-brand-version">· 多协议节点管理系统 · V1.0.6</span>
           </span>
         </a>
       </div>
@@ -8392,22 +8386,44 @@ function bindUnifiedSelectEvents() {
 function syncUnifiedSelect(selectId) { renderUnifiedSelect(selectId); }
 
 function countryFlag(country) {
-  const name = translateCountry(country);
-  const flags = {
-    "日本":"🇯🇵","韩国":"🇰🇷","美国":"🇺🇸","俄罗斯":"🇷🇺","中国":"🇨🇳","台湾":"🇹🇼","香港":"🇭🇰","澳门":"🇲🇴",
-    "新加坡":"🇸🇬","马来西亚":"🇲🇾","印度尼西亚":"🇮🇩","印度":"🇮🇳","菲律宾":"🇵🇭","泰国":"🇹🇭","越南":"🇻🇳",
-    "澳大利亚":"🇦🇺","新西兰":"🇳🇿","加拿大":"🇨🇦","英国":"🇬🇧","法国":"🇫🇷","德国":"🇩🇪","荷兰":"🇳🇱",
-    "瑞典":"🇸🇪","挪威":"🇳🇴","芬兰":"🇫🇮","丹麦":"🇩🇰","冰岛":"🇮🇸","爱尔兰":"🇮🇪","西班牙":"🇪🇸",
-    "葡萄牙":"🇵🇹","意大利":"🇮🇹","瑞士":"🇨🇭","比利时":"🇧🇪","奥地利":"🇦🇹","希腊":"🇬🇷","土耳其":"🇹🇷",
-    "波兰":"🇵🇱","捷克":"🇨🇿","斯洛伐克":"🇸🇰","匈牙利":"🇭🇺","罗马尼亚":"🇷🇴","保加利亚":"🇧🇬","克罗地亚":"🇭🇷",
-    "塞尔维亚":"🇷🇸","斯洛文尼亚":"🇸🇮","爱沙尼亚":"🇪🇪","拉脱维亚":"🇱🇻","立陶宛":"🇱🇹","乌克兰":"🇺🇦",
-    "格鲁吉亚":"🇬🇪","哈萨克斯坦":"🇰🇿","亚美尼亚":"🇦🇲","阿塞拜疆":"🇦🇿","吉尔吉斯斯坦":"🇰🇬","蒙古":"🇲🇳",
-    "以色列":"🇮🇱","阿联酋":"🇦🇪","沙特阿拉伯":"🇸🇦","伊朗":"🇮🇷","伊拉克":"🇮🇶","卡塔尔":"🇶🇦","阿曼":"🇴🇲",
-    "埃及":"🇪🇬","南非":"🇿🇦","尼日利亚":"🇳🇬","肯尼亚":"🇰🇪","摩洛哥":"🇲🇦","突尼斯":"🇹🇳","巴西":"🇧🇷",
-    "阿根廷":"🇦🇷","智利":"🇨🇱","墨西哥":"🇲🇽","哥伦比亚":"🇨🇴","秘鲁":"🇵🇪","厄瓜多尔":"🇪🇨","乌拉圭":"🇺🇾",
-    "巴拿马":"🇵🇦","哥斯达黎加":"🇨🇷","多米尼加共和国":"🇩🇴","波多黎各":"🇵🇷"
+  const raw = String(country || "").trim();
+  const name = translateCountry(raw);
+  const flagCodes = {
+    "日本":"JP","韩国":"KR","美国":"US","俄罗斯":"RU","中国":"CN","台湾":"TW","香港":"HK","澳门":"MO",
+    "新加坡":"SG","马来西亚":"MY","印度尼西亚":"ID","印度":"IN","菲律宾":"PH","泰国":"TH","越南":"VN",
+    "澳大利亚":"AU","新西兰":"NZ","加拿大":"CA","英国":"GB","法国":"FR","德国":"DE","荷兰":"NL","瑞典":"SE",
+    "挪威":"NO","芬兰":"FI","丹麦":"DK","冰岛":"IS","爱尔兰":"IE","西班牙":"ES","葡萄牙":"PT","意大利":"IT",
+    "瑞士":"CH","比利时":"BE","奥地利":"AT","希腊":"GR","土耳其":"TR","波兰":"PL","捷克":"CZ","斯洛伐克":"SK",
+    "匈牙利":"HU","罗马尼亚":"RO","保加利亚":"BG","克罗地亚":"HR","塞尔维亚":"RS","斯洛文尼亚":"SI","爱沙尼亚":"EE",
+    "拉脱维亚":"LV","立陶宛":"LT","乌克兰":"UA","格鲁吉亚":"GE","哈萨克斯坦":"KZ","亚美尼亚":"AM","阿塞拜疆":"AZ",
+    "吉尔吉斯斯坦":"KG","蒙古":"MN","以色列":"IL","阿联酋":"AE","沙特阿拉伯":"SA","伊朗":"IR","伊拉克":"IQ","卡塔尔":"QA","阿曼":"OM",
+    "埃及":"EG","南非":"ZA","尼日利亚":"NG","肯尼亚":"KE","摩洛哥":"MA","突尼斯":"TN","巴西":"BR","阿根廷":"AR","智利":"CL",
+    "墨西哥":"MX","哥伦比亚":"CO","秘鲁":"PE","厄瓜多尔":"EC","乌拉圭":"UY","巴拿马":"PA","哥斯达黎加":"CR","多米尼加共和国":"DO",
+    "波多黎各":"PR","阿尔巴尼亚":"AL","阿尔及利亚":"DZ","安哥拉":"AO","白俄罗斯":"BY","波斯尼亚和黑塞哥维那":"BA","博茨瓦纳":"BW",
+    "文莱":"BN","喀麦隆":"CM","塞浦路斯":"CY","萨尔瓦多":"SV","埃塞俄比亚":"ET","斐济":"FJ","危地马拉":"GT","海地":"HT","牙买加":"JM",
+    "约旦":"JO","科威特":"KW","黎巴嫩":"LB","利比亚":"LY","列支敦士登":"LI","马耳他":"MT","毛里求斯":"MU","摩尔多瓦":"MD","黑山":"ME",
+    "缅甸":"MM","尼泊尔":"NP","巴基斯坦":"PK","巴拉圭":"PY","马达加斯加":"MG","斯里兰卡":"LK","乌干达":"UG","乌兹别克斯坦":"UZ","津巴布韦":"ZW",
+    "巴哈马":"BS","玻利维亚":"BO","洪都拉斯":"HN","尼加拉瓜":"NI","特立尼达和多巴哥":"TT","圭亚那":"GY","苏里南":"SR","马尔代夫":"MV",
+    "巴勒斯坦":"PS","百慕大":"BM","直布罗陀":"GI","马恩岛":"IM","泽西岛":"JE","根西岛":"GG","新喀里多尼亚":"NC","塞舌尔":"SC",
+    "卢森堡":"LU","毛里塔尼亚":"MR","纳米比亚":"NA","刚果共和国":"CG","刚果民主共和国":"CD","加纳":"GH","坦桑尼亚":"TZ","赞比亚":"ZM",
+    "塞内加尔":"SN","科特迪瓦":"CI","佛得角":"CV","莫桑比克":"MZ","马拉维":"MW","科索沃":"XK"
   };
-  return flags[name] || "🌐";
+  if (/^[A-Z]{2}$/.test(flagCodes[name] || "")) {
+    return String.fromCodePoint(...flagCodes[name].split("").map(ch => 127397 + ch.charCodeAt(0)));
+  }
+  const rawAliases = {
+    "Korea Republic of":"KR","Republic of Korea":"KR","Korea":"KR","Russian Federation":"RU","Russian":"RU",
+    "Viet Nam":"VN","Vietnam":"VN","United States":"US","United States of America":"US","USA":"US","United Kingdom":"GB","UK":"GB",
+    "Taiwan Province of China":"TW","Czech Republic":"CZ","Czechia":"CZ","Türkiye":"TR","Turkey":"TR","Brunei Darussalam":"BN",
+    "Lao People's Democratic Republic":"LA","Laos":"LA","Côte d'Ivoire":"CI","Ivory Coast":"CI","Eswatini":"SZ","Swaziland":"SZ",
+    "Moldova, Republic of":"MD","Palestine, State of":"PS","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ",
+    "Bolivia, Plurinational State of":"BO","Venezuela, Bolivarian Republic of":"VE","Cabo Verde":"CV","Cape Verde":"CV",
+    "Curacao":"CW","Curaçao":"CW","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK"
+  };
+  const code = rawAliases[raw] || rawAliases[name] || "";
+  return /^[A-Z]{2}$/.test(code)
+    ? String.fromCodePoint(...code.split("").map(ch => 127397 + ch.charCodeAt(0)))
+    : "🌐";
 }
 
 function renderCustomFilter(selectId, withCount = false) {
@@ -8614,7 +8630,7 @@ function updateCountryFilter() {
     return `<option value="${esc(country)}">${esc(country)} · ${count} IP</option>`;
   }).join("");
 
-  select.innerHTML = `<option value="">所有国家 · ${totalCount} IP</option>` + options;
+  select.innerHTML = `<option value="">全球国家 · ${totalCount} IP</option>` + options;
   if (countries.includes(selectedValue)) select.value = selectedValue;
   else select.value = "";
   renderCustomCountryFilter();
@@ -9865,16 +9881,9 @@ async function loadGithubCurrentVersion() {
     const versionLabel = String(result.current_version || "未知");
     const el = $("github_current_version");
     if (el) el.textContent = versionLabel;
-    const pieces = versionLabel.split(" · ");
-    const versionEl = $("footer_app_version");
-    const commitEl = $("footer_commit_version");
-    if (versionEl && pieces[0]) versionEl.textContent = pieces[0];
-    if (commitEl) commitEl.textContent = pieces[1] || (result.current_commit ? String(result.current_commit).slice(0, 8) : "未知");
   } catch (e) {
     const el = $("github_current_version");
     if (el) el.textContent = "未知";
-    const commitEl = $("footer_commit_version");
-    if (commitEl) commitEl.textContent = "未知";
   }
 }
 
