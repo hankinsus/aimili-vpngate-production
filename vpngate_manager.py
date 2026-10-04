@@ -1,7 +1,11 @@
+[Reading 13480 lines from start (total: 13480 lines, 0 remaining)]
+
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import base64
 import csv
+import ipaddress
 import json
 import os
 import queue
@@ -22,6 +26,8 @@ from typing import Any
 import concurrent.futures
 import sys
 import uuid
+import gzip
+from ui_control_plane import ui_command_plane
 
 # Prefer IPv4 resolution to avoid slow AAAA DNS timeouts (e.g. in WSL),
 # but fall back to system default (IPv6) if IPv4 resolution fails.
@@ -80,6 +86,7 @@ from node_pool import NodePool
 import tunnel_adapters
 import vpngate_discovery
 from resource_sharing import ResourceShareManager
+from web_certificate import WebCertificateManager
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -170,6 +177,7 @@ DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPN
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
+BOOTSTRAP_STATE_FILE = DATA_DIR / "bootstrap_state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 SESSION_FILE = DATA_DIR / "ui_sessions.json"
 SESSION_TTL_SECONDS = 30 * 24 * 3600
@@ -214,6 +222,10 @@ is_connecting = False
 manual_connection_lock = threading.RLock()
 manual_connection_active = False
 manual_connection_epoch = 0
+manual_connection_quiet_until = 0.0
+manual_route_pin: dict[str, Any] = {}
+connection_generation = 0
+active_connection_generation = 0
 manual_add_probe_lock = threading.Lock()
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -490,6 +502,18 @@ def upstream_proxy_auth_file() -> str | None:
 
 def write_json(path: Path, data: Any) -> None:
     with lock:
+        # The persistent node catalog is never allowed to regress from a
+        # populated snapshot to [] because a collector/probe produced a
+        # transient empty result. Only the explicit first-install state may
+        # create an empty node file.
+        if path == NODES_FILE and isinstance(data, list) and not data and path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(existing, list) and existing:
+                    log_to_json("WARNING", "Main", "拒绝用临时空节点快照覆盖已有节点库")
+                    return
+            except Exception:
+                pass
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
@@ -545,7 +569,8 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
-            "fav_fail_fallback": True
+            "fav_fail_fallback": True,
+            "web_domain": ""
         }
         updated = False
         if auth_file.exists():
@@ -553,7 +578,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -771,6 +796,11 @@ def log_to_json(level: str, module: str, message: str) -> None:
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
+web_certificate = WebCertificateManager(
+    DATA_DIR / "web_certificate.json",
+    log_fn=lambda message: log_to_json("INFO", "WebSSL", message),
+)
+
 resource_share = ResourceShareManager(
     DATA_DIR / "resource_sharing.json",
     node_pool,
@@ -781,6 +811,20 @@ def set_state(**updates: Any) -> None:
     state = get_state()
     state.update(updates)
     write_json(STATE_FILE, state)
+
+def set_manual_route_pin(*, protocol: str, endpoint_id: str = "", node_id: str = "") -> None:
+    global manual_route_pin, manual_connection_quiet_until
+    manual_route_pin = {
+        "protocol": str(protocol or ""),
+        "endpoint_id": str(endpoint_id or ""),
+        "node_id": str(node_id or ""),
+        "set_at": time.time(),
+    }
+    manual_connection_quiet_until = time.time() + 15.0
+
+def clear_manual_route_pin() -> None:
+    global manual_route_pin
+    manual_route_pin = {}
 
 def read_nodes() -> list[dict[str, Any]]:
     raw = read_json(NODES_FILE, [])
@@ -794,6 +838,9 @@ def get_state() -> dict[str, Any]:
     global global_pool_refresh_message, global_pool_refresh_servers, global_pool_refresh_sources
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
+    cert_state = web_certificate.snapshot()
+    state["web_domain"] = str(load_ui_config().get("web_domain") or cert_state.get("domain") or "")
+    state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
     state["active_pool_endpoint"] = None
@@ -853,6 +900,8 @@ def get_state() -> dict[str, Any]:
         state["pool_servers"] = int(pool_stats.get("servers") or 0)
         state["pool_endpoints"] = int(pool_stats.get("endpoints") or 0)
         state["pool_states"] = pool_stats.get("states") or {}
+        state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
+        state["hot_pool_target"] = HOT_POOL_TARGET
     except Exception:
         state.setdefault("pool_servers", 0)
         state.setdefault("pool_endpoints", 0)
@@ -879,6 +928,9 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = bool(ui_cfg.get("fav_fail_fallback", True))
+    state["manual_route_pin"] = dict(manual_route_pin)
+    state["manual_connection_quiet_until"] = manual_connection_quiet_until
+    state["ui_command_plane"] = ui_command_plane.ui_state()
 
     return state
 
@@ -1273,7 +1325,7 @@ def dedupe_ui_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         status_rank = {"available": 0, "testing": 1, "not_checked": 2, "unavailable": 3}.get(status, 4)
         active_rank = 0 if node.get("active") else 1
         trusted_rank = 0 if bool((node.get("_pool_metadata") or {}).get("trusted_observation")) else 1
-        latency = float(node.get("latency_ms") or node.get("ping") or 999999)
+        latency = float(node.get("latency_ms") or 999999)
         if latency <= 0:
             latency = 999999
         seen = float(node.get("probed_at") or node.get("fetched_at") or 0)
@@ -1632,6 +1684,38 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
+def _openvpn_elapsed_ms(message: str) -> int:
+    match = re.search(r"OpenVPN connected in (\d+) ms", str(message or ""))
+    if not match:
+        return 0
+    try:
+        return max(1, int(match.group(1)))
+    except (TypeError, ValueError):
+        return 0
+
+def _prefer_openvpn_ip(config_text: str, node: dict[str, Any]) -> str:
+    """Use the fresh pool IP when the stored VPNGate remote hostname is stale."""
+    text_value = str(config_text or "")
+    ip = str(node.get("ip") or node.get("current_ip") or "").strip()
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return text_value
+    port = parse_int(node.get("remote_port"))
+    if not ip or port <= 0:
+        return text_value
+    lines = text_value.splitlines()
+    changed = False
+    out: list[str] = []
+    for line in lines:
+        match = re.match(r"^(\s*remote\s+)(\S+)(\s+)(\d+)(.*)$", line, re.IGNORECASE)
+        if match and parse_int(match.group(4)) == port and match.group(2) != ip:
+            out.append(f"{match.group(1)}{ip}{match.group(3)}{match.group(4)}{match.group(5)}")
+            changed = True
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if text_value.endswith("\n") else "") if changed else text_value
+
 def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
@@ -1775,6 +1859,17 @@ def cleanup_policy_routing() -> None:
     except Exception:
         pass
 
+def _clear_all_node_active_flags() -> None:
+    with lock:
+        nodes = read_nodes()
+        changed = False
+        for item in nodes:
+            if item.get("active"):
+                item["active"] = False
+                changed = True
+        if changed:
+            write_json(NODES_FILE, nodes)
+
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
@@ -1797,7 +1892,9 @@ def stop_active_openvpn() -> None:
                 path = Path(config_to_delete)
                 if path.exists():
                     path.unlink()
-            except Exception:                pass
+            except Exception:
+                pass
+        _clear_all_node_active_flags()
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -1840,6 +1937,7 @@ def stop_active_external_tunnel() -> None:
     proxy_server.clear_active_interface()
     active_external_tunnel = None
     active_pool_endpoint_id = ""
+    _clear_all_node_active_flags()
     set_state(active_pool_endpoint_id="", active_tunnel_protocol="", active_tunnel_interface="")
 
 def stop_all_tunnels() -> None:
@@ -2262,6 +2360,9 @@ def protocol_catalog_loop() -> None:
     time.sleep(10)
     while True:
         try:
+            if ui_command_plane.is_busy() or global_pool_refresh_running:
+                time.sleep(5)
+                continue
             if not ISOLATED_INSTANCE:
                 refresh_multi_protocol_catalog(force=True)
                 refresh_protocol_ip_metadata(max_ips=100)
@@ -2276,6 +2377,9 @@ def resource_share_loop() -> None:
     time.sleep(45)
     while True:
         try:
+            if ui_command_plane.is_busy() or global_pool_refresh_running:
+                time.sleep(5)
+                continue
             peers = resource_share.list_peers()
             if peers:
                 results = resource_share.sync_all(force=False)
@@ -2288,8 +2392,25 @@ def resource_share_loop() -> None:
         time.sleep(RESOURCE_SHARE_SYNC_INTERVAL_SECONDS)
 
 
+def _wait_for_automatic_connection_idle(timeout: float = 30.0) -> None:
+    deadline = time.time() + float(timeout)
+    warned = False
+    while True:
+        with lock:
+            busy = bool(is_connecting)
+        if not busy:
+            return
+        if not warned:
+            warned = True
+            set_state(
+                last_check_message="人工操作已获得优先权，正在等待当前自动连接任务收尾；不会再启动新的自动连接。"
+            )
+        if time.time() >= deadline:
+            raise RuntimeError("当前自动连接任务收尾超时，人工切换未强行并发执行。请稍后重试。")
+        time.sleep(0.25)
+
 def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
-    global active_external_tunnel, active_pool_endpoint_id, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch
+    global active_external_tunnel, active_pool_endpoint_id, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch, connection_generation, active_connection_generation
     endpoint_id = str(endpoint_id or "").strip()
     endpoint = node_pool.get_endpoint(endpoint_id)
     if endpoint is None:
@@ -2299,11 +2420,10 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
     if protocol not in ("softether", "sstp", "l2tp-ipsec"):
         raise RuntimeError(f"协议 {protocol} 当前尚未开放生产连接")
 
-    # Mirror-only discovery is not a hard UI block. Before a manual production
-    # connection, perform the same live protocol/egress verification used by the
-    # background validator. A successful real-time probe is sufficient evidence
-    # for this connection attempt; a failed probe returns the actual reason.
-    if not metadata.get("trusted_observation"):
+    # Manual switching performs a real production tunnel + egress verification
+    # below, so a second pre-probe is skipped. Background validation keeps the
+    # original multi-source probe path. A failed validation is still recorded.
+    if not metadata.get("trusted_observation") and not manual:
         probe_result = None
         for _ in range(3):
             probe_result = probe_pool_endpoint(endpoint_id)
@@ -2335,7 +2455,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
 
     manual_guard = False
     if manual:
-        manual_connection_lock.acquire()
+        if not manual_connection_lock.acquire(blocking=False):
+            raise RuntimeError("已有人工连接操作正在执行，请等待当前切换完成")
         manual_guard = True
         with lock:
             if manual_connection_active:
@@ -2344,15 +2465,32 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 raise RuntimeError("当前已有手动连接任务正在运行，请稍候")
             manual_connection_epoch += 1
             manual_connection_active = True
-            # During background detection, is_connecting belongs to the
-            # detector. Manual connection is explicitly allowed to take over.
-            if is_connecting and not (maintenance_lock.locked() or country_priority_lock.locked() or global_pool_refresh_running):
+        set_state(
+            manual_switch_active=True,
+            manual_switch_started_at=time.time(),
+            pending_connection_id=endpoint_id,
+            pending_connection_pool_endpoint_id=endpoint_id,
+            pending_connection_protocol=protocol,
+            pending_connection_country=str(endpoint.get("country") or ""),
+            pending_connection_address=(
+                str(metadata.get("ip") or metadata.get("hostname") or endpoint.get("hostname") or endpoint.get("current_ip") or endpoint_id)
+                + (f":{parse_int(endpoint.get('port'))}" if parse_int(endpoint.get('port')) else "")
+            ),
+            manual_switch_message=f"正在建立 {protocol} 安全隧道…",
+            is_connecting=True,
+            last_check_message=f"正在切换至 {protocol} 节点，请稍候…",
+        )
+    if manual and manual_guard:
+        try:
+            _wait_for_automatic_connection_idle()
+        except Exception:
+            with lock:
                 manual_connection_active = False
-                manual_connection_lock.release()
-                manual_guard = False
-                raise RuntimeError("当前已有连接任务正在运行，请稍后再试")
+            manual_connection_lock.release()
+            manual_guard = False
+            raise
     with lock:
-        if is_connecting and not (manual and (maintenance_lock.locked() or country_priority_lock.locked() or global_pool_refresh_running)):
+        if is_connecting and not manual:
             if manual_guard:
                 manual_connection_active = False
                 manual_connection_lock.release()
@@ -2398,6 +2536,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
 
         # Make-before-break: establish a completely separate candidate tunnel
         # while the existing production 8500 path continues serving traffic.
+        if manual:
+            set_state(manual_switch_message=f"正在建立 {protocol} 安全隧道…")
         if protocol == "softether":
             result = tunnel_adapters.SoftEtherAdapter().connect(
                 host=host,
@@ -2428,6 +2568,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             node_pool.record_endpoint_probe(endpoint_id, False, 0, result.message)
             raise RuntimeError(result.message or f"{protocol} 连接失败")
 
+        if manual:
+            set_state(manual_switch_message="目标隧道已建立，正在验证真实出口与网络质量…", last_check_message="目标节点已建立隧道，正在进行真实出口验证…")
         direct_health = (
             tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
             if protocol == "l2tp-ipsec"
@@ -2439,6 +2581,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             raise RuntimeError(message)
 
         # Candidate is independently verified. Only now release the old tunnel.
+        if manual:
+            set_state(manual_switch_message="目标节点验证通过，正在平滑接管当前连接…", last_check_message="目标节点验证通过，正在平滑切换；原连接暂时保持。")
         if active_external_tunnel is not None:
             stop_active_external_tunnel()
         if active_openvpn_running():
@@ -2451,6 +2595,9 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         setup_policy_routing(result.interface, gateway=result.gateway)
         promoted = True
 
+        connection_generation += 1
+        active_connection_generation = connection_generation
+
         health = check_proxy_health()
         if not health.get("ok"):
             node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "8500 代理出口检测失败"))
@@ -2459,9 +2606,12 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
 
         latency = parse_int(health.get("latency_ms")) or parse_int(direct_health.get("latency_ms"))
         node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
+        if manual:
+            set_manual_route_pin(protocol=protocol, endpoint_id=endpoint_id)
         set_state(
             active_pool_endpoint_id=endpoint_id,
             active_tunnel_protocol=protocol,
+            manual_switch_message=("切换完成，正在确认客户端状态…" if manual else ""),
             active_tunnel_interface=result.interface,
             proxy_ok=True,
             proxy_ip=health.get("ip", ""),
@@ -2583,7 +2733,7 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
 def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple[int, int, float, int, float, int, float]:
     status = str(endpoint.get("status") or "").upper()
     status_rank = 0 if status == "HOT" else 1
-    latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or endpoint.get("latest_ping") or 999999)
+    latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 999999)
     if latency <= 0:
         latency = 999999
     speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
@@ -2609,13 +2759,13 @@ def openvpn_node_to_routing_endpoint(node: dict[str, Any]) -> dict[str, Any]:
         "protocol": "openvpn",
         "transport": str(node.get("proto") or ""),
         "port": parse_int(node.get("remote_port")),
-        "status": "HOT" if node.get("probe_status") == "available" else "AVAILABLE",
+        "status": "HOT" if node.get("probe_status") == "available" and parse_int(node.get("latency_ms")) > 0 else "NEW",
         "first_seen": float(node.get("fetched_at") or 0),
         "last_seen": float(node.get("fetched_at") or 0),
         "last_success": float(node.get("probed_at") or 0),
         "success_streak": 1 if node.get("probe_status") == "available" else 0,
         "fail_streak": 0,
-        "latency_ewma": float(node.get("latency_ms") or node.get("ping") or 0),
+        "latency_ewma": float(node.get("latency_ms") or 0),
         "jitter_ewma": 0,
         "latest_ping": int(node.get("ping") or 0),
         "latest_speed": int(node.get("speed") or 0),
@@ -2643,13 +2793,30 @@ def routing_node_service_key(node: dict[str, Any], ui_cfg: dict[str, Any]) -> tu
 
 def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str = "", limit: int = 100) -> list[dict[str, Any]]:
     endpoints: dict[str, dict[str, Any]] = {}
+
+    # Routing must use the persistent Master Pool, not the small front-end
+    # snapshot. The UI may show only a page of nodes; backend failover must see
+    # every verified HOT/AVAILABLE endpoint.
     try:
-        for endpoint in node_pool.ranked_hot_pool(limit=100, per_server_limit=2):
+        for endpoint in node_pool.list_endpoints(limit=5000):
             eid = str(endpoint.get("endpoint_id") or "")
-            if eid:
+            status = str(endpoint.get("status") or "").upper()
+            protocol = str(endpoint.get("protocol") or "").lower()
+            if (
+                eid
+                and status in ("HOT", "AVAILABLE")
+                and protocol in ("openvpn", "softether", "sstp", "l2tp-ipsec")
+                and (
+                    protocol == "openvpn"
+                    or bool((endpoint.get("metadata") or {}).get("trusted_observation"))
+                )
+            ):
                 endpoints[eid] = endpoint
     except Exception as exc:
-        log_to_json("WARNING", "Routing", f"Hot Pool 读取失败: {exc}")
+        log_to_json("WARNING", "Routing", f"Master Pool 读取失败: {exc}")
+
+    # Keep a small secondary source from nodes.json for freshly fetched OpenVPN
+    # observations that have not yet been materialized into the pool snapshot.
     for node in read_nodes():
         if node.get("probe_status") != "available" or node.get("active"):
             continue
@@ -2683,6 +2850,8 @@ def current_active_routing_endpoint() -> dict[str, Any] | None:
     return None
 
 def maybe_recover_preferred_route(force: bool = False) -> bool:
+    if manual_route_pin or ui_command_plane.is_busy():
+        return False
     ui_cfg = load_ui_config()
     if ui_cfg.get("routing_mode") in ("fixed_ip", "favorites") or not bool(ui_cfg.get("connection_enabled", True)):
         return False
@@ -3054,16 +3223,22 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     temp_path = test_config_path(node_id)
     try:
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        config_text = _prefer_openvpn_ip(config_text, node)
         temp_path.write_text(config_text, encoding="utf-8")
     except Exception as e:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
-    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+    # Final latency is measured from the real OpenVPN tunnel establishment,
+    # not from VPNGate's advertised Ping value. ICMP/TCP reachability is only
+    # a fast hint and is deliberately not used as the final probe metric.
+    latency = 0
 
     idx = None
     try:
         idx = get_free_test_index()
         ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        if ok:
+            latency = _openvpn_elapsed_ms(message)
     finally:
         if idx is not None:
             release_test_index(idx)
@@ -3138,6 +3313,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         temp_path = test_config_path(node_id)
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+            config_text = _prefer_openvpn_ip(config_text, n_info)
             temp_path.write_text(config_text, encoding="utf-8")
         except Exception as e:
             return {
@@ -3154,12 +3330,16 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 "quality": "",
             }
 
-        latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+        # For OpenVPN, use real tunnel establishment time as the final
+        # latency metric. The source-list Ping value may be stale or external.
+        latency = 0
         tun_idx = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
             ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+            if ok:
+                latency = _openvpn_elapsed_ms(message)
         finally:
             if tun_idx is not None:
                 release_test_index(tun_idx)
@@ -3262,6 +3442,12 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     return list(updated_nodes_map.values())
 
 def auto_switch_node(attempt: int = 0) -> None:
+    if ui_command_plane.is_busy():
+        log_to_json("INFO", "VPN", "前端人工指令进行中，自动切换暂缓")
+        return
+    if manual_connection_active:
+        log_to_json("INFO", "VPN", "用户正在手动操作，自动切换暂缓")
+        return
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，等待后台检测周期继续恢复。", flush=True)
         return
@@ -3317,15 +3503,156 @@ def auto_switch_node(attempt: int = 0) -> None:
             print(f"[自动切换后台补齐] 获取并测试节点失败: {exc}", flush=True)
     threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
+def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) -> str:
+    """Make-before-break manual OpenVPN switch with rollback before the new route is committed."""
+    global active_openvpn_process, active_openvpn_node_id, active_external_tunnel
+    global active_pool_endpoint_id, connection_generation, active_connection_generation
+
+    node_id = str(node.get("id") or "")
+    config_path = Path(node["config_file"])
+    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+    config_text = _prefer_openvpn_ip(node.get("config_text") or "", node)
+    config_path.write_text(config_text, encoding="utf-8")
+
+    old_openvpn_process = active_openvpn_process
+    old_openvpn_node_id = str(active_openvpn_node_id or "")
+    old_external_tunnel = active_external_tunnel
+    old_iface = str(proxy_server.get_active_interface() or "")
+    old_gateway = str(getattr(old_external_tunnel, "gateway", "") or "")
+    candidate_token = re.sub(r"[^a-z0-9]", "", node_id.lower())[:8] or uuid.uuid4().hex[:8]
+    candidate_dev = f"tun-sw-{candidate_token}"[:15]
+
+    set_state(
+        manual_switch_active=True,
+        pending_connection_id=node_id,
+        pending_connection_pool_endpoint_id="",
+        pending_connection_protocol="openvpn",
+        pending_connection_country=str(node.get("country") or ""),
+        pending_connection_address=(
+            str(node.get("ip") or node.get("remote_host") or node_id)
+            + (f":{parse_int(node.get('remote_port'))}" if parse_int(node.get("remote_port")) else "")
+        ),
+        manual_switch_message="正在建立候选 OpenVPN 隧道，当前连接保持在线…",
+        last_check_message=f"正在建立候选 OpenVPN 节点 {node_id}…",
+    )
+
+    ok, message, candidate_process = run_openvpn_until_ready(
+        str(config_path), keep_alive=True, route_nopull=True, dev=candidate_dev
+    )
+    if not ok or candidate_process is None:
+        raise RuntimeError(message or "候选 OpenVPN 隧道建立失败")
+    if not tunnel_adapters.interface_has_ipv4(candidate_dev):
+        stop_process(candidate_process)
+        raise RuntimeError("候选 OpenVPN 隧道已启动，但未获得 IPv4 地址")
+
+    set_state(
+        manual_switch_message="候选 OpenVPN 已建立，正在验证真实出口…",
+        last_check_message="候选 OpenVPN 已建立，正在验证真实出口…",
+    )
+    candidate_egress = check_interface_egress(candidate_dev)
+    if not candidate_egress.get("ok"):
+        stop_process(candidate_process)
+        raise RuntimeError(str(candidate_egress.get("error") or "候选 OpenVPN 真实出口验证失败"))
+
+    set_state(
+        manual_switch_message="候选节点验证通过，正在平滑接管 8500 连接…",
+        last_check_message="候选节点验证通过，正在切换本地出口路由；原连接仍保留到验证完成。",
+    )
+
+    cleanup_policy_routing()
+    proxy_server.set_active_interface(candidate_dev)
+    setup_policy_routing(candidate_dev)
+    final_health = check_proxy_health()
+    if not final_health.get("ok"):
+        cleanup_policy_routing()
+        try:
+            if old_external_tunnel is not None and old_iface:
+                proxy_server.set_active_interface(old_iface)
+                setup_policy_routing(old_iface, gateway=old_gateway)
+            elif old_openvpn_process is not None and old_iface:
+                proxy_server.set_active_interface(old_iface)
+                setup_policy_routing(old_iface)
+        except Exception as rollback_exc:
+            log_to_json("ERROR", "VPN", f"平滑切换路由回滚失败: {rollback_exc}")
+        stop_process(candidate_process)
+        raise RuntimeError(str(final_health.get("error") or "新 OpenVPN 接管后 8500 出口验证失败"))
+
+    if old_external_tunnel is not None:
+        try:
+            details = old_external_tunnel.details or {}
+            if old_external_tunnel.protocol == "softether":
+                tunnel_adapters.SoftEtherAdapter().disconnect(
+                    account=str(details.get("account") or "aimili"),
+                    nic=str(details.get("nic") or "aimili"),
+                    delete=True,
+                    added_routes=details.get("added_host_routes") or [],
+                )
+            elif old_external_tunnel.protocol == "sstp":
+                tunnel_adapters.SSTPAdapter.disconnect(
+                    old_external_tunnel.process,
+                    added_routes=details.get("added_host_routes") or [],
+                )
+            elif old_external_tunnel.protocol == "l2tp-ipsec":
+                l2tp_adapter.disconnect(old_external_tunnel.namespace or "aimili-l2tp-prod")
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"旧多协议隧道清理失败（新连接已接管）: {exc}")
+    elif old_openvpn_process is not None and old_openvpn_process is not candidate_process:
+        stop_process(old_openvpn_process)
+
+    if old_openvpn_node_id and old_openvpn_node_id != node_id:
+        old_node = next((x for x in read_nodes() if x.get("id") == old_openvpn_node_id), None)
+        if old_node:
+            try:
+                old_cfg = Path(old_node.get("config_file") or "")
+                if old_cfg.exists() and old_cfg != config_path:
+                    old_cfg.unlink()
+            except Exception:
+                pass
+
+    active_external_tunnel = None
+    active_pool_endpoint_id = ""
+    active_openvpn_process = candidate_process
+    active_openvpn_node_id = node_id
+    connection_generation += 1
+    active_connection_generation = connection_generation
+
+    nodes = read_nodes()
+    for item in nodes:
+        item["active"] = item.get("id") == node_id
+        if item["active"]:
+            _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
+            item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
+            item["probe_status"] = "available"
+            item["latency_ms"] = int(final_health.get("latency_ms") or candidate_egress.get("latency_ms") or 0)
+    write_json(NODES_FILE, nodes)
+
+    latency = parse_int(final_health.get("latency_ms")) or parse_int(candidate_egress.get("latency_ms")) or 0
+    set_state(
+        active_openvpn_node_id=node_id,
+        active_pool_endpoint_id="",
+        active_tunnel_protocol="openvpn",
+        active_tunnel_interface=candidate_dev,
+        proxy_ok=True,
+        proxy_ip=final_health.get("ip") or candidate_egress.get("ip") or "",
+        proxy_latency_ms=latency,
+        proxy_error="",
+        active_node_latency=(f"{latency} ms" if latency else "出口已连接，等待延迟"),
+        last_check_message=f"Connected {node_id}",
+        manual_switch_message="切换完成",
+    )
+    set_manual_route_pin(protocol="openvpn", node_id=node_id)
+    return f"Connected {node_id} (smooth switch)"
+
 def connect_node(node_id: str, enable_connection: bool = False, manual: bool = False) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch
+    global active_openvpn_process, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch, connection_generation, active_connection_generation
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Node id is required")
     stopped_existing = False
     manual_guard = False
     if manual:
-        manual_connection_lock.acquire()
+        if not manual_connection_lock.acquire(blocking=False):
+            raise RuntimeError("已有人工连接操作正在执行，请等待当前切换完成")
         manual_guard = True
         with lock:
             if manual_connection_active:
@@ -3334,13 +3661,26 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 raise RuntimeError("当前已有手动连接任务正在运行，请稍候")
             manual_connection_epoch += 1
             manual_connection_active = True
-            if is_connecting and not (maintenance_lock.locked() or country_priority_lock.locked() or global_pool_refresh_running):
+        set_state(
+            manual_switch_active=True,
+            manual_switch_started_at=time.time(),
+            pending_connection_id=node_id,
+            pending_connection_pool_endpoint_id="",
+            pending_connection_protocol="openvpn",
+            manual_switch_message="正在准备 OpenVPN 切换…",
+            last_check_message="已开始人工切换，正在准备目标节点…",
+        )
+    if manual and manual_guard:
+        try:
+            _wait_for_automatic_connection_idle()
+        except Exception:
+            with lock:
                 manual_connection_active = False
-                manual_connection_lock.release()
-                manual_guard = False
-                raise RuntimeError("当前已有连接任务正在运行，请稍后再试")
+            manual_connection_lock.release()
+            manual_guard = False
+            raise
     with lock:
-        if is_connecting and not (manual and (maintenance_lock.locked() or country_priority_lock.locked() or global_pool_refresh_running)):
+        if is_connecting and not manual:
             if manual_guard:
                 manual_connection_active = False
                 manual_connection_lock.release()
@@ -3358,6 +3698,21 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         if not node:
             raise ValueError(f"Node not found: {node_id}")
 
+        if manual:
+            set_state(
+                manual_switch_active=True,
+                pending_connection_id=node_id,
+                pending_connection_pool_endpoint_id="",
+                pending_connection_protocol="openvpn",
+                pending_connection_country=str(node.get("country") or ""),
+                pending_connection_address=(
+                    str(node.get("ip") or node.get("remote_host") or node_id)
+                    + (f":{parse_int(node.get('remote_port'))}" if parse_int(node.get('remote_port')) else "")
+                ),
+                manual_switch_message="正在准备 OpenVPN 安全隧道…",
+                last_check_message=f"正在切换至 OpenVPN 节点 {node_id}，请稍候…",
+            )
+
         ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, ui_cfg)
         if not enable_connection and not ui_cfg.get("connection_enabled", True):
@@ -3373,7 +3728,12 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 ui_cfg = latest_cfg
                 write_json(auth_file, ui_cfg)
 
-        set_state(active_node_latency="清理连接", last_check_message="正在关闭与清理旧的 VPN 连接及网卡...")
+        if manual and active_tunnel_running():
+            return _manual_smooth_openvpn_switch(node, ui_cfg)
+
+        if manual:
+            set_state(manual_switch_message="正在建立候选连接，当前 VPN 暂不受影响…")
+        set_state(active_node_latency="清理连接", last_check_message="正在准备新的 OpenVPN 连接…")
         stop_all_tunnels()
         stopped_existing = True
 
@@ -3381,11 +3741,12 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         config_path = Path(node["config_file"])
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+            config_text = _prefer_openvpn_ip(node.get("config_text") or "", node)
+            config_path.write_text(config_text, encoding="utf-8")
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
-        set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
+        set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...", manual_switch_message=("正在建立 OpenVPN 安全隧道…" if manual else ""))
         ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
         if not ok or process is None:
             try:
@@ -3408,9 +3769,13 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         with lock:
             active_openvpn_process = process
             active_openvpn_node_id = node_id
+            connection_generation += 1
+            active_connection_generation = connection_generation
 
         proxy_server.set_active_interface("tun0")
         set_state(active_tunnel_protocol="openvpn", active_tunnel_interface="tun0")
+        if manual:
+            set_state(manual_switch_message="候选 OpenVPN 已建立，正在验证真实出口…", last_check_message="候选 OpenVPN 已建立，正在验证真实出口…")
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
 
@@ -3418,16 +3783,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         last_active_ping_time = time.time()
         last_active_latency = 0
 
-        set_state(active_node_latency="测试延迟", last_check_message="正在直连测试代理出口延迟与可用性...")
-        try:
-            ip = node.get("ip") or node.get("remote_host")
-            port = parse_int(node.get("remote_port"))
-            fallback = parse_int(node.get("ping"))
-            latency = vpn_utils.ping_latency_ms(ip, port, fallback)
-            if latency > 0:
-                last_active_latency = latency
-        except Exception:
-            pass
+        set_state(active_node_latency="测试出口", last_check_message="正在测试本地代理出站联通性与出口 IP...")
 
         for item in nodes:
             item["active"] = item.get("id") == node_id
@@ -3439,10 +3795,12 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
         if res["ok"]:
+            last_active_latency = parse_int(res.get("latency_ms")) or 0
             set_state(
                 proxy_ok=True,
                 proxy_ip=res["ip"],
                 proxy_latency_ms=res["latency_ms"],
+                active_node_latency=(f"{last_active_latency} ms" if last_active_latency > 0 else "出口已连接，等待延迟"),
                 proxy_error=""
             )
         else:
@@ -3454,6 +3812,9 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
             )
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
+        if manual:
+            set_state(manual_switch_message="目标节点验证完成，正在确认客户端状态…", last_check_message="真实出口验证通过，正在完成平滑切换…")
+            set_manual_route_pin(protocol="openvpn", node_id=node_id)
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
@@ -3596,7 +3957,8 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             account = f"probe{token}"
             nic = f"p{token}"
             adapter = tunnel_adapters.SoftEtherAdapter()
-            result = adapter.connect(                host=host,
+            result = adapter.connect(
+                host=host,
                 port=port or 443,
                 account=account,
                 nic=nic,
@@ -3677,7 +4039,7 @@ def protocol_probe_loop() -> None:
     time.sleep(90)
     while True:
         try:
-            if is_connecting or manual_connection_active:
+            if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active:
                 time.sleep(15)
                 continue
             current_hot = node_pool.ranked_hot_pool(limit=HOT_POOL_TARGET, per_server_limit=2)
@@ -3759,6 +4121,9 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
             Path(config_file).write_text(config_text, encoding="utf-8")
         except Exception:
             pass
+    real_probe_at = float(endpoint.get("last_success") or 0)
+    real_latency = int(endpoint.get("latency_ewma") or 0)
+    is_realtime_verified = real_probe_at > 0 and real_latency > 0
     node = {
         "id": node_id,
         "country": endpoint.get("country") or "",
@@ -3775,7 +4140,7 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
         "location": str(server_meta.get("location") or endpoint.get("country") or ""),
         "ip_type": str(server_meta.get("ip_type") or ""),
         "quality": str(server_meta.get("quality") or ""),
-        "latency_ms": int(endpoint.get("latency_ewma") or endpoint.get("latest_ping") or 0),
+        "latency_ms": real_latency if is_realtime_verified else 0,
         "config_file": config_file,
         "config_text": config_text,
         "proto": transport,
@@ -3783,9 +4148,9 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
         "remote_host": host,
         "remote_port": port,
         "fetched_at": time.time(),
-        "probe_status": "available",
-        "probe_message": "来自 Master Pool 的已验证历史资源",
-        "probed_at": float(endpoint.get("last_success") or time.time()),
+        "probe_status": "available" if is_realtime_verified else "not_checked",
+        "probe_message": "已完成真实 OpenVPN 隧道测速" if is_realtime_verified else "来自 Master Pool 的资源，等待真实 OpenVPN 隧道测速",
+        "probed_at": real_probe_at,
         "pool_endpoint_id": endpoint_id,
         "pool_rehydrated": True,
     }
@@ -3830,6 +4195,25 @@ def connect_ranked_endpoint(endpoint: dict[str, Any], manual: bool = False) -> s
         manual=manual,
     )
 
+def restore_manual_previous_connection(previous_openvpn_node_id: str = "", previous_pool_endpoint_id: str = "") -> tuple[bool, str]:
+    """Restore the connection that existed before a manual switch failed.
+    This is deliberately a manual rollback, not an automatic failover.
+    """
+    try:
+        previous_pool_endpoint_id = str(previous_pool_endpoint_id or "").strip()
+        previous_openvpn_node_id = str(previous_openvpn_node_id or "").strip()
+        if previous_pool_endpoint_id:
+            if active_pool_endpoint_id == previous_pool_endpoint_id and active_tunnel_running():
+                return True, "原多协议连接保持不变"
+            return True, connect_pool_endpoint(previous_pool_endpoint_id, manual=True)
+        if previous_openvpn_node_id:
+            if active_openvpn_node_id == previous_openvpn_node_id and active_tunnel_running():
+                return True, "原 OpenVPN 连接保持不变"
+            return True, connect_node(previous_openvpn_node_id, manual=True)
+    except Exception as exc:
+        return False, str(exc)
+    return False, "之前没有可恢复的活动连接"
+
 def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
     routing_mode = ui_cfg.get("routing_mode", "auto")
     if routing_mode == "fixed_ip":
@@ -3847,6 +4231,8 @@ def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str,
     return True
 
 def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4, preferred_only: bool = False, manual: bool = False) -> bool:
+    if ui_command_plane.is_busy() and not manual:
+        return False
     if not failover_lock.acquire(blocking=False):
         return True
     started = time.time()
@@ -3980,6 +4366,8 @@ def _pick_global_country_for_coverage() -> str:
 
 
 def schedule_global_country_coverage() -> dict[str, Any]:
+    if ui_command_plane.is_busy():
+        return {"ok": True, "running": True, "message": "前端人工指令进行中，暂缓国家覆盖任务"}
     if manual_connection_active:
         return {"ok": True, "running": True, "message": "手动连接正在进行，暂缓国家覆盖检测"}
     if country_priority_lock.locked() or country_priority_request:
@@ -3993,6 +4381,8 @@ def schedule_global_country_coverage() -> dict[str, Any]:
 
 def global_probe_sweep_once() -> dict[str, Any]:
     """Probe due OpenVPN and non-OpenVPN resources without touching the active tunnel."""
+    if ui_command_plane.is_busy():
+        return {"ok": True, "skipped": True, "reason": "用户正在执行前端指令"}
     if maintenance_lock.locked() or is_connecting:
         return {"ok": True, "skipped": True, "reason": "busy"}
     openvpn_limit = 6 if active_tunnel_running() else 10
@@ -4055,7 +4445,7 @@ def refresh_global_pool_background(force: bool = True) -> dict[str, Any]:
             return {"ok": True, "running": True, "message": "全球节点库刷新正在后台进行"}
         global_pool_refresh_running = True
         global_pool_refresh_status = "running"
-        global_pool_refresh_message = "正在拉取官方全球节点库，并写入 Master Pool；不会断开当前 VPN。"
+        global_pool_refresh_message = "正在重新开始全球资源轮询；保留历史节点与质量数据，不断开当前 VPN。"
         global_pool_refresh_servers = 0
         global_pool_refresh_sources = 0
 
@@ -4077,6 +4467,13 @@ def refresh_global_pool_background(force: bool = True) -> dict[str, Any]:
                 if not maintenance_lock.locked() and not is_connecting:
                     break
                 time.sleep(1)
+            # Requeue the entire persisted pool without deleting history.
+            try:
+                requeued = node_pool.reset_probe_schedule(include_retired=False)
+                log_to_json("INFO", "Probe", f"人工重新轮询：已重新排队 {requeued} 个非退役端点")
+            except Exception as exc:
+                requeued = 0
+                log_to_json("WARNING", "Probe", f"人工重新轮询排队失败: {exc}")
             candidates: list[dict[str, Any]] = []
             try:
                 candidates = fetch_candidates()
@@ -4088,8 +4485,8 @@ def refresh_global_pool_background(force: bool = True) -> dict[str, Any]:
             global_pool_refresh_last_at = time.time()
             global_pool_refresh_status = "ok"
             global_pool_refresh_message = (
-                f"全球节点库刷新完成：OpenVPN {len(candidates)} 个候选，多协议目录 {int(catalog.get('servers') or 0)} 台；"
-                "后台会继续进行可用性检测与国家缺口补齐。"
+                f"全球资源重新轮询完成：OpenVPN {len(candidates)} 个候选，多协议目录 {int(catalog.get('servers') or 0)} 台；"
+                "已有资源已重新排入检测，后台会继续进行全量可用性复核与国家缺口补齐。"
             )
             log_to_json("INFO", "Main", global_pool_refresh_message)
 
@@ -4130,7 +4527,7 @@ def global_country_coverage_loop() -> None:
     while True:
         try:
             global_country_coverage_heartbeat = time.time()
-            if not global_pool_refresh_running and not maintenance_lock.locked() and not manual_connection_active:
+            if not global_pool_refresh_running and not ui_command_plane.is_busy() and not maintenance_lock.locked() and not manual_connection_active:
                 schedule_global_country_coverage()
         except Exception as exc:
             log_to_json("WARNING", "Main", f"全球国家可用性补齐调度异常: {exc}")
@@ -4139,6 +4536,10 @@ def global_country_coverage_loop() -> None:
 def maintain_valid_nodes(force: bool = False):
     global active_openvpn_process, active_openvpn_node_id, is_connecting, manual_connection_epoch
     ensure_dirs()
+    if ui_command_plane.is_busy() and not force:
+        return "前端人工指令进行中，后台维护本轮暂缓"
+    if global_pool_refresh_running and not force:
+        return "全球资源重新轮询进行中，后台维护本轮暂缓"
     if not maintenance_lock.acquire(blocking=False):
         msg = "节点维护任务正在运行，请稍后再试"
         set_state(last_check_message=msg)
@@ -5313,6 +5714,25 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select[data-filter-id="country_filter"] {
       width: min(270px, 42vw);
     }
+    .toolbar-custom-select[data-filter-id="country_filter"] {
+      width: min(270px, 42vw);
+    }
+    .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
+    .unified-select-full { width: 100%; height: 40px; }
+    .unified-select-sync { width: 112px; height: 40px; flex: 0 0 112px; }
+    .unified-select-log { width: 156px; height: 32px; flex: 0 0 156px; }
+    .unified-select .toolbar-custom-select-button {
+      height: 40px; font-size: 13px; border-radius: 8px; padding: 0 12px; font-weight: 500;
+    }
+    .unified-select-log .toolbar-custom-select-button {
+      height: 32px; font-size: 12px; border-radius: 7px; padding: 0 10px;
+    }
+    .unified-select .toolbar-custom-select-menu {
+      position: fixed; left: 0; right: auto; top: auto; bottom: auto;
+      z-index: 120000; max-height: min(360px, calc(100vh - 24px));
+    }
+    .unified-select .toolbar-custom-option { min-height: 38px; font-size: 13px; }
+    .unified-select-log .toolbar-custom-option { min-height: 34px; font-size: 12px; }
     .toolbar-custom-select.open {
       z-index: 10070;
     }
@@ -5395,7 +5815,8 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-option {
       width: 100%;
-      min-height: 40px;      display: flex;
+      min-height: 40px;
+      display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
@@ -5828,6 +6249,29 @@ INDEX_HTML = r"""<!doctype html>
       color: #e2e8f0;
     }
 
+    .switching-active-card {
+      border-color: rgba(245, 158, 11, .38) !important;
+      background: linear-gradient(135deg, rgba(245,158,11,.09), rgba(255,255,255,.025)) !important;
+      box-shadow: 0 0 20px rgba(245,158,11,.10) !important;
+    }
+    .switching-icon {
+      background: rgba(245,158,11,.13) !important;
+      border-color: rgba(245,158,11,.28) !important;
+      color: #f59e0b !important;
+    }
+    .switch-spinner {
+      width: 24px; height: 24px; animation: spin .9s linear infinite; color: #f59e0b;
+    }
+    .switching-badge {
+      background: rgba(245,158,11,.13) !important; color: #fbbf24 !important; border-color: rgba(245,158,11,.3) !important;
+    }
+    .switch-elapsed { margin-left: 6px; color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+    .switching-target { color: var(--text-primary); opacity: .96; }
+    .switching-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+    .switching-lock-note { display:flex; align-items:center; gap:7px; color:#fbbf24; font-size:12px; white-space:nowrap; margin-left:14px; }
+    .switch-spinner-dot { width:7px; height:7px; border-radius:999px; background:#f59e0b; box-shadow:0 0 8px rgba(245,158,11,.5); animation:pulse 1.2s ease-in-out infinite; }
+    .switching-btn { opacity:1 !important; background:rgba(245,158,11,.12) !important; border-color:rgba(245,158,11,.34) !important; color:#fbbf24 !important; display:inline-flex; align-items:center; justify-content:center; gap:6px; }
+    .switching-btn .switch-spinner { width:13px; height:13px; }
     .latency-val {
       font-weight: 600;
       padding: 2px 6px;
@@ -6584,9 +7028,9 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
-    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
+    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="重新开始一轮全球资源采集与可用性检测，不清空历史数据，不断开当前 VPN。">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
-      刷新全球库
+      重新轮询全球库
     </button>
     <button id="btn_add_node" class="btn-primary" type="button" onclick="openAddNodeModal()" style="background: rgba(129,140,248,0.14); border: 1px solid rgba(129,140,248,0.35);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14" /></svg>
@@ -6799,9 +7243,17 @@ INDEX_HTML = r"""<!doctype html>
           <input type="number" id="cred_port" class="input-field" required value="8443" disabled title="管理端口固定为 8443">
         </div>
 
-        <div class="form-group" style="margin-bottom: 20px;">
+        <div class="form-group" style="margin-bottom: 12px;">
           <label class="form-label" for="cred_suffix">登录安全后缀 (仅字母和数字)</label>
           <input type="text" id="cred_suffix" class="input-field" required pattern="[A-Za-z0-9]+" placeholder="EJsW2EeBo9lY">
+        </div>
+
+        <div class="form-group" style="margin-bottom: 20px;">
+          <label class="form-label" for="cred_domain">HTTPS 域名（可选）</label>
+          <input type="text" id="cred_domain" class="input-field" placeholder="例如 vpn.example.com" autocomplete="url" spellcheck="false">
+          <div id="cred_cert_status" style="margin-top:8px; padding:9px 11px; border:1px solid var(--border-color); border-radius:8px; color:var(--text-secondary); font-size:12px; line-height:1.55; background:rgba(15,23,42,.24);">
+            填写已解析到本服务器的域名，保存后自动申请约 90 天 HTTPS 证书并自动续期。
+          </div>
         </div>
 
         <div style="display: flex; gap: 12px; justify-content: flex-end;">
@@ -6861,9 +7313,16 @@ INDEX_HTML = r"""<!doctype html>
 
           <div id="net_force_country_group" class="form-group" style="margin-bottom: 16px; display: none;">
             <label class="form-label" for="net_force_country">优先国家地区</label>
-            <select id="net_force_country" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
+            <select id="net_force_country" aria-hidden="true" tabindex="-1" style="display:none;">
               <option value="">正在加载节点国家...</option>
             </select>
+            <div id="net_force_country_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_force_country" aria-label="优先国家地区">
+              <button id="net_force_country_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                <span id="net_force_country_label" class="toolbar-custom-select-label">请选择优先国家...</span>
+                <span class="toolbar-custom-select-arrow">⌄</span>
+              </button>
+              <div id="net_force_country_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+            </div>
           </div>
 
           <div class="form-group" style="margin-bottom: 16px;">
@@ -7071,11 +7530,18 @@ INDEX_HTML = r"""<!doctype html>
             <input id="rs_invite_input" class="input-field" placeholder="对方邀请码 RS-XXXX-XXXX-XXXX-XXXX">
             <div class="rs-sync-row">
               <input id="rs_sync_interval_value" class="input-field" type="number" min="1" max="84" value="6" placeholder="同步周期">
-              <select id="rs_sync_interval_unit" class="input-field">
+              <select id="rs_sync_interval_unit" aria-hidden="true" tabindex="-1" style="display:none;">
                 <option value="hours">小时</option>
                 <option value="days">天</option>
                 <option value="weeks">周</option>
               </select>
+              <div id="rs_sync_interval_unit_widget" class="toolbar-custom-select unified-select unified-select-sync" data-unified-select-id="rs_sync_interval_unit" aria-label="同步周期单位">
+                <button id="rs_sync_interval_unit_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                  <span id="rs_sync_interval_unit_label" class="toolbar-custom-select-label">小时</span>
+                  <span class="toolbar-custom-select-arrow">⌄</span>
+                </button>
+                <div id="rs_sync_interval_unit_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+              </div>
             </div>
             <div class="rs-help">自动同步仅用于本机拉取对方资源；“立即同步”始终可以手动执行。</div>
             <button id="rs_join_btn" type="button" class="btn-primary rs-full-btn" onclick="joinResourcePeer()">添加并立即同步</button>
@@ -7157,11 +7623,18 @@ INDEX_HTML = r"""<!doctype html>
           <label>自动同步周期</label>
           <div class="rs-sync-row rs-edit-sync-row">
             <input id="rs_edit_sync_value" class="input-field" type="number" min="1" max="84" value="6" placeholder="周期">
-            <select id="rs_edit_sync_unit" class="input-field">
+            <select id="rs_edit_sync_unit" aria-hidden="true" tabindex="-1" style="display:none;">
               <option value="hours">小时</option>
               <option value="days">天</option>
               <option value="weeks">周</option>
             </select>
+            <div id="rs_edit_sync_unit_widget" class="toolbar-custom-select unified-select unified-select-sync" data-unified-select-id="rs_edit_sync_unit" aria-label="同步周期单位">
+              <button id="rs_edit_sync_unit_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                <span id="rs_edit_sync_unit_label" class="toolbar-custom-select-label">小时</span>
+                <span class="toolbar-custom-select-arrow">⌄</span>
+              </button>
+              <div id="rs_edit_sync_unit_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+            </div>
           </div>
           <div class="rs-edit-field-help">修改后下一个周期按新配置重新计算；也可以随时手动同步。</div>
         </div>
@@ -7187,13 +7660,21 @@ INDEX_HTML = r"""<!doctype html>
 
         <div style="display: flex; align-items: center; gap: 10px; margin-left: auto;">
           <label class="form-label" for="log_filter_select" style="margin: 0; font-size: 13px; color: var(--text-secondary);">日志筛选:</label>
-          <select id="log_filter_select" class="input-field" style="width: 140px; height: 32px; font-size: 12px; border-radius: 6px; padding: 0 8px; background: rgba(255, 255, 255, 0.03);" onchange="filterAndRenderLogs()">
+          <select id="log_filter_select" aria-hidden="true" tabindex="-1" style="display:none;">
             <option value="all">全部日志</option>
             <option value="proxy">代理相关 (Proxy)</option>
             <option value="vpn">VPN 连接 (VPN)</option>
             <option value="system">系统运行 (Main/Route)</option>
           </select>
+          <div id="log_filter_select_widget" class="toolbar-custom-select unified-select unified-select-log" data-unified-select-id="log_filter_select" aria-label="日志筛选">
+            <button id="log_filter_select_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+              <span id="log_filter_select_label" class="toolbar-custom-select-label">全部日志</span>
+              <span class="toolbar-custom-select-arrow">⌄</span>
+            </button>
+            <div id="log_filter_select_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+          </div>
         </div>
+
         <button type="button" onclick="closeLogsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
@@ -7393,9 +7874,10 @@ const translateStatus = s => {
 };
 
 function getLatencyClass(ms) {
-  if (!ms) return '';
-  if (ms < 50) return 'latency-good';
-  if (ms < 150) return 'latency-medium';
+  const value = Number(ms);
+  if (!value || value < 0) return '';
+  if (value <= 400) return 'latency-good';
+  if (value <= 800) return 'latency-medium';
   return 'latency-poor';
 }
 
@@ -7429,6 +7911,111 @@ const CUSTOM_FILTER_CONFIG = {
   protocol_filter: {widget:"protocol_filter_widget", button:"protocol_filter_button", label:"protocol_filter_label", menu:"protocol_filter_menu"},
   ip_type_filter: {widget:"ip_type_filter_widget", button:"ip_type_filter_button", label:"ip_type_filter_label", menu:"ip_type_filter_menu"}
 };
+
+
+const UNIFIED_SELECT_CONFIG = {
+  net_force_country: {widget:"net_force_country_widget", button:"net_force_country_button", label:"net_force_country_label", menu:"net_force_country_menu"},
+  rs_sync_interval_unit: {widget:"rs_sync_interval_unit_widget", button:"rs_sync_interval_unit_button", label:"rs_sync_interval_unit_label", menu:"rs_sync_interval_unit_menu"},
+  rs_edit_sync_unit: {widget:"rs_edit_sync_unit_widget", button:"rs_edit_sync_unit_button", label:"rs_edit_sync_unit_label", menu:"rs_edit_sync_unit_menu"},
+  log_filter_select: {widget:"log_filter_select_widget", button:"log_filter_select_button", label:"log_filter_select_label", menu:"log_filter_select_menu"}
+};
+
+function renderUnifiedSelect(selectId) {
+  const cfg = UNIFIED_SELECT_CONFIG[selectId];
+  const select = cfg ? $(selectId) : null;
+  const label = cfg ? $(cfg.label) : null;
+  const menu = cfg ? $(cfg.menu) : null;
+  if (!cfg || !select || !label || !menu) return;
+  const selected = select.options[select.selectedIndex];
+  label.textContent = selected ? selected.textContent : "";
+  const html = Array.from(select.options).map(option => {
+    const value = String(option.value || "");
+    const textValue = String(option.textContent || "");
+    const active = value === String(select.value || "");
+    const disabled = !!option.disabled;
+    return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') + '"' +
+      (disabled ? ' disabled style="opacity:.45;cursor:not-allowed;"' : '') +
+      ' role="option" aria-selected="' + (active ? 'true' : 'false') + '"' +
+      ' onclick="event.preventDefault();event.stopPropagation();chooseUnifiedSelect(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
+      '<span>' + esc(textValue) + '</span></button>';
+  }).join("");
+  if (menu.innerHTML !== html) menu.innerHTML = html;
+}
+
+function renderAllUnifiedSelects() {
+  Object.keys(UNIFIED_SELECT_CONFIG).forEach(renderUnifiedSelect);
+}
+
+function closeUnifiedSelects(exceptId = "") {
+  Object.keys(UNIFIED_SELECT_CONFIG).forEach(id => {
+    if (id === exceptId) return;
+    const cfg = UNIFIED_SELECT_CONFIG[id];
+    const widget = $(cfg.widget);
+    const button = $(cfg.button);
+    const menu = $(cfg.menu);
+    if (widget) widget.classList.remove("open");
+    if (button) button.setAttribute("aria-expanded", "false");
+    if (menu) { menu.style.top=""; menu.style.left=""; menu.style.bottom=""; }
+  });
+}
+
+function toggleUnifiedSelect(selectId, event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  const cfg = UNIFIED_SELECT_CONFIG[selectId];
+  const widget = cfg ? $(cfg.widget) : null;
+  const button = cfg ? $(cfg.button) : null;
+  const menu = cfg ? $(cfg.menu) : null;
+  if (!cfg || !widget || !menu) return;
+  const opening = !widget.classList.contains("open");
+  closeCustomFilters("");
+  closeUnifiedSelects(selectId);
+  renderUnifiedSelect(selectId);
+  widget.classList.toggle("open", opening);
+  if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
+  if (opening) {
+    requestAnimationFrame(() => {
+      const rect = widget.getBoundingClientRect();
+      const menuHeight = Math.min(menu.scrollHeight || 280, Math.min(360, window.innerHeight - 24));
+      const spaceBelow = window.innerHeight - rect.bottom - 10;
+      const spaceAbove = rect.top - 10;
+      const openUp = menuHeight > spaceBelow && spaceAbove >= menuHeight;
+      const top = openUp ? Math.max(8, rect.top - menuHeight - 8) : Math.min(window.innerHeight - menuHeight - 8, rect.bottom + 8);
+      const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - rect.width - 8));
+      menu.style.left = left + "px";
+      menu.style.width = rect.width + "px";
+      menu.style.top = top + "px";
+      menu.style.bottom = "auto";
+    });
+  }
+}
+
+function chooseUnifiedSelect(selectId, value) {
+  const cfg = UNIFIED_SELECT_CONFIG[selectId];
+  const select = cfg ? $(selectId) : null;
+  const option = select ? Array.from(select.options).find(x => String(x.value) === String(value)) : null;
+  if (!select || !option || option.disabled) return;
+  select.value = value;
+  select.dispatchEvent(new Event("change", {bubbles:true}));
+  if (selectId === "log_filter_select") filterAndRenderLogs();
+  renderUnifiedSelect(selectId);
+  closeUnifiedSelects("");
+}
+
+function bindUnifiedSelectEvents() {
+  document.querySelectorAll("[data-unified-toggle]").forEach(button => {
+    button.addEventListener("click", event => {
+      const widget = button.closest(".unified-select");
+      const selectId = widget?.getAttribute("data-unified-select-id");
+      if (selectId) toggleUnifiedSelect(selectId, event);
+    });
+  });
+  document.addEventListener("click", event => {
+    if (!event.target?.closest?.(".unified-select")) closeUnifiedSelects("");
+  });
+  window.addEventListener("resize", () => closeUnifiedSelects(""));
+}
+
+function syncUnifiedSelect(selectId) { renderUnifiedSelect(selectId); }
 
 function renderCustomFilter(selectId, withCount = false) {
   const cfg = CUSTOM_FILTER_CONFIG[selectId];
@@ -7500,6 +8087,7 @@ function toggleCustomFilter(selectId, event) {
   if (!cfg || !widget) return;
   const opening = !widget.classList.contains("open");
   closeCustomFilters(selectId);
+  closeUnifiedSelects("");
   if (opening) renderCustomFilter(selectId, selectId === "country_filter");
   widget.classList.toggle("open", opening);
   if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
@@ -7650,8 +8238,8 @@ function stableSortNodes() {
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
 
-    const aActive = !!(a.active || (a.pool_endpoint_id && state.active_pool_endpoint_id === a.pool_endpoint_id));
-    const bActive = !!(b.active || (b.pool_endpoint_id && state.active_pool_endpoint_id === b.pool_endpoint_id));
+    const aActive = !!((a.pool_endpoint_id && state.active_pool_endpoint_id === a.pool_endpoint_id) || (!state.active_pool_endpoint_id && a.active && a.id === state.active_openvpn_node_id));
+    const bActive = !!((b.pool_endpoint_id && state.active_pool_endpoint_id === b.pool_endpoint_id) || (!state.active_pool_endpoint_id && b.active && b.id === state.active_openvpn_node_id));
     if (aActive !== bActive) return aActive ? -1 : 1;
 
     const aRank = statusRank[a.probe_status || "not_checked"] ?? 2;
@@ -7685,11 +8273,50 @@ function stableSortNodes() {
 
 function render(){
   const activeNodeId = state.active_openvpn_node_id;
-  const activeNode = nodes.find(n => n && (n.active || n.id === activeNodeId));
+  const activeNode = state.active_pool_endpoint_id
+    ? null
+    : nodes.find(n => n && (n.active && (!activeNodeId || n.id === activeNodeId) || n.id === activeNodeId));
 
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
-  if (!activeNode && !state.active_pool_endpoint && state.connection_status === "connecting") {
+  const switching = !!state.manual_switch_active || (!!state.is_connecting && !!state.pending_connection_id);
+  if (switching) {
+    const pendingCountry = translateCountry(state.pending_connection_country || "-");
+    const pendingProtocol = translateProtocol(state.pending_connection_protocol || "-");
+    const pendingAddress = state.pending_connection_address || state.pending_connection_id || "目标节点";
+    const startedAt = Number(state.manual_switch_started_at || 0);
+    const elapsed = startedAt ? Math.max(0, Math.floor(Date.now() / 1000 - startedAt)) : 0;
+    const currentEp = state.active_pool_endpoint;
+    const currentNode = activeNode;
+    const currentLabel = currentEp
+      ? `${translateProtocol(currentEp.protocol || state.active_tunnel_protocol || "")} · ${translateCountry(currentEp.country || "-")}`
+      : currentNode
+        ? `${translateProtocol(currentNode.protocol || "openvpn")} · ${translateCountry(currentNode.country || "-")}`
+        : "当前连接";
+    const switchMessage = state.manual_switch_message || state.last_check_message || "正在建立新连接…";
+    activeCardContainer.innerHTML = `
+      <div class="active-card switching-active-card">
+        <div class="active-card-info">
+          <div class="stat-icon-wrapper switching-icon">
+            <svg xmlns="http://www.w3.org/2000/svg" class="switch-spinner" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 0121.21 8H18" /></svg>
+          </div>
+          <div class="active-card-details">
+            <div class="active-card-title switching-title">
+              <span class="badge switching-badge"><span class="badge-pulse"></span>切换中</span>
+              <strong>正在切换至 ${esc(pendingProtocol)} · ${esc(pendingCountry)}</strong>
+              <span class="switch-elapsed">${elapsed}s</span>
+            </div>
+            <div class="active-card-value mono switching-target">${esc(pendingAddress)}</div>
+            <div class="active-card-meta switching-meta">
+              <span>当前连接：<strong>${esc(currentLabel)}</strong>，验证完成前保持在线</span>
+              <span>阶段：<strong>${esc(switchMessage)}</strong></span>
+            </div>
+          </div>
+        </div>
+        <div class="switching-lock-note"><span class="switch-spinner-dot"></span>正在平滑建立并验证新隧道</div>
+      </div>
+    `;
+  } else if (!activeNode && !state.active_pool_endpoint && state.connection_status === "connecting") {
     const busyTitle = state.maintenance_running ? "正在更新节点" : "正在连接";
     const busyLatency = state.maintenance_running ? "节点检测中" : (state.active_node_latency || "正在连接...");
     const busyMessage = state.last_check_message || (state.maintenance_running ? "正在后台拉取并检测节点，已完成的结果会实时显示在下方列表。" : "正在与 VPN 节点建立加密隧道，请稍候...");
@@ -7713,7 +8340,7 @@ function render(){
     `;
   } else if (state.active_pool_endpoint) {
     const ep = state.active_pool_endpoint;
-    const latencyValue = Number(state.proxy_latency_ms || ep.latency_ms || 0);
+    const latencyValue = Number(state.proxy_latency_ms || 0);
     const latencyClass = getLatencyClass(latencyValue);
     const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
     const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
@@ -7749,8 +8376,9 @@ function render(){
       </div>
     `;
   } else if (activeNode) {
-    const latencyClass = getLatencyClass(activeNode.latency_ms);
-    const latencyText = activeNode.latency_ms ? `<span class="latency-val ${latencyClass}">${activeNode.latency_ms} ms</span>` : "-";
+    const activeLatencyValue = Number(state.proxy_latency_ms || 0);
+    const latencyClass = getLatencyClass(activeLatencyValue);
+    const latencyText = activeLatencyValue ? `<span class="latency-val ${latencyClass}">${activeLatencyValue} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
     const clientBadge = state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证");
     const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
@@ -7809,16 +8437,20 @@ function render(){
     const collecting = !!state.resource_engine_running;
     const probing = !!state.availability_engine_running;
     const priorityRunning = !!state.priority_running;
+    const bootstrapRunning = !!state.initial_bootstrap_running;
+    const manualSwitchRunning = !!state.manual_switch_active;
     const tested = Number(state.availability_tested_total || 0);
     const queue = Number(state.availability_queue || 0);
     let bgText = "资源守护正常运行 · 新资源进入后立即检测 · 后台检测不影响当前 VPN 连接";
-    if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
+    if (manualSwitchRunning) bgText = "人工切换中 · " + String(state.manual_switch_message || state.last_check_message || "正在平滑建立并验证新隧道") + " · 当前连接保持在线";
+    else if (bootstrapRunning) bgText = "首次安装初始化中 · 先获取资源，再检测本机国家并自动连接最低延迟节点";
+    else if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
     else if (collecting) bgText = "资源收集中 · 正在从主站、镜像和多协议目录补充 Master Pool";
     else if (probing) bgText = "可用性检测中 · 新资源优先 · 全量资源最长 4 小时滚动复检";
     else if (priorityRunning) bgText = String(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + "/" + Number(state.priority_target || 10);
     const detail = (tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "";
     bgActivityEl.style.display = "flex";
-    bgActivityEl.className = "background-task-strip " + ((collecting || probing || priorityRunning || state.failover_in_progress) ? "running" : "");
+    bgActivityEl.className = "background-task-strip " + ((manualSwitchRunning || collecting || probing || priorityRunning || bootstrapRunning || state.failover_in_progress) ? "running" : "");
     bgActivityTextEl.textContent = bgText + detail;
   }
 
@@ -7833,7 +8465,7 @@ function render(){
       globalRefreshEl.style.display = "flex";
       globalRefreshEl.className = "country-priority " + (running ? "running" : "");
       if (running) {
-        globalRefreshEl.innerHTML = `<span class="badge not_checked"><span class="badge-pulse"></span>全球节点库更新中</span><span>${esc(message || "正在从官方主站和镜像拉取资源；当前 VPN 连接不会被断开。")}</span>`;
+        globalRefreshEl.innerHTML = `<span class="badge not_checked"><span class="badge-pulse"></span>全球资源轮询中</span><span>${esc(message || "正在重新开始全球资源采集与可用性检测；当前 VPN 连接不会被断开。")}</span>`;
       } else {
         const detail = status === "error"
           ? message
@@ -7945,21 +8577,22 @@ function render(){
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
-      const isCurrentlyActive = (n.pool_endpoint_id && state.active_pool_endpoint_id === n.pool_endpoint_id) || (!!activeNode && n.id === activeNode.id);
+      const isCurrentlyActive = (n.pool_endpoint_id && state.active_pool_endpoint_id === n.pool_endpoint_id) || (!state.active_pool_endpoint_id && !!activeNode && n.id === activeNode.id);
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
+      const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
+      const displayProbeStatus = isTesting ? "testing" : (n.probe_status || "not_checked");
 
       const badgeClass = isCurrentlyActive ? 'available' : displayProbeStatus;
       const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(displayProbeStatus);
-      const latencyClass = getLatencyClass(n.latency_ms);
-      const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
+      const rowLatencyValue = isCurrentlyActive ? Number(state.proxy_latency_ms || 0) : Number(n.latency_ms || 0);
+      const latencyClass = getLatencyClass(rowLatencyValue);
+      const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}">${rowLatencyValue} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
       const protocolName = translateProtocol(n.protocol || "openvpn");
       const nodeHost = n.ip || n.remote_host || "-";
       const nodePort = Number(n.remote_port || 0) > 0 ? ":" + String(n.remote_port) : "";
       const nodeAddress = nodeHost + nodePort;
 
-      const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
-      const displayProbeStatus = isTesting ? "testing" : (n.probe_status || "not_checked");
       const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
       const statusCell = isCurrentlyActive
         ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
@@ -7978,9 +8611,16 @@ function render(){
       );
       const manualConnectBusy = manualConnectionUiBusy || !!state.manual_connection_active ||
         (!!state.is_connecting && !backgroundDetectionRunning);
+      const switchRunning = !!state.manual_switch_active || manualConnectionUiBusy || !!state.manual_connection_active;
+      const isPendingSwitch = switchRunning && (
+        (state.pending_connection_pool_endpoint_id && n.pool_endpoint_id === state.pending_connection_pool_endpoint_id) ||
+        (!state.pending_connection_pool_endpoint_id && state.pending_connection_id && n.id === state.pending_connection_id)
+      );
       const connectBtn = isCurrentlyActive
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || isTesting || manualConnectBusy) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+        : isPendingSwitch
+          ? `<button class="connect-btn switching-btn" disabled><span class="switch-spinner"></span>切换中</button>`
+          : `<button class="connect-btn" ${(isUnavailable || isTesting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
 
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
@@ -8086,8 +8726,8 @@ async function prioritizeCountry(country){
       try {
         const d = await fetchNodesState(8000);
         if (requestSeq !== countryPriorityRequestSeq) return;
-        nodes = Array.isArray(d.nodes) ? d.nodes : [];
-        state = d.state || {};
+        if (Array.isArray(d.nodes) && d.nodes.length > 0) nodes = d.nodes;
+        if (d.state) state = d.state;
         stableSortNodes();
         updateCountryFilter();
         render();
@@ -8198,10 +8838,31 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
   }
 }
 
+let lastGoodNodesState = null;
 async function fetchNodesState(timeoutMs = 8000) {
   if (nodesFetchPromise) return nodesFetchPromise;
-  nodesFetchPromise = fetchJsonWithTimeout("./api/nodes", {}, timeoutMs)
-    .finally(() => { nodesFetchPromise = null; });
+  nodesFetchPromise = Promise.all([
+    fetchJsonWithTimeout("./api/ui/nodes", {}, timeoutMs),
+    fetchJsonWithTimeout("./api/ui/state", {}, Math.min(timeoutMs, 4000))
+  ]).then(([nodeData, stateData]) => {
+    const data = {
+      nodes: Array.isArray(nodeData?.nodes) ? nodeData.nodes : [],
+      state: stateData?.state || {}
+    };
+    const poolEndpoints = Number(data?.state?.pool_endpoints || data?.state?.pool_servers || 0);
+    if (data.nodes.length > 0 || poolEndpoints <= 0) {
+      lastGoodNodesState = data;
+    } else if (lastGoodNodesState && Array.isArray(lastGoodNodesState.nodes) && lastGoodNodesState.nodes.length > 0) {
+      data.nodes = lastGoodNodesState.nodes;
+    }
+    return data;
+  }).catch(err => {
+    if (lastGoodNodesState) {
+      console.warn("UI 节点读取暂时失败，继续使用最近一次成功快照", err);
+      return lastGoodNodesState;
+    }
+    throw err;
+  }).finally(() => { nodesFetchPromise = null; });
   return nodesFetchPromise;
 }
 
@@ -8216,19 +8877,19 @@ function refreshButtonIdle() {
   const btn = $("refresh");
   if (!btn) return;
   btn.disabled = false;
-  btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>刷新全球库`;
+  btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>重新轮询全球库`;
 }
 
 function startRefreshPolling() {
   if (refreshPollInterval) clearInterval(refreshPollInterval);
-  refreshButtonBusy("正在刷新全球库...");
+  refreshButtonBusy("正在重新轮询全球库...");
   refreshPollInterval = setInterval(async () => {
     if (refreshPollBusy) return;
     refreshPollBusy = true;
     try {
       const data = await fetchNodesState(8000);
-      nodes = Array.isArray(data.nodes) ? data.nodes : [];
-      state = data.state || {};
+      if (Array.isArray(data.nodes) && data.nodes.length > 0) nodes = data.nodes;
+      if (data.state) state = data.state;
       stableSortNodes();
       updateCountryFilter();
       render();
@@ -8255,49 +8916,44 @@ function startConnectionPolling() {
     if (connectionPollBusy) return;
     connectionPollBusy = true;
     try {
-      const data = await fetchNodesState(8000);
-      nodes = Array.isArray(data.nodes) ? data.nodes : [];
-      state = data.state || {};
-      stableSortNodes();
-      updateCountryFilter();
+      // Connection progress is state-only. Avoid re-downloading the full ~1.5MB
+      // node list every 500ms; refresh the node list once the switch completes.
+      const data = await fetchJsonWithTimeout("./api/ui/state", {}, 2500);
+      if (data.state) state = data.state;
       render();
 
-      if (!state.is_connecting && !state.maintenance_running) {
+      if (!state.is_connecting && !state.manual_switch_active && !state.maintenance_running && !state.failover_in_progress) {
         clearInterval(pollInterval);
         pollInterval = null;
+        manualConnectionUiBusy = false;
+        await load();
         fetchJsonWithTimeout("./api/test_proxy", { method: "POST" }, 8000).catch(() => {});
         render();
       }
     } catch(pe) {
-      if (pe?.name !== "AbortError") {
-        clearInterval(pollInterval);
-        pollInterval = null;
-        load();
-      }
+      if (pe?.name !== "AbortError") console.warn("切换状态读取失败，继续等待下一次状态更新", pe);
     } finally {
       connectionPollBusy = false;
     }
-  }, 2000);
+  }, 500);
 }
 
 async function connectNode(id){
-  if (manualConnectionUiBusy) return;
+  if (manualConnectionUiBusy || state.manual_connection_active || state.manual_switch_active || state.failover_in_progress) return;
+  if (state.ui_command_plane?.active?.kind === "manual_connect") return;
   manualConnectionUiBusy = true;
   const selectedNode = nodes.find(n => n && n.id === id);
   const poolEndpointId = selectedNode && selectedNode.pool_endpoint_id ? selectedNode.pool_endpoint_id : "";
   state.is_connecting = true;
   state.manual_connection_active = true;
-  if (poolEndpointId) {
-    state.active_openvpn_node_id = "";
-    state.active_pool_endpoint_id = poolEndpointId;
-    state.active_tunnel_protocol = selectedNode.protocol || "";
-  } else {
-    state.active_openvpn_node_id = id;
-    state.active_pool_endpoint_id = "";
-    state.active_tunnel_protocol = "";
-  }
-  state.active_node_latency = "正在连接";
-  state.last_check_message = "正在发送连接请求...";
+  state.manual_switch_active = true;
+  state.manual_switch_started_at = Date.now() / 1000;
+  state.pending_connection_id = id;
+  state.pending_connection_protocol = selectedNode?.protocol || "";
+  state.pending_connection_country = selectedNode?.country || "";
+  state.active_node_latency = "正在切换";
+  state.manual_switch_message = "正在发送连接请求…";
+  state.last_check_message = "正在切换，当前连接在目标节点验证通过前保持不变…";
   render();
 
   startConnectionPolling();
@@ -8315,48 +8971,52 @@ async function connectNode(id){
           ? JSON.stringify({endpoint_id: poolEndpointId, endpoint_ids: fallbackEndpointIds})
           : JSON.stringify({id})
       },
-      240000
+      600000
     );
     if (result.ok && result.auto_fallback) {
       state.last_check_message = result.message || "当前节点失败，正在自动切换备用节点...";
       state.active_node_latency = "自动切换";
       render();
     }
-    if (result.ok) manualConnectionUiBusy = false;
+    if (result.ok) {
+      if (result.state) state = result.state;
+      state.pending_connection_id = "";
+      state.pending_connection_protocol = "";
+      state.pending_connection_country = "";
+      manualConnectionUiBusy = false;
+      load();
+    }
     if (!result.ok) {
-      alert("连接失败: " + (result.error || "未知错误"));
-      if (pollInterval) {
-        clearInterval(pollInterval);
-        pollInterval = null;
-      }
+      if (result.state) state = result.state;
+      manualConnectionUiBusy = false;
       state.is_connecting = false;
       state.manual_connection_active = false;
-      manualConnectionUiBusy = false;
-      if (poolEndpointId) {
-        state.active_pool_endpoint_id = "";
-        state.active_tunnel_protocol = "";
-      } else {
-        state.active_openvpn_node_id = "";
-      }
+      state.manual_switch_active = false;
+      state.pending_connection_id = "";
+      state.pending_connection_pool_endpoint_id = "";
+      state.pending_connection_protocol = "";
+      state.pending_connection_country = "";
+      state.pending_connection_address = "";
+      state.last_check_message = result.error || "人工切换失败，服务器未完成目标节点验证。";
+      state.manual_switch_message = result.restored_previous
+        ? "切换失败，已保留/恢复原连接。"
+        : "切换失败，请检查节点状态或稍后重试。";
+      await load();
       render();
       return;
     }
   } catch(e) {
-    alert("连接请求错误");
-    if (pollInterval) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-    }
-    state.is_connecting = false;
-    state.manual_connection_active = false;
-    manualConnectionUiBusy = false;
-    if (poolEndpointId) {
-      state.active_pool_endpoint_id = "";
-      state.active_tunnel_protocol = "";
-    } else {
-      state.active_openvpn_node_id = "";
-    }
+    // The reverse proxy may time out before the backend finishes a long,
+    // make-before-break switch. Do not fabricate a failure or clear the server
+    // state; keep polling until the backend reports the final result.
+    state.last_check_message = "连接请求暂时中断，服务器仍可能正在验证新节点；请勿重复点击，正在继续读取切换状态…";
+    state.manual_switch_message = "正在等待服务器最终切换结果…";
+    state.is_connecting = true;
+    state.manual_connection_active = true;
+    state.manual_switch_active = true;
+    manualConnectionUiBusy = true;
     render();
+    startConnectionPolling();
   }
 }
 
@@ -8511,10 +9171,43 @@ async function submitAddNode(){
   }
 }
 
+let initialNodeLoadRetryCount = 0;
 async function load(){
-  const d = await fetchNodesState(8000);
-  nodes=Array.isArray(d.nodes) ? d.nodes : [];
-  state=d.state||{};
+  try {
+    const d = await fetchNodesState(8000);
+    const incomingNodes = Array.isArray(d.nodes) ? d.nodes : [];
+    if (incomingNodes.length > 0) {
+      nodes = incomingNodes;
+      initialNodeLoadRetryCount = 0;
+      try {
+        sessionStorage.setItem("aimili_last_nodes_snapshot", JSON.stringify({
+          nodes: incomingNodes.slice(0, 1000),
+          saved_at: Date.now()
+        }));
+      } catch (_) {}
+    } else if (!nodes.length) {
+      let restored = false;
+      try {
+        const cached = JSON.parse(sessionStorage.getItem("aimili_last_nodes_snapshot") || "null");
+        if (cached && Array.isArray(cached.nodes) && cached.nodes.length) {
+          nodes = cached.nodes;
+          restored = true;
+        }
+      } catch (_) {}
+      const poolEndpoints = Number(d?.state?.pool_endpoints || 0);
+      if (!restored && poolEndpoints > 0 && initialNodeLoadRetryCount < 12) {
+        initialNodeLoadRetryCount += 1;
+        state = d.state || state || {};
+        state.last_check_message = "节点资源正在恢复，保留后台检测；正在重新读取节点列表...";
+        render();
+        setTimeout(load, 600);
+        return;
+      }
+    }
+    if (d.state) state = d.state;
+  } catch (e) {
+    console.warn("节点列表加载暂时失败，保留当前节点数据", e);
+  }
 
   stableSortNodes();
   updateCountryFilter();
@@ -8552,16 +9245,19 @@ $("ip_type_filter").onchange=applyNodeFilterChange;
 $("status_filter").onchange=applyNodeFilterChange;
 renderAllCustomFilters();
 bindCustomFilterEvents();
+renderAllUnifiedSelects();
+bindUnifiedSelectEvents();
 
 $("refresh").onclick=async()=>{
-  refreshButtonBusy("正在刷新全球库...");
+  if (manualConnectionUiBusy || state.manual_connection_active) return;
+  refreshButtonBusy("正在重新轮询全球库...");
   try{
     const data = await fetchJsonWithTimeout("./api/refresh_global_pool",{method:"POST"}, 10000);
     if (data.ok === false) throw new Error(data.error || "全球库刷新启动失败");
     state = Object.assign({}, state, {
       global_pool_refresh_running: true,
       global_pool_refresh_status: "running",
-      global_pool_refresh_message: data.message || "正在后台刷新全球节点库"
+      global_pool_refresh_message: data.message || "正在重新开始全球资源轮询"
     });
     render();
     startRefreshPolling();
@@ -8646,7 +9342,7 @@ async function checkGithubUpdate() {
   if (applyBtn) applyBtn.style.display = "none";
   setGithubUpdateMessage("正在检查 GitHub 正式版...");
   try {
-    const result = await fetchJsonWithTimeout("./api/github_update/check", { method: "POST" }, 10000);
+    const result = await fetchJsonWithTimeout("./api/github_update/check", {}, 10000);
     const current = result.current_version || "未知";
     const latest = result.latest_version || current;
     const currentEl = $("github_current_version");
@@ -8869,7 +9565,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>仅用收藏</strong>：只连接和切换您收藏的节点。如果所有收藏的节点均失效，系统不会自动切换到未收藏的节点。请确保收藏列表中有足够多且可用的节点。`;
+    warningDiv.innerHTML = `ℹ️ <strong>仅用收藏</strong>：优先使用您收藏的节点；如果全部收藏节点暂时不可用，系统默认自动回退到全局可用节点，避免代理中断。收藏节点恢复后会自动优先切回。`;
   } else if (mode === "fixed_ip") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -8909,6 +9605,73 @@ function populateRoutingCountries() {
   if (state) {
     select.value = state.force_country ? translateCountry(state.force_country) : "";
   }
+  syncUnifiedSelect("net_force_country");
+}
+
+let certificatePollInterval = null;
+
+function renderCertificateStatus(certState) {
+  const el = $("cred_cert_status");
+  if (!el) return;
+  const cert = certState || state?.web_certificate || {};
+  const status = String(cert.status || "not_configured");
+  const domain = String(cert.domain || state?.web_domain || "");
+  const message = String(cert.message || "");
+  const error = String(cert.last_error || "");
+  const expiresAt = Number(cert.expires_at || 0);
+
+  let badgeText = "未启用";
+  let badgeBg = "rgba(148,163,184,.12)";
+  let badgeColor = "var(--text-secondary)";
+  let detail = message || "填写域名后自动申请 HTTPS 证书。";
+
+  if (status === "issuing" || status === "installing" || status === "running") {
+    badgeText = status === "installing" ? "安装中" : "申请中";
+    badgeBg = "rgba(245,158,11,.14)";
+    badgeColor = "#f59e0b";
+    detail = message || "正在申请 HTTPS 证书，请稍候…";
+  } else if (status === "active") {
+    badgeText = "已启用";
+    badgeBg = "rgba(16,185,129,.14)";
+    badgeColor = "var(--success)";
+    const expiryText = expiresAt ? new Date(expiresAt * 1000).toLocaleString() : "读取中";
+    detail = domain
+      ? `HTTPS 已启用：${esc(domain)} · 证书到期：${esc(expiryText)} · 自动续期已开启`
+      : "HTTPS 证书已启用。";
+  } else if (status === "error" || status === "interrupted") {
+    badgeText = status === "interrupted" ? "任务中断" : "申请失败";
+    badgeBg = "rgba(244,63,94,.12)";
+    badgeColor = "var(--danger)";
+    detail = error || message || "HTTPS 证书申请失败，请检查域名解析及 80 端口。";
+  }
+
+  el.innerHTML = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+    <span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;background:${badgeBg};color:${badgeColor};font-weight:600;">${esc(badgeText)}</span>
+    <span>${esc(detail)}</span>
+  </div>`;
+}
+
+async function startCertificatePolling() {
+  if (certificatePollInterval) clearInterval(certificatePollInterval);
+  const poll = async () => {
+    try {
+      const data = await fetchJsonWithTimeout("./api/certificate_status", {}, 5000);
+      if (data.certificate) {
+        state.web_certificate = data.certificate;
+        state.web_domain = data.certificate.domain || state.web_domain || "";
+        renderCertificateStatus(data.certificate);
+        const done = !data.certificate.running && ["active", "error", "not_configured", "interrupted"].includes(String(data.certificate.status || ""));
+        if (done && certificatePollInterval) {
+          clearInterval(certificatePollInterval);
+          certificatePollInterval = null;
+        }
+      }
+    } catch (err) {
+      console.warn("HTTPS 证书状态读取失败，继续等待下一次状态更新", err);
+    }
+  };
+  await poll();
+  certificatePollInterval = setInterval(poll, 1500);
 }
 
 function openCredentialsModal() {
@@ -8920,7 +9683,9 @@ function openCredentialsModal() {
     $("cred_password").value = "";
     $("cred_port").value = 8443;
     $("cred_suffix").value = state.secret_path || "";
+    $("cred_domain").value = state.web_domain || state.web_certificate?.domain || "";
   }
+  renderCertificateStatus(state?.web_certificate || {});
   $("credentials_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
 }
@@ -8942,6 +9707,7 @@ async function saveCredentials(e) {
   const password = $("cred_password").value.trim();
   const port = parseInt($("cred_port").value);
   const suffix = $("cred_suffix").value.trim();
+  const domain = $("cred_domain").value.trim();
 
   if (!username || (!password && !(state && state.password_set))) {
     errorDivEl.textContent = "用户名不能为空；首次设置时密码不能为空";
@@ -8957,6 +9723,12 @@ async function saveCredentials(e) {
 
   if (!/^[A-Za-z0-9]+$/.test(suffix)) {
     errorDivEl.textContent = "登录安全后缀仅能由英文字母和数字组成";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
+  if (domain && !/^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$/.test(domain.replace(/\.$/, ""))) {
+    errorDivEl.textContent = "域名格式不正确，请填写完整域名，例如 vpn.example.com";
     errorDivEl.style.display = "block";
     return;
   }
@@ -8978,14 +9750,22 @@ async function saveCredentials(e) {
         username: username,
         password: password,
         port: port,
-        secret_path: suffix
+        secret_path: suffix,
+        domain: domain
       })
     });
 
     const data = await res.json();
     if (res.ok && data.ok) {
+      if (data.certificate) {
+        state.web_certificate = data.certificate;
+        state.web_domain = data.certificate.domain || domain;
+        renderCertificateStatus(data.certificate);
+      }
       if (data.restart_needed) {
-        successDiv.textContent = "保存成功！网页管理端口或路径已变更，页面将在 4 秒内自动跳转...";
+        successDiv.textContent = data.certificate?.status === "issuing"
+          ? "保存成功，网页安全配置将在 4 秒内重启；证书申请会在重启后继续。"
+          : "保存成功！网页管理端口或路径已变更，页面将在 4 秒内自动跳转...";
         successDiv.style.display = "block";
 
         const inputs = $("credentials_form").querySelectorAll("input, button");
@@ -8993,19 +9773,31 @@ async function saveCredentials(e) {
 
         setTimeout(() => {
           const protocol = window.location.protocol;
-          const host = window.location.hostname;          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
+          const host = window.location.hostname;
+          window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
         }, 4000);
       } else {
-        successDiv.textContent = data.reauth_required ? "账号密码保存成功，请重新登录..." : "账号密码保存成功，已即时生效！";
-        successDiv.style.display = "block";
-        setTimeout(() => {
-          if (data.reauth_required) {
-            window.location.reload();
-          } else {
-            closeCredentialsModal();
-            load();
-          }
-        }, 1500);
+        const certBusy = !!data.certificate?.running && ["issuing", "installing"].includes(String(data.certificate?.status || ""));
+        if (certBusy) {
+          successDiv.textContent = data.reauth_required
+            ? "账号密码保存成功，HTTPS 证书正在后台申请；完成后会自动更新状态。"
+            : "保存成功，HTTPS 证书正在后台申请；完成后会自动更新状态。";
+          successDiv.style.display = "block";
+          submitBtn.disabled = false;
+          submitBtn.textContent = "保存修改";
+          startCertificatePolling();
+        } else {
+          successDiv.textContent = data.reauth_required ? "账号密码保存成功，请重新登录..." : "账号密码保存成功，已即时生效！";
+          successDiv.style.display = "block";
+          setTimeout(() => {
+            if (data.reauth_required) {
+              window.location.reload();
+            } else {
+              closeCredentialsModal();
+              load();
+            }
+          }, 1500);
+        }
       }
     } else {
       errorDivEl.textContent = data.error || "保存失败，请检查输入";
@@ -9038,6 +9830,7 @@ function openNetworkModal() {
   }
 
   populateRoutingCountries();
+  syncUnifiedSelect("net_force_country");
   $("network_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
 }
@@ -9168,14 +9961,9 @@ load();
 setInterval(async () => {
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
-      const r = await fetch("./api/nodes", {credentials:"same-origin", cache:"no-store"});
-      const d = await r.json();
-      if (r.status === 401) {
-        window.location.reload();
-        return;
-      }
-      nodes = d.nodes || [];
-      state = d.state || {};
+      const d = await fetchNodesState(8000);
+      if (Array.isArray(d.nodes) && d.nodes.length > 0) nodes = d.nodes;
+      if (d.state) state = d.state;
       stableSortNodes();
       updateCountryFilter();
       render();
@@ -9275,6 +10063,7 @@ function openResourceShareModal() {
   if (dropdown) dropdown.style.display = "none";
   const modal = $("resource_share_modal");
   if (modal) modal.style.display = "flex";
+  syncUnifiedSelect("rs_sync_interval_unit");
   loadResourceShareStatus();
 }
 
@@ -9463,6 +10252,7 @@ async function openResourceShareEditModal(type, id) {
     $("rs_edit_remote_invite").value = payload.remote_invite_code || "";
     $("rs_edit_sync_value").value = Number(payload.sync_interval_value || 6);
     $("rs_edit_sync_unit").value = payload.sync_interval_unit || "hours";
+    syncUnifiedSelect("rs_edit_sync_unit");
 
     const isInvite = type === "invite";
     const hasOutbound = !isInvite && !!payload.outbound_peer_id;
@@ -9870,6 +10660,7 @@ let rawLogsCache = [];
 
 function openLogsModal() {
   $("admin_dropdown").style.display = "none";
+  syncUnifiedSelect("log_filter_select");
   $("logs_modal").style.display = "flex";
   loadLogs();
   if (logsPollInterval) clearInterval(logsPollInterval);
@@ -10160,12 +10951,24 @@ def check_proxy_health() -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
-def handle_confirmed_tunnel_failure(error_msg: str) -> None:
+def handle_confirmed_tunnel_failure(error_msg: str, expected_target: str = "") -> None:
     global is_connecting
+    if expected_target:
+        current_target = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+        if current_target != str(expected_target):
+            log_to_json("INFO", "Proxy", f"忽略旧连接迟到故障事件: expected={expected_target}, current={current_target}")
+            return
+    if manual_connection_active:
+        log_to_json("INFO", "VPN", "人工连接操作进行中，忽略自动故障接管")
+        return
+    if time.time() < manual_connection_quiet_until:
+        log_to_json("INFO", "VPN", "人工连接刚完成，忽略本轮可能来自旧连接的陈旧故障结果")
+        return
     if not bool(load_ui_config().get("connection_enabled", True)):
         return
     if active_pool_endpoint_id:
         failed_endpoint = active_pool_endpoint_id
+        clear_manual_route_pin()
         try:
             node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
         except Exception:
@@ -10176,6 +10979,7 @@ def handle_confirmed_tunnel_failure(error_msg: str) -> None:
         return
 
     if active_openvpn_node_id:
+        clear_manual_route_pin()
         ui_cfg = load_ui_config()
         routing_mode = ui_cfg.get("routing_mode", "auto")
         if routing_mode != "fixed_ip":
@@ -10235,26 +11039,40 @@ def owned_tunnel_local_liveness() -> tuple[bool, str]:
     if active_openvpn_node_id:
         if not active_openvpn_running():
             return False, "OpenVPN 进程已退出"
-        if sys.platform.startswith("linux") and not Path("/sys/class/net/tun0").exists():
-            return False, "OpenVPN tun0 已消失"
+        active_iface = str(proxy_server.get_active_interface() or "tun0")
+        if sys.platform.startswith("linux") and not Path("/sys/class/net").joinpath(active_iface).exists():
+            return False, f"OpenVPN 活动网卡 {active_iface} 已消失"
+        if not tunnel_adapters.interface_has_ipv4(active_iface):
+            return False, f"OpenVPN 活动网卡 {active_iface} 没有 IPv4"
         return True, ""
 
     return True, "idle"
 
 
 def fast_tunnel_liveness_loop() -> None:
+    liveness_failures = 0
+    last_target = ""
     time.sleep(3)
     while True:
         try:
-            if is_connecting or failover_lock.locked():
+            if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or failover_lock.locked():
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             if not active_pool_endpoint_id and not active_openvpn_node_id:
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
+            target = active_pool_endpoint_id or active_openvpn_node_id
+            if target != last_target:
+                liveness_failures = 0
+                last_target = target
             ok, reason = owned_tunnel_local_liveness()
             if not ok:
-                error_msg = f"本地快速存活检测失败: {reason}"
+                liveness_failures += 1
+                if liveness_failures < 3:
+                    time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                    continue
+                error_msg = f"本地快速存活检测连续 {liveness_failures} 次失败: {reason}"
+                liveness_failures = 0
                 set_state(
                     proxy_ok=False,
                     proxy_ip="-",
@@ -10282,8 +11100,9 @@ def background_proxy_checker() -> None:
             # If this manager has no intended active endpoint, it is idle.
             # If an endpoint ID still exists but the process/interface vanished,
             # that is a real tunnel failure and must enter failover handling.
+            check_target = str(active_pool_endpoint_id or active_openvpn_node_id or "")
             if not active_tunnel_running():
-                if not active_pool_endpoint_id and not active_openvpn_node_id:
+                if not check_target:
                     set_state(
                         proxy_ok=False,
                         proxy_ip="-",
@@ -10336,34 +11155,25 @@ def background_proxy_checker() -> None:
                 )
 
                 # Only confirmed failures can trigger production failover.
-                handle_confirmed_tunnel_failure(error_msg)
+                handle_confirmed_tunnel_failure(error_msg, expected_target=check_target)
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
         time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
 
 def active_node_pinger() -> None:
+    # Heartbeat only. Real client health and latency are maintained by the
+    # background proxy health loop, avoiding duplicate ICMP/TCP probes.
     global last_pinger_heartbeat
     while True:
         last_pinger_heartbeat = time.time()
         try:
-            if active_tunnel_running() and active_openvpn_node_id:
-                nodes = read_nodes()
-                node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                if node:
-                    ip = node.get("ip") or node.get("remote_host")
-                    port = parse_int(node.get("remote_port"))
-                    fallback = parse_int(node.get("ping"))
-                    if ip:
-                        latency = vpn_utils.ping_latency_ms(ip, port, fallback)
-                        if latency > 0:
-                            set_state(active_node_latency=f"{latency} ms")
-                        else:
-                            set_state(active_node_latency="检测超时")
-                    else:
-                        set_state(active_node_latency="检测超时")
+            if active_tunnel_running():
+                current = int(read_json(STATE_FILE, {}).get("proxy_latency_ms") or 0)
+                if current > 0:
+                    set_state(active_node_latency=f"{current} ms")
                 else:
-                    set_state(active_node_latency="检测超时")
+                    set_state(active_node_latency="出口已连接，等待检测")
             elif is_connecting:
                 set_state(active_node_latency="测试中...")
             else:
@@ -10438,7 +11248,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        self.send_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
+        if hasattr(self, "_ui_command_token") and int(status) >= 400:
+            self._ui_command_ok = False
+        body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(body) >= 16384 and "gzip" in str(self.headers.get("Accept-Encoding") or "").lower():
+            body = gzip.compress(body, compresslevel=5)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_bytes(body, "application/json; charset=utf-8", status)
 
     def read_request_body(self, max_bytes: int = 65536) -> bytes:
         length = parse_int(self.headers.get("Content-Length"))
@@ -10558,8 +11382,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(link_test_path.read_bytes(), "text/html; charset=utf-8")
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
-        elif effective_path == "/api/github_version":
-            self.send_json(current_github_version())
+        elif effective_path in ("/api/github_version", "/api/github_update/check"):
+            self.send_json(check_github_update() if effective_path.endswith("/check") else current_github_version())
+        elif effective_path == "/api/certificate_status":
+            self.send_json({"ok": True, "certificate": web_certificate.snapshot()})
         elif effective_path == "/api/github_update/status":
             self.send_json({
                 "ok": True,
@@ -10567,42 +11393,13 @@ class Handler(BaseHTTPRequestHandler):
                 "last_result": github_update_last_result,
             })
         elif effective_path == "/api/nodes":
-            global last_active_ping_time, last_active_latency, active_openvpn_node_id
-            nodes = read_nodes()
-            try:
-                for endpoint in node_pool.list_endpoints(limit=5000):
-                    if str(endpoint.get("protocol") or "").lower() == "openvpn":
-                        continue
-                    pool_node = protocol_endpoint_to_ui_node(endpoint)
-                    if pool_node:
-                        nodes.append(pool_node)
-            except Exception as exc:
-                log_to_json("WARNING", "Main", f"多协议节点列表合并失败: {exc}")
-            nodes = dedupe_ui_nodes(nodes)
+            global active_openvpn_node_id
+            nodes = _get_ui_nodes_snapshot()
             active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
             for n in nodes:
-                n["active"] = (active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
-            if active_node:
-                ip = active_node.get("ip") or active_node.get("remote_host")
-                if ip:
-                    now = time.time()
-                    if now - last_active_ping_time > 15.0:
-                        last_active_ping_time = now
-                        def bg_ping(ip_addr: str, port: int, fallback: int) -> None:
-                            global last_active_latency
-                            try:
-                                latency = vpn_utils.ping_latency_ms(ip_addr, port, fallback)
-                                if latency > 0:
-                                    last_active_latency = latency
-                            except Exception:
-                                pass
-                        threading.Thread(
-                            target=bg_ping,
-                            args=(ip, parse_int(active_node.get("remote_port")), parse_int(active_node.get("ping"))),
-                            daemon=True
-                        ).start()
-                    if last_active_latency > 0:
-                        active_node["latency_ms"] = last_active_latency
+                n["active"] = bool(active_openvpn_node_id and n.get("id") == active_openvpn_node_id)
+            if active_node and last_active_latency > 0:
+                active_node["latency_ms"] = last_active_latency
             stripped_nodes = []
             for n in nodes:
                 stripped = n.copy()
@@ -10610,7 +11407,11 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped.pop("_pool_metadata", None)
                 stripped_nodes.append(stripped)
-            self.send_json({"nodes": stripped_nodes, "state": get_state()})
+            self.send_json({"nodes": stripped_nodes, "state": _get_fast_nodes_state()})
+        elif effective_path == "/api/ui/state":
+            self.send_json({"ok": True, "state": _get_fast_nodes_state(), "ui_command": ui_command_plane.ui_state()})
+        elif effective_path == "/api/ui/nodes":
+            self.send_json({"ok": True, "nodes": _get_ui_nodes_snapshot(), "generated_at": time.time()})
         elif effective_path == "/api/protocol_capabilities":
             self.send_json({"ok": True, "protocols": tunnel_adapters.capability_report()})
         elif effective_path == "/api/node_pool_stats":
@@ -10792,7 +11593,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif effective_path == "/api/resource_share/status":
             try:
-                status = resource_share.status()                status["local_url"] = self.resource_share_local_url()
+                status = resource_share.status()
+                status["local_url"] = self.resource_share_local_url()
                 status["pool"] = node_pool.stats()
                 self.send_json(status)
             except Exception as exc:
@@ -10816,6 +11618,45 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        effective_path = self.validate_path()
+        if effective_path == "":
+            return
+        if effective_path in ("/api/login", "/api/logout"):
+            return self._do_POST_impl()
+        if not self.is_authorized():
+            return self._do_POST_impl()
+
+        # All authenticated UI write operations pass through one command gate.
+        # Connection endpoints retain their dedicated connection lock below.
+        command_bypass = {"/api/connect", "/api/connect_pool_endpoint"}
+        if effective_path in command_bypass:
+            return self._do_POST_impl()
+
+        command = ui_command_plane.begin("ui_command", effective_path)
+        if command is None:
+            self.send_json(
+                {"ok": False, "busy": True, "error": "已有前端操作正在执行，请等待当前操作完成"},
+                HTTPStatus.CONFLICT,
+            )
+            return
+
+        self._ui_command_token = command["token"]
+        self._ui_command_ok = True
+        try:
+            return self._do_POST_impl()
+        except Exception:
+            self._ui_command_ok = False
+            raise
+        finally:
+            ui_command_plane.finish(
+                command["token"],
+                ok=bool(getattr(self, "_ui_command_ok", False)),
+                message=effective_path,
+            )
+            self._ui_command_token = ""
+            self._ui_command_ok = True
+
+    def _do_POST_impl(self) -> None:
         global is_connecting
         effective_path = self.validate_path()
         if effective_path == "": return
@@ -11119,9 +11960,16 @@ class Handler(BaseHTTPRequestHandler):
                 new_username = str(payload.get("username") or "").strip()
                 new_password = str(payload.get("password") or "").strip()
                 new_suffix = str(payload.get("secret_path") or "").strip()
+                raw_domain = str(payload.get("domain") or "").strip()
                 new_port_int = 8501
 
                 ui_cfg = load_ui_config()
+                try:
+                    new_domain = web_certificate.normalize_domain(raw_domain)
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
+
                 if not new_username or (not new_password and not ui_cfg.get("password")):
                     self.send_json({"ok": False, "error": "用户名不能为空；首次设置时密码不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
@@ -11132,8 +11980,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 expected_username = ui_cfg.get("username", "")
                 expected_password = ui_cfg.get("password", "")
-                expected_port = ui_cfg.get("port", 8501)
                 expected_suffix = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
+                old_domain = str(ui_cfg.get("web_domain") or "").strip()
+                cert_before = web_certificate.snapshot()
+
+                # Do not let a second domain overwrite an in-flight ACME order.
+                # The user can retry the same domain while a job is running.
+                cert_running_domain = str(cert_before.get("domain") or "").strip()
+                if cert_before.get("running") and new_domain != cert_running_domain:
+                    self.send_json(
+                        {"ok": False, "error": f"HTTPS 证书正在申请 {cert_running_domain or '当前域名'}，请等待当前任务完成后再修改域名。"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
 
                 ui_cfg["username"] = new_username
                 if new_password:
@@ -11141,6 +12000,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["port"] = 8501
                 ui_cfg["host"] = "127.0.0.1"
                 ui_cfg["secret_path"] = new_suffix
+                ui_cfg["web_domain"] = new_domain
 
                 auth_file = DATA_DIR / "ui_auth.json"
                 reauth_required = new_username != expected_username or (new_password and new_password != expected_password)
@@ -11151,8 +12011,41 @@ class Handler(BaseHTTPRequestHandler):
                         active_sessions.clear()
 
                 restart_needed = (new_suffix != expected_suffix)
+                certificate_result = web_certificate.snapshot()
+                domain_changed = new_domain != old_domain
+
+                if new_domain:
+                    if restart_needed:
+                        # Persist a resumable state marker without starting the
+                        # ACME child process inside a process that is about to exit.
+                        web_certificate._write_state(
+                            status="issuing",
+                            domain=new_domain,
+                            message="网页安全配置正在重启，重启后将自动继续申请 HTTPS 证书。",
+                            last_error="",
+                        )
+                        certificate_result = web_certificate.snapshot()
+                    elif domain_changed or str(cert_before.get("domain") or "") != new_domain or str(cert_before.get("status") or "") in ("error", "interrupted", "not_configured"):
+                        certificate_result = web_certificate.start(new_domain)
+                    else:
+                        certificate_result = web_certificate.snapshot()
+                elif old_domain:
+                    certificate_result = web_certificate.disable()
+                    if not certificate_result.get("ok"):
+                        self.send_json(
+                            {"ok": False, "error": certificate_result.get("error") or certificate_result.get("last_error") or "清除 HTTPS 域名失败"},
+                            HTTPStatus.BAD_GATEWAY,
+                        )
+                        return
+
                 if restart_needed:
-                    self.send_json({"ok": True, "restart_needed": True, "reauth_required": reauth_required, "message": "配置更新成功，网页管理端口或路径已变更，将在 2 秒内重启..."})
+                    self.send_json({
+                        "ok": True,
+                        "restart_needed": True,
+                        "reauth_required": reauth_required,
+                        "certificate": certificate_result,
+                        "message": "配置更新成功，网页安全后缀已变更；服务将在约 2 秒后重启，HTTPS 证书任务会在重启后自动继续。",
+                    })
 
                     def restart_server():
                         time.sleep(2)
@@ -11161,7 +12054,22 @@ class Handler(BaseHTTPRequestHandler):
 
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
-                    self.send_json({"ok": True, "restart_needed": False, "reauth_required": reauth_required, "message": "账号密码配置更新成功，已即时生效！"})
+                    message = "账号密码配置保存成功。"
+                    if certificate_result.get("status") in ("issuing", "installing") and certificate_result.get("running"):
+                        message += " HTTPS 证书正在后台申请。"
+                    elif certificate_result.get("status") == "active":
+                        message += " HTTPS 证书已启用。"
+                    elif new_domain and certificate_result.get("status") == "error":
+                        message += " HTTPS 证书申请失败，请检查域名解析、80 端口及防火墙设置。"
+                    elif not new_domain:
+                        message += " HTTPS 域名已清除。"
+                    self.send_json({
+                        "ok": True,
+                        "restart_needed": False,
+                        "reauth_required": reauth_required,
+                        "certificate": certificate_result,
+                        "message": message,
+                    })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -11219,6 +12127,7 @@ class Handler(BaseHTTPRequestHandler):
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
 
+                clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
                 if routing_mode == "fixed_region" or routing_ip_type != "all":
                     threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
@@ -11246,6 +12155,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                ui_cfg = load_ui_config()
                 fav_fail_fallback = bool(payload.get("fav_fail_fallback", ui_cfg.get("fav_fail_fallback", True)))
 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
@@ -11277,6 +12187,7 @@ class Handler(BaseHTTPRequestHandler):
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
 
+                clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "出站路由配置已更新")
                 if routing_mode == "fixed_region" or routing_ip_type != "all":
                     threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
@@ -11326,6 +12237,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_global_pool":
             try:
+                if manual_connection_active or manual_connection_lock.locked():
+                    self.send_json({"ok": False, "busy": True, "error": "当前正在执行人工切换，请完成后再重新轮询全球库"}, HTTPStatus.CONFLICT)
+                    return
                 result = refresh_global_pool_background(force=True)
                 self.send_json(result)
             except Exception as exc:
@@ -11384,6 +12298,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/disconnect":
             try:
                 ui_cfg = load_ui_config()
+                clear_manual_route_pin()
                 ui_cfg["connection_enabled"] = False
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
@@ -11518,6 +12433,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect_pool_endpoint":
             try:
+                if manual_connection_active or manual_connection_lock.locked():
+                    self.send_json({"ok": False, "busy": True, "error": "已有人工切换正在执行，请等待当前切换完成"}, HTTPStatus.CONFLICT)
+                    return
                 payload = self.read_json_body()
                 endpoint_id = str(payload.get("endpoint_id") or "").strip()
                 endpoint_ids = payload.get("endpoint_ids", [])
@@ -11529,79 +12447,84 @@ class Handler(BaseHTTPRequestHandler):
                 if not endpoint_ids:
                     self.send_json({"ok": False, "error": "endpoint_id 不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
+                ui_cmd = ui_command_plane.begin("manual_connect", endpoint_ids[0])
+                if ui_cmd is None:
+                    self.send_json({"ok": False, "busy": True, "error": "已有前端人工操作正在执行，请等待当前操作完成"}, HTTPStatus.CONFLICT)
+                    return
+                previous_openvpn_node_id = str(active_openvpn_node_id or "")
+                previous_pool_endpoint_id = str(active_pool_endpoint_id or "")
                 ui_cfg = load_ui_config()
                 ui_cfg["connection_enabled"] = True
                 write_json(DATA_DIR / "ui_auth.json", ui_cfg)
                 try:
                     message = connect_pool_endpoint_with_fallback(endpoint_ids, manual=True)
+                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message="切换完成", last_check_message="人工切换完成，当前节点可用。")
+                    ui_command_plane.finish(ui_cmd["token"], ok=True, message=message)
                     self.send_json({"ok": True, "message": message, "state": get_state()})
                 except Exception as primary_exc:
-                    # Manual connection failure automatically enters the same
-                    # unified Hot Pool failover used by tunnel-failure recovery.
-                    fallback_ok = try_unified_failover(
-                        exclude_endpoint_id=endpoint_ids[0],
-                        attempts=6,
-                        preferred_only=False,
-                        manual=True,
+                    restored, restore_msg = restore_manual_previous_connection(
+                        previous_openvpn_node_id,
+                        previous_pool_endpoint_id,
                     )
-                    if fallback_ok:
-                        self.send_json({
-                            "ok": True,
-                            "auto_fallback": True,
-                            "message": "当前节点连接失败，已自动切换到其他可用节点。",
-                            "state": get_state(),
-                        })
+                    if restored:
+                        message = "人工切换失败，已保留/恢复原连接：" + str(restore_msg)
                     else:
-                        self.send_json({
-                            "ok": False,
-                            "auto_fallback": False,
-                            "error": "当前节点连接失败，自动选择备用节点也未成功： " + str(primary_exc),
-                            "state": get_state(),
-                        }, HTTPStatus.BAD_GATEWAY)
+                        message = "人工切换失败，原连接恢复失败：" + str(restore_msg)
+                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message=message)
+                    ui_command_plane.finish(ui_cmd["token"], ok=False, message=message)
+                    self.send_json({
+                        "ok": False,
+                        "auto_fallback": False,
+                        "restored_previous": restored,
+                        "error": message,
+                        "state": get_state(),
+                    }, HTTPStatus.BAD_GATEWAY)
             except Exception as exc:
+                if "ui_cmd" in locals():
+                    ui_command_plane.finish(ui_cmd["token"], ok=False, message=str(exc))
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
             try:
+                if manual_connection_active or manual_connection_lock.locked():
+                    self.send_json({"ok": False, "busy": True, "error": "已有人工切换正在执行，请等待当前切换完成"}, HTTPStatus.CONFLICT)
+                    return
                 payload = self.read_json_body()
                 node_id = str(payload.get("id") or "").strip()
                 if not node_id:
                     self.send_json({"ok": False, "error": "节点 ID 不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
+                ui_cmd = ui_command_plane.begin("manual_connect", node_id)
+                if ui_cmd is None:
+                    self.send_json({"ok": False, "busy": True, "error": "已有前端人工操作正在执行，请等待当前操作完成"}, HTTPStatus.CONFLICT)
+                    return
+                previous_openvpn_node_id = str(active_openvpn_node_id or "")
+                previous_pool_endpoint_id = str(active_pool_endpoint_id or "")
                 try:
                     message = connect_node(node_id, enable_connection=True, manual=True)
+                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message="切换完成", last_check_message="人工切换完成，当前节点可用。")
+                    ui_command_plane.finish(ui_cmd["token"], ok=True, message=message)
                     self.send_json({"ok": True, "message": message, "state": get_state()})
                 except Exception as primary_exc:
-                    # Convert an OpenVPN node to its routing endpoint ID so the
-                    # generic Hot Pool can exclude the failed node correctly.
-                    exclude_endpoint_id = ""
-                    try:
-                        node = next((n for n in read_nodes() if str(n.get("id") or "") == node_id), None)
-                        if node:
-                            route_ep = openvpn_node_to_routing_endpoint(node)
-                            exclude_endpoint_id = str(route_ep.get("endpoint_id") or "")
-                    except Exception:
-                        exclude_endpoint_id = ""
-                    fallback_ok = try_unified_failover(
-                        exclude_endpoint_id=exclude_endpoint_id,
-                        attempts=6,
-                        preferred_only=False,
-                        manual=True,
+                    restored, restore_msg = restore_manual_previous_connection(
+                        previous_openvpn_node_id,
+                        previous_pool_endpoint_id,
                     )
-                    if fallback_ok:
-                        self.send_json({
-                            "ok": True,
-                            "auto_fallback": True,
-                            "message": "当前节点连接失败，已自动切换到其他可用节点。",
-                            "state": get_state(),
-                        })
+                    if restored:
+                        message = "人工切换失败，已保留/恢复原连接：" + str(restore_msg)
                     else:
-                        self.send_json({
-                            "ok": False,
-                            "auto_fallback": False,
-                            "error": "当前节点连接失败，自动选择备用节点也未成功： " + str(primary_exc),
-                            "state": get_state(),
-                        }, HTTPStatus.BAD_GATEWAY)
+                        message = "人工切换失败，原连接恢复失败：" + str(restore_msg)
+                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message=message)
+                    ui_command_plane.finish(ui_cmd["token"], ok=False, message=message)
+                    self.send_json({
+                        "ok": False,
+                        "auto_fallback": False,
+                        "restored_previous": restored,
+                        "error": message,
+                        "state": get_state(),
+                    }, HTTPStatus.BAD_GATEWAY)
             except Exception as exc:
+                if "ui_cmd" in locals():
+                    ui_command_plane.finish(ui_cmd["token"], ok=False, message=str(exc))
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/prioritize_country":
             try:
@@ -11708,6 +12631,11 @@ COUNTRY_COVERAGE_ROTATION_SECONDS = 600
 
 resource_engine_lock = threading.Lock()
 availability_engine_lock = threading.Lock()
+ui_nodes_cache_lock = threading.Lock()
+ui_nodes_cache = []
+ui_nodes_cache_at = 0.0
+ui_nodes_cache_building = False
+UI_NODES_CACHE_TTL_SECONDS = 3.0
 bootstrap_connection_lock = threading.Lock()
 resource_engine_running = False
 resource_engine_message = ""
@@ -11724,9 +12652,216 @@ coverage_selected = 0
 coverage_target = COUNTRY_RESERVE_TARGET
 coverage_last_at = 0.0
 country_priority_explicit = False
+initial_bootstrap_active = False
 
 _legacy_get_state_v2 = get_state
 _legacy_unified_hot_pool_candidates_v2 = unified_hot_pool_candidates
+
+def _sanitize_ui_nodes(nodes):
+    cleaned = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        item = dict(node)
+        item.pop("config_text", None)
+        item.pop("_pool_metadata", None)
+        cleaned.append(item)
+    return dedupe_ui_nodes(cleaned)
+
+def _build_ui_nodes_cache():
+    global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
+    try:
+        nodes = read_nodes()
+        try:
+            for endpoint in node_pool.list_endpoints(limit=5000):
+                if str(endpoint.get("protocol") or "").lower() == "openvpn":
+                    continue
+                pool_node = protocol_endpoint_to_ui_node(endpoint)
+                if pool_node:
+                    nodes.append(pool_node)
+        except Exception as exc:
+            log_to_json("WARNING", "Main", f"后台多协议节点快照合并失败: {exc}")
+        snapshot = _sanitize_ui_nodes(nodes)
+        with ui_nodes_cache_lock:
+            ui_nodes_cache = snapshot
+            ui_nodes_cache_at = time.time()
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"后台节点列表快照构建失败: {exc}")
+    finally:
+        ui_nodes_cache_building = False
+
+def _detect_local_server_country():
+    """Detect this server's public egress country once during first-install bootstrap."""
+    urls = (
+        "http://ip-api.com/json/?lang=zh-CN&fields=status,query,country,countryCode",
+        "https://ipapi.co/json/",
+    )
+    for url in urls:
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "aimilivpn/bootstrap"})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8", errors="replace"))
+            if not isinstance(data, dict):
+                continue
+            country = str(data.get("country") or data.get("country_name") or "").strip()
+            if country:
+                try:
+                    country = normalized_country_name(country)
+                except Exception:
+                    pass
+                return {
+                    "country": country,
+                    "country_code": str(data.get("countryCode") or data.get("country_code") or "").strip().upper(),
+                    "public_ip": str(data.get("query") or data.get("ip") or "").strip(),
+                    "source": url,
+                }
+        except Exception as exc:
+            log_to_json("WARNING", "Bootstrap", f"本机服务器国家探测失败: {exc}")
+    return {"country": "", "country_code": "", "public_ip": "", "source": ""}
+
+def _read_bootstrap_state():
+    try:
+        data = read_json(BOOTSTRAP_STATE_FILE, {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _write_bootstrap_state(**updates):
+    state = _read_bootstrap_state()
+    state.update(updates)
+    write_json(BOOTSTRAP_STATE_FILE, state)
+    return state
+
+def _first_install_bootstrap_needed():
+    state = _read_bootstrap_state()
+    if state.get("completed"):
+        return False
+    try:
+        stats = node_pool.stats()
+        return int(stats.get("endpoints") or 0) == 0
+    except Exception:
+        return not BOOTSTRAP_STATE_FILE.exists()
+
+def _refresh_ui_nodes_cache_async(force=False):
+    global ui_nodes_cache_building
+    with ui_nodes_cache_lock:
+        fresh = bool(ui_nodes_cache) and (time.time() - ui_nodes_cache_at) < UI_NODES_CACHE_TTL_SECONDS
+        if ui_nodes_cache_building or (not force and fresh):
+            return
+        ui_nodes_cache_building = True
+    threading.Thread(target=_build_ui_nodes_cache, daemon=True, name="ui-node-cache").start()
+
+def _get_ui_nodes_snapshot():
+    _refresh_ui_nodes_cache_async()
+    with ui_nodes_cache_lock:
+        if ui_nodes_cache:
+            return [dict(x) for x in ui_nodes_cache]
+    return _sanitize_ui_nodes(read_nodes())
+
+def _get_fast_nodes_state():
+    state = read_json(STATE_FILE, {})
+    state.pop("password", None)
+    cert_state = web_certificate.snapshot()
+    state["web_domain"] = str(load_ui_config().get("web_domain") or cert_state.get("domain") or "")
+    state["web_certificate"] = cert_state
+    state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["active_pool_endpoint"] = None
+    if active_pool_endpoint_id:
+        try:
+            endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
+            if endpoint:
+                meta = endpoint.get("server_metadata") or {}
+                state["active_pool_endpoint"] = {
+                    "endpoint_id": endpoint.get("endpoint_id", ""),
+                    "protocol": endpoint.get("protocol", ""),
+                    "transport": endpoint.get("transport", ""),
+                    "port": endpoint.get("port", 0),
+                    "hostname": endpoint.get("hostname", ""),
+                    "current_ip": (endpoint.get("metadata") or {}).get("ip") or "",
+                    "country": endpoint.get("country", ""),
+                    "location": meta.get("location") or endpoint.get("country", ""),
+                    "owner": meta.get("owner") or meta.get("as_name") or "",
+                    "ip_type": meta.get("ip_type") or "",
+                    "quality": meta.get("quality") or "",
+                    "speed": endpoint.get("latest_speed", 0),
+                    "latency_ms": endpoint.get("latency_ewma", 0),
+                }
+        except Exception:
+            state["active_pool_endpoint"] = None
+
+    try:
+        pool_stats = node_pool.stats()
+        state["pool_servers"] = int(pool_stats.get("servers") or 0)
+        state["pool_endpoints"] = int(pool_stats.get("endpoints") or 0)
+        state["pool_states"] = pool_stats.get("states") or {}
+        state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
+        state["hot_pool_target"] = HOT_POOL_TARGET
+    except Exception:
+        state.setdefault("pool_servers", 0)
+        state.setdefault("pool_endpoints", 0)
+    state["is_connecting"] = is_connecting
+    state["manual_connection_active"] = manual_connection_active
+    state["connection_generation"] = connection_generation
+    state["active_connection_generation"] = active_connection_generation
+    state["manual_route_pin"] = dict(manual_route_pin)
+    state["manual_connection_quiet_until"] = manual_connection_quiet_until
+    state["ui_command_plane"] = ui_command_plane.ui_state()
+    state["maintenance_running"] = maintenance_lock.locked()
+    state["global_pool_refresh_running"] = global_pool_refresh_running
+    state["global_pool_refresh_last_at"] = global_pool_refresh_last_at
+    state["global_pool_refresh_status"] = global_pool_refresh_status
+    state["global_pool_refresh_message"] = global_pool_refresh_message
+    state["global_pool_refresh_servers"] = global_pool_refresh_servers
+    state["global_pool_refresh_sources"] = global_pool_refresh_sources
+
+    try:
+        active = active_tunnel_running()
+    except Exception:
+        active = False
+    if active:
+        state["connection_status"] = "connected"
+        state["connection_message"] = "当前 VPN 隧道正常运行"
+        if state.get("proxy_ok") is True:
+            state["client_status"] = "usable"
+        elif state.get("proxy_ok") is False:
+            state["client_status"] = "degraded"
+        else:
+            state["client_status"] = "validating"
+    elif manual_connection_active or failover_lock.locked() or is_connecting:
+        state["connection_status"] = "connecting"
+        state["connection_message"] = "正在建立或切换 VPN 隧道"
+        state["client_status"] = "validating"
+    else:
+        state["connection_status"] = "disconnected"
+        state["connection_message"] = "当前没有活动 VPN 隧道"
+        state["client_status"] = "not_connected"
+    state["client_usable"] = state["client_status"] == "usable"
+
+    state["resource_engine_running"] = bool(resource_engine_running)
+    state["resource_engine_message"] = resource_engine_message
+    state["resource_engine_last_at"] = resource_engine_last_at
+    state["availability_engine_running"] = bool(availability_engine_running)
+    state["availability_engine_message"] = availability_engine_message
+    state["availability_tested_total"] = int(availability_tested_total)
+    state["availability_queue"] = int(availability_queue)
+    state["availability_new_pending"] = int(availability_new_pending)
+    state["availability_recheck_seconds"] = 4 * 3600
+    state["coverage_country"] = coverage_country
+    state["coverage_inventory"] = int(coverage_inventory)
+    state["coverage_available"] = int(coverage_available)
+    state["coverage_selected"] = int(coverage_selected)
+    state["coverage_target"] = int(coverage_target)
+    state["coverage_last_at"] = coverage_last_at
+    proxy_state = _upstream_proxy_state()
+    state["upstream_proxy_mode"] = proxy_state["mode"]
+    state["upstream_proxy_type"] = proxy_state["type"]
+    state["upstream_proxy_host"] = proxy_state["host"]
+    state["upstream_proxy_port"] = proxy_state["port"]
+    state["upstream_proxy_label"] = proxy_state["label"]
+    state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
+    state.setdefault("favorite_node_ids", [])
+    return state
 
 def _runtime_connection_status():
     if active_tunnel_running():
@@ -11755,30 +12890,6 @@ def _upstream_proxy_state():
                 "label":f"自定义上游代理 · {ptype or 'proxy'}://{host}:{port}"}
     return {"mode":"system_default","type":"","host":"","port":0,"label":"系统默认网络（未设置自定义上游代理）"}
 
-def get_state():
-    state = _legacy_get_state_v2()
-    status, message = _runtime_connection_status()
-    state["connection_status"] = status
-    state["connection_message"] = message
-    state["client_status"] = _runtime_client_status()
-    state["client_usable"] = state["client_status"] == "usable"
-    state["resource_engine_running"] = bool(resource_engine_running)
-    state["resource_engine_message"] = resource_engine_message
-    state["resource_engine_last_at"] = resource_engine_last_at
-    state["availability_engine_running"] = bool(availability_engine_running)
-    state["availability_engine_message"] = availability_engine_message
-    state["availability_tested_total"] = int(availability_tested_total)
-    state["availability_queue"] = int(availability_queue)
-    state["availability_new_pending"] = int(availability_new_pending)
-    state["availability_recheck_seconds"] = 4 * 3600
-    state["coverage_country"] = coverage_country
-    state["coverage_inventory"] = int(coverage_inventory)
-    state["coverage_available"] = int(coverage_available)
-    state["coverage_selected"] = int(coverage_selected)
-    state["coverage_target"] = int(coverage_target)
-    state["coverage_last_at"] = coverage_last_at
-    state.update({f"upstream_proxy_{k}":v for k,v in _upstream_proxy_state().items()})
-    return state
 
 def _endpoint_country(endpoint):
     return normalized_country_name(endpoint.get("country") or "")
@@ -11855,26 +12966,7 @@ def _pick_global_country_for_coverage_v2():
     ranked.sort()
     return ranked[0][3] if ranked else ""
 
-def schedule_global_country_coverage():
-    global coverage_country,coverage_inventory,coverage_available,coverage_selected,coverage_last_at
-    country=_pick_global_country_for_coverage_v2()
-    if not country: return {"ok":True,"running":False,"message":"当前国家覆盖已基本满足或等待新资源"}
-    snap=country_reserve_snapshot(country)
-    coverage_country=country; coverage_inventory=int(snap.get("inventory") or 0); coverage_available=int(snap.get("available") or 0)
-    coverage_selected=int(snap.get("selected") or 0); coverage_last_at=time.time()
-    global_country_coverage_last_attempt[country]=coverage_last_at
-    return {"ok":True,"running":True,"country":country,"inventory":coverage_inventory,"available":coverage_available,"selected":coverage_selected,"target":COUNTRY_RESERVE_TARGET}
 
-def start_country_priority(country):
-    global country_priority_request,country_priority_explicit
-    target=normalized_country_name(country)
-    if not target: return {"ok":False,"error":"国家不能为空"}
-    snap=country_reserve_snapshot(target)
-    country_priority_request=target; country_priority_explicit=True
-    set_state(priority_country=target,priority_inventory=int(snap.get("inventory") or 0),priority_inventory_target=min(60,max(1,int(snap.get("inventory") or 0))) if snap.get("inventory") else 60,
-              priority_available=min(COUNTRY_PRIORITY_AVAILABLE_TARGET,int(snap.get("available") or 0)),priority_target=COUNTRY_PRIORITY_AVAILABLE_TARGET,
-              priority_minimum=5,priority_running=True,priority_message=f"{target} 已加入优先检测队列，不会阻塞其他国家")
-    return {"ok":True,"running":True,"available":min(COUNTRY_PRIORITY_AVAILABLE_TARGET,int(snap.get("available") or 0)),"target":COUNTRY_PRIORITY_AVAILABLE_TARGET}
 
 def _due_endpoints(country="", protocols=("openvpn","softether","sstp","l2tp-ipsec"), limit=10):
     now=time.time(); target=normalized_country_name(country); wanted={str(x).lower() for x in protocols}; rows=[]
@@ -11951,7 +13043,8 @@ def availability_sweep_once(priority_country=""):
                         if not fut.result().get("skipped"): tested+=1
                     except Exception as exc: log_to_json("WARNING","Probe",f"V2 多协议探测异常: {exc}")
         availability_tested_total+=tested
-        if not active_tunnel_running() and not manual_connection_active and bool(load_ui_config().get("connection_enabled",True)):
+        if (not initial_bootstrap_active and not active_tunnel_running()
+                and not manual_connection_active and bool(load_ui_config().get("connection_enabled", True))):
             threading.Thread(target=_ensure_active_client_v2, daemon=True).start()
         ov_due,pool_due=_due_counts()
         set_state(availability_engine_running=False,
@@ -11967,11 +13060,13 @@ def availability_sweep_once(priority_country=""):
         availability_engine_running=False
         availability_engine_lock.release()
 
-def global_probe_sweep_once():
-    return availability_sweep_once(country_priority_request if country_priority_explicit else coverage_country)
 
 def resource_collect_once(force=False):
     global resource_engine_running,resource_engine_message,resource_engine_last_at
+    if ui_command_plane.is_busy() and not force:
+        return {"ok": True, "skipped": True, "reason": "用户正在执行前端指令"}
+    if manual_connection_active and not force:
+        return {"ok":True,"skipped":True,"reason":"用户正在手动切换节点"}
     if not resource_engine_lock.acquire(blocking=False): return {"ok":True,"running":True}
     resource_engine_running=True
     resource_engine_message="正在采集资源，不影响当前 VPN 连接"
@@ -11985,6 +13080,7 @@ def resource_collect_once(force=False):
         after=int(node_pool.stats().get("endpoints") or 0)
         resource_engine_last_at=time.time(); added=max(0,after-before)
         resource_engine_message=f"资源采集完成 · OpenVPN {len(candidates)} · 多协议服务器 {int(catalog.get('servers') or 0)} · 新增/恢复约 {added} 个端点，立即进入检测"
+        _refresh_ui_nodes_cache_async(force=True)
         set_state(resource_engine_running=False,resource_engine_message=resource_engine_message,resource_engine_last_at=resource_engine_last_at,
                   last_fetch_at=resource_engine_last_at,last_fetch_status="ok",last_fetch_message=resource_engine_message)
         return {"ok":True,"endpoints":after,"added":added}
@@ -11997,49 +13093,9 @@ def resource_collect_once(force=False):
         resource_engine_running=False
         resource_engine_lock.release()
 
-def maintain_valid_nodes(force=False):
-    if force:
-        threading.Thread(target=resource_collect_once,kwargs={"force":True},daemon=True).start()
-    if not availability_engine_running:
-        threading.Thread(target=availability_sweep_once,args=(country_priority_request if country_priority_explicit else "",),daemon=True).start()
-    msg="独立资源采集与可用性检测已启动；不会覆盖当前 VPN 连接状态"
-    set_state(last_check_at=time.time(),last_check_message=msg)
-    return msg
 
-def collector_loop():
-    time.sleep(8)
-    while True:
-        try:
-            if not resource_engine_running and time.time()-float(resource_engine_last_at or 0)>=RESOURCE_COLLECTION_INTERVAL_SECONDS:
-                resource_collect_once(False)
-        except Exception as exc:
-            log_to_json("WARNING","Main",f"资源采集守护异常: {exc}")
-        time.sleep(5)
 
-def protocol_catalog_loop():
-    time.sleep(30)
-    while True:
-        try:
-            if not resource_engine_running and not availability_engine_running:
-                refresh_protocol_ip_metadata(max_ips=100)
-        except Exception as exc:
-            log_to_json("WARNING","Main",f"多协议元数据补全异常: {exc}")
-        time.sleep(900)
 
-def global_country_coverage_loop():
-    global coverage_country,coverage_inventory,coverage_available,coverage_selected,coverage_last_at
-    time.sleep(20)
-    while True:
-        try:
-            schedule_global_country_coverage()
-            target=country_priority_request if country_priority_explicit else ""
-            if target:
-                snap=country_reserve_snapshot(target)
-                coverage_country=target; coverage_inventory=int(snap.get("inventory") or 0); coverage_available=int(snap.get("available") or 0)
-                coverage_selected=int(snap.get("selected") or 0); coverage_last_at=time.time()
-        except Exception as exc:
-            log_to_json("WARNING","Coverage",f"国家 Coverage 调度异常: {exc}")
-        time.sleep(60)
 
 def _switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id="",limit=30):
     candidates=_legacy_unified_hot_pool_candidates_v2(ui_cfg,exclude_endpoint_id=exclude_endpoint_id,limit=limit)
@@ -12049,28 +13105,6 @@ def _switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id="",lim
         return _legacy_unified_hot_pool_candidates_v2(fallback,exclude_endpoint_id=exclude_endpoint_id,limit=limit),True
     return [],False
 
-def auto_switch_node(attempt=0):
-    if attempt>=3: return
-    ui_cfg=load_ui_config()
-    if not bool(ui_cfg.get("connection_enabled",True)) or ui_cfg.get("routing_mode")=="fixed_ip": return
-    current=current_active_routing_endpoint()
-    exclude=str(current.get("endpoint_id") or "") if current else ""
-    candidates,used_fallback=_switch_candidates_with_favorites_fallback(ui_cfg,exclude,30)
-    if candidates:
-        if used_fallback: log_to_json("INFO","VPN","收藏全部不可用，自动回退到全局可用池")
-        for ep in candidates[:min(6,len(candidates))]:
-            try:
-                connect_ranked_endpoint(ep); return
-            except Exception as exc:
-                log_to_json("WARNING","VPN",f"备用节点切换失败 {ep.get('endpoint_id')}: {exc}")
-        return auto_switch_node(attempt+1)
-    stop_all_tunnels()
-    with lock:
-        nodes=read_nodes()
-        for item in nodes: item["active"]=False
-        write_json(NODES_FILE,nodes)
-    set_state(active_openvpn_node_id="",active_pool_endpoint_id="",active_tunnel_protocol="",
-              last_check_message="暂无经过验证的备用节点；后台资源采集与可用性检测继续运行",proxy_ok=False,proxy_ip="-",proxy_latency_ms=0)
 
 def _ensure_active_client_v2():
     if active_tunnel_running() or manual_connection_active or failover_lock.locked() or is_connecting:
@@ -12090,66 +13124,222 @@ def _ensure_active_client_v2():
     finally:
         bootstrap_connection_lock.release()
 
-def try_unified_failover(exclude_endpoint_id="",attempts=4,preferred_only=False,manual=False):
-    if not failover_lock.acquire(blocking=False):
-        for _ in range(60):
-            time.sleep(0.25)
-            if not failover_lock.locked(): return active_tunnel_running()
-        return active_tunnel_running()
-    started=time.time()
-    try:
-        ui_cfg=load_ui_config()
-        if not bool(ui_cfg.get("connection_enabled",True)): return False
-        if manual_connection_active and not manual: return False
-        current=current_active_routing_endpoint()
-        from_protocol=str(current.get("protocol") or "") if current else ""
-        from_endpoint=str(current.get("endpoint_id") or "") if current else ""
-        candidates,used_fallback=_switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id,100)
-        if preferred_only: candidates=[x for x in candidates if int(x.get("routing_tier") or 99)==0]
-        set_state(failover_in_progress=True,failover_started_at=started,failover_from_protocol=from_protocol,
-                  failover_from_endpoint=from_endpoint,failover_candidate_count=len(candidates),
-                  failover_preferred_only=preferred_only,failover_favorites_fallback=used_fallback)
-        last_error=""
-        for ep in candidates[:max(1,int(attempts))]:
-            try:
-                connect_ranked_endpoint(ep,manual=manual)
-                duration=int((time.time()-started)*1000)
-                set_state(failover_in_progress=False,last_failover_ok=True,last_failover_at=time.time(),
-                          last_failover_duration_ms=duration,last_failover_from_protocol=from_protocol,last_failover_from_endpoint=from_endpoint,
-                          last_failover_to_protocol=str(ep.get("protocol") or ""),last_failover_to_endpoint=str(ep.get("endpoint_id") or ""),last_failover_error="")
-                return True
-            except Exception as exc:
-                last_error=str(exc); log_to_json("WARNING","VPN",f"统一备用节点切换失败 {ep.get('endpoint_id')}: {exc}")
-        set_state(failover_in_progress=False,last_failover_ok=False,last_failover_at=time.time(),
-                  last_failover_duration_ms=int((time.time()-started)*1000),last_failover_error=last_error or "无可用 Hot Pool 候选")
-        return False
-    finally:
-        if failover_lock.locked(): failover_lock.release()
-
-def apply_user_routing_preferences():
-    try:
-        ui_cfg=load_ui_config()
-        if not bool(ui_cfg.get("connection_enabled",True)) or ui_cfg.get("routing_mode")=="fixed_ip": return
-        target=str(ui_cfg.get("force_country") or "").strip()
-        if target: start_country_priority(target)
-        if active_tunnel_running(): maybe_recover_preferred_route(force=True)
-        else: auto_switch_node()
-    except Exception as exc:
-        log_to_json("WARNING","Routing",f"应用用户路由偏好失败: {exc}")
-
-def protocol_probe_loop():
-    time.sleep(12)
+def startup_recovery_loop():
+    """Independent boot/restart recovery; never depends on resource collection."""
+    time.sleep(5)
     while True:
         try:
-            if not availability_engine_running and not manual_connection_active and not failover_lock.locked():
-                availability_sweep_once(country_priority_request if country_priority_explicit else coverage_country)
+            if (
+                not initial_bootstrap_active
+                and not global_pool_refresh_running
+                and not ui_command_plane.is_busy()
+                and not manual_connection_active
+                and not is_connecting
+                and bool(load_ui_config().get("connection_enabled", True))
+                and not active_tunnel_running()
+            ):
+                set_state(last_check_message="启动恢复：正在从已验证节点中选择最佳备用节点...")
+                _ensure_active_client_v2()
         except Exception as exc:
-            log_to_json("ERROR","Probe",f"V2 可用性检测循环异常: {exc}")
-        time.sleep(AVAILABILITY_TICK_SECONDS)
+            log_to_json("WARNING", "VPN", f"启动恢复守护异常: {exc}")
+        time.sleep(15)
+
+
+
+def _initial_bootstrap_candidate(local_country):
+    temp_cfg = {
+        "routing_mode": "fixed_region",
+        "force_country": str(local_country or "").strip(),
+        "routing_ip_type": "all",
+        "connection_enabled": True,
+    }
+    candidates = unified_hot_pool_candidates(temp_cfg, limit=100)
+    target = normalized_country_name(local_country)
+    if target:
+        local = [x for x in candidates if normalized_country_name(x.get("country")) == target]
+        if local:
+            return local[0], "local_country"
+    return (candidates[0], "global_fallback") if candidates else (None, "")
+
+def initial_install_bootstrap_loop():
+    global initial_bootstrap_active
+    if not _first_install_bootstrap_needed():
+        if not _read_bootstrap_state().get("completed"):
+            _write_bootstrap_state(completed=True, completed_at=time.time(), mode="existing_install_detected")
+        return
+    initial_bootstrap_active = True
+    detected = _detect_local_server_country()
+    local_country = str(detected.get("country") or "").strip()
+    _write_bootstrap_state(
+        started_at=time.time(),
+        completed=False,
+        local_server_country=local_country,
+        local_server_country_code=str(detected.get("country_code") or ""),
+        local_server_public_ip=str(detected.get("public_ip") or ""),
+        detection_source=str(detected.get("source") or ""),
+    )
+    set_state(
+        initial_bootstrap_running=True,
+        initial_bootstrap_country=local_country,
+        initial_bootstrap_public_ip=str(detected.get("public_ip") or ""),
+        last_check_message=(
+            f"首次安装初始化：正在获取资源并检测"
+            + (f"，本机服务器位于 {local_country}" if local_country else "")
+        ),
+    )
+    try:
+        try:
+            resource_collect_once(force=True)
+        except Exception as exc:
+            log_to_json("WARNING", "Bootstrap", f"首次安装资源获取启动失败: {exc}")
+        try:
+            if local_country:
+                availability_sweep_once(local_country)
+            else:
+                availability_sweep_once("")
+        except Exception as exc:
+            log_to_json("WARNING", "Bootstrap", f"首次安装初始可用性检测失败: {exc}")
+
+        deadline = time.time() + 15 * 60
+        while time.time() < deadline and not active_tunnel_running():
+            if not bool(load_ui_config().get("connection_enabled", True)):
+                break
+            candidate, reason = (None, "")
+            try:
+                candidate, reason = _initial_bootstrap_candidate(local_country)
+            except Exception as exc:
+                log_to_json("WARNING", "Bootstrap", f"首次安装候选节点选择失败: {exc}")
+            if candidate:
+                try:
+                    set_state(
+                        initial_bootstrap_running=True,
+                        initial_bootstrap_country=local_country,
+                        last_check_message=(
+                            f"首次安装自动连接：优先 {local_country or '本机国家'}，"
+                            f"正在连接最低延迟节点 {candidate.get('protocol','')} "
+                            f"{candidate.get('current_ip') or candidate.get('hostname') or candidate.get('endpoint_id')}"
+                        ),
+                    )
+                    connect_ranked_endpoint(candidate, manual=False)
+                    _write_bootstrap_state(
+                        completed=True,
+                        completed_at=time.time(),
+                        selected_endpoint=str(candidate.get("endpoint_id") or ""),
+                        selected_country=str(candidate.get("country") or ""),
+                        selection_reason=reason,
+                    )
+                    set_state(
+                        initial_bootstrap_running=False,
+                        initial_bootstrap_completed=True,
+                        initial_bootstrap_country=local_country,
+                        last_check_message=(
+                            f"首次安装初始化完成：已自动连接 "
+                            f"{candidate.get('country') or local_country or '最佳节点'}，"
+                            "现在进入资源采集、可用性检测与 4 小时复检维护。"
+                        ),
+                    )
+                    return
+                except Exception as exc:
+                    log_to_json("WARNING", "Bootstrap", f"首次安装自动连接失败: {candidate.get('endpoint_id')}: {exc}")
+            time.sleep(5)
+
+        _write_bootstrap_state(
+            completed=True,
+            completed_at=time.time(),
+            selection_reason="no_verified_local_candidate",
+        )
+        set_state(
+            initial_bootstrap_running=False,
+            initial_bootstrap_completed=True,
+            initial_bootstrap_country=local_country,
+            last_check_message=(
+                "首次安装初始化完成，但暂时没有经过验证的本国节点；"
+                "后台资源与可用性检测将继续运行，获得可用节点后自动连接。"
+            ),
+        )
+    except Exception as exc:
+        log_to_json("ERROR", "Bootstrap", f"首次安装初始化异常: {exc}")
+        _write_bootstrap_state(completed=True, completed_at=time.time(), selection_reason="bootstrap_exception")
+        set_state(initial_bootstrap_running=False, initial_bootstrap_completed=True, last_check_message=f"首次安装初始化异常：{exc}")
+    finally:
+        initial_bootstrap_active = False
+
+
+
+OPENVPN_LATENCY_MIGRATION_MARKER = DATA_DIR / "openvpn_latency_metrics_v2.json"
+
+
+def migrate_openvpn_latency_metrics() -> None:
+    """Remove persisted OpenVPN latency values that were not proven by a live tunnel."""
+    if OPENVPN_LATENCY_MIGRATION_MARKER.exists():
+        return
+    try:
+        reset_count = node_pool.reset_openvpn_latency_metrics()
+        nodes = read_nodes()
+        changed = 0
+        for node in nodes:
+            if str(node.get("protocol") or "openvpn").lower() != "openvpn":
+                continue
+            # pool_rehydrated rows can carry the old Master-Pool latency into the UI.
+            # Clear that value unless it has been re-created by the current real probe path.
+            if node.get("pool_rehydrated"):
+                node["latency_ms"] = 0
+                if not node.get("active"):
+                    node["probe_status"] = "not_checked"
+                    node["probe_message"] = "历史资源已重置，等待真实 OpenVPN 隧道测速"
+                    node["probed_at"] = 0
+                changed += 1
+        if changed:
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+        write_json(
+            OPENVPN_LATENCY_MIGRATION_MARKER,
+            {
+                "version": 2,
+                "completed_at": time.time(),
+                "db_rows_reset": reset_count,
+                "nodes_reset": changed,
+            },
+        )
+        log_to_json(
+            "INFO",
+            "Main",
+            f"已完成 OpenVPN 延迟可信度迁移：重置 {reset_count} 个 Master Pool 端点、{changed} 个本地缓存节点；后续延迟只采用真实隧道测速。",
+        )
+    except Exception as exc:
+        log_to_json("ERROR", "Main", f"OpenVPN 延迟可信度迁移失败：{exc}")
+
+
+def resume_web_certificate_if_needed() -> None:
+    try:
+        cfg = load_ui_config()
+        domain = str(cfg.get("web_domain") or "").strip()
+        if not domain:
+            return
+        cert = web_certificate.snapshot()
+        status = str(cert.get("status") or "")
+        cert_domain = str(cert.get("domain") or "").strip()
+        should_resume = (
+            status in ("issuing", "installing", "interrupted")
+            or (status == "not_configured" and cert_domain != domain)
+        )
+        if not should_resume:
+            return
+
+        def resume() -> None:
+            try:
+                web_certificate.start(domain)
+            except Exception as exc:
+                log_to_json("ERROR", "WebSSL", f"HTTPS 证书任务自动恢复失败：{domain} · {exc}")
+
+        threading.Timer(1.5, resume).start()
+        log_to_json("INFO", "WebSSL", f"已检测到 HTTPS 证书任务需要恢复：{domain}")
+    except Exception as exc:
+        log_to_json("ERROR", "WebSSL", f"HTTPS 证书启动检查失败：{exc}")
 
 
 def main() -> None:
     ensure_dirs()
+    migrate_openvpn_latency_metrics()
     if not ISOLATED_INSTANCE:
         kill_existing_openvpn_processes()
 
@@ -12264,10 +13454,23 @@ def main() -> None:
     if ENABLE_PROTOCOL_PROBE_LOOP:
         threading.Thread(target=protocol_probe_loop, daemon=True).start()
         enabled_loops.append("protocol-probe")
+
+    threading.Thread(target=startup_recovery_loop, daemon=True, name="startup-recovery").start()
+    enabled_loops.append("startup-recovery")
+
+    # First installation is a one-time bootstrap only when the persistent pool
+    # is empty. Existing installations keep their saved routing preferences.
+    if _first_install_bootstrap_needed():
+        threading.Thread(target=initial_install_bootstrap_loop, daemon=True, name="initial-bootstrap").start()
+        enabled_loops.append("initial-bootstrap")
+    elif not _read_bootstrap_state().get("completed"):
+        _write_bootstrap_state(completed=True, completed_at=time.time(), mode="existing_install_detected")
+
     if ISOLATED_INSTANCE:
         print(f"[隔离实例] 已启用后台循环: {', '.join(enabled_loops) if enabled_loops else '无'}", flush=True)
 
     ui_cfg = load_ui_config()
+    resume_web_certificate_if_needed()
     ui_host = ui_cfg.get("host", UI_HOST)
     ui_port = bounded_int(ui_cfg.get("port"), UI_PORT, 1, 65535)
 
@@ -12277,3 +13480,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]

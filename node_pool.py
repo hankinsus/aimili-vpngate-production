@@ -1,3 +1,6 @@
+[Reading 1036 lines from start (total: 1036 lines, 0 remaining)]
+
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import hashlib
@@ -630,6 +633,45 @@ class NodePool:
                 db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, key))
             db.commit()
 
+    def reset_openvpn_latency_metrics(self) -> int:
+        """Discard historical OpenVPN latency/status values that may have been sourced from VPNGate Ping.
+
+        OpenVPN latency shown and used for routing must come only from a real tunnel
+        establishment/egress probe. Existing persisted values predate that invariant,
+        so reset them once and let the availability worker rebuild trustworthy metrics.
+        """
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM endpoints
+                WHERE protocol='openvpn'
+                  AND (
+                    COALESCE(latency_ewma, 0) > 0
+                    OR COALESCE(jitter_ewma, 0) > 0
+                    OR status IN ('HOT','AVAILABLE','DEGRADED','COOLDOWN','STALE')
+                  )
+                """
+            ).fetchone()
+            count = int(row["count"] or 0) if row else 0
+            db.execute(
+                """
+                UPDATE endpoints
+                SET status='NEW',
+                    last_success=0,
+                    success_count=0,
+                    success_streak=0,
+                    next_test=0,
+                    latency_ewma=0,
+                    jitter_ewma=0
+                WHERE protocol='openvpn'
+                """
+            )
+            # Do not rewrite servers.state here: a server may expose a healthy
+            # non-OpenVPN protocol endpoint that must remain independently available.
+            db.commit()
+        return count
+
     @staticmethod
     def _selection_score(endpoint: dict[str, Any], now: float | None = None) -> tuple[float, dict[str, float]]:
         now = time.time() if now is None else now
@@ -904,7 +946,21 @@ class NodePool:
                 db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, row["server_key"]))
             db.commit()
 
+    def reset_probe_schedule(self, include_retired: bool = False) -> int:
+        """Requeue all persisted endpoints for an immediate full validation pass.
+        Historical latency/success/failure data is deliberately preserved.
+        """
+        now = time.time()
+        with self.lock, closing(self._connect()) as db:
+            if include_retired:
+                cur = db.execute("UPDATE endpoints SET next_test=?", (now,))
+            else:
+                cur = db.execute("UPDATE endpoints SET next_test=? WHERE status <> 'RETIRED'", (now,))
+            db.commit()
+            return int(cur.rowcount if cur.rowcount is not None else 0)
+
     def due_endpoints(self, protocols: tuple[str, ...] = ("softether", "sstp"), limit: int = 20) -> list[dict[str, Any]]:
+
         now = time.time()
         wanted = tuple(str(p).lower() for p in protocols if p)
         if not wanted:
@@ -980,3 +1036,5 @@ class NodePool:
                 for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
             }
             return {"servers": servers, "endpoints": endpoints, "states": states}
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]

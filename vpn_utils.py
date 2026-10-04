@@ -1,3 +1,5 @@
+[Reading 689 lines from start (total: 689 lines, 0 remaining)]
+
 #!/usr/bin/env python3
 from __future__ import annotations
 import json
@@ -259,27 +261,8 @@ def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
 
 def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     dev = get_physical_interface()
-    # 1. Try ping with interface binding
-    if dev:
-        try:
-            cmd = ["ping", "-c", "1", "-W", "2", "-I", dev, host]
-            res = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=2
-            )
-            if res.returncode == 0:
-                match = re.search(r"time=([\d.]+)\s*ms", res.stdout)
-                if match:
-                    val = int(float(match.group(1)))
-                    if val > 0:
-                        return val
-        except Exception:
-            pass
-
-    # 2. Try ping without interface binding
+    # BusyBox ping on this production image does not support -I. Use one
+    # ordinary ICMP probe and rely on the kernel route for the destination.
     try:
         cmd = ["ping", "-c", "1", "-W", "2", host]
         res = subprocess.run(
@@ -298,7 +281,7 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
     except Exception:
         pass
 
-    # 3. Try TCP latency check
+    # 2. Try TCP latency when a TCP service is actually reachable.
     tcp_val = tcp_latency_ms(host, port, dev)
     if tcp_val > 0:
         return tcp_val
@@ -706,3 +689,5 @@ def diagnose_local_obstructions(proxy_port: int = 8500, host: str = "127.0.0.1")
                 pass
 
     return None
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
