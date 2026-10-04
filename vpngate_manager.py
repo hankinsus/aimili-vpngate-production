@@ -2867,35 +2867,75 @@ def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
         return str(meta.get("ip_type") or "")
     return str((endpoint.get("metadata") or {}).get("ip_type") or "")
 
-def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
-    routing_mode = ui_cfg.get("routing_mode", "auto")
-    if routing_mode == "fixed_ip":
-        return 99
-    if routing_mode == "favorites":
-        return 0
-    country_rank = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
-    ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
-    # Country proximity is the primary preference; IP type is secondary.
-    return country_rank * 10 + ip_rank
+ROUTING_MIN_LINE_SPEED_BPS = 50_000_000
 
-def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple[int, int, float, int, float, int, float]:
+def routing_target_country(ui_cfg: dict[str, Any]) -> str:
+    """Explicit country preference first; otherwise use the server's own country."""
+    explicit = str(ui_cfg.get("force_country") or "").strip()
+    if explicit:
+        return normalized_country_name(explicit)
+    try:
+        bootstrap = _read_bootstrap_state()
+        local = str(bootstrap.get("local_server_country") or "").strip()
+        if local:
+            return normalized_country_name(local)
+    except Exception:
+        pass
+    try:
+        state = get_state()
+        local = str(state.get("server_country") or "").strip()
+        if local:
+            return normalized_country_name(local)
+    except Exception:
+        pass
+    return ""
+
+def routing_favorite_rank(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
+    favorites = {str(x) for x in (ui_cfg.get("favorite_node_ids") or []) if str(x)}
+    if not favorites:
+        return 1
+    endpoint_id = str(endpoint.get("endpoint_id") or "")
+    metadata = endpoint.get("metadata") or {}
+    variants = {endpoint_id, "pool:" + endpoint_id if endpoint_id else "", str(metadata.get("node_id") or "")}
+    return 0 if favorites.intersection(variants) else 1
+
+def routing_speed_gate(endpoint: dict[str, Any]) -> int:
+    """50 Mbps is a preferred minimum for residential/mobile; below it remains fallback."""
+    if endpoint_ip_type(endpoint) not in ("residential", "mobile"):
+        return 0
+    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    return 0 if speed >= ROUTING_MIN_LINE_SPEED_BPS else 1
+
+def routing_web_health_rank(endpoint: dict[str, Any]) -> int:
     status = str(endpoint.get("status") or "").upper()
-    status_rank = 0 if status == "HOT" else 1
+    return {"HOT": 0, "AVAILABLE": 1, "DEGRADED": 2}.get(status, 3)
+
+def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
+    if ui_cfg.get("routing_mode") == "fixed_ip":
+        return 99
+    target_country = routing_target_country(ui_cfg)
+    country_rank = 0 if target_country and normalized_country_name(endpoint.get("country")) == target_country else 2
+    favorite_rank = routing_favorite_rank(endpoint, ui_cfg)
+    ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
+    speed_gate = routing_speed_gate(endpoint)
+    return country_rank * 100 + favorite_rank * 20 + ip_rank * 5 + speed_gate
+
+def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple:
     latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 999999)
     if latency <= 0:
         latency = 999999
     speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
     jitter = float(endpoint.get("jitter_ewma") or 999999)
     success_streak = int(endpoint.get("success_streak") or 0)
-    selection_score = float(endpoint.get("selection_score") or 0)
     return (
         routing_preference_tier(endpoint, ui_cfg),
-        status_rank,
-        latency,
+        routing_speed_gate(endpoint),
         -speed,
+        latency,
+        routing_web_health_rank(endpoint),
+        -float(endpoint.get("last_success") or 0),
         jitter,
         -success_streak,
-        -selection_score,
     )
 
 def openvpn_node_to_routing_endpoint(node: dict[str, Any]) -> dict[str, Any]:
@@ -2980,11 +3020,13 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
             continue
         if str(endpoint.get("protocol") or "").lower() != "openvpn" and not bool((endpoint.get("metadata") or {}).get("trusted_observation")):
             continue
-        if ui_cfg.get("routing_mode") == "favorites" and not endpoint_allowed_by_pool_routing(endpoint, ui_cfg):
-            continue
         endpoint["routing_tier"] = routing_preference_tier(endpoint, ui_cfg)
-        endpoint["routing_country_rank"] = country_preference_rank(ui_cfg.get("force_country", ""), endpoint.get("country", ""))
+        target_country = routing_target_country(ui_cfg)
+        endpoint["routing_country_rank"] = 0 if target_country and normalized_country_name(endpoint.get("country")) == target_country else 2
+        endpoint["routing_favorite_rank"] = routing_favorite_rank(endpoint, ui_cfg)
         endpoint["routing_ip_rank"] = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
+        endpoint["routing_speed_gate"] = routing_speed_gate(endpoint)
+        endpoint["routing_web_health_rank"] = routing_web_health_rank(endpoint)
         candidates.append(endpoint)
     candidates.sort(key=lambda endpoint: routing_service_key(endpoint, ui_cfg))
     return candidates[:max(1, min(int(limit), 100))]
@@ -3003,7 +3045,11 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
     ui_cfg = load_ui_config()
     if ui_cfg.get("routing_mode") in ("fixed_ip", "favorites") or not bool(ui_cfg.get("connection_enabled", True)):
         return False
-    has_preference = bool(ui_cfg.get("force_country")) or str(ui_cfg.get("routing_ip_type", "all")) != "all"
+    has_preference = (
+        bool(routing_target_country(ui_cfg))
+        or str(ui_cfg.get("routing_ip_type", "all")) != "all"
+        or bool(ui_cfg.get("favorite_node_ids"))
+    )
     if not has_preference:
         return False
     state = get_state()
@@ -3019,7 +3065,11 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
         return False
     if routing_preference_tier(current, ui_cfg) == 0:
         return False
-    preferred = [ep for ep in unified_hot_pool_candidates(ui_cfg, limit=30) if int(ep.get("routing_tier") or 99) == 0 and str(ep.get("status") or "").upper() == "HOT"]
+    preferred = [
+        ep for ep in unified_hot_pool_candidates(ui_cfg, limit=100)
+        if int(ep.get("routing_country_rank") or 99) == 0
+        and str(ep.get("status") or "").upper() in ("HOT", "AVAILABLE")
+    ]
     if not preferred:
         return False
     target = preferred[0]
@@ -3039,14 +3089,8 @@ def apply_user_routing_preferences() -> None:
             return
         if ui_cfg.get("routing_mode") == "fixed_ip":
             return
-        if ui_cfg.get("routing_mode") == "favorites":
-            # Favorites is a hard outbound routing mode: when the current tunnel
-            # is not one of the user's favorites, leave the current tunnel state
-            # to the enforcement path and immediately select a favorite endpoint.
-            if not active_tunnel_running():
-                auto_switch_node()
-            return
-
+        # Country/IP/favorites are all soft preferences. The same ranking and
+        # availability fallback is used for every automatic mode.
         target_country = str(ui_cfg.get("force_country") or "").strip()
         if target_country:
             priority_result = start_country_priority(target_country)
@@ -3064,13 +3108,9 @@ def apply_routing_filters(
     ui_cfg: dict[str, Any],
     include_unknown_ip_type: bool = False,
 ) -> list[dict[str, Any]]:
-    candidates = list(nodes)
-    routing_mode = ui_cfg.get("routing_mode", "auto")
-    if routing_mode == "favorites":
-        fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-        candidates = [n for n in candidates if n.get("id") in fav_ids]
-    # fixed_region is now a soft preference. fixed_ip is handled by callers.
-    return candidates
+    # Automatic routing preferences are soft; availability always wins when
+    # the preferred pool is empty.
+    return list(nodes)
 
 def normalized_country_name(country: Any) -> str:
     value = str(country or "").strip()
@@ -3098,15 +3138,9 @@ def current_fixed_node_id(ui_cfg: dict[str, Any]) -> str:
     return str(ui_cfg.get("fixed_node_id") or "").strip()
 
 def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any]) -> None:
-    routing_mode = ui_cfg.get("routing_mode", "auto")
-    node_id = str(node.get("id") or "")
-
-    if routing_mode == "favorites":
-        fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-        if node_id not in fav_ids:
-            raise RuntimeError("当前处于仅用收藏模式，不能连接未收藏节点")
-    # fixed_region/force_country and routing_ip_type are soft preferences.
-    # Automatic routing may temporarily fall back for availability, then recover.
+    # Country/IP/favorite rules are automatic preferences, not hard blocks.
+    # Only fixed-IP mode is restricted to its explicitly selected node by its caller.
+    return None
 
 def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str = "路由规则已更新") -> str | None:
     active_id = active_openvpn_node_id
@@ -3952,12 +3986,14 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 proxy_error=""
             )
         else:
-            set_state(
-                proxy_ok=False,
-                proxy_ip="-",
-                proxy_latency_ms=0,
-                proxy_error=res.get("error", "未知错误")
-            )
+            error_message = str(res.get("error") or "网页出口检测失败")
+            set_state(proxy_ok=False, proxy_ip="-", proxy_latency_ms=0, proxy_error=error_message)
+            node["probe_status"] = "unavailable"
+            node["probe_message"] = error_message
+            for item in nodes:
+                item["active"] = False
+            write_json(NODES_FILE, nodes)
+            raise RuntimeError("网页出口检测失败: " + error_message)
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
         if manual:
@@ -4348,20 +4384,8 @@ def restore_manual_previous_connection(previous_openvpn_node_id: str = "", previ
     return False, "之前没有可恢复的活动连接"
 
 def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
-    routing_mode = ui_cfg.get("routing_mode", "auto")
-    if routing_mode == "fixed_ip":
-        return False
-    if routing_mode == "favorites":
-        favorite_ids = {str(x) for x in (ui_cfg.get("favorite_node_ids") or []) if str(x)}
-        endpoint_id = str(endpoint.get("endpoint_id") or "")
-        metadata = endpoint.get("metadata") or {}
-        variants = {
-            endpoint_id,
-            "pool:" + endpoint_id if endpoint_id else "",
-            str(metadata.get("node_id") or ""),
-        }
-        return bool(favorite_ids.intersection(variants))
-    return True
+    # Favorites are a preference, never a hard lock.
+    return ui_cfg.get("routing_mode", "auto") != "fixed_ip"
 
 def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4, preferred_only: bool = False, manual: bool = False) -> bool:
     if ui_command_plane.is_busy() and not manual:
