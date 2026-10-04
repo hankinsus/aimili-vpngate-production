@@ -21,6 +21,14 @@ def parse_positive_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
+# Keep DNS results for a short time so each HTTPS connection does not pay for
+# another DNS round trip over the active VPN interface.
+DNS_CACHE_TTL_SECONDS = 60.0
+DNS_NEGATIVE_TTL_SECONDS = 5.0
+DNS_CACHE: dict[str, tuple[float, str | None]] = {}
+DNS_CACHE_LOCK = threading.Lock()
+PROXY_SOCKET_BUFFER_BYTES = 131072
+
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else Path(__file__).resolve().parent / "vpngate_data"
 ACTIVE_IFACE_FILE = DATA_DIR / "active_iface.txt"
 
@@ -246,7 +254,49 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
         return host
     except OSError:
         pass
-    return dns_query_over_active_tunnel(host, 1, dns_server, timeout) or dns_query_over_active_tunnel(host, 28, dns_server, timeout)
+
+    key = str(host or "").strip().rstrip(".").lower()
+    if not key:
+        return None
+    now = time.monotonic()
+    with DNS_CACHE_LOCK:
+        cached = DNS_CACHE.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    resolved = (
+        dns_query_over_active_tunnel(key, 1, dns_server, timeout)
+        or dns_query_over_active_tunnel(key, 28, dns_server, timeout)
+    )
+    ttl = DNS_CACHE_TTL_SECONDS if resolved else DNS_NEGATIVE_TTL_SECONDS
+    with DNS_CACHE_LOCK:
+        DNS_CACHE[key] = (now + ttl, resolved)
+        if len(DNS_CACHE) > 1024:
+            cutoff = time.monotonic()
+            stale = [k for k, (expiry, _) in DNS_CACHE.items() if expiry <= cutoff]
+            for k in stale[:256]:
+                DNS_CACHE.pop(k, None)
+    return resolved
+
+def _tune_socket(sock: socket.socket) -> socket.socket:
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    for level, opt in (
+        (socket.SOL_SOCKET, socket.SO_RCVBUF),
+        (socket.SOL_SOCKET, socket.SO_SNDBUF),
+    ):
+        try:
+            sock.setsockopt(level, opt, PROXY_SOCKET_BUFFER_BYTES)
+        except OSError:
+            pass
+    return sock
+
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
@@ -261,8 +311,13 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
+            _tune_socket(sock)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
             sock.connect(sa)
+            # The timeout protects only connection establishment. Long-lived
+            # HTTPS/WebSocket sessions should not be dropped after 30 seconds
+            # of idle time.
+            sock.settimeout(None)
             return sock
         except OSError as e:
             err = e
@@ -278,6 +333,12 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         raise OSError("getaddrinfo returns empty list")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
+    # Handshake timeouts should not apply once the tunnel is established.
+    for sock in (left, right):
+        try:
+            sock.settimeout(None)
+        except OSError:
+            pass
     sockets = [left, right]
     while True:
         readable, _, errored = select.select(sockets, [], sockets, 120)
@@ -434,6 +495,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
 
 def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
     try:
+        _tune_socket(client)
         client.settimeout(30)
         if not proxy_client_allowed(address):
             print(f"[代理访问控制] 拒绝客户端 {address[0]}:{address[1]}", flush=True)
@@ -465,8 +527,9 @@ def start_proxy_server(host: str, port: int) -> None:
                 server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             except OSError:
                 pass
+        _tune_socket(server)
         server.bind((host, port))
-        server.listen(256)
+        server.listen(1024)
         print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
     except Exception as e:
         if server is not None:
@@ -479,8 +542,9 @@ def start_proxy_server(host: str, port: int) -> None:
             try:
                 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _tune_socket(server)
                 server.bind(("0.0.0.0", port))
-                server.listen(256)
+                server.listen(1024)
                 print(f"HTTP/SOCKS5 proxy listening on 0.0.0.0:{port} (仅 IPv4)", flush=True)
             except Exception as ex:
                 import vpn_utils
@@ -493,8 +557,9 @@ def start_proxy_server(host: str, port: int) -> None:
             try:
                 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _tune_socket(server)
                 server.bind(("127.0.0.1", port))
-                server.listen(256)
+                server.listen(1024)
                 print(f"HTTP/SOCKS5 proxy listening on 127.0.0.1:{port} (仅 IPv4)", flush=True)
             except Exception as ex:
                 import vpn_utils

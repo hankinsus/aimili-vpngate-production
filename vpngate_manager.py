@@ -5088,7 +5088,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AimiliVPN 多协议节点管理系统</title>
+  <title>我爱研究.ILovestudy｜多协议节点管理系统</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
@@ -5574,127 +5574,203 @@ INDEX_HTML = r"""<!doctype html>
       text-decoration: underline;
     }
     .site-footer {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      text-align: center;
-      font-size: 12px;
-      color: var(--text-secondary);
-      padding: 26px 0 34px;
-      margin-top: 18px;
+      position: relative;
+      margin-top: 30px;
+      padding: 40px 20px 28px;
+      overflow: hidden;
+      background:
+        radial-gradient(900px 220px at 50% 0%, rgba(20,184,166,.10), transparent 72%),
+        linear-gradient(180deg, rgba(8,14,28,.10), rgba(8,14,28,.56));
+      border-top: 1px solid rgba(99,102,241,.14);
+    }
+    .site-footer::before {
+      content: "";
+      position: absolute;
+      left: -5%;
+      right: -5%;
+      top: -20px;
+      height: 90px;
+      pointer-events: none;
+      background:
+        radial-gradient(60% 80px at 15% 100%, rgba(20,184,166,.08), transparent 72%),
+        radial-gradient(55% 90px at 85% 100%, rgba(99,102,241,.10), transparent 72%);
+      border-top: 1px solid rgba(20,184,166,.08);
+      transform: rotate(-1deg);
+      opacity: .85;
+    }
+    .site-footer-inner {
+      position: relative;
+      z-index: 1;
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      display: grid;
+      gap: 18px;
+      justify-items: center;
     }
     .footer-brand {
       display: flex;
-      flex-wrap: wrap;
       align-items: center;
       justify-content: center;
-      gap: 7px;
+      gap: 12px;
+      width: 100%;
       min-width: 0;
+      text-align: center;
     }
     .footer-brand-link {
       display: inline-flex;
       align-items: center;
-      gap: 7px;
+      gap: 11px;
       min-width: 0;
       color: var(--text-primary);
       text-decoration: none;
-      font-weight: 750;
     }
     .footer-brand-link:hover { color: #ffffff; }
-    .footer-brand-logo {
-      width: 36px;
-      height: 36px;
+    .footer-brand-logo-image {
+      width: 58px;
+      height: 58px;
       display: block;
-      flex: 0 0 auto;
+      flex: 0 0 58px;
+      object-fit: contain;
+      object-position: center;
+      filter: drop-shadow(0 6px 18px rgba(20,184,166,.16));
+    }
+    .footer-brand-copy {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: center;
+      gap: 7px;
+      min-width: 0;
     }
     .footer-brand strong {
       color: var(--text-primary);
-      font-size: 14.5px;
-      font-weight: 750;
+      font-size: 20px;
+      font-weight: 760;
       line-height: 1.2;
+      letter-spacing: -.2px;
     }
-    .footer-brand span { overflow-wrap: anywhere; line-height: 1.5; }
+    .footer-brand-version {
+      color: var(--text-secondary);
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
     .footer-channels {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: center;
-      gap: 10px;
-      margin: 1px 0 0;
+      gap: 12px;
     }
     .footer-channel {
-      min-height: 40px;
+      min-width: 190px;
+      min-height: 48px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
-      padding: 8px 14px;
-      border: 1px solid rgba(255,255,255,.12);
+      gap: 9px;
+      padding: 10px 18px;
+      border: 1px solid rgba(255,255,255,.10);
       border-radius: 999px;
-      background: rgba(255,255,255,.96);
-      box-shadow: 0 3px 12px rgba(0,0,0,.18);
-      color: #162033;
-      font-size: 13px;
-      font-weight: 700;
+      background: rgba(248,250,252,.98);
+      box-shadow: 0 8px 24px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.9);
+      color: #182033;
+      font-size: 14px;
+      font-weight: 750;
       line-height: 1;
       text-decoration: none;
       white-space: nowrap;
-      transition: transform .16s ease,border-color .16s ease,box-shadow .16s ease,background .16s ease;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease, background .16s ease;
     }
     .footer-channel:hover {
       transform: translateY(-1px);
-      border-color: rgba(20,184,166,.42);
+      border-color: rgba(20,184,166,.38);
       background: #ffffff;
-      box-shadow: 0 6px 18px rgba(0,0,0,.24);
+      box-shadow: 0 10px 28px rgba(0,0,0,.26), 0 0 0 1px rgba(20,184,166,.08);
     }
     .footer-channel:active { transform: translateY(0); }
-    .footer-channel:focus-visible {
-      outline: 2px solid var(--primary);
-      outline-offset: 2px;
-    }
+    .footer-channel:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
     .footer-channel-icon {
-      width: 18px;
-      height: 18px;
+      width: 20px;
+      height: 20px;
       display: grid;
       place-items: center;
-      flex: 0 0 18px;
+      flex: 0 0 20px;
     }
-    .footer-channel-icon svg {
-      width: 18px;
-      height: 18px;
-      display: block;
-      fill: currentColor;
-    }
+    .footer-channel-icon svg { width: 20px; height: 20px; display: block; fill: currentColor; }
     .footer-channel-youtube .footer-channel-icon { color: #ff0033; }
     .footer-channel-telegram .footer-channel-icon { color: #229ed9; }
-    .footer-channel-label {
-      display: inline-block;
-      transform: translateY(.2px);
+    .footer-disclaimer {
+      width: min(1040px, 100%);
+      box-sizing: border-box;
+      padding: 18px 20px 16px;
+      border: 1px solid rgba(99,102,241,.14);
+      border-radius: 16px;
+      background:
+        linear-gradient(135deg, rgba(16,24,43,.82), rgba(10,18,34,.68));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 10px 28px rgba(0,0,0,.16);
+      text-align: left;
     }
-    .footer-legal {
+    .footer-disclaimer-title {
+      margin-bottom: 9px;
+      text-align: center;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-weight: 720;
+    }
+    .footer-disclaimer-list {
+      margin: 0;
+      padding-left: 21px;
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.75;
+    }
+    .footer-disclaimer-list li { padding-left: 4px; margin: 2px 0; }
+    .footer-bottom {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       justify-content: center;
-      gap: 10px;
-      line-height: 1.5;
+      gap: 12px;
+      color: rgba(156,163,175,.82);
       font-size: 11px;
-      color: var(--text-secondary);
     }
-    .footer-legal a {
-      color: var(--text-secondary);
+    .footer-bottom a {
+      color: inherit;
       text-decoration: none;
+      padding: 2px 4px;
     }
-    .footer-legal a:hover { color: var(--text-primary); text-decoration: underline; }
+    .footer-bottom a:hover { color: var(--text-primary); text-decoration: underline; }
+    .footer-divider { opacity: .34; }
     @media (max-width:699px) {
-      .site-footer { padding: 20px 12px 28px; gap: 10px; }
-      .footer-brand { max-width: 100%; gap: 5px; }
-      .footer-brand-logo { width: 32px; height: 32px; }
-      .footer-brand strong { font-size: 13.5px; }
-      .footer-brand span { flex-basis: 100%; font-size: 11.5px; }
+      .site-footer { margin-top: 24px; padding: 28px 12px 22px; }
+      .site-footer-inner { gap: 14px; }
+      .footer-brand {
+        align-items: flex-start;
+        text-align: left;
+      }
+      .footer-brand-logo-image { width: 52px; height: 52px; flex-basis: 52px; }
+      .footer-brand-copy {
+        justify-content: flex-start;
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .footer-brand strong { font-size: 17px; }
+      .footer-brand-version { font-size: 11.5px; }
       .footer-channels { width: 100%; gap: 8px; }
-      .footer-channel { min-height: 44px; padding: 9px 12px; font-size: 12.5px; }
+      .footer-channel { min-width: 0; width: 100%; min-height: 46px; padding: 10px 14px; font-size: 13px; }
+      .footer-disclaimer { padding: 14px 14px 12px; border-radius: 14px; }
+      .footer-disclaimer-title { font-size: 13px; }
+      .footer-disclaimer-list { font-size: 10.5px; line-height: 1.72; padding-left: 18px; }
+      .footer-bottom { gap: 8px; font-size: 10.5px; }
+    }
+    @media (min-width:700px) and (max-width:1024px) {
+      .site-footer { padding-left: 18px; padding-right: 18px; }
+      .footer-disclaimer { width: min(900px, 100%); }
+      .footer-brand strong { font-size: 18px; }
+      .footer-brand-version { font-size: 12px; }
     }
 
     .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
@@ -5878,9 +5954,19 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-select-label {
       min-width: 0;
+      max-width: calc(100% - 24px);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .toolbar-custom-option-label {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      line-height: 1.35;
     }
     .toolbar-custom-select-arrow {
       color: var(--text-secondary);
@@ -6032,29 +6118,90 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(15,23,42,.78);
     }
 
-    .table-wrapper,
+    @media (max-width:1100px) {
+      .toolbar { gap: 10px; padding: 12px; }
+      .toolbar-custom-select {
+        width: calc(25% - 8px);
+        min-width: 0;
+      }
+      .toolbar-custom-select[data-filter-id="country_filter"] {
+        width: calc(25% - 8px);
+      }
+      .toolbar-custom-select-button {
+        padding: 0 11px;
+        font-size: 13px;
+      }
+      .toolbar input { min-width: 0; flex: 1 1 100%; }
+    }
+
+    @media (max-width:699px) {
+      .toolbar {
+        display: grid;
+        grid-template-columns: minmax(0,1fr) minmax(0,1fr);
+        gap: 9px;
+        padding: 10px;
+      }
+      .toolbar-custom-select,
+      .toolbar-custom-select[data-filter-id="country_filter"] {
+        width: 100%;
+        height: 44px;
+      }
+      .toolbar-custom-select-button {
+        height: 44px;
+        padding: 0 10px;
+        font-size: 13px;
+      }
+      .toolbar input {
+        grid-column: 1 / -1;
+        width: 100%;
+        height: 42px;
+        min-width: 0;
+      }
+      .toolbar-custom-select-menu {
+        max-width: min(420px, calc(100vw - 20px));
+        min-width: min(190px, calc(100vw - 20px));
+        max-height: min(320px, calc(100vh - 120px));
+      }
+      .toolbar-custom-option {
+        min-height: 42px;
+        padding: 7px 10px;
+        align-items: flex-start;
+      }
+      .toolbar-custom-option-count {
+        min-width: 0;
+        flex: 0 0 auto;
+        padding-top: 2px;
+      }
+    }
+
+    .table-wrapper {
+      width: 100%;
+      max-width: 100%;
+      overflow: hidden !important;
+    }
     .table-container {
       width: 100%;
       max-width: 100%;
-      overflow-x: hidden !important;
+      overflow-x: auto !important;
       overflow-y: hidden;
-      -webkit-overflow-scrolling: auto;
-      scrollbar-width: none !important;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(20,184,166,.28) transparent;
     }
 
     .table-container::-webkit-scrollbar {
-      display: none !important;
-      width: 0;
-      height: 0;
+      height: 5px;
     }
+    .table-container::-webkit-scrollbar-track { background: transparent; }
+    .table-container::-webkit-scrollbar-thumb { background: rgba(20,184,166,.28); border-radius: 999px; }
 
     table {
       width: 100%;
-      min-width: 0;
-      max-width: 100%;
+      min-width: 820px;
+      max-width: none;
       border-collapse: collapse;
       text-align: left;
-      table-layout: fixed;
+      table-layout: auto;
     }
 
     th, td {
@@ -6263,10 +6410,15 @@ INDEX_HTML = r"""<!doctype html>
 
     @media (max-width: 1100px) {
       .table-container {
-        overflow-x: hidden;
+        overflow-x: auto;
+        overflow-y: hidden;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
       }
       table {
-        min-width: 0;
+        min-width: 820px;
+        max-width: none;
+        table-layout: auto;
       }
       th, td {
         padding: 10px 6px;
@@ -7155,7 +7307,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="brand">
     <h1>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
-      AimiliVPN 多协议节点管理系统
+      我爱研究.ILovestudy｜多协议节点管理系统
     </h1>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
@@ -7355,8 +7507,9 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
+        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条已加载节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
         <span id="pool_summary" style="margin-left: 14px; color: var(--text-secondary);">Master Pool：—</span>
+        <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
       </div>
       <div style="display: flex; gap: 8px; align-items: center;">
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
@@ -7871,42 +8024,49 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
   <footer class="site-footer" aria-label="我爱研究官方入口">
-    <div class="footer-brand">
-      <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
-        <svg class="footer-brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" aria-hidden="true">
-          <defs>
-            <linearGradient id="footer-shield-g" x1="8" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
-              <stop stop-color="#6d78ff"/><stop offset=".55" stop-color="#26386e"/><stop offset="1" stop-color="#13b9a6"/>
-            </linearGradient>
-          </defs>
-          <path d="M32 4 53 12v16c0 13.8-8.7 25.2-21 31C19.7 53.2 11 41.8 11 28V12L32 4Z" fill="url(#footer-shield-g)" stroke="#172554" stroke-width="2"/>
-          <path d="M24.5 23.5h15a4 4 0 0 1 4 4v13h-23v-13a4 4 0 0 1 4-4Z" fill="#0b1020" stroke="#d9e4ff" stroke-width="2"/>
-          <path d="M28 23.5v-3.2a4 4 0 0 1 8 0v3.2" stroke="#d9e4ff" stroke-width="2" stroke-linecap="round"/>
-          <circle cx="32.5" cy="32.5" r="2" fill="#14b8a6"/><path d="M32.5 34.5v3" stroke="#14b8a6" stroke-width="2" stroke-linecap="round"/>
-        </svg>
-        <strong>我爱研究.ILovestudy</strong>
-      </a>
-      <span>· 多协议节点管理系统 · V9.0.6</span>
-    </div>
-    <div class="footer-channels">
-      <a class="footer-channel footer-channel-youtube" href="https://www.youtube.com/@ILovestudycn" target="_blank" rel="noopener noreferrer" aria-label="打开 YouTube 频道">
-        <span class="footer-channel-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8ZM9.6 15.6V8.4l6.2 3.6-6.2 3.6Z"/></svg>
-        </span>
-        <span class="footer-channel-label">YouTube 频道</span>
-      </a>
-      <a class="footer-channel footer-channel-telegram" href="https://t.me/ILovestudyus" target="_blank" rel="noopener noreferrer" aria-label="打开 Telegram 频道">
-        <span class="footer-channel-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M21.6 3.4 2.9 10.6c-1.3.5-1.3 1.2-.2 1.5l4.8 1.5 1.8 5.5c.2.6.1.8.7.8.5 0 .7-.2 1-.5l2.3-2.2 4.8 3.6c.9.5 1.5.3 1.7-.8l3.1-14.7c.4-1.4-.5-2-1.5-1.4ZM9.1 13.3l10.5-6.6c.5-.3 1-.1.6.2l-8.8 7.9-.3 3.2-1.4-4.7-.6-.2Z"/></svg>
-        </span>
-        <span class="footer-channel-label">Telegram 频道</span>
-      </a>
-    </div>
-    <div class="footer-legal">
-      <a href="https://ilovestudycn.com" target="_blank" rel="noopener noreferrer">官网</a>
-      <a href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer">IP 节点检测</a>
-      <a href="#privacy">隐私</a>
-      <a href="#disclaimer">免责声明</a>
+    <div class="site-footer-inner">
+      <div class="footer-brand">
+        <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
+          <img class="footer-brand-logo-image" src="https://ilovestudyip.com/v1/assets/ilovestudy-logo-hd.png?v=9.0.0-logo-r1" alt="我爱研究.ILovestudy 标志" width="58" height="58" decoding="async" loading="lazy" />
+          <span class="footer-brand-copy">
+            <strong>我爱研究.ILovestudy</strong>
+            <span class="footer-brand-version">· 多协议节点管理系统 · V9.0.6</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="footer-channels" aria-label="官方频道入口">
+        <a class="footer-channel footer-channel-youtube" href="https://www.youtube.com/@ILovestudycn" target="_blank" rel="noopener noreferrer" aria-label="打开 YouTube 频道">
+          <span class="footer-channel-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M23.5 6.2a3 3 0 0 0-2.1-2.1C19.5 3.6 12 3.6 12 3.6s-7.5 0-9.4.5A3 3 0 0 0 .5 6.2 31 31 0 0 0 0 12a31 31 0 0 0 .5 5.8 3 3 0 0 0 2.1 2.1c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 0 0 2.1-2.1A31 31 0 0 0 24 12a31 31 0 0 0-.5-5.8ZM9.6 15.6V8.4l6.2 3.6-6.2 3.6Z"/></svg>
+          </span>
+          <span class="footer-channel-label">YouTube 频道</span>
+        </a>
+        <a class="footer-channel footer-channel-telegram" href="https://t.me/ILovestudyus" target="_blank" rel="noopener noreferrer" aria-label="打开 Telegram 频道">
+          <span class="footer-channel-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M21.6 3.4 2.9 10.6c-1.3.5-1.3 1.2-.2 1.5l4.8 1.5 1.8 5.5c.2.6.1.8.7.8.5 0 .7-.2 1-.5l2.3-2.2 4.8 3.6c.9.5 1.5.3 1.7-.8l3.1-14.7c.4-1.4-.5-2-1.5-1.4ZM9.1 13.3l10.5-6.6c.5-.3 1-.1.6.2l-8.8 7.9-.3 3.2-1.4-.7-.6-.2Z"/></svg>
+          </span>
+          <span class="footer-channel-label">Telegram 频道</span>
+        </a>
+      </div>
+
+      <section class="footer-disclaimer" aria-labelledby="footer-disclaimer-title">
+        <div id="footer-disclaimer-title" class="footer-disclaimer-title">隐私免责声明</div>
+        <ol class="footer-disclaimer-list">
+          <li>本工具仅用于整理订阅和检测你拥有或获授权使用的节点，不提供、出售或分发节点资源。请自行确认使用权限，并遵守适用法律、网络服务条款及相关规则。</li>
+          <li>检测结果仅反映执行时的网络状态和当次可取得的信息，可能受网络、设备及数据可用性影响；结果仅供参考，不构成安全、信誉、可用性、合规性或任何第三方平台判断的保证。</li>
+          <li>“IP属地”“原生 / 广播”网络类型等为技术分类，不属于官方认证，IPv4 与 IPv6 独立检测，结果可能不同。未执行、未知或直接生成的结果不代表已经通过全部检测。</li>
+          <li>订阅输入、节点列表、筛选状态和已完成的节点检测结果默认在当前设备本机处理和保存。仅在完成当前操作确有必要时进行网络通信或一次性临时读取；公开页面和错误提示不会展示原始凭据、访问令牌、完整请求地址或原始服务响应。</li>
+          <li>只有你主动生成在线订阅时，最终选中的节点连接信息才会进入临时订阅存储，并在 30 分钟后自动失效。订阅链接和二维码具有访问能力，请按敏感信息管理，不要公开分享。</li>
+          <li>清除本机节点订阅不会立即撤销已经发布的临时链接；已发布链接按照到期时间自动失效。使用共享设备后请清理本机记录、截图、复制内容和导出文件，也请谨慎保存和分享。</li>
+        </ol>
+      </section>
+
+      <nav class="footer-bottom" aria-label="底部官方入口">
+        <a href="https://ilovestudycn.com" target="_blank" rel="noopener noreferrer">官网</a>
+        <span class="footer-divider">|</span>
+        <a href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer">IP 节点检测</a>
+      </nav>
     </div>
   </footer>
 </main>
@@ -8247,7 +8407,7 @@ function renderCustomFilter(selectId, withCount = false) {
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
       '" data-filter-option="1" data-filter-value="' + esc(value) + '"' +
       ' onclick="event.preventDefault();event.stopPropagation();chooseCustomFilter(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
-      '<span>' + esc(name) + '</span>' +
+      '<span class="toolbar-custom-option-label">' + esc(name) + '</span>' +
       (count ? '<span class="toolbar-custom-option-count">' + esc(count) + '</span>' : '') +
       '</button>';
   }).join("");
@@ -8648,8 +8808,8 @@ function render(){
     else if (bootstrapRunning) bgText = "首次安装初始化中 · 先获取资源，再检测本机国家并自动连接最低延迟节点";
     else if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
     else if (collecting) bgText = "资源收集中 · 正在从主站、镜像和多协议目录补充 Master Pool";
-    else if (probing) bgText = "可用性检测中 · 新资源优先 · 全量资源最长 4 小时滚动复检";
-    else if (priorityRunning) bgText = String(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + "/" + Number(state.priority_target || 10);
+    else if (probing) bgText = "可用性检测中 · 新资源优先 · 全球资源最长 4 小时滚动复检";
+    else if (priorityRunning) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + "/" + Number(state.priority_target || 10);
     const detail = (tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "";
     bgActivityEl.style.display = "flex";
     bgActivityEl.className = "background-task-strip " + ((manualSwitchRunning || collecting || probing || priorityRunning || bootstrapRunning || state.failover_in_progress) ? "running" : "");
@@ -8681,7 +8841,8 @@ function render(){
 
   const priorityStatusEl = $("country_priority_status");
   if (priorityStatusEl) {
-    const pc = String(state.priority_country || "");
+    const pcRaw = String(state.priority_country || "");
+    const pc = translateCountry(pcRaw);
     if (pc) {
       const av = Number(state.priority_available || 0);
       const target = Number(state.priority_target || 10);
@@ -8691,7 +8852,9 @@ function render(){
       const rawPriorityMessage = String(state.priority_message || (av + " 个可用节点"));
       const priorityMessage = /unauthorized|http\\s*401/i.test(rawPriorityMessage)
         ? "管理员会话已失效，请刷新页面并重新登录"
-        : rawPriorityMessage;
+        : (pcRaw && rawPriorityMessage.startsWith(pcRaw)
+          ? rawPriorityMessage.replace(pcRaw, pc)
+          : rawPriorityMessage);
       priorityStatusEl.style.display = "flex";
       priorityStatusEl.className = state.priority_running ? "country-priority running" : "country-priority";
       priorityStatusEl.innerHTML = state.priority_running
@@ -8704,7 +8867,7 @@ function render(){
 
   const shown = getFilteredNodes();
 
-  if ($("total")) $("total").textContent = nodes.length;
+  if ($("total")) $("total").textContent = totalNodeCount || nodes.length;
   if ($("target")) $("target").textContent = state.target_valid_nodes || 3;
   if ($("active")) $("active").textContent = activeNode ? 1 : 0;
 
@@ -8930,7 +9093,7 @@ async function prioritizeCountry(country){
       try {
         const d = await fetchNodesState(8000);
         if (requestSeq !== countryPriorityRequestSeq) return;
-        if (Array.isArray(d.nodes) && d.nodes.length > 0) nodes = d.nodes;
+        if (Array.isArray(d.nodes) && d.nodes.length > 0) mergeLoadedNodePage(d.nodes);
         if (d.state) state = d.state;
         stableSortNodes();
         updateCountryFilter();
@@ -9017,6 +9180,10 @@ let countryPriorityPollBusy = false;
 let manualConnectionUiBusy = false;
 
 let nodesFetchPromise = null;
+let nodeProgressivePromise = null;
+let nodeLoadGeneration = 0;
+let totalNodeCount = 0;
+let nodeCacheBuilding = false;
 
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
@@ -9046,28 +9213,128 @@ let lastGoodNodesState = null;
 async function fetchNodesState(timeoutMs = 8000) {
   if (nodesFetchPromise) return nodesFetchPromise;
   nodesFetchPromise = Promise.all([
-    fetchJsonWithTimeout("./api/ui/nodes", {}, timeoutMs),
+    fetchJsonWithTimeout("./api/ui/nodes?offset=0&limit=100", {}, timeoutMs),
     fetchJsonWithTimeout("./api/ui/state", {}, Math.min(timeoutMs, 4000))
   ]).then(([nodeData, stateData]) => {
     const data = {
       nodes: Array.isArray(nodeData?.nodes) ? nodeData.nodes : [],
-      state: stateData?.state || {}
+      state: stateData?.state || {},
+      total: Number(nodeData?.total || 0),
+      cache_building: !!nodeData?.cache_building
     };
     const poolEndpoints = Number(data?.state?.pool_endpoints || data?.state?.pool_servers || 0);
+    totalNodeCount = Math.max(data.total, Number(data?.state?.pool_endpoints || 0), 0);
+    nodeCacheBuilding = data.cache_building;
     if (data.nodes.length > 0 || poolEndpoints <= 0) {
       lastGoodNodesState = data;
     } else if (lastGoodNodesState && Array.isArray(lastGoodNodesState.nodes) && lastGoodNodesState.nodes.length > 0) {
       data.nodes = lastGoodNodesState.nodes;
+      data.total = lastGoodNodesState.total || data.total;
     }
     return data;
   }).catch(err => {
     if (lastGoodNodesState) {
-      console.warn("UI 节点读取暂时失败，继续使用最近一次成功快照", err);
+      console.warn("UI 首屏节点读取暂时失败，继续使用最近一次成功快照", err);
       return lastGoodNodesState;
     }
     throw err;
   }).finally(() => { nodesFetchPromise = null; });
   return nodesFetchPromise;
+}
+
+async function fetchNodePage(offset, limit = 100, timeoutMs = 10000) {
+  const safeOffset = Math.max(0, Number(offset) || 0);
+  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 100));
+  return fetchJsonWithTimeout(`./api/ui/nodes?offset=${safeOffset}&limit=${safeLimit}`, {}, timeoutMs);
+}
+
+function nodeLoadYield() {
+  return new Promise(resolve => {
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(() => resolve(), { timeout: 150 });
+    } else {
+      setTimeout(resolve, 35);
+    }
+  });
+}
+
+function mergeLoadedNodePage(pageNodes) {
+  if (!Array.isArray(pageNodes) || !pageNodes.length) return;
+  const incoming = new Map(pageNodes.map((n, idx) => [String(n?.id || n?.pool_endpoint_id || '__page_' + idx), n]));
+  nodes = nodes.filter(n => !incoming.has(String(n?.id || n?.pool_endpoint_id || "")));
+  nodes.push(...pageNodes);
+  stableSortNodes();
+}
+
+function updateNodeLoadProgress(done, total, finished = false) {
+  const el = $("nodes_load_progress");
+  if (!el) return;
+  if (!total || total <= done) {
+    el.textContent = total ? `全球节点已全部加载 · 共 ${total} 条` : "";
+    return;
+  }
+  el.textContent = finished
+    ? `已加载 ${done}/${total} 条`
+    : `首页 ${Math.min(done, 100)} 条已就绪 · 后台继续加载 ${Math.max(0, total - done)} 条`;
+}
+
+async function progressivelyLoadNodes(total, generation) {
+  if (nodeProgressivePromise) return nodeProgressivePromise;
+  nodeProgressivePromise = (async () => {
+    let offset = Math.min(100, nodes.length);
+    let emptyBuildingRetries = 0;
+    try {
+      while (generation === nodeLoadGeneration && offset < Math.max(total, 0)) {
+        await nodeLoadYield();
+        if (generation !== nodeLoadGeneration) return;
+        const page = await fetchNodePage(offset, 100, 12000);
+        if (generation !== nodeLoadGeneration) return;
+
+        const pageTotal = Number(page?.total || total || 0);
+        nodeCacheBuilding = !!page?.cache_building;
+        // Once the server-side UI snapshot is fully built, its deduplicated
+        // total is authoritative. While it is still building, keep the larger
+        // pool estimate so the loader waits for the complete snapshot.
+        if (pageTotal > 0 && (!nodeCacheBuilding || pageTotal > totalNodeCount || totalNodeCount === 0)) {
+          totalNodeCount = pageTotal;
+          total = pageTotal;
+        }
+
+        const pageNodes = Array.isArray(page?.nodes) ? page.nodes : [];
+        if (!pageNodes.length) {
+          if (nodeCacheBuilding && emptyBuildingRetries < 20) {
+            emptyBuildingRetries += 1;
+            await new Promise(r => setTimeout(r, 450));
+            continue;
+          }
+          break;
+        }
+        emptyBuildingRetries = 0;
+        mergeLoadedNodePage(pageNodes);
+        offset += pageNodes.length;
+        updateCountryFilter();
+        updateNodeLoadProgress(nodes.length, totalNodeCount);
+        render();
+      }
+      if (generation === nodeLoadGeneration) {
+        updateNodeLoadProgress(nodes.length, totalNodeCount, true);
+        try {
+          sessionStorage.setItem("aimili_last_nodes_snapshot", JSON.stringify({
+            nodes: nodes.slice(0, 1000),
+            saved_at: Date.now()
+          }));
+        } catch (_) {}
+      }
+    } catch (e) {
+      if (generation === nodeLoadGeneration) {
+        console.warn("后台分批加载节点失败，首屏继续可用", e);
+        updateNodeLoadProgress(nodes.length, totalNodeCount, true);
+      }
+    } finally {
+      if (generation === nodeLoadGeneration) nodeProgressivePromise = null;
+    }
+  })();
+  return nodeProgressivePromise;
 }
 
 function refreshButtonBusy(message = "正在后台更新...") {
@@ -9092,7 +9359,7 @@ function startRefreshPolling() {
     refreshPollBusy = true;
     try {
       const data = await fetchNodesState(8000);
-      if (Array.isArray(data.nodes) && data.nodes.length > 0) nodes = data.nodes;
+      if (Array.isArray(data.nodes) && data.nodes.length > 0) mergeLoadedNodePage(data.nodes);
       if (data.state) state = data.state;
       stableSortNodes();
       updateCountryFilter();
@@ -9102,6 +9369,9 @@ function startRefreshPolling() {
         clearInterval(refreshPollInterval);
         refreshPollInterval = null;
         refreshButtonIdle();
+        // Rebuild the browser snapshot from the first page, then lazily load
+        // the remaining global nodes in the background.
+        load();
       }
     } catch (pe) {
       if (pe?.name === "AbortError") return;
@@ -9377,24 +9647,34 @@ async function submitAddNode(){
 
 let initialNodeLoadRetryCount = 0;
 async function load(){
+  const generation = ++nodeLoadGeneration;
+  // A fresh page load starts with the first 100 rows only. Any previous
+  // progressive loader sees the generation change and exits without touching
+  // the new snapshot.
+  nodes = [];
+  totalNodeCount = 0;
+  nodeCacheBuilding = false;
+  nodeProgressivePromise = null;
+
   try {
     const d = await fetchNodesState(8000);
     const incomingNodes = Array.isArray(d.nodes) ? d.nodes : [];
+    totalNodeCount = Math.max(
+      Number(d.total || 0),
+      Number(d?.state?.pool_endpoints || 0),
+      incomingNodes.length
+    );
+    nodeCacheBuilding = !!d.cache_building;
+
     if (incomingNodes.length > 0) {
       nodes = incomingNodes;
       initialNodeLoadRetryCount = 0;
-      try {
-        sessionStorage.setItem("aimili_last_nodes_snapshot", JSON.stringify({
-          nodes: incomingNodes.slice(0, 1000),
-          saved_at: Date.now()
-        }));
-      } catch (_) {}
-    } else if (!nodes.length) {
+    } else {
       let restored = false;
       try {
         const cached = JSON.parse(sessionStorage.getItem("aimili_last_nodes_snapshot") || "null");
         if (cached && Array.isArray(cached.nodes) && cached.nodes.length) {
-          nodes = cached.nodes;
+          nodes = cached.nodes.slice(0, 100);
           restored = true;
         }
       } catch (_) {}
@@ -9402,20 +9682,32 @@ async function load(){
       if (!restored && poolEndpoints > 0 && initialNodeLoadRetryCount < 12) {
         initialNodeLoadRetryCount += 1;
         state = d.state || state || {};
-        state.last_check_message = "节点资源正在恢复，保留后台检测；正在重新读取节点列表...";
+        state.last_check_message = "节点资源正在恢复；首页先显示可用数据，后台继续读取其余节点...";
         render();
-        setTimeout(load, 600);
+        setTimeout(() => load(), 600);
         return;
       }
     }
     if (d.state) state = d.state;
   } catch (e) {
-    console.warn("节点列表加载暂时失败，保留当前节点数据", e);
+    console.warn("节点首屏读取暂时失败，尝试使用本地缓存", e);
+    try {
+      const cached = JSON.parse(sessionStorage.getItem("aimili_last_nodes_snapshot") || "null");
+      if (cached && Array.isArray(cached.nodes) && cached.nodes.length) {
+        nodes = cached.nodes.slice(0, 100);
+        totalNodeCount = Math.max(totalNodeCount, nodes.length);
+      }
+    } catch (_) {}
   }
 
   stableSortNodes();
   updateCountryFilter();
+  updateNodeLoadProgress(nodes.length, totalNodeCount);
   render();
+
+  if (totalNodeCount > nodes.length) {
+    progressivelyLoadNodes(totalNodeCount, generation);
+  }
 
   if (state.global_pool_refresh_running) {
     startRefreshPolling();
@@ -10208,7 +10500,7 @@ setInterval(async () => {
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
       const d = await fetchNodesState(8000);
-      if (Array.isArray(d.nodes) && d.nodes.length > 0) nodes = d.nodes;
+      if (Array.isArray(d.nodes) && d.nodes.length > 0) mergeLoadedNodePage(d.nodes);
       if (d.state) state = d.state;
       stableSortNodes();
       updateCountryFilter();
@@ -11657,7 +11949,20 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/ui/state":
             self.send_json({"ok": True, "state": _get_fast_nodes_state(), "ui_command": ui_command_plane.ui_state()})
         elif effective_path == "/api/ui/nodes":
-            self.send_json({"ok": True, "nodes": _get_ui_nodes_snapshot(), "generated_at": time.time()})
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            offset = bounded_int((query.get("offset") or ["0"])[0], 0, 0, 200000)
+            limit = bounded_int((query.get("limit") or ["100"])[0], 100, 1, 200)
+            page_nodes, total_nodes, cache_building = _get_ui_nodes_page(offset, limit)
+            self.send_json({
+                "ok": True,
+                "nodes": page_nodes,
+                "offset": offset,
+                "limit": limit,
+                "total": total_nodes,
+                "has_more": offset + len(page_nodes) < total_nodes,
+                "cache_building": cache_building,
+                "generated_at": time.time(),
+            })
         elif effective_path == "/api/protocol_capabilities":
             self.send_json({"ok": True, "protocols": tunnel_adapters.capability_report()})
         elif effective_path == "/api/node_pool_stats":
@@ -12999,12 +13304,70 @@ def _refresh_ui_nodes_cache_async(force=False):
         ui_nodes_cache_building = True
     threading.Thread(target=_build_ui_nodes_cache, daemon=True, name="ui-node-cache").start()
 
+def _sort_ui_nodes_for_page(nodes):
+    """Return the same stable ranking used by the browser, but server-side.
+
+    This lets the first 100 rows be the true first page instead of an arbitrary
+    slice of a multi-thousand-node snapshot.
+    """
+    status_rank = {"available": 0, "testing": 1, "not_checked": 2, "unavailable": 3}
+    protocol_rank = {"softether": 0, "sstp": 1, "l2tp-ipsec": 2, "openvpn": 3}
+    now = time.time()
+
+    def key(n):
+        active = 0
+        if active_pool_endpoint_id and n.get("pool_endpoint_id") == active_pool_endpoint_id:
+            active = 0
+        elif (not active_pool_endpoint_id and n.get("id") == active_openvpn_node_id):
+            active = 0
+        else:
+            active = 1
+        status = str(n.get("probe_status") or "not_checked").lower()
+        manual_ts = float(n.get("manual_added_at") or 0)
+        recent = 0 if manual_ts > 0 and (now - manual_ts) <= 3600 else 1
+        recent_ts = -manual_ts if recent == 0 else 0
+        latency = float(n.get("latency_ms") or 0)
+        latency_key = latency if latency > 0 else float("inf")
+        protocol = str(n.get("protocol") or "openvpn").lower()
+        score = -float(n.get("score") or 0)
+        return (
+            active,
+            status_rank.get(status, 2),
+            recent,
+            recent_ts,
+            latency_key,
+            protocol_rank.get(protocol, 9),
+            score,
+            str(n.get("id") or ""),
+        )
+
+    return sorted(_sanitize_ui_nodes(nodes), key=key)
+
+
 def _get_ui_nodes_snapshot():
     _refresh_ui_nodes_cache_async()
     with ui_nodes_cache_lock:
         if ui_nodes_cache:
             return [dict(x) for x in ui_nodes_cache]
     return _sanitize_ui_nodes(read_nodes())
+
+
+def _get_ui_nodes_page(offset=0, limit=100):
+    """Return a bounded, sorted UI page so initial browser load stays light."""
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(200, int(limit or 100)))
+    _refresh_ui_nodes_cache_async()
+
+    with ui_nodes_cache_lock:
+        building = bool(ui_nodes_cache_building)
+        snapshot = [dict(x) for x in ui_nodes_cache] if ui_nodes_cache else []
+
+    if not snapshot:
+        snapshot = _sanitize_ui_nodes(read_nodes())
+
+    ordered = _sort_ui_nodes_for_page(snapshot)
+    total = len(ordered)
+    return ordered[offset:offset + limit], total, building
 
 def _get_fast_nodes_state():
     state = read_json(STATE_FILE, {})
@@ -13271,7 +13634,7 @@ def availability_sweep_once(priority_country=""):
             if len(selected_pool)>=pool_limit: break
         availability_queue=len(selected_ov)+len(selected_pool)
         availability_new_pending=sum(1 for ep in selected_ov+selected_pool if str(ep.get("status") or "").upper()=="NEW")
-        availability_engine_message=f"可用性检测中 · 新资源优先 · OpenVPN {len(selected_ov)} · 多协议 {len(selected_pool)} · 全量资源最长 4 小时复检"
+        availability_engine_message=f"可用性检测中 · 新资源优先 · OpenVPN {len(selected_ov)} · 多协议 {len(selected_pool)} · 全球资源最长 4 小时复检"
         set_state(availability_engine_running=True,availability_engine_message=availability_engine_message,availability_queue=availability_queue,availability_new_pending=availability_new_pending)
         tested=0
         ids=[str((ep.get("metadata") or {}).get("node_id") or "") for ep in selected_ov]

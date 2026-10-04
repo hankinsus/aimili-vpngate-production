@@ -5,6 +5,11 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本项目用于在 Linux VPS 上统一管理 OpenVPN、SoftEther、SSTP、L2TP/IPsec 等多协议节点，提供节点资源采集、持续可用性检测、真实连接延迟、自动故障切换、HTTP/SOCKS5 出站代理与 Web 管理。
 
+### ⭐ 我的邀请入口
+[🎁 专线流媒体｜顶级三网优化](https://yiy.one/register?codes=98BA33)
+
+[📢 无限流量住宅 IP](https://www.miyaip.com/?invitecode=2955039)
+
 <a name="中文"></a>
 
 ## 中文
@@ -150,6 +155,11 @@ export https_proxy="http://服务器IP:8500"
 **ILovestudy｜Multi-Protocol Node Management System**
 
 The system is designed for Linux VPS deployments and manages OpenVPN, SoftEther, SSTP, and L2TP/IPsec resources from one web console. It provides resource collection, continuous availability testing, real connection latency, automatic failover, an HTTP/SOCKS5 egress proxy, and web administration.
+
+### ⭐ My invitation links
+[🎁 Dedicated Streaming Media｜Top 3-Network Optimization](https://yiy.one/register?codes=98BA33)
+
+[📢 Unlimited Traffic Residential IP](https://www.miyaip.com/?invitecode=2955039)
 
 ### 2. Port architecture
 
