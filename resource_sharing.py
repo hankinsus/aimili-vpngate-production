@@ -325,11 +325,12 @@ class ResourceShareManager:
             invite = data["invites"].get(invite_id)
             if not isinstance(invite, dict):
                 raise KeyError("邀请码不存在")
-            # Permanent deletion is only exposed for already-revoked invites.
-            # Remove any linked inbound Peer as well so the deleted grant can
-            # no longer authorize resource access.
+            # Permanent deletion is an explicit destructive action. If the
+            # invite is still active, revoke it atomically first so the link
+            # cannot authorize any new enrollment during deletion.
             if not invite.get("revoked"):
-                raise ValueError("请先撤销邀请码，再进行永久删除")
+                invite["revoked"] = True
+                invite["revoked_at"] = time.time()
             linked = [
                 peer_id for peer_id, peer in data["peers"].items()
                 if isinstance(peer, dict) and str(peer.get("invite_id") or "") == invite_id
