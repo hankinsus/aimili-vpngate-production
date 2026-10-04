@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import base64
@@ -189,7 +188,9 @@ active_openvpn_node_id = ""
 active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
 protocol_discovery_lock = threading.Lock()
-protocol_probe_lock = threading.Lock()
+protocol_probe_lock = threading.BoundedSemaphore(4)
+probe_route_table_lock = threading.Lock()
+probe_route_tables_free: set[int] = set(range(201,221))
 country_priority_lock = threading.Lock()
 global_pool_refresh_lock = threading.Lock()
 global_country_coverage_lock = threading.Lock()
@@ -544,7 +545,7 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
-            "fav_fail_fallback": False
+            "fav_fail_fallback": True
         }
         updated = False
         if auth_file.exists():
@@ -564,6 +565,10 @@ def load_ui_config() -> dict[str, Any]:
 
         if not config.get("password"):
             config["password"] = generate_random_password()
+            updated = True
+
+        if config.get("fav_fail_fallback") is not True:
+            config["fav_fail_fallback"] = True
             updated = True
 
         if not ISOLATED_INSTANCE:
@@ -873,7 +878,7 @@ def get_state() -> dict[str, Any]:
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
-    state["fav_fail_fallback"] = False
+    state["fav_fail_fallback"] = bool(ui_cfg.get("fav_fail_fallback", True))
 
     return state
 
@@ -1793,6 +1798,8 @@ def stop_active_openvpn() -> None:
                 if path.exists():
                     path.unlink()
             except Exception:
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
                 pass
 
 def active_openvpn_running() -> bool:
@@ -3503,12 +3510,12 @@ def setup_probe_policy_routing(interface: str, gateway: str = "", table: int = P
         cleanup_probe_policy_routing(table)
         return False, str(exc)
 
-def check_interface_egress(interface: str, gateway: str = "") -> dict[str, Any]:
+def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
     interface = str(interface or "").strip()
     if not interface:
         return {"ok": False, "error": "缺少测试网卡"}
 
-    route_ok, route_error = setup_probe_policy_routing(interface, gateway)
+    route_ok, route_error = setup_probe_policy_routing(interface, gateway, table=table)
     if not route_ok:
         return {"ok": False, "error": f"临时策略路由建立失败: {route_error}"}
 
@@ -3528,7 +3535,7 @@ def check_interface_egress(interface: str, gateway: str = "") -> dict[str, Any]:
                 diagnostics.append(f"curl_error={res.stderr.strip()[-500:]}")
             for label, diag_cmd in [
                 ("addr", ["ip", "-4", "addr", "show", "dev", interface]),
-                ("table200", ["ip", "route", "show", "table", str(PROBE_ROUTE_TABLE)]),
+                ("probe_table", ["ip", "route", "show", "table", str(table)]),
                 ("route_get", ["ip", "route", "get", "1.1.1.1", "oif", interface]),
             ]:
                 try:
@@ -3549,7 +3556,18 @@ def check_interface_egress(interface: str, gateway: str = "") -> dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
-        cleanup_probe_policy_routing()
+        cleanup_probe_policy_routing(table)
+
+def _acquire_probe_route_table() -> int | None:
+    with probe_route_table_lock:
+        if not probe_route_tables_free:
+            return None
+        return probe_route_tables_free.pop()
+
+def _release_probe_route_table(table: int) -> None:
+    cleanup_probe_policy_routing(table)
+    with probe_route_table_lock:
+        probe_route_tables_free.add(int(table))
 
 def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
     endpoint_id = str(endpoint_id or "").strip()
@@ -3572,13 +3590,18 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
     token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:10] or uuid.uuid4().hex[:10]
     result: tunnel_adapters.TunnelResult | None = None
     cleanup = None
+    probe_table: int | None = _acquire_probe_route_table()
 
     try:
+        if probe_table is None:
+            return {"ok": False, "skipped": True, "error": "探测临时路由表暂时已满"}
         if protocol == "softether":
             account = f"probe{token}"
             nic = f"p{token}"
             adapter = tunnel_adapters.SoftEtherAdapter()
             result = adapter.connect(
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
                 host=host,
                 port=port or 443,
                 account=account,
@@ -3622,7 +3645,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         egress = (
             tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
             if protocol == "l2tp-ipsec"
-            else check_interface_egress(result.interface, result.gateway)
+            else check_interface_egress(result.interface, result.gateway, table=probe_table)
         )
         if not egress.get("ok"):
             message = str(egress.get("error") or "接口出口不可用")
@@ -3650,6 +3673,8 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
                 cleanup()
             except Exception:
                 pass
+        if probe_table is not None:
+            _release_probe_route_table(probe_table)
         protocol_probe_lock.release()
 
 def protocol_probe_loop() -> None:
@@ -5193,6 +5218,38 @@ INDEX_HTML = r"""<!doctype html>
       outline: 2px solid var(--primary);
       outline-offset: 2px;
     }
+    .background-task-strip {
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 8px 12px;
+      border: 1px solid rgba(99,102,241,.16);
+      border-radius: 10px;
+      background: rgba(99,102,241,.045);
+      color: var(--text-secondary);
+      font-size: 12px;
+      line-height: 1.45;
+      box-sizing: border-box;
+    }
+    .background-task-strip.running {
+      border-color: rgba(245,158,11,.22);
+      background: rgba(245,158,11,.055);
+    }
+    .background-task-dot {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 7px;
+      border-radius: 999px;
+      background: var(--primary);
+      box-shadow: 0 0 8px rgba(20,184,166,.4);
+    }
+    .background-task-strip.running .background-task-dot {
+      background: var(--warning);
+      box-shadow: 0 0 8px rgba(245,158,11,.45);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+
     .country-priority {
       display: flex;
       align-items: center;
@@ -5260,7 +5317,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow: visible !important;
     }
     .toolbar-custom-select[data-filter-id="country_filter"] {
-      width: 240px;
+      width: min(270px, 42vw);
     }
     .toolbar-custom-select.open {
       z-index: 10070;
@@ -5345,6 +5402,8 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-option {
       width: 100%;
       min-height: 40px;
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -6580,9 +6639,13 @@ INDEX_HTML = r"""<!doctype html>
 <main>
 
     <!-- 当前连接活动节点卡片 -->
-    <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
+    <section class="active-node-section" id="active_node_card" style="margin-bottom: 14px;">
       <!-- Rendered dynamically by render() -->
     </section>
+    <div id="background_activity_status" class="background-task-strip" style="display:none;margin-bottom:24px;">
+      <span class="background-task-dot"></span>
+      <span id="background_activity_text"></span>
+    </div>
 
 
 
@@ -6766,6 +6829,7 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
           代理设置
         </h3>
+        <div id="net_upstream_proxy_state" style="font-size:11px;color:var(--text-secondary);margin-top:4px;">系统默认网络（未设置自定义上游代理）</div>
         <button type="button" onclick="closeNetworkModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
@@ -7140,6 +7204,8 @@ INDEX_HTML = r"""<!doctype html>
           </select>
         </div>
 
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
         <button type="button" onclick="closeLogsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
@@ -7450,6 +7516,19 @@ function toggleCustomFilter(selectId, event) {
   widget.classList.toggle("open", opening);
   if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
   if (opening) {
+    const menu = $(cfg.menu);
+    if (menu) {
+      menu.style.top = "";
+      menu.style.bottom = "";
+      requestAnimationFrame(() => {
+        const rect = widget.getBoundingClientRect();
+        const menuHeight = Math.min(menu.scrollHeight || 320, Math.min(360, window.innerHeight - 40));
+        const spaceBelow = window.innerHeight - rect.bottom - 12;
+        const openUp = menuHeight > 0 && spaceBelow < menuHeight && rect.top > menuHeight + 12;
+        menu.style.top = openUp ? "auto" : "calc(100% + 8px)";
+        menu.style.bottom = openUp ? "calc(100% + 8px)" : "auto";
+      });
+    }
     const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
     if (active) active.scrollIntoView({block:"nearest"});
   }
@@ -7622,7 +7701,7 @@ function render(){
 
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
-  if (state.is_connecting && !activeNode) {
+  if (!activeNode && !state.active_pool_endpoint && state.connection_status === "connecting") {
     const busyTitle = state.maintenance_running ? "正在更新节点" : "正在连接";
     const busyLatency = state.maintenance_running ? "节点检测中" : (state.active_node_latency || "正在连接...");
     const busyMessage = state.last_check_message || (state.maintenance_running ? "正在后台拉取并检测节点，已完成的结果会实时显示在下方列表。" : "正在与 VPN 节点建立加密隧道，请稍候...");
@@ -7651,6 +7730,8 @@ function render(){
     const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
     const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
     const endpointAddress = ep.hostname || ep.current_ip || ep.endpoint_id || "-";
+    const clientBadge = state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证");
+    const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
@@ -7659,7 +7740,7 @@ function render(){
           </div>
           <div class="active-card-details">
             <div class="active-card-title">
-              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
+              <span class="badge ${clientBadgeClass}"><span class="badge-pulse"></span>${esc(clientBadge)}</span>
               <strong>${esc(protocolName)} · ${esc(translateCountry(ep.country || "-"))}</strong>
             </div>
             <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
@@ -7683,6 +7764,8 @@ function render(){
     const latencyClass = getLatencyClass(activeNode.latency_ms);
     const latencyText = activeNode.latency_ms ? `<span class="latency-val ${latencyClass}">${activeNode.latency_ms} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
+    const clientBadge = state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证");
+    const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
@@ -7691,7 +7774,7 @@ function render(){
           </div>
           <div class="active-card-details">
             <div class="active-card-title">
-              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
+              <span class="badge ${clientBadgeClass}"><span class="badge-pulse"></span>${esc(clientBadge)}</span>
               <strong>${esc(translateCountry(activeNode.country))} · ${esc(translateProtocol(activeNode.protocol || "openvpn"))}</strong>
             </div>
             <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
@@ -7730,6 +7813,25 @@ function render(){
         </div>
       </div>
     `;
+  }
+
+  const bgActivityEl = $("background_activity_status");
+  const bgActivityTextEl = $("background_activity_text");
+  if (bgActivityEl && bgActivityTextEl) {
+    const collecting = !!state.resource_engine_running;
+    const probing = !!state.availability_engine_running;
+    const priorityRunning = !!state.priority_running;
+    const tested = Number(state.availability_tested_total || 0);
+    const queue = Number(state.availability_queue || 0);
+    let bgText = "资源守护正常运行 · 新资源进入后立即检测 · 后台检测不影响当前 VPN 连接";
+    if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
+    else if (collecting) bgText = "资源收集中 · 正在从主站、镜像和多协议目录补充 Master Pool";
+    else if (probing) bgText = "可用性检测中 · 新资源优先 · 全量资源最长 4 小时滚动复检";
+    else if (priorityRunning) bgText = String(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + "/" + Number(state.priority_target || 10);
+    const detail = (tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "";
+    bgActivityEl.style.display = "flex";
+    bgActivityEl.className = "background-task-strip " + ((collecting || probing || priorityRunning || state.failover_in_progress) ? "running" : "");
+    bgActivityTextEl.textContent = bgText + detail;
   }
 
   const globalRefreshEl = $("global_refresh_status");
@@ -7858,8 +7960,8 @@ function render(){
       const isCurrentlyActive = (n.pool_endpoint_id && state.active_pool_endpoint_id === n.pool_endpoint_id) || (!!activeNode && n.id === activeNode.id);
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
 
-      const badgeClass = isCurrentlyActive ? 'available' : (n.probe_status || 'not_checked');
-      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(n.probe_status);
+      const badgeClass = isCurrentlyActive ? 'available' : displayProbeStatus;
+      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(displayProbeStatus);
       const latencyClass = getLatencyClass(n.latency_ms);
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
@@ -7869,6 +7971,7 @@ function render(){
       const nodeAddress = nodeHost + nodePort;
 
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
+      const displayProbeStatus = isTesting ? "testing" : (n.probe_status || "not_checked");
       const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
       const statusCell = isCurrentlyActive
         ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
@@ -8040,6 +8143,14 @@ async function testNode(btn, id, event){
       }
     }
   } catch (e) {
+    const idx = nodes.findIndex(n => n && n.id === id);
+    if (idx !== -1) {
+      nodes[idx] = Object.assign({}, nodes[idx], {
+        probe_status: "unavailable",
+        probe_message: "手动检测失败：" + (e?.message || "请求超时"),
+        probed_at: Date.now() / 1000
+      });
+    }
   } finally {
     testingNodeIds.delete(id);
     render();
@@ -8895,6 +9006,8 @@ async function saveCredentials(e) {
         setTimeout(() => {
           const protocol = window.location.protocol;
           const host = window.location.hostname;
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
           window.location.href = `${protocol}//${host}:${port}/${suffix}/`;
         }, 4000);
       } else {
@@ -8935,6 +9048,8 @@ function openNetworkModal() {
 
     selectOptionCard('routing_mode', mode);
     selectOptionCard('routing_ip_type', ipType);
+    const upstreamEl = $("net_upstream_proxy_state");
+    if (upstreamEl) upstreamEl.textContent = state.upstream_proxy_label || "系统默认网络（未设置自定义上游代理）";
   }
 
   populateRoutingCountries();
@@ -10693,6 +10808,8 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/resource_share/status":
             try:
                 status = resource_share.status()
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
                 status["local_url"] = self.resource_share_local_url()
                 status["pool"] = node_pool.stats()
                 self.send_json(status)
@@ -11111,7 +11228,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 if routing_mode == "favorites":
-                    ui_cfg["fav_fail_fallback"] = False
+                    ui_cfg["fav_fail_fallback"] = True
                 if routing_mode == "fixed_ip":
                     ui_cfg["fixed_node_id"] = fixed_node_id
 
@@ -11147,7 +11264,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
-                fav_fail_fallback = False
+                fav_fail_fallback = bool(payload.get("fav_fail_fallback", ui_cfg.get("fav_fail_fallback", True)))
 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
@@ -11594,6 +11711,461 @@ class Tee:
     def __getattr__(self, attr: str) -> Any:
         return getattr(self.stdout, attr)
 
+
+# ========================= AimiliVPN V2 Runtime =========================
+RESOURCE_COLLECTION_INTERVAL_SECONDS = 600
+AVAILABILITY_TICK_SECONDS = 5
+AVAILABILITY_OPENVPN_IDLE_BATCH = 10
+AVAILABILITY_OPENVPN_ACTIVE_BATCH = 5
+AVAILABILITY_PROTOCOL_IDLE_BATCH = 4
+AVAILABILITY_PROTOCOL_ACTIVE_BATCH = 2
+COUNTRY_RESERVE_TARGET = 60
+COUNTRY_RESERVE_PER_BUCKET = 5
+COUNTRY_PRIORITY_AVAILABLE_TARGET = 10
+COUNTRY_COVERAGE_ROTATION_SECONDS = 600
+
+resource_engine_lock = threading.Lock()
+availability_engine_lock = threading.Lock()
+bootstrap_connection_lock = threading.Lock()
+resource_engine_running = False
+resource_engine_message = ""
+resource_engine_last_at = 0.0
+availability_engine_running = False
+availability_engine_message = ""
+availability_tested_total = 0
+availability_queue = 0
+availability_new_pending = 0
+coverage_country = ""
+coverage_inventory = 0
+coverage_available = 0
+coverage_selected = 0
+coverage_target = COUNTRY_RESERVE_TARGET
+coverage_last_at = 0.0
+country_priority_explicit = False
+
+_legacy_get_state_v2 = get_state
+_legacy_unified_hot_pool_candidates_v2 = unified_hot_pool_candidates
+
+def _runtime_connection_status():
+    if active_tunnel_running():
+        return "connected", "当前 VPN 隧道正常运行"
+    if manual_connection_active or failover_lock.locked():
+        return "connecting", "正在建立或切换 VPN 隧道"
+    return "disconnected", "当前没有活动 VPN 隧道"
+
+def _runtime_client_status():
+    if not active_tunnel_running():
+        return "not_connected"
+    state = _legacy_get_state_v2()
+    if state.get("proxy_ok") is True:
+        return "usable"
+    if state.get("proxy_ok") is False:
+        return "degraded"
+    return "validating"
+
+def _upstream_proxy_state():
+    try:
+        ptype, host, port = vpn_utils.get_upstream_proxy()
+    except Exception:
+        ptype = host = port = None
+    if host and port:
+        return {"mode":"custom_upstream","type":str(ptype or ""), "host":str(host), "port":int(port),
+                "label":f"自定义上游代理 · {ptype or 'proxy'}://{host}:{port}"}
+    return {"mode":"system_default","type":"","host":"","port":0,"label":"系统默认网络（未设置自定义上游代理）"}
+
+def get_state():
+    state = _legacy_get_state_v2()
+    status, message = _runtime_connection_status()
+    state["connection_status"] = status
+    state["connection_message"] = message
+    state["client_status"] = _runtime_client_status()
+    state["client_usable"] = state["client_status"] == "usable"
+    state["resource_engine_running"] = bool(resource_engine_running)
+    state["resource_engine_message"] = resource_engine_message
+    state["resource_engine_last_at"] = resource_engine_last_at
+    state["availability_engine_running"] = bool(availability_engine_running)
+    state["availability_engine_message"] = availability_engine_message
+    state["availability_tested_total"] = int(availability_tested_total)
+    state["availability_queue"] = int(availability_queue)
+    state["availability_new_pending"] = int(availability_new_pending)
+    state["availability_recheck_seconds"] = 4 * 3600
+    state["coverage_country"] = coverage_country
+    state["coverage_inventory"] = int(coverage_inventory)
+    state["coverage_available"] = int(coverage_available)
+    state["coverage_selected"] = int(coverage_selected)
+    state["coverage_target"] = int(coverage_target)
+    state["coverage_last_at"] = coverage_last_at
+    state.update({f"upstream_proxy_{k}":v for k,v in _upstream_proxy_state().items()})
+    return state
+
+def _endpoint_country(endpoint):
+    return normalized_country_name(endpoint.get("country") or "")
+
+def _endpoint_ip(endpoint):
+    return str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
+
+def _endpoint_ip_type(endpoint):
+    m=endpoint.get("server_metadata") or {}
+    value=str(m.get("ip_type") or (endpoint.get("metadata") or {}).get("ip_type") or "").lower()
+    return value if value in ("residential","mobile","hosting") else "unknown"
+
+def country_reserve_snapshot(country, target=COUNTRY_RESERVE_TARGET):
+    target_country=normalized_country_name(country)
+    if not target_country:
+        return {"country":"","inventory":0,"available":0,"selected":0,"target":0,"selected_endpoints":[]}
+    all_items=[]
+    available_items=[]
+    for ep in node_pool.list_endpoints(limit=5000):
+        if _endpoint_country(ep)!=target_country:
+            continue
+        if not _endpoint_ip(ep):
+            continue
+        status=str(ep.get("status") or "").upper()
+        if status in ("RETIRED","STALE"):
+            continue
+        all_items.append(ep)
+        if status in ("HOT","AVAILABLE"):
+            ep["selection_score"]=node_pool._selection_score(ep)[0]
+            available_items.append(ep)
+
+    inventory={_endpoint_ip(x) for x in all_items if _endpoint_ip(x)}
+    available_ips={_endpoint_ip(x) for x in available_items if _endpoint_ip(x)}
+    selected=[]; used=set()
+    for protocol in ("openvpn","softether","sstp","l2tp-ipsec"):
+        for ip_type in ("residential","mobile","hosting"):
+            bucket=[x for x in available_items if str(x.get("protocol") or "").lower()==protocol and _endpoint_ip_type(x)==ip_type and _endpoint_ip(x) not in used]
+            bucket.sort(key=lambda x:(-float(x.get("selection_score") or 0),float(x.get("latency_ewma") or 999999),-int(x.get("success_streak") or 0)))
+            taken=0
+            for ep in bucket:
+                ip=_endpoint_ip(ep)
+                if not ip or ip in used:
+                    continue
+                selected.append(ep); used.add(ip); taken+=1
+                if taken>=COUNTRY_RESERVE_PER_BUCKET or len(selected)>=target:
+                    break
+            if len(selected)>=target:
+                break
+        if len(selected)>=target:
+            break
+    if len(selected)<target:
+        rest=[x for x in available_items if _endpoint_ip(x) not in used]
+        rest.sort(key=lambda x:(-float(x.get("selection_score") or 0),float(x.get("latency_ewma") or 999999),-int(x.get("success_streak") or 0)))
+        for ep in rest:
+            ip=_endpoint_ip(ep)
+            if not ip or ip in used:
+                continue
+            selected.append(ep); used.add(ip)
+            if len(selected)>=target:
+                break
+    return {"country":target_country,"inventory":len(inventory),"available":len(available_ips),"selected":len(selected),
+            "target":min(int(target),max(1,len(inventory))) if inventory else 0,"selected_endpoints":selected[:int(target)]}
+
+def _pick_global_country_for_coverage_v2():
+    snapshot=_global_country_pool_snapshot(); now=time.time(); ranked=[]
+    for country,values in snapshot.items():
+        inventory=len(values.get("inventory") or set()); available=len(values.get("available") or set())
+        if inventory<=0: continue
+        target=min(COUNTRY_RESERVE_TARGET,inventory)
+        if available>=target: continue
+        last=float(global_country_coverage_last_attempt.get(country,0) or 0)
+        if now-last<COUNTRY_COVERAGE_ROTATION_SECONDS: continue
+        ranked.append((-(target-available)/max(1,target),-inventory,last,country))
+    ranked.sort()
+    return ranked[0][3] if ranked else ""
+
+def schedule_global_country_coverage():
+    global coverage_country,coverage_inventory,coverage_available,coverage_selected,coverage_last_at
+    country=_pick_global_country_for_coverage_v2()
+    if not country: return {"ok":True,"running":False,"message":"当前国家覆盖已基本满足或等待新资源"}
+    snap=country_reserve_snapshot(country)
+    coverage_country=country; coverage_inventory=int(snap.get("inventory") or 0); coverage_available=int(snap.get("available") or 0)
+    coverage_selected=int(snap.get("selected") or 0); coverage_last_at=time.time()
+    global_country_coverage_last_attempt[country]=coverage_last_at
+    return {"ok":True,"running":True,"country":country,"inventory":coverage_inventory,"available":coverage_available,"selected":coverage_selected,"target":COUNTRY_RESERVE_TARGET}
+
+def start_country_priority(country):
+    global country_priority_request,country_priority_explicit
+    target=normalized_country_name(country)
+    if not target: return {"ok":False,"error":"国家不能为空"}
+    snap=country_reserve_snapshot(target)
+    country_priority_request=target; country_priority_explicit=True
+    set_state(priority_country=target,priority_inventory=int(snap.get("inventory") or 0),priority_inventory_target=min(60,max(1,int(snap.get("inventory") or 0))) if snap.get("inventory") else 60,
+              priority_available=min(COUNTRY_PRIORITY_AVAILABLE_TARGET,int(snap.get("available") or 0)),priority_target=COUNTRY_PRIORITY_AVAILABLE_TARGET,
+              priority_minimum=5,priority_running=True,priority_message=f"{target} 已加入优先检测队列，不会阻塞其他国家")
+    return {"ok":True,"running":True,"available":min(COUNTRY_PRIORITY_AVAILABLE_TARGET,int(snap.get("available") or 0)),"target":COUNTRY_PRIORITY_AVAILABLE_TARGET}
+
+def _due_endpoints(country="", protocols=("openvpn","softether","sstp","l2tp-ipsec"), limit=10):
+    now=time.time(); target=normalized_country_name(country); wanted={str(x).lower() for x in protocols}; rows=[]
+    for ep in node_pool.list_endpoints(limit=5000):
+        protocol=str(ep.get("protocol") or "").lower(); status=str(ep.get("status") or "").upper()
+        if protocol not in wanted or status in ("RETIRED","STALE"): continue
+        if target and _endpoint_country(ep)!=target: continue
+        if float(ep.get("next_test") or 0)>now: continue
+        rows.append(ep)
+    rows.sort(key=lambda x:(0 if str(x.get("status") or "").upper()=="NEW" else 1,float(x.get("next_test") or 0),float(x.get("last_success") or 0)))
+    return rows[:max(1,min(int(limit),5000))]
+
+def _due_counts():
+    rows=_due_endpoints("",("openvpn","softether","sstp","l2tp-ipsec"),5000)
+    return sum(1 for x in rows if str(x.get("protocol") or "").lower()=="openvpn"),sum(1 for x in rows if str(x.get("protocol") or "").lower()!="openvpn")
+
+def _finish_priority_if_ready(country):
+    global country_priority_request,country_priority_explicit
+    if not country_priority_explicit or not country: return
+    snap=country_reserve_snapshot(country); available=int(snap.get("available") or 0); inventory=int(snap.get("inventory") or 0)
+    if available>=COUNTRY_PRIORITY_AVAILABLE_TARGET:
+        set_state(priority_country=country,priority_inventory=inventory,priority_inventory_target=min(60,max(1,inventory)),priority_available=COUNTRY_PRIORITY_AVAILABLE_TARGET,
+                  priority_target=COUNTRY_PRIORITY_AVAILABLE_TARGET,priority_minimum=5,priority_running=False,priority_message=f"{country} 已达到 {COUNTRY_PRIORITY_AVAILABLE_TARGET} 个可用节点")
+        country_priority_request=""; country_priority_explicit=False
+    elif not _due_endpoints(country,("openvpn","softether","sstp","l2tp-ipsec"),1):
+        set_state(priority_country=country,priority_inventory=inventory,priority_inventory_target=min(60,max(1,inventory)) if inventory else 60,
+                  priority_available=min(COUNTRY_PRIORITY_AVAILABLE_TARGET,available),priority_target=COUNTRY_PRIORITY_AVAILABLE_TARGET,
+                  priority_minimum=5,priority_running=False,priority_message=f"{country} 当前资源已完成检测，可用 {available}；等待新资源自动进入")
+        country_priority_request=""; country_priority_explicit=False
+
+def availability_sweep_once(priority_country=""):
+    global availability_engine_running,availability_engine_message,availability_tested_total,availability_queue,availability_new_pending
+    if manual_connection_active or failover_lock.locked() or is_connecting: return {"ok":True,"skipped":True,"reason":"用户连接或主备切换进行中"}
+    if not availability_engine_lock.acquire(blocking=False): return {"ok":True,"running":True}
+    availability_engine_running=True
+    try:
+        active=active_tunnel_running()
+        ov_limit=AVAILABILITY_OPENVPN_ACTIVE_BATCH if active else AVAILABILITY_OPENVPN_IDLE_BATCH
+        pool_limit=AVAILABILITY_PROTOCOL_ACTIVE_BATCH if active else AVAILABILITY_PROTOCOL_IDLE_BATCH
+        priority=normalized_country_name(priority_country)
+        priority_ov=_due_endpoints(priority,("openvpn",),min(5,ov_limit)) if priority else []
+        priority_pool=_due_endpoints(priority,("softether","sstp","l2tp-ipsec"),min(3,pool_limit)) if priority else []
+        selected_ov=[]; selected_pool=[]; seen=set()
+        for ep in priority_ov+_due_endpoints("",("openvpn",),ov_limit):
+            eid=str(ep.get("endpoint_id") or "")
+            if not eid or eid in seen: continue
+            seen.add(eid); selected_ov.append(ep)
+            if len(selected_ov)>=ov_limit: break
+        seen=set()
+        for ep in priority_pool+_due_endpoints("",("softether","sstp","l2tp-ipsec"),pool_limit):
+            eid=str(ep.get("endpoint_id") or "")
+            if not eid or eid in seen: continue
+            seen.add(eid); selected_pool.append(ep)
+            if len(selected_pool)>=pool_limit: break
+        availability_queue=len(selected_ov)+len(selected_pool)
+        availability_new_pending=sum(1 for ep in selected_ov+selected_pool if str(ep.get("status") or "").upper()=="NEW")
+        availability_engine_message=f"可用性检测中 · 新资源优先 · OpenVPN {len(selected_ov)} · 多协议 {len(selected_pool)} · 全量资源最长 4 小时复检"
+        set_state(availability_engine_running=True,availability_engine_message=availability_engine_message,availability_queue=availability_queue,availability_new_pending=availability_new_pending)
+        tested=0
+        ids=[str((ep.get("metadata") or {}).get("node_id") or "") for ep in selected_ov]
+        ids=[x for x in ids if x]
+        if ids:
+            try: tested+=len(test_multiple_nodes(ids))
+            except Exception as exc: log_to_json("WARNING","Probe",f"V2 OpenVPN 批量检测失败: {exc}")
+        if selected_pool:
+            workers=min(4 if not active else 2,len(selected_pool))
+            def one(ep):
+                eid=str(ep.get("endpoint_id") or "")
+                return probe_pool_endpoint(eid) if eid else {"skipped":True}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,workers)) as ex:
+                futs=[ex.submit(one,ep) for ep in selected_pool]
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        if not fut.result().get("skipped"): tested+=1
+                    except Exception as exc: log_to_json("WARNING","Probe",f"V2 多协议探测异常: {exc}")
+        availability_tested_total+=tested
+        if not active_tunnel_running() and not manual_connection_active and bool(load_ui_config().get("connection_enabled",True)):
+            threading.Thread(target=_ensure_active_client_v2, daemon=True).start()
+        ov_due,pool_due=_due_counts()
+        set_state(availability_engine_running=False,
+                  availability_engine_message=f"本轮已检测 {tested} 个 · 待检测 OpenVPN {ov_due} / 多协议 {pool_due} · 后台继续运行",
+                  availability_tested_total=availability_tested_total,availability_queue=ov_due+pool_due,availability_new_pending=0)
+        if priority: _finish_priority_if_ready(priority)
+        return {"ok":True,"tested":tested,"openvpn_due":ov_due,"protocol_due":pool_due}
+    except Exception as exc:
+        set_state(availability_engine_running=False,availability_engine_message=f"可用性检测异常：{exc}",availability_queue=0)
+        log_to_json("ERROR","Probe",f"V2 可用性检测异常: {exc}")
+        return {"ok":False,"error":str(exc)}
+    finally:
+        availability_engine_running=False
+        availability_engine_lock.release()
+
+def global_probe_sweep_once():
+    return availability_sweep_once(country_priority_request if country_priority_explicit else coverage_country)
+
+def resource_collect_once(force=False):
+    global resource_engine_running,resource_engine_message,resource_engine_last_at
+    if not resource_engine_lock.acquire(blocking=False): return {"ok":True,"running":True}
+    resource_engine_running=True
+    resource_engine_message="正在采集资源，不影响当前 VPN 连接"
+    set_state(resource_engine_running=True,resource_engine_message=resource_engine_message)
+    try:
+        before=int(node_pool.stats().get("endpoints") or 0)
+        try: candidates=fetch_candidates()
+        except Exception as exc:
+            candidates=[]; log_to_json("WARNING","Main",f"V2 OpenVPN 资源采集失败: {exc}")
+        catalog=refresh_multi_protocol_catalog(force=True)
+        after=int(node_pool.stats().get("endpoints") or 0)
+        resource_engine_last_at=time.time(); added=max(0,after-before)
+        resource_engine_message=f"资源采集完成 · OpenVPN {len(candidates)} · 多协议服务器 {int(catalog.get('servers') or 0)} · 新增/恢复约 {added} 个端点，立即进入检测"
+        set_state(resource_engine_running=False,resource_engine_message=resource_engine_message,resource_engine_last_at=resource_engine_last_at,
+                  last_fetch_at=resource_engine_last_at,last_fetch_status="ok",last_fetch_message=resource_engine_message)
+        return {"ok":True,"endpoints":after,"added":added}
+    except Exception as exc:
+        resource_engine_message=f"资源采集异常：{exc}"
+        set_state(resource_engine_running=False,resource_engine_message=resource_engine_message)
+        log_to_json("ERROR","Main",resource_engine_message)
+        return {"ok":False,"error":str(exc)}
+    finally:
+        resource_engine_running=False
+        resource_engine_lock.release()
+
+def maintain_valid_nodes(force=False):
+    if force:
+        threading.Thread(target=resource_collect_once,kwargs={"force":True},daemon=True).start()
+    if not availability_engine_running:
+        threading.Thread(target=availability_sweep_once,args=(country_priority_request if country_priority_explicit else "",),daemon=True).start()
+    msg="独立资源采集与可用性检测已启动；不会覆盖当前 VPN 连接状态"
+    set_state(last_check_at=time.time(),last_check_message=msg)
+    return msg
+
+def collector_loop():
+    time.sleep(8)
+    while True:
+        try:
+            if not resource_engine_running and time.time()-float(resource_engine_last_at or 0)>=RESOURCE_COLLECTION_INTERVAL_SECONDS:
+                resource_collect_once(False)
+        except Exception as exc:
+            log_to_json("WARNING","Main",f"资源采集守护异常: {exc}")
+        time.sleep(5)
+
+def protocol_catalog_loop():
+    time.sleep(30)
+    while True:
+        try:
+            if not resource_engine_running and not availability_engine_running:
+                refresh_protocol_ip_metadata(max_ips=100)
+        except Exception as exc:
+            log_to_json("WARNING","Main",f"多协议元数据补全异常: {exc}")
+        time.sleep(900)
+
+def global_country_coverage_loop():
+    global coverage_country,coverage_inventory,coverage_available,coverage_selected,coverage_last_at
+    time.sleep(20)
+    while True:
+        try:
+            schedule_global_country_coverage()
+            target=country_priority_request if country_priority_explicit else ""
+            if target:
+                snap=country_reserve_snapshot(target)
+                coverage_country=target; coverage_inventory=int(snap.get("inventory") or 0); coverage_available=int(snap.get("available") or 0)
+                coverage_selected=int(snap.get("selected") or 0); coverage_last_at=time.time()
+        except Exception as exc:
+            log_to_json("WARNING","Coverage",f"国家 Coverage 调度异常: {exc}")
+        time.sleep(60)
+
+def _switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id="",limit=30):
+    candidates=_legacy_unified_hot_pool_candidates_v2(ui_cfg,exclude_endpoint_id=exclude_endpoint_id,limit=limit)
+    if candidates: return candidates,False
+    if ui_cfg.get("routing_mode")=="favorites" and bool(ui_cfg.get("fav_fail_fallback",True)):
+        fallback=dict(ui_cfg); fallback["routing_mode"]="auto"; fallback["favorite_node_ids"]=[]
+        return _legacy_unified_hot_pool_candidates_v2(fallback,exclude_endpoint_id=exclude_endpoint_id,limit=limit),True
+    return [],False
+
+def auto_switch_node(attempt=0):
+    if attempt>=3: return
+    ui_cfg=load_ui_config()
+    if not bool(ui_cfg.get("connection_enabled",True)) or ui_cfg.get("routing_mode")=="fixed_ip": return
+    current=current_active_routing_endpoint()
+    exclude=str(current.get("endpoint_id") or "") if current else ""
+    candidates,used_fallback=_switch_candidates_with_favorites_fallback(ui_cfg,exclude,30)
+    if candidates:
+        if used_fallback: log_to_json("INFO","VPN","收藏全部不可用，自动回退到全局可用池")
+        for ep in candidates[:min(6,len(candidates))]:
+            try:
+                connect_ranked_endpoint(ep); return
+            except Exception as exc:
+                log_to_json("WARNING","VPN",f"备用节点切换失败 {ep.get('endpoint_id')}: {exc}")
+        return auto_switch_node(attempt+1)
+    stop_all_tunnels()
+    with lock:
+        nodes=read_nodes()
+        for item in nodes: item["active"]=False
+        write_json(NODES_FILE,nodes)
+    set_state(active_openvpn_node_id="",active_pool_endpoint_id="",active_tunnel_protocol="",
+              last_check_message="暂无经过验证的备用节点；后台资源采集与可用性检测继续运行",proxy_ok=False,proxy_ip="-",proxy_latency_ms=0)
+
+def _ensure_active_client_v2():
+    if active_tunnel_running() or manual_connection_active or failover_lock.locked() or is_connecting:
+        return
+    ui_cfg=load_ui_config()
+    if not bool(ui_cfg.get("connection_enabled",True)):
+        return
+    if not bootstrap_connection_lock.acquire(blocking=False):
+        return
+    try:
+        if ui_cfg.get("routing_mode") == "fixed_ip":
+            reconnect_fixed_node_if_needed(ui_cfg)
+        else:
+            auto_switch_node()
+    except Exception as exc:
+        log_to_json("WARNING","VPN",f"启动/恢复活动 VPN 失败: {exc}")
+    finally:
+        bootstrap_connection_lock.release()
+
+def try_unified_failover(exclude_endpoint_id="",attempts=4,preferred_only=False,manual=False):
+    if not failover_lock.acquire(blocking=False):
+        for _ in range(60):
+            time.sleep(0.25)
+            if not failover_lock.locked(): return active_tunnel_running()
+        return active_tunnel_running()
+    started=time.time()
+    try:
+        ui_cfg=load_ui_config()
+        if not bool(ui_cfg.get("connection_enabled",True)): return False
+        if manual_connection_active and not manual: return False
+        current=current_active_routing_endpoint()
+        from_protocol=str(current.get("protocol") or "") if current else ""
+        from_endpoint=str(current.get("endpoint_id") or "") if current else ""
+        candidates,used_fallback=_switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id,100)
+        if preferred_only: candidates=[x for x in candidates if int(x.get("routing_tier") or 99)==0]
+        set_state(failover_in_progress=True,failover_started_at=started,failover_from_protocol=from_protocol,
+                  failover_from_endpoint=from_endpoint,failover_candidate_count=len(candidates),
+                  failover_preferred_only=preferred_only,failover_favorites_fallback=used_fallback)
+        last_error=""
+        for ep in candidates[:max(1,int(attempts))]:
+            try:
+                connect_ranked_endpoint(ep,manual=manual)
+                duration=int((time.time()-started)*1000)
+                set_state(failover_in_progress=False,last_failover_ok=True,last_failover_at=time.time(),
+                          last_failover_duration_ms=duration,last_failover_from_protocol=from_protocol,last_failover_from_endpoint=from_endpoint,
+                          last_failover_to_protocol=str(ep.get("protocol") or ""),last_failover_to_endpoint=str(ep.get("endpoint_id") or ""),last_failover_error="")
+                return True
+            except Exception as exc:
+                last_error=str(exc); log_to_json("WARNING","VPN",f"统一备用节点切换失败 {ep.get('endpoint_id')}: {exc}")
+        set_state(failover_in_progress=False,last_failover_ok=False,last_failover_at=time.time(),
+                  last_failover_duration_ms=int((time.time()-started)*1000),last_failover_error=last_error or "无可用 Hot Pool 候选")
+        return False
+    finally:
+        if failover_lock.locked(): failover_lock.release()
+
+def apply_user_routing_preferences():
+    try:
+        ui_cfg=load_ui_config()
+        if not bool(ui_cfg.get("connection_enabled",True)) or ui_cfg.get("routing_mode")=="fixed_ip": return
+        target=str(ui_cfg.get("force_country") or "").strip()
+        if target: start_country_priority(target)
+        if active_tunnel_running(): maybe_recover_preferred_route(force=True)
+        else: auto_switch_node()
+    except Exception as exc:
+        log_to_json("WARNING","Routing",f"应用用户路由偏好失败: {exc}")
+
+def protocol_probe_loop():
+    time.sleep(12)
+    while True:
+        try:
+            if not availability_engine_running and not manual_connection_active and not failover_lock.locked():
+                availability_sweep_once(country_priority_request if country_priority_explicit else coverage_country)
+        except Exception as exc:
+            log_to_json("ERROR","Probe",f"V2 可用性检测循环异常: {exc}")
+        time.sleep(AVAILABILITY_TICK_SECONDS)
+
+
 def main() -> None:
     ensure_dirs()
     if not ISOLATED_INSTANCE:
@@ -11723,3 +12295,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
