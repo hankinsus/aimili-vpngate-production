@@ -10151,24 +10151,31 @@ async function load(){
     startConnectionPolling();
   }
 }
-function applyNodeFilterChange() {
+async function applyNodeFilterChange() {
   currentPage = 1;
-  updateCountryFilter();
-  render();
+  try {
+    await refreshCountryCatalog(true);
+  } catch (_) {}
+  const country = activeCountryScope;
+  await loadScope(country, {preserveState:true});
 }
 
-$("country_filter").onchange=()=>{
+$("country_filter").onchange=async()=>{
+  const country = String($("country_filter").value || "").trim();
+  activeCountryScope = country;
   currentPage = 1;
-  const country = $("country_filter").value || "";
-  updateCountryFilter();
-  render();
-  if (country) {
-    setTimeout(() => {
-      if (($("country_filter")?.value || "") === country) {
-        prioritizeCountry(country);
-      }
-    }, 0);
+
+  // Empty country is the explicit “全球国家” action and is the only path
+  // allowed to request the complete global node list.
+  if (!country) {
+    await loadScope("", {preserveState:true});
+    return;
   }
+
+  // Country selection loads that country only; priority probing is started
+  // after its rows are visible instead of blocking the dropdown itself.
+  await loadScope(country, {preserveState:true});
+  prioritizeCountry(country);
 };
 $("protocol_filter").onchange=applyNodeFilterChange;
 $("ip_type_filter").onchange=applyNodeFilterChange;
