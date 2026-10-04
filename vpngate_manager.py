@@ -8869,56 +8869,80 @@ function getNodeCountry(n) {
   return "";
 }
 
+let countryCatalogData = null;
+let countryCatalogKey = "";
+let countryCatalogPromise = null;
+let activeCountryScope = "";
+let scopeLoadGeneration = 0;
+
+function currentFilterKey() {
+  return [
+    $("status_filter")?.value || "",
+    $("protocol_filter")?.value || "",
+    $("ip_type_filter")?.value || ""
+  ].join("|");
+}
+
+async function refreshCountryCatalog(force = false) {
+  const key = currentFilterKey();
+  if (!force && countryCatalogData && countryCatalogKey === key) {
+    updateCountryFilter();
+    return countryCatalogData;
+  }
+  if (countryCatalogPromise) return countryCatalogPromise;
+  const [status, protocol, ipType] = key.split("|");
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  if (protocol) params.set("protocol", protocol);
+  if (ipType) params.set("ip_type", ipType);
+
+  countryCatalogPromise = fetchJsonWithTimeout("./api/ui/country_catalog" + (params.toString() ? "?" + params.toString() : ""), {}, 8000)
+    .then(data => {
+      countryCatalogData = data || {countries:{}, total_ip_count:0, server_country:""};
+      countryCatalogKey = key;
+      if (countryCatalogData.server_country && !state.server_country) {
+        state.server_country = countryCatalogData.server_country;
+      }
+      updateCountryFilter();
+      return countryCatalogData;
+    })
+    .finally(() => { countryCatalogPromise = null; });
+  return countryCatalogPromise;
+}
+
 function updateCountryFilter() {
   const select = $("country_filter");
   if (!select) return;
-  const selectedValue = select.value;
-  const countryIps = {};
-  const filteredAllIps = new Set();
-  const hasOtherFilter = !!(
-    $("status_filter")?.value &&
-    $("status_filter").value !== "all"
-  ) || !!$("protocol_filter")?.value || !!$("ip_type_filter")?.value || !!showFavoritesOnly;
+  const selectedValue = String(select.value || "");
+  const catalog = countryCatalogData || {countries:{}, total_ip_count:0};
+  const countries = Object.entries(catalog.countries || {})
+    .filter(([, item]) => Number(item?.ip_count || 0) > 0)
+    .sort((a,b) => {
+      const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
+      return diff || a[0].localeCompare(b[0], "zh-CN");
+    });
 
-  nodes.forEach(n => {
-    if (!n) return;
-    const country = getNodeCountry(n);
-    const ip = String(n.ip || n.current_ip || n.remote_host || "").trim();
-    if (!country || country === "—" || country === "-" || !ip) return;
+  const total = Number(catalog.total_ip_count || 0);
+  const globalLabel = activeCountryScope
+    ? "全球国家 · " + total + " IP"
+    : "全球国家 · " + total + " IP";
 
-    const matchesOther = matchesNodeFilters(n, true);
-    if (matchesOther) filteredAllIps.add(ip);
-
-    if (!countryIps[country]) {
-      countryIps[country] = {total: new Set(), visible: new Set()};
-    }
-    countryIps[country].total.add(ip);
-    if (matchesOther) countryIps[country].visible.add(ip);
-  });
-
-  const countries = Object.keys(countryIps).sort((a,b) => {
-    const diff = countryIps[b].total.size - countryIps[a].total.size;
-    return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
-  });
-  const loadedIpCount = new Set(
-    nodes.map(n => String(n && (n.ip || n.current_ip || n.remote_host || "")).trim()).filter(Boolean)
-  ).size;
-  const fullyLoaded = !totalNodeCount || loadedIpCount >= totalNodeCount;
-  const totalCount = hasOtherFilter ? filteredAllIps.size : (fullyLoaded ? loadedIpCount : totalNodeCount);
-
-  const options = countries.map(country => {
-    const count = hasOtherFilter ? countryIps[country].visible.size : countryIps[country].total.size;
-    return `<option value="${esc(country)}">${esc(country)} · ${count} IP</option>`;
+  const options = countries.map(([country, item]) => {
+    const count = Number(item?.ip_count || 0);
+    return '<option value="' + esc(country) + '">' + esc(country) + ' · ' + count + ' IP</option>';
   }).join("");
 
-  const globalLabel = fullyLoaded
-    ? `全球国家 · ${totalCount} IP`
-    : `全球国家 · 加载中 ${loadedIpCount}/${totalNodeCount} IP`;
-  select.innerHTML = `<option value="">${globalLabel}</option>` + options;
-  if (countries.includes(selectedValue)) select.value = selectedValue;
-  else select.value = "";
+  select.innerHTML = '<option value="">' + globalLabel + '</option>' + options;
+  if (selectedValue && countries.some(([country]) => country === selectedValue)) {
+    select.value = selectedValue;
+  } else if (activeCountryScope && countries.some(([country]) => country === activeCountryScope)) {
+    select.value = activeCountryScope;
+  } else {
+    select.value = "";
+  }
   renderCustomCountryFilter();
 }
+
 
 function getFilteredNodes() {
   return nodes.filter(n => matchesNodeFilters(n, false));
