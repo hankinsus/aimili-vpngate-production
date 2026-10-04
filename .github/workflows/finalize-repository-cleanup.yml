@@ -1,0 +1,48 @@
+name: Finalize repository cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: ${{ hashFiles('.maintenance/clean.py') != '' && hashFiles('.maintenance/logo.b64') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply cleanup
+        run: |
+          python3 .maintenance/clean.py
+          python3 -m py_compile vpngate_manager.py
+          git diff --check
+
+      - name: Verify
+        run: |
+          ! grep -RInE '八合一|我的邀请入口|My invitation links|referral code|referral links' README.md install.sh vpngate_manager.py
+          python3 - <<'PY'
+          from PIL import Image
+          from pathlib import Path
+          p = Path("footer-logo-clean.png")
+          im = Image.open(p).convert("RGBA")
+          assert im.getchannel("A").getextrema()[0] == 0
+          assert im.getchannel("A").getextrema()[1] == 255
+          print("logo", im.size, p.stat().st_size)
+          PY
+
+      - name: Commit final cleanup
+        run: |
+          rm -rf .maintenance
+          rm -f .github/workflows/finalize-repository-cleanup.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md VERSION footer-logo-clean.png install.sh vpngate_manager.py
+          git add -u
+          git commit -m "Finalize repository cleanup" || exit 0
+          git push origin HEAD:main
