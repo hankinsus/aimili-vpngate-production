@@ -436,41 +436,40 @@ def start_github_update() -> dict[str, Any]:
             "started_at": time.time(),
         }
 
-        log_path = DATA_DIR / "github_update.log"
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        log_handle = open(log_path, "a", encoding="utf-8")
-        script = (
-            "set -e\n"
-            f"cd {shlex.quote(str(ROOT_DIR))}\n"
-            f"echo '[GitHub Update] started at '$(date -Is)\n"
-            f"git fetch --prune origin {shlex.quote(GITHUB_BRANCH)}\n"
-            f"git checkout {shlex.quote(GITHUB_BRANCH)}\n"
-            f"git reset --hard origin/{shlex.quote(GITHUB_BRANCH)}\n"
-            "find . -type d -name __pycache__ -prune -exec rm -rf {} +\n"
-            "python3 -m py_compile vpngate_manager.py proxy_server.py vpn_utils.py node_pool.py tunnel_adapters.py vpngate_discovery.py\n"
-            "echo '[GitHub Update] build check passed at '$(date -Is)\n"
-            "systemctl restart aimilivpn\n"
-        )
+        # Do not restart the current service from a child in its own
+        # KillMode=control-group. That can terminate the updater before the
+        # git reset happens. A dedicated systemd oneshot unit owns the update
+        # process and can safely restart aimilivpn after the new checkout is ready.
         try:
-            systemd_run = shutil.which("systemd-run")
-            if systemd_run:
-                unit_name = f"aimilivpn-github-update-{int(time.time())}"
-                subprocess.Popen([
-                    systemd_run,
-                    "--quiet",
-                    "--unit", unit_name,
-                    "--collect",
-                    "/bin/bash",
-                    "-lc",
-                    script,
-                ], cwd=str(ROOT_DIR), stdout=log_handle, stderr=log_handle, start_new_session=True)
-            else:
-                subprocess.Popen(["/bin/bash", "-lc", script], cwd=str(ROOT_DIR), stdout=log_handle, stderr=log_handle, start_new_session=True)
-            threading.Timer(20.0, _clear_github_update_running).start()
-        except Exception:
-            log_handle.close()
+            completed = subprocess.run(
+                ["systemctl", "start", "--no-block", "aimilivpn-github-update.service"],
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if completed.returncode != 0:
+                github_update_running = False
+                error = (completed.stderr or completed.stdout or "无法启动 GitHub 更新服务。").strip()
+                github_update_last_result = {
+                    "ok": False,
+                    "status": "failed",
+                    "error": error,
+                    "checked_at": time.time(),
+                }
+                return {"ok": False, "error": error}
+        except Exception as exc:
             github_update_running = False
-            raise
+            github_update_last_result = {
+                "ok": False,
+                "status": "failed",
+                "error": str(exc),
+                "checked_at": time.time(),
+            }
+            return {"ok": False, "error": str(exc)}
+
+        threading.Timer(30.0, _clear_github_update_running).start()
         return {
             "ok": True,
             "status": "starting",
@@ -478,7 +477,6 @@ def start_github_update() -> dict[str, Any]:
             "current_version": check.get("current_version"),
             "latest_version": check.get("latest_version"),
         }
-
 
 def _clear_github_update_running() -> None:
     global github_update_running
