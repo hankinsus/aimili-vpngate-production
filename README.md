@@ -1,5 +1,5 @@
 
-# 我爱研究.ILovestudy｜多协议节点管理系统 🌐
+# Aimili VPN｜多协议节点管理系统 🌐
 
 Bilingual: [中文](#中文) | [English](#english)
 
@@ -16,7 +16,7 @@ Bilingual: [中文](#中文) | [English](#english)
 
 ### 1. 系统名称与定位
 
-**我爱研究.ILovestudy｜多协议节点管理系统**
+**Aimili VPN｜多协议节点管理系统**
 
 系统以后台持续任务为核心。新资源进入 Master Pool 后进入待检测队列；后台检测会持续消费待检测节点，并在后续周期复检已经验证过的资源。当前连接存在时，后台检测不会主动断开当前 VPN。
 
@@ -286,4 +286,4 @@ Thank you for using and reporting issues. The official project entry point is [I
 
 ---
 
-**Version: V9.0.6**
+**Version: V1.0.6**

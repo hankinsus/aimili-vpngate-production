@@ -165,9 +165,14 @@ ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
+APP_VERSION = "V1.0.6"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
+
+def _version_label(commit_sha: str | None = None) -> str:
+    commit = str(commit_sha or "").strip().lower()
+    return f"{APP_VERSION} · {commit[:8]}" if commit else APP_VERSION
 GITHUB_UPDATE_TIMEOUT_SECONDS = 8
 github_update_lock = threading.Lock()
 github_update_running = False
@@ -295,7 +300,7 @@ def current_github_version() -> dict[str, Any]:
         "ok": bool(local),
         "repository": GITHUB_REPOSITORY,
         "branch": GITHUB_BRANCH,
-        "current_version": local[:8] if local else "未知",
+        "current_version": _version_label(local) if local else "未知",
         "current_commit": local,
         "source": "git",
     }
@@ -319,7 +324,7 @@ def check_github_update() -> dict[str, Any]:
             "error": f"无法访问 GitHub 正式版：{exc}",
             "repository": GITHUB_REPOSITORY,
             "branch": GITHUB_BRANCH,
-            "current_version": local[:8],
+            "current_version": _version_label(local),
         }
 
     if not remote:
@@ -328,7 +333,7 @@ def check_github_update() -> dict[str, Any]:
             "error": "GitHub 未返回有效的 main 分支版本。",
             "repository": GITHUB_REPOSITORY,
             "branch": GITHUB_BRANCH,
-            "current_version": local[:8],
+            "current_version": _version_label(local),
         }
 
     local_only = 0
@@ -372,9 +377,9 @@ def check_github_update() -> dict[str, Any]:
         "ok": True,
         "repository": GITHUB_REPOSITORY,
         "branch": GITHUB_BRANCH,
-        "current_version": local[:8],
+        "current_version": _version_label(local),
         "current_commit": local,
-        "latest_version": remote[:8],
+        "latest_version": _version_label(remote),
         "latest_commit": remote,
         "has_update": has_update,
         "relation": relation,
@@ -5088,7 +5093,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>我爱研究.ILovestudy｜多协议节点管理系统</title>
+  <title>Aimili VPN｜多协议节点管理系统</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
@@ -5576,27 +5581,27 @@ INDEX_HTML = r"""<!doctype html>
     .site-footer {
       position: relative;
       margin-top: 30px;
-      padding: 40px 20px 28px;
+      padding: 34px 20px 24px;
       overflow: hidden;
       background:
-        radial-gradient(900px 220px at 50% 0%, rgba(20,184,166,.10), transparent 72%),
-        linear-gradient(180deg, rgba(8,14,28,.10), rgba(8,14,28,.56));
-      border-top: 1px solid rgba(99,102,241,.14);
+        radial-gradient(900px 260px at 50% 0%, rgba(20,184,166,.09), transparent 72%),
+        linear-gradient(180deg, rgba(10,18,34,.12), rgba(7,12,24,.72));
+      border-top: 1px solid rgba(99,102,241,.13);
     }
     .site-footer::before {
       content: "";
       position: absolute;
-      left: -5%;
-      right: -5%;
-      top: -20px;
-      height: 90px;
+      left: -8%;
+      right: -8%;
+      top: -26px;
+      height: 78px;
       pointer-events: none;
       background:
-        radial-gradient(60% 80px at 15% 100%, rgba(20,184,166,.08), transparent 72%),
-        radial-gradient(55% 90px at 85% 100%, rgba(99,102,241,.10), transparent 72%);
+        radial-gradient(42% 70px at 22% 100%, rgba(20,184,166,.08), transparent 72%),
+        radial-gradient(46% 78px at 78% 100%, rgba(99,102,241,.09), transparent 72%);
       border-top: 1px solid rgba(20,184,166,.08);
-      transform: rotate(-1deg);
-      opacity: .85;
+      transform: rotate(-.8deg);
+      opacity: .8;
     }
     .site-footer-inner {
       position: relative;
@@ -5604,35 +5609,64 @@ INDEX_HTML = r"""<!doctype html>
       width: min(1180px, 100%);
       margin: 0 auto;
       display: grid;
-      gap: 18px;
+      gap: 15px;
       justify-items: center;
+    }
+    .footer-disclaimer {
+      width: min(1080px, 100%);
+      box-sizing: border-box;
+      padding: 16px 20px 14px;
+      border: 1px solid rgba(99,102,241,.15);
+      border-radius: 15px;
+      background: linear-gradient(135deg, rgba(14,23,42,.78), rgba(9,16,30,.66));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.022), 0 8px 24px rgba(0,0,0,.14);
+      text-align: left;
+    }
+    .footer-disclaimer-title {
+      margin-bottom: 8px;
+      text-align: center;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-weight: 720;
+      letter-spacing: .1px;
+    }
+    .footer-disclaimer-list {
+      margin: 0;
+      padding-left: 20px;
+      color: rgba(156,163,175,.92);
+      font-size: 10.8px;
+      line-height: 1.72;
+    }
+    .footer-disclaimer-list li {
+      padding-left: 4px;
+      margin: 1px 0;
     }
     .footer-brand {
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 12px;
+      gap: 11px;
       width: 100%;
       min-width: 0;
-      text-align: center;
+      padding-top: 3px;
     }
     .footer-brand-link {
       display: inline-flex;
       align-items: center;
-      gap: 11px;
+      gap: 10px;
       min-width: 0;
       color: var(--text-primary);
       text-decoration: none;
     }
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
-      width: 58px;
-      height: 58px;
+      width: 50px;
+      height: 50px;
       display: block;
-      flex: 0 0 58px;
+      flex: 0 0 50px;
       object-fit: contain;
       object-position: center;
-      filter: drop-shadow(0 6px 18px rgba(20,184,166,.16));
+      filter: drop-shadow(0 5px 14px rgba(20,184,166,.15));
     }
     .footer-brand-copy {
       display: flex;
@@ -5644,16 +5678,16 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand strong {
       color: var(--text-primary);
-      font-size: 20px;
-      font-weight: 760;
+      font-size: 18px;
+      font-weight: 740;
       line-height: 1.2;
-      letter-spacing: -.2px;
+      letter-spacing: -.15px;
     }
     .footer-brand-version {
-      color: var(--text-secondary);
-      font-size: 13px;
+      color: rgba(156,163,175,.9);
+      font-size: 11.5px;
       font-weight: 500;
-      line-height: 1.45;
+      line-height: 1.4;
       overflow-wrap: anywhere;
     }
     .footer-channels {
@@ -5661,116 +5695,94 @@ INDEX_HTML = r"""<!doctype html>
       flex-wrap: wrap;
       align-items: center;
       justify-content: center;
-      gap: 12px;
+      gap: 9px;
     }
     .footer-channel {
-      min-width: 190px;
-      min-height: 48px;
+      min-width: 176px;
+      min-height: 42px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 9px;
-      padding: 10px 18px;
-      border: 1px solid rgba(255,255,255,.10);
+      gap: 8px;
+      padding: 8px 15px;
+      border: 1px solid rgba(255,255,255,.095);
       border-radius: 999px;
-      background: rgba(248,250,252,.98);
-      box-shadow: 0 8px 24px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.9);
-      color: #182033;
-      font-size: 14px;
-      font-weight: 750;
+      background: rgba(17,26,45,.72);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 6px 18px rgba(0,0,0,.15);
+      color: #e8edf5;
+      font-size: 12.5px;
+      font-weight: 680;
       line-height: 1;
       text-decoration: none;
       white-space: nowrap;
-      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease, background .16s ease;
+      transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease, background .16s ease, color .16s ease;
     }
     .footer-channel:hover {
       transform: translateY(-1px);
-      border-color: rgba(20,184,166,.38);
-      background: #ffffff;
-      box-shadow: 0 10px 28px rgba(0,0,0,.26), 0 0 0 1px rgba(20,184,166,.08);
+      border-color: rgba(20,184,166,.36);
+      background: rgba(20,184,166,.08);
+      box-shadow: 0 8px 22px rgba(0,0,0,.2), 0 0 0 1px rgba(20,184,166,.045);
+      color: #fff;
     }
     .footer-channel:active { transform: translateY(0); }
     .footer-channel:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
     .footer-channel-icon {
-      width: 20px;
-      height: 20px;
+      width: 18px;
+      height: 18px;
       display: grid;
       place-items: center;
-      flex: 0 0 20px;
+      flex: 0 0 18px;
     }
-    .footer-channel-icon svg { width: 20px; height: 20px; display: block; fill: currentColor; }
-    .footer-channel-youtube .footer-channel-icon { color: #ff0033; }
-    .footer-channel-telegram .footer-channel-icon { color: #229ed9; }
-    .footer-disclaimer {
-      width: min(1040px, 100%);
-      box-sizing: border-box;
-      padding: 18px 20px 16px;
-      border: 1px solid rgba(99,102,241,.14);
-      border-radius: 16px;
-      background:
-        linear-gradient(135deg, rgba(16,24,43,.82), rgba(10,18,34,.68));
-      box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 10px 28px rgba(0,0,0,.16);
-      text-align: left;
+    .footer-channel-icon svg {
+      width: 18px;
+      height: 18px;
+      display: block;
+      fill: currentColor;
     }
-    .footer-disclaimer-title {
-      margin-bottom: 9px;
-      text-align: center;
-      color: var(--text-primary);
-      font-size: 14px;
-      font-weight: 720;
-    }
-    .footer-disclaimer-list {
-      margin: 0;
-      padding-left: 21px;
-      color: var(--text-secondary);
-      font-size: 11px;
-      line-height: 1.75;
-    }
-    .footer-disclaimer-list li { padding-left: 4px; margin: 2px 0; }
+    .footer-channel-youtube .footer-channel-icon { color: #ff3850; }
+    .footer-channel-telegram .footer-channel-icon { color: #38aeea; }
     .footer-bottom {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: center;
-      gap: 12px;
-      color: rgba(156,163,175,.82);
-      font-size: 11px;
+      gap: 9px;
+      color: rgba(156,163,175,.74);
+      font-size: 10.5px;
     }
     .footer-bottom a {
       color: inherit;
       text-decoration: none;
       padding: 2px 4px;
+      transition: color .16s ease;
     }
     .footer-bottom a:hover { color: var(--text-primary); text-decoration: underline; }
-    .footer-divider { opacity: .34; }
+    .footer-divider { opacity: .28; }
     @media (max-width:699px) {
-      .site-footer { margin-top: 24px; padding: 28px 12px 22px; }
-      .site-footer-inner { gap: 14px; }
-      .footer-brand {
-        align-items: flex-start;
-        text-align: left;
-      }
-      .footer-brand-logo-image { width: 52px; height: 52px; flex-basis: 52px; }
+      .site-footer { margin-top: 22px; padding: 24px 10px 18px; }
+      .site-footer-inner { gap: 12px; }
+      .footer-disclaimer { padding: 13px 13px 11px; border-radius: 13px; }
+      .footer-disclaimer-title { font-size: 12.5px; margin-bottom: 7px; }
+      .footer-disclaimer-list { font-size: 10px; line-height: 1.7; padding-left: 18px; }
+      .footer-brand { align-items: flex-start; text-align: left; }
+      .footer-brand-logo-image { width: 46px; height: 46px; flex-basis: 46px; }
       .footer-brand-copy {
         justify-content: flex-start;
         align-items: flex-start;
         flex-direction: column;
         gap: 3px;
       }
-      .footer-brand strong { font-size: 17px; }
-      .footer-brand-version { font-size: 11.5px; }
-      .footer-channels { width: 100%; gap: 8px; }
-      .footer-channel { min-width: 0; width: 100%; min-height: 46px; padding: 10px 14px; font-size: 13px; }
-      .footer-disclaimer { padding: 14px 14px 12px; border-radius: 14px; }
-      .footer-disclaimer-title { font-size: 13px; }
-      .footer-disclaimer-list { font-size: 10.5px; line-height: 1.72; padding-left: 18px; }
-      .footer-bottom { gap: 8px; font-size: 10.5px; }
+      .footer-brand strong { font-size: 16px; }
+      .footer-brand-version { font-size: 10.5px; }
+      .footer-channels { width: 100%; gap: 7px; }
+      .footer-channel { min-width: 0; width: 100%; min-height: 43px; padding: 8px 12px; font-size: 12px; }
+      .footer-bottom { gap: 7px; font-size: 10px; }
     }
     @media (min-width:700px) and (max-width:1024px) {
-      .site-footer { padding-left: 18px; padding-right: 18px; }
-      .footer-disclaimer { width: min(900px, 100%); }
-      .footer-brand strong { font-size: 18px; }
-      .footer-brand-version { font-size: 12px; }
+      .site-footer { padding-left: 16px; padding-right: 16px; }
+      .footer-disclaimer { width: min(920px, 100%); }
+      .footer-brand strong { font-size: 17px; }
+      .footer-brand-version { font-size: 11px; }
     }
 
     .official-links { padding: 18px 18px 16px; border: 1px solid rgba(20,184,166,.18); border-radius: 14px; background: linear-gradient(135deg,rgba(20,184,166,.08),rgba(255,255,255,.025)); }
@@ -7307,7 +7319,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="brand">
     <h1>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
-      我爱研究.ILovestudy｜多协议节点管理系统
+      Aimili VPN｜多协议节点管理系统
     </h1>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
@@ -7323,7 +7335,7 @@ INDEX_HTML = r"""<!doctype html>
         <a href="https://github.com/hankinsus/aimili-vpngate-production" target="_blank">正式版</a>
         <div class="github-update-panel" id="github_update_panel">
           <div class="github-update-row">
-            <span class="github-update-label">当前版本</span>
+            <span class="github-update-label">当前正式版</span>
             <code class="github-update-version" id="github_current_version">读取中...</code>
           </div>
           <div class="github-update-message" id="github_update_message">点击“检查更新”获取 GitHub 最新版本。</div>
@@ -8023,14 +8035,26 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
-  <footer class="site-footer" aria-label="我爱研究官方入口">
+  <footer class="site-footer" aria-label="Aimili VPN 官方入口">
     <div class="site-footer-inner">
+      <section class="footer-disclaimer" aria-labelledby="footer-disclaimer-title">
+        <div id="footer-disclaimer-title" class="footer-disclaimer-title">隐私免责声明</div>
+        <ol class="footer-disclaimer-list">
+          <li>本节点管理系统仅用于整理订阅和检测你拥有或获授权使用的节点，不提供、出售或分发节点资源。请自行确认使用权限，并遵守适用法律、网络服务条款及相关规则。</li>
+          <li>检测结果仅反映执行时的网络状态和当次可取得的信息，可能受网络、设备及数据可用性影响；结果仅供参考，不构成安全、信誉、可用性、合规性或任何第三方平台判断的保证。</li>
+          <li>“IP属地”“原生 / 广播”网络类型等为技术分类，不属于官方认证，IPv4 与 IPv6 独立检测，结果可能不同。未执行、未知或直接生成的结果不代表已经通过全部检测。</li>
+          <li>订阅输入、节点列表、筛选状态和已完成的节点检测结果默认在当前设备本机处理和保存。仅在完成当前操作确有必要时进行网络通信或一次性临时读取；公开页面和错误提示不会展示原始凭据、访问令牌、完整请求地址或原始服务响应。</li>
+          <li>只有你主动生成在线订阅时，最终选中的节点连接信息才会进入临时订阅存储，并在 30 分钟后自动失效。订阅链接和二维码具有访问能力，请按敏感信息管理，不要公开分享。</li>
+          <li>清除本机节点订阅不会立即撤销已经发布的临时链接；已发布链接按照到期时间自动失效。使用共享设备后请清理本机记录、截图、复制内容和导出文件，也请谨慎保存和分享。</li>
+        </ol>
+      </section>
+
       <div class="footer-brand">
         <a class="footer-brand-link" href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer" aria-label="打开我爱研究.ILovestudy 官网">
-          <img class="footer-brand-logo-image" src="https://ilovestudyip.com/v1/assets/ilovestudy-logo-hd.png?v=9.0.0-logo-r1" alt="我爱研究.ILovestudy 标志" width="58" height="58" decoding="async" loading="lazy" />
+          <img class="footer-brand-logo-image" src="https://ilovestudyip.com/v1/assets/ilovestudy-logo-hd.png?v=9.0.0-logo-r1" alt="我爱研究.ILovestudy 标志" width="50" height="50" decoding="async" loading="lazy" />
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version">· 多协议节点管理系统 · V9.0.6</span>
+            <span class="footer-brand-version">· 多协议节点管理系统 · <span id="footer_app_version">V1.0.6</span> · <span id="footer_commit_version">读取版本中...</span></span>
           </span>
         </a>
       </div>
@@ -8049,18 +8073,6 @@ INDEX_HTML = r"""<!doctype html>
           <span class="footer-channel-label">Telegram 频道</span>
         </a>
       </div>
-
-      <section class="footer-disclaimer" aria-labelledby="footer-disclaimer-title">
-        <div id="footer-disclaimer-title" class="footer-disclaimer-title">隐私免责声明</div>
-        <ol class="footer-disclaimer-list">
-          <li>本工具仅用于整理订阅和检测你拥有或获授权使用的节点，不提供、出售或分发节点资源。请自行确认使用权限，并遵守适用法律、网络服务条款及相关规则。</li>
-          <li>检测结果仅反映执行时的网络状态和当次可取得的信息，可能受网络、设备及数据可用性影响；结果仅供参考，不构成安全、信誉、可用性、合规性或任何第三方平台判断的保证。</li>
-          <li>“IP属地”“原生 / 广播”网络类型等为技术分类，不属于官方认证，IPv4 与 IPv6 独立检测，结果可能不同。未执行、未知或直接生成的结果不代表已经通过全部检测。</li>
-          <li>订阅输入、节点列表、筛选状态和已完成的节点检测结果默认在当前设备本机处理和保存。仅在完成当前操作确有必要时进行网络通信或一次性临时读取；公开页面和错误提示不会展示原始凭据、访问令牌、完整请求地址或原始服务响应。</li>
-          <li>只有你主动生成在线订阅时，最终选中的节点连接信息才会进入临时订阅存储，并在 30 分钟后自动失效。订阅链接和二维码具有访问能力，请按敏感信息管理，不要公开分享。</li>
-          <li>清除本机节点订阅不会立即撤销已经发布的临时链接；已发布链接按照到期时间自动失效。使用共享设备后请清理本机记录、截图、复制内容和导出文件，也请谨慎保存和分享。</li>
-        </ol>
-      </section>
 
       <nav class="footer-bottom" aria-label="底部官方入口">
         <a href="https://ilovestudycn.com" target="_blank" rel="noopener noreferrer">官网</a>
@@ -8379,6 +8391,25 @@ function bindUnifiedSelectEvents() {
 
 function syncUnifiedSelect(selectId) { renderUnifiedSelect(selectId); }
 
+function countryFlag(country) {
+  const name = translateCountry(country);
+  const flags = {
+    "日本":"🇯🇵","韩国":"🇰🇷","美国":"🇺🇸","俄罗斯":"🇷🇺","中国":"🇨🇳","台湾":"🇹🇼","香港":"🇭🇰","澳门":"🇲🇴",
+    "新加坡":"🇸🇬","马来西亚":"🇲🇾","印度尼西亚":"🇮🇩","印度":"🇮🇳","菲律宾":"🇵🇭","泰国":"🇹🇭","越南":"🇻🇳",
+    "澳大利亚":"🇦🇺","新西兰":"🇳🇿","加拿大":"🇨🇦","英国":"🇬🇧","法国":"🇫🇷","德国":"🇩🇪","荷兰":"🇳🇱",
+    "瑞典":"🇸🇪","挪威":"🇳🇴","芬兰":"🇫🇮","丹麦":"🇩🇰","冰岛":"🇮🇸","爱尔兰":"🇮🇪","西班牙":"🇪🇸",
+    "葡萄牙":"🇵🇹","意大利":"🇮🇹","瑞士":"🇨🇭","比利时":"🇧🇪","奥地利":"🇦🇹","希腊":"🇬🇷","土耳其":"🇹🇷",
+    "波兰":"🇵🇱","捷克":"🇨🇿","斯洛伐克":"🇸🇰","匈牙利":"🇭🇺","罗马尼亚":"🇷🇴","保加利亚":"🇧🇬","克罗地亚":"🇭🇷",
+    "塞尔维亚":"🇷🇸","斯洛文尼亚":"🇸🇮","爱沙尼亚":"🇪🇪","拉脱维亚":"🇱🇻","立陶宛":"🇱🇹","乌克兰":"🇺🇦",
+    "格鲁吉亚":"🇬🇪","哈萨克斯坦":"🇰🇿","亚美尼亚":"🇦🇲","阿塞拜疆":"🇦🇿","吉尔吉斯斯坦":"🇰🇬","蒙古":"🇲🇳",
+    "以色列":"🇮🇱","阿联酋":"🇦🇪","沙特阿拉伯":"🇸🇦","伊朗":"🇮🇷","伊拉克":"🇮🇶","卡塔尔":"🇶🇦","阿曼":"🇴🇲",
+    "埃及":"🇪🇬","南非":"🇿🇦","尼日利亚":"🇳🇬","肯尼亚":"🇰🇪","摩洛哥":"🇲🇦","突尼斯":"🇹🇳","巴西":"🇧🇷",
+    "阿根廷":"🇦🇷","智利":"🇨🇱","墨西哥":"🇲🇽","哥伦比亚":"🇨🇴","秘鲁":"🇵🇪","厄瓜多尔":"🇪🇨","乌拉圭":"🇺🇾",
+    "巴拿马":"🇵🇦","哥斯达黎加":"🇨🇷","多米尼加共和国":"🇩🇴","波多黎各":"🇵🇷"
+  };
+  return flags[name] || "🌐";
+}
+
 function renderCustomFilter(selectId, withCount = false) {
   const cfg = CUSTOM_FILTER_CONFIG[selectId];
   const select = cfg ? $(selectId) : null;
@@ -8393,8 +8424,14 @@ function renderCustomFilter(selectId, withCount = false) {
   if (widget?.classList.contains("open")) return;
 
   const selected = select.options[select.selectedIndex];
-  const nextLabel = selected ? selected.textContent : "";
-  if (label.textContent !== nextLabel) label.textContent = nextLabel;
+  const nextRawLabel = selected ? selected.textContent : "";
+  const selectedParts = withCount ? String(nextRawLabel).split(" · ") : [String(nextRawLabel)];
+  const selectedName = selectedParts.shift() || nextRawLabel;
+  const selectedCount = selectedParts.join(" · ");
+  const selectedDisplay = withCount
+    ? ((String(select.value || "") ? countryFlag(select.value) + " " : "🌐 ") + selectedName + (selectedCount ? " · " + selectedCount : ""))
+    : nextRawLabel;
+  if (label.textContent !== selectedDisplay) label.textContent = selectedDisplay;
 
   const html = Array.from(select.options).map(option => {
     const value = String(option.value || "");
@@ -8403,11 +8440,14 @@ function renderCustomFilter(selectId, withCount = false) {
     const parts = withCount ? textValue.split(" · ") : [textValue];
     const name = parts.shift() || textValue;
     const count = parts.join(" · ");
+    const displayName = withCount
+      ? ((value ? countryFlag(value) + " " : "🌐 ") + name)
+      : name;
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') +
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
       '" data-filter-option="1" data-filter-value="' + esc(value) + '"' +
       ' onclick="event.preventDefault();event.stopPropagation();chooseCustomFilter(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
-      '<span class="toolbar-custom-option-label">' + esc(name) + '</span>' +
+      '<span class="toolbar-custom-option-label">' + esc(displayName) + '</span>' +
       (count ? '<span class="toolbar-custom-option-count">' + esc(count) + '</span>' : '') +
       '</button>';
   }).join("");
@@ -9822,11 +9862,19 @@ function setGithubUpdateButtonBusy(busy, label) {
 async function loadGithubCurrentVersion() {
   try {
     const result = await fetchJsonWithTimeout("./api/github_version", {}, 4000);
+    const versionLabel = String(result.current_version || "未知");
     const el = $("github_current_version");
-    if (el) el.textContent = result.current_version || "未知";
+    if (el) el.textContent = versionLabel;
+    const pieces = versionLabel.split(" · ");
+    const versionEl = $("footer_app_version");
+    const commitEl = $("footer_commit_version");
+    if (versionEl && pieces[0]) versionEl.textContent = pieces[0];
+    if (commitEl) commitEl.textContent = pieces[1] || (result.current_commit ? String(result.current_commit).slice(0, 8) : "未知");
   } catch (e) {
     const el = $("github_current_version");
     if (el) el.textContent = "未知";
+    const commitEl = $("footer_commit_version");
+    if (commitEl) commitEl.textContent = "未知";
   }
 }
 
