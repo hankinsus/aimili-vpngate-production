@@ -11077,9 +11077,18 @@ load();
 setInterval(async () => {
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
-      const d = await fetchNodesState(8000);
-      if (Array.isArray(d.nodes) && d.nodes.length > 0) mergeLoadedNodePage(d.nodes);
-      if (d.state) state = d.state;
+      const pageOffset = Math.max(0, (currentPage - 1) * pageSize);
+      const [d, stateData] = await Promise.all([
+        fetchScopedNodePage(pageOffset, pageSize, 8000),
+        fetchUiStateOnly(4000)
+      ]);
+      if (Array.isArray(d?.nodes)) {
+        nodes = [];
+        mergeLoadedNodePage(d.nodes);
+      }
+      if (d?.total != null) totalNodeCount = Number(d.total || 0);
+      if (d?.cache_building != null) nodeCacheBuilding = !!d.cache_building;
+      if (stateData?.state) state = stateData.state;
       stableSortNodes();
       updateCountryFilter();
       render();
