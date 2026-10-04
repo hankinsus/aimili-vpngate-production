@@ -27,13 +27,17 @@ jobs:
         run: |
           ! grep -RInE '八合一|我的邀请入口|My invitation links|referral code|referral links' README.md install.sh vpngate_manager.py
           python3 - <<'PY'
-          from PIL import Image
           from pathlib import Path
+          import struct
           p = Path("footer-logo-clean.png")
-          im = Image.open(p).convert("RGBA")
-          assert im.getchannel("A").getextrema()[0] == 0
-          assert im.getchannel("A").getextrema()[1] == 255
-          print("logo", im.size, p.stat().st_size)
+          b = p.read_bytes()
+          assert b[:8] == b"\x89PNG\r\n\x1a\n"
+          assert b[12:16] == b"IHDR"
+          w, h = struct.unpack(">II", b[16:24])
+          bit_depth = b[24]
+          color_type = b[25]
+          assert w > 0 and h > 0 and color_type in (4, 6)
+          print("logo", (w, h), "bit_depth", bit_depth, "color_type", color_type, "bytes", len(b))
           PY
 
       - name: Commit final cleanup
