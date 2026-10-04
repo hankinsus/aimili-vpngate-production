@@ -5849,12 +5849,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     .footer-brand-link:hover { color: #ffffff; }
     .footer-brand-logo-image {
-      width: 50px;
-      height: 59px;
-      max-width: 50px;
-      max-height: 59px;
+      width: 46px;
+      height: 48px;
+      max-width: 46px;
+      max-height: 48px;
       display: block;
-      flex: 0 0 50px;
+      flex: 0 0 46px;
       object-fit: contain;
       object-position: center;
       background: transparent;
@@ -7773,14 +7773,14 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <!-- 分页控制栏 -->
-    <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
+    <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: flex-start; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条已加载节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
         <span id="pool_summary" style="margin-left: 14px; color: var(--text-secondary);">Master Pool：—</span>
         <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
       </div>
-      <div style="display: flex; gap: 8px; align-items: center;">
-        <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
+      <div class="pagination-controls-right" style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
+        <button id="btn_first_page class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
         <button id="btn_prev_page" class="connect-btn" style="height: 32px; padding: 0 10px;">上一页</button>
         <span style="font-size: 13px; color: var(--text-secondary); margin: 0 8px;">
           页码 <strong id="current_page_val" style="color: var(--primary);">1</strong> / <strong id="total_pages_val">1</strong>
@@ -8307,7 +8307,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="footer-brand">
         <div class="footer-brand-link" aria-label="我爱研究.ILovestudy 品牌标志">
-          <svg class="footer-brand-logo-image footer-brand-logo-svg" viewBox="0 0 96 112" role="img" aria-label="我爱研究.ILovestudy 标志">
+          <svg class="footer-brand-logo-image footer-brand-logo-svg" viewBox="0 0 96 96" role="img" aria-label="我爱研究.ILovestudy 标志">
             <defs>
               <linearGradient id="brandShield" x1="0" y1="0" x2="1" y2="1">
                 <stop offset="0" stop-color="#e0f2fe"/>
@@ -8332,17 +8332,15 @@ INDEX_HTML = r"""<!doctype html>
               </linearGradient>
             </defs>
             <!-- Clean native shield: no decorative top/bottom lines, no external background. -->
-            <path d="M48 4 82 18v31c0 25-14 43-34 55C28 92 14 74 14 49V18L48 4Z"
+            <path d="M48 4 82 18v25c0 23-13 38-34 49C27 81 14 66 14 43V18L48 4Z"
                   fill="url(#brandShield)" stroke="#e0f2fe" stroke-width="2.5" stroke-linejoin="round"/>
-            <path d="M48 13 73 23v25c0 19-9 33-25 43-16-10-25-24-25-43V23l25-10Z"
+            <path d="M48 13 73 23v20c0 17-9 29-25 39-16-10-25-22-25-39V23l25-10Z"
                   fill="url(#brandInner)" stroke="#22d3ee" stroke-width="1.5" opacity=".98"/>
             <!-- Centered chip, aligned to the shield's visual center. -->
-            <g transform="translate(48 56)">
+            <g transform="translate(48 49)">
               <rect x="-19" y="-19" width="38" height="38" rx="8" fill="url(#brandMetal)" stroke="#f8fafc" stroke-width="1.5"/>
               <rect x="-11" y="-11" width="22" height="22" rx="4" fill="url(#brandChip)" stroke="#fef3c7" stroke-width="1"/>
               <path d="M-6 -5h12M-6 0h12M-6 5h12" stroke="#78350f" stroke-width="1.6" stroke-linecap="round"/>
-              <path d="M-13-25v7M0-25v7M13-25v7M-13 18v7M0 18v7M13 18v7M-25-13h7M-25 0h7M-25 13h7M18-13h7M18 0h7M18 13h7"
-                    stroke="#fbbf24" stroke-width="2.6" stroke-linecap="round"/>
             </g>
           </svg>
           <span class="footer-brand-copy">
@@ -8754,12 +8752,16 @@ function countryFlagEmoji(code) {
 }
 
 function countryFlag(country, title = "", loading = "lazy") {
-  const code = countryFlagCode(country);
+  const code = countryFlagCode(country).toLowerCase();
   const label = esc(title || translateCountry(country) || country || "");
-  return '<span class="country-flag-fallback" role="img" aria-label="' + label + '" title="' + label + '">' +
-    countryFlagEmoji(code) + '</span>';
+  if (!code) {
+    return '<span class="country-flag-fallback" role="img" aria-label="' + label + '" title="' + label + '">🌐</span>';
+  }
+  const eager = loading === "eager" ? ' fetchpriority="high"' : ' loading="lazy"';
+  return '<img class="country-flag-img" src="https://flagcdn.com/w40/' + code + '.png" alt="" aria-hidden="true"' + eager +
+    ' referrerpolicy="no-referrer" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline-flex\';" title="' + label + '">' +
+    '<span class="country-flag-fallback" role="img" aria-label="' + label + '" title="' + label + '" style="display:none;">🌐</span>';
 }
-
 function renderCustomFilter(selectId, withCount = false) {
   const cfg = CUSTOM_FILTER_CONFIG[selectId];
   const select = cfg ? $(selectId) : null;
