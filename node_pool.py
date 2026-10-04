@@ -1025,28 +1025,37 @@ class NodePool:
                 break
         return result
 
-    def country_catalog(self) -> dict[str, Any]:
-        """Return authoritative country/IP inventory from the persistent Master Pool.
+    def country_catalog(self, status: str = "", protocol: str = "", ip_type: str = "") -> dict[str, Any]:
+        """Return distinct server-IP inventory, optionally scoped by UI filters."""
+        status = str(status or "").strip().lower()
+        protocol = str(protocol or "").strip().lower()
+        ip_type = str(ip_type or "").strip().lower()
 
-        Counts are distinct current server IPs, not protocol endpoints, so a server
-        exposing OpenVPN + SSTP + SoftEther is counted once. This endpoint is cheap
-        enough for the UI to call on every page load and avoids shipping the entire
-        global node list to the browser just to build a country dropdown.
+        where = [
+            "TRIM(COALESCE(s.country, '')) <> ''",
+            "TRIM(COALESCE(s.current_ip, '')) <> ''",
+        ]
+        params: list[Any] = []
+        if protocol:
+            where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.protocol=?)")
+            params.append(protocol)
+        if status == "available":
+            where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.status IN ('HOT','AVAILABLE'))")
+        elif status == "testing":
+            where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.status IN ('NEW','DEGRADED'))")
+        elif status == "unavailable":
+            where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.status IN ('COOLDOWN','STALE'))")
+        if ip_type:
+            where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), '')) = ?")
+            params.append(ip_type)
+
+        sql = f"""
+            SELECT s.country, s.current_ip, s.hostname, s.metadata_json
+            FROM servers s
+            WHERE {' AND '.join(where)}
         """
         with self.lock, closing(self._connect()) as db:
-            rows = db.execute(
-                """
-                SELECT s.country, s.current_ip, s.hostname, s.state,
-                       s.metadata_json,
-                       COUNT(e.endpoint_id) AS endpoint_count,
-                       SUM(CASE WHEN e.status IN ('HOT','AVAILABLE') THEN 1 ELSE 0 END) AS ready_endpoints
-                FROM servers s
-                LEFT JOIN endpoints e ON e.server_key = s.server_key
-                WHERE TRIM(COALESCE(s.country, '')) <> ''
-                  AND TRIM(COALESCE(s.current_ip, '')) <> ''
-                GROUP BY s.server_key
-                """
-            ).fetchall()
+            rows = db.execute(sql, params).fetchall()
 
         result: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -1054,43 +1063,24 @@ class NodePool:
             ip = str(row["current_ip"] or "").strip()
             if not country or not ip:
                 continue
-            item = result.setdefault(country, {
-                "ips": set(),
-                "servers": set(),
-                "ready_ips": set(),
-                "hosting_ips": set(),
-                "residential_ips": set(),
-                "mobile_ips": set(),
-            })
+            item = result.setdefault(country, {"ips": set(), "servers": set()})
             item["ips"].add(ip)
             item["servers"].add(str(row["hostname"] or ip).strip().lower())
-            if int(row["ready_endpoints"] or 0) > 0:
-                item["ready_ips"].add(ip)
-            try:
-                meta = json.loads(row["metadata_json"] or "{}")
-            except Exception:
-                meta = {}
-            ip_type = str((meta or {}).get("ip_type") or "").strip().lower()
-            if ip_type == "hosting":
-                item["hosting_ips"].add(ip)
-            elif ip_type == "mobile":
-                item["mobile_ips"].add(ip)
-            elif ip_type == "residential":
-                item["residential_ips"].add(ip)
 
-        countries: dict[str, Any] = {}
-        total_ips: set[str] = set()
-        for country, item in result.items():
-            total_ips.update(item["ips"])
-            countries[country] = {
+        countries = {
+            country: {
                 "ip_count": len(item["ips"]),
                 "server_count": len(item["servers"]),
-                "available_ip_count": len(item["ready_ips"]),
-                "hosting_ip_count": len(item["hosting_ips"]),
-                "residential_ip_count": len(item["residential_ips"]),
-                "mobile_ip_count": len(item["mobile_ips"]),
             }
-        return {"total_ip_count": len(total_ips), "countries": countries}
+            for country, item in result.items()
+        }
+        return {
+            "total_ip_count": sum(int(item["ip_count"]) for item in countries.values()),
+            "countries": countries,
+            "status": status,
+            "protocol": protocol,
+            "ip_type": ip_type,
+        }
 
     def stats(self) -> dict[str, Any]:
         with self.lock, closing(self._connect()) as db:
