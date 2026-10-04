@@ -144,6 +144,44 @@ else
     fi
 fi
 
+# 4.1 Verify the exact production source before installing/running it.
+# The public main branch is the single source of truth for new servers.
+echo -e "\n${YELLOW}[源码校验] 正在验证 GitHub 正式版来源与提交...${PLAIN}"
+EXPECTED_REMOTE_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
+REMOTE_VERIFY_LINE=$(git ls-remote "$EXPECTED_REMOTE_URL" "refs/heads/${DEPLOY_BRANCH}" 2>/dev/null || true)
+REMOTE_VERIFY_SHA=$(printf '%s\n' "$REMOTE_VERIFY_LINE" | awk 'NR==1{print $1}')
+if ! printf '%s' "$REMOTE_VERIFY_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo -e "${RED}错误: 无法验证 GitHub ${GITHUB_USER}/${GITHUB_REPO} 的 ${DEPLOY_BRANCH} 正式提交，停止安装。${PLAIN}"
+    exit 1
+fi
+cd "${INSTALL_DIR}"
+LOCAL_VERIFY_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+ORIGIN_VERIFY_SHA=$(git rev-parse "origin/${DEPLOY_BRANCH}" 2>/dev/null || true)
+if [ -z "$ORIGIN_VERIFY_SHA" ]; then
+    git fetch --quiet origin "${DEPLOY_BRANCH}"
+    ORIGIN_VERIFY_SHA=$(git rev-parse "origin/${DEPLOY_BRANCH}")
+fi
+if [ "$LOCAL_VERIFY_SHA" != "$REMOTE_VERIFY_SHA" ]; then
+    echo -e "${RED}错误: 本地源码提交与 GitHub 正式提交不一致。${PLAIN}"
+    echo -e "  GitHub 正式提交: ${REMOTE_VERIFY_SHA}"
+    echo -e "  当前本地提交:   ${LOCAL_VERIFY_SHA:-未检测到}"
+    echo -e "${RED}停止安装，避免在未经验证的源码上继续部署。${PLAIN}"
+    exit 1
+fi
+if [ "$ORIGIN_VERIFY_SHA" != "$REMOTE_VERIFY_SHA" ]; then
+    echo -e "${RED}错误: origin/${DEPLOY_BRANCH} 与 GitHub 远端提交不一致，停止安装。${PLAIN}"
+    exit 1
+fi
+
+echo -e "${GREEN}  -> GitHub 来源验证通过${PLAIN}"
+echo -e "  -> 仓库: ${EXPECTED_REMOTE_URL}"
+echo -e "  -> 分支: ${DEPLOY_BRANCH}"
+echo -e "  -> 提交: ${REMOTE_VERIFY_SHA}"
+
+# Syntax verification must pass before any service restart.
+python3 -m py_compile vpngate_manager.py resource_sharing.py node_pool.py proxy_server.py vpn_utils.py tunnel_adapters.py vpngate_discovery.py
+echo -e "${GREEN}  -> Python 语法/构建校验通过${PLAIN}"
+
 # 4.5 Public HTTP/SOCKS5 proxy settings
 PROXY_ENV_FILE="/etc/default/aimilivpn"
 mkdir -p /etc/default
@@ -1070,9 +1108,24 @@ fi
 
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart aimilivpn.service || true
+    if ! systemctl restart aimilivpn.service; then
+        echo -e "${RED}错误: aimilivpn.service 启动失败，安装终止。${PLAIN}"
+        systemctl --no-pager --full status aimilivpn.service || true
+        exit 1
+    fi
+    sleep 2
+    if ! systemctl is-active --quiet aimilivpn.service; then
+        echo -e "${RED}错误: aimilivpn.service 未进入 active 状态，安装终止。${PLAIN}"
+        systemctl --no-pager --full status aimilivpn.service || true
+        exit 1
+    fi
+    echo -e "${GREEN}  -> aimilivpn.service 已验证为 active${PLAIN}"
 elif command -v rc-service >/dev/null 2>&1; then
-    rc-service aimilivpn restart || true
+    if ! rc-service aimilivpn restart; then
+        echo -e "${RED}错误: aimilivpn OpenRC 服务启动失败，安装终止。${PLAIN}"
+        exit 1
+    fi
+    echo -e "${GREEN}  -> aimilivpn OpenRC 服务已启动${PLAIN}"
 fi
 
 # Configure the public HTTPS management front end (8443); leave the external 18443 subscription service untouched.
