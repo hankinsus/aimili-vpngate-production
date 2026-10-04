@@ -1,5 +1,3 @@
-[Reading 1000 lines from start (total: 1162 lines, 162 remaining)]
-
 #!/usr/bin/env bash
 set -e
 
@@ -665,7 +663,7 @@ def configure_web():
     print("=======================================================")
     print("  管理后台:     https://服务器IP:8443/")
     print("  内部管理服务: 127.0.0.1:8501")
-    print("  HTTP/SOCKS5代理: 服务器IP:8500")
+    print("  HTTP/SOCKS5代理:   服务器IP:8500")
     print("  安全登录后缀:", cfg.get("secret_path", ""))
     print("=======================================================")
     input("按回车返回主菜单...")
@@ -681,7 +679,7 @@ def configure_port():
         print("                      端口配置菜单")
         print("=======================================================")
         print("1) HTTPS 管理入口: 8443 (固定)")
-        print("2) HTTP/SOCKS5 代理: 8500 (固定)")
+        print("2) HTTP/SOCKS5代理: 8500 (固定)")
         print("3) HTTPS 订阅入口: 18443 (固定)")
         print("4) 返回主菜单")
         print("-------------------------------------------------------")
@@ -690,7 +688,7 @@ def configure_port():
             print("HTTPS 管理入口固定为 8443；内部管理监听为 127.0.0.1:8501。")
             input("按回车继续...")
         elif key == '2':
-            print("HTTP/SOCKS5 代理固定为 8500。")
+            print("HTTP/SOCKS5代理固定为 8500。")
             print("账号、密码与允许来源请修改 /etc/default/aimilivpn。")
             input("按回车继续...")
         elif key == '3':
@@ -1000,5 +998,165 @@ while True:
         done
         
         # 3. Custom login username and password
+        read -p "请输入登录账号 [默认 $UI_USERNAME]: " input_user
+        if [ -n "$input_user" ]; then
+            UI_USERNAME=$input_user
+        fi
+        
+        while true; do
+            read -p "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: " input_pass
+            if [ -z "$input_pass" ]; then
+                break
+            fi
+            if [ ${#input_pass} -ge 4 ]; then
+                UI_PASSWORD=$input_pass
+                break
+            else
+                echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
+            fi
+        done
+    fi
 
-[executed on device: instance-20260601-095619 (57357237-fed5-46f5-bb41-5a6bf595b7b2)]
+    # Write config JSON. Values are passed as argv to avoid breaking Python code
+    # when username/password contain quotes, backslashes, or shell metacharacters.
+    python3 - "$AUTH_FILE" "$UI_PORT" "$SECRET_PATH" "$UI_USERNAME" "$UI_PASSWORD" <<'PY'
+import json
+import sys
+
+auth_file, ui_port, secret_path, username, password = sys.argv[1:6]
+cfg = {
+    "host": "127.0.0.1",
+    "port": int(ui_port),
+    "proxy_port": 8500,
+    "secret_path": secret_path,
+    "username": username,
+    "password": password,
+}
+with open(auth_file, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+PY
+fi
+
+# 8. Start service
+# 8.5 Optimize network parameters (rp_filter for policy routing)
+echo -e "\n正在优化网络参数 (配置反向路径过滤 rp_filter=2 以支持策略路由)..."
+if [ -d "/etc/sysctl.d" ]; then
+    cat > /etc/sysctl.d/99-aimilivpn.conf <<EOF
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
+    sysctl -p /etc/sysctl.d/99-aimilivpn.conf >/dev/null 2>&1 || true
+else
+    # Fallback to appending to /etc/sysctl.conf
+    if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf; then
+        echo "" >> /etc/sysctl.conf
+        echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
+        echo "net.ipv4.conf.default.rp_filter = 2" >> /etc/sysctl.conf
+    else
+        sed -i 's/net.ipv4.conf.all.rp_filter\s*=\s*[0-9]/net.ipv4.conf.all.rp_filter = 2/g' /etc/sysctl.conf
+        sed -i 's/net.ipv4.conf.default.rp_filter\s*=\s*[0-9]/net.ipv4.conf.default.rp_filter = 2/g' /etc/sysctl.conf
+    fi
+    sysctl -p >/dev/null 2>&1 || true
+fi
+# Apply to currently active interfaces dynamically (prefer native proc write for BusyBox/Alpine compatibility)
+echo "2" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+echo "2" > /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+if [ -d "/proc/sys/net/ipv4/conf" ]; then
+    for dev_dir in /proc/sys/net/ipv4/conf/*; do
+        dev_name=$(basename "$dev_dir")
+        echo "2" > "/proc/sys/net/ipv4/conf/${dev_name}/rp_filter" 2>/dev/null || sysctl -w net.ipv4.conf.${dev_name}.rp_filter=2 >/dev/null 2>&1 || true
+    done
+fi
+
+echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart aimilivpn.service || true
+elif command -v rc-service >/dev/null 2>&1; then
+    rc-service aimilivpn restart || true
+fi
+
+# Configure the public HTTPS management front end (8443); leave the external 18443 subscription service untouched.
+if [ -x "${INSTALL_DIR}/scripts/setup_https.sh" ]; then
+    echo -e "\n正在配置 HTTPS 管理后台与订阅入口..."
+    bash "${INSTALL_DIR}/scripts/setup_https.sh"
+fi
+
+# Wait and poll for node loading and active connection
+echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
+ACTIVE_ID=""
+LAST_MSG=""
+for i in {1..90}; do
+    if [ -f "${INSTALL_DIR}/vpngate_data/state.json" ]; then
+        ACTIVE_ID=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('active_openvpn_node_id', ''))" 2>/dev/null || echo "")
+        IS_CONN=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('is_connecting', False))" 2>/dev/null || echo "False")
+        CUR_MSG=$(python3 -c "import json; print(json.load(open('${INSTALL_DIR}/vpngate_data/state.json')).get('last_check_message', ''))" 2>/dev/null || echo "")
+        
+        if [ "$IS_CONN" = "False" ] || [ "$IS_CONN" = "false" ]; then
+            if [ -n "$ACTIVE_ID" ]; then
+                echo -e "  -> ${GREEN}[已就绪]${PLAIN} 首次节点连接成功，活动节点: ${GREEN}$ACTIVE_ID${PLAIN}"
+                break
+            else
+                if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
+                    echo -e "  -> 提示: ${YELLOW}${CUR_MSG}${PLAIN}"
+                    LAST_MSG="$CUR_MSG"
+                fi
+            fi
+        else
+            if [ -n "$CUR_MSG" ] && [ "$CUR_MSG" != "$LAST_MSG" ]; then
+                echo -e "  -> 状态: ${YELLOW}${CUR_MSG}${PLAIN}"
+                LAST_MSG="$CUR_MSG"
+            fi
+        fi
+    else
+        echo -n "."
+    fi
+    sleep 1
+done
+if [ -z "$ACTIVE_ID" ]; then
+    echo -e "  -> ${YELLOW}[加载超时]${PLAIN} 首次节点获取或连接超时，将在后台继续尝试..."
+fi
+
+SECRET_PATH="EJsW2EeBo9lY"
+USERNAME="未配置"
+PASSWORD="未配置"
+UI_PORT=8501
+PROXY_PORT=8500
+AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
+if [ -f "$AUTH_FILE" ]; then
+    SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
+    USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
+    PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
+    UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8501))" 2>/dev/null || echo "8501")
+    PROXY_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_port', 8500))" 2>/dev/null || echo "8500")
+fi
+
+# Get VPS public IP
+echo -e "正在获取 VPS 公网 IP..."
+PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || curl -s --max-time 3 icanhazip.com || echo "您的服务器公网IP")
+echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
+
+# Get VPS public IPv6
+echo -e "正在获取 VPS 公网 IPv6..."
+PUBLIC_IPV6=$(curl -6 -s --max-time 3 https://api.ipify.org || curl -6 -s --max-time 3 https://ifconfig.me || curl -6 -s --max-time 3 icanhazip.com || echo "")
+
+echo -e "\n${GREEN}==========================================================${PLAIN}"
+echo -e "${GREEN}             AimiliVPN 源码一键部署已完成！${PLAIN}"
+echo -e "${GREEN}==========================================================${PLAIN}"
+echo -e "  * HTTPS 管理后台:       ${BLUE}https://${PUBLIC_IP}:8443/${SECRET_PATH}/${PLAIN}"
+if [ -n "$PUBLIC_IPV6" ]; then
+    echo -e "  * HTTPS 管理后台(IPv6):  ${BLUE}https://[${PUBLIC_IPV6}]:8443/${SECRET_PATH}/${PLAIN}"
+fi
+echo -e "  * 网页管理账号:          ${YELLOW}${USERNAME}${PLAIN}"
+echo -e "  * 网页管理密码:          ${YELLOW}${PASSWORD}${PLAIN}"
+echo -e "  * HTTPS 订阅入口:       ${BLUE}https://${PUBLIC_IP}:18443/${PLAIN}"
+echo -e "  * HTTP/SOCKS5代理:   ${BLUE}${PUBLIC_IP}:8500${PLAIN}"
+echo -e "  * 代理账号配置:         ${BLUE}/etc/default/aimilivpn${PLAIN}"
+echo -e "  * 默认 SOCKS5 密码:     ${YELLOW}ilovestudy${PLAIN}（建议首次部署后修改）"
+echo -e "  * 默认允许来源:         ${BLUE}127.0.0.1/32,::1/128${PLAIN}"
+echo -e " --------------------------------------------------------"
+echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
+echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
+echo -e "  * 停止服务:       ${YELLOW}ml stop${PLAIN}"
+echo -e "  * 重启服务:       ${YELLOW}ml restart${PLAIN}"
+echo -e "=========================================================="
+echo
