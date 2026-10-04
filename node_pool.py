@@ -998,7 +998,6 @@ class NodePool:
                   AND e.status NOT IN ('RETIRED')
                 ORDER BY
                   CASE e.protocol
-
                     {" ".join(
                         f"WHEN '{protocol}' THEN {deficit[protocol]:.12f}"
                         for protocol in wanted
