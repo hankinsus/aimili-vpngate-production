@@ -144,7 +144,7 @@ else
     fi
 fi
 
-# 4.5 Public HTTP/SOCKS5 eight-in-one gateway settings
+# 4.5 Public HTTP/SOCKS5 proxy settings
 PROXY_ENV_FILE="/etc/default/aimilivpn"
 mkdir -p /etc/default
 [ -f "$PROXY_ENV_FILE" ] || touch "$PROXY_ENV_FILE"
@@ -663,7 +663,7 @@ def configure_web():
     print("=======================================================")
     print("  管理后台:     https://服务器IP:8443/")
     print("  内部管理服务: 127.0.0.1:8501")
-    print("  八合一代理:   服务器IP:8500")
+    print("  HTTP/SOCKS5代理:   服务器IP:8500")
     print("  安全登录后缀:", cfg.get("secret_path", ""))
     print("=======================================================")
     input("按回车返回主菜单...")
@@ -679,7 +679,7 @@ def configure_port():
         print("                      端口配置菜单")
         print("=======================================================")
         print("1) HTTPS 管理入口: 8443 (固定)")
-        print("2) HTTP/SOCKS5 八合一: 8500 (固定)")
+        print("2) HTTP/SOCKS5代理: 8500 (固定)")
         print("3) HTTPS 订阅入口: 18443 (固定)")
         print("4) 返回主菜单")
         print("-------------------------------------------------------")
@@ -688,7 +688,7 @@ def configure_port():
             print("HTTPS 管理入口固定为 8443；内部管理监听为 127.0.0.1:8501。")
             input("按回车继续...")
         elif key == '2':
-            print("HTTP/SOCKS5 八合一固定为 8500。")
+            print("HTTP/SOCKS5代理固定为 8500。")
             print("账号、密码与允许来源请修改 /etc/default/aimilivpn。")
             input("按回车继续...")
         elif key == '3':
@@ -1149,7 +1149,7 @@ fi
 echo -e "  * 网页管理账号:          ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:          ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTPS 订阅入口:       ${BLUE}https://${PUBLIC_IP}:18443/${PLAIN}"
-echo -e "  * HTTP/SOCKS5 八合一:   ${BLUE}${PUBLIC_IP}:8500${PLAIN}"
+echo -e "  * HTTP/SOCKS5代理:   ${BLUE}${PUBLIC_IP}:8500${PLAIN}"
 echo -e "  * 代理账号配置:         ${BLUE}/etc/default/aimilivpn${PLAIN}"
 echo -e "  * 默认 SOCKS5 密码:     ${YELLOW}ilovestudy${PLAIN}（建议首次部署后修改）"
 echo -e "  * 默认允许来源:         ${BLUE}127.0.0.1/32,::1/128${PLAIN}"
