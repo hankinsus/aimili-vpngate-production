@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -6022,6 +6023,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .toolbar {
+      position: relative;
+      z-index: 50;
+      isolation: isolate;
       background: var(--bg-surface);
       backdrop-filter: blur(12px);
       -webkit-backdrop-filter: blur(12px);
@@ -6033,8 +6037,6 @@ INDEX_HTML = r"""<!doctype html>
       gap: 16px;
       flex-wrap: wrap;
       align-items: center;
-      position: relative;
-      z-index: 50;
       overflow: visible;
     }
 
@@ -6191,10 +6193,10 @@ INDEX_HTML = r"""<!doctype html>
       transform: rotate(180deg) translateY(1px);
     }
     .toolbar-custom-select-menu {
-      position: fixed;
+      position: absolute;
       left: 0;
       right: auto;
-      top: auto;
+      top: calc(100% + 8px);
       bottom: auto;
       z-index: 10080;
       min-width: 100%;
@@ -6204,10 +6206,10 @@ INDEX_HTML = r"""<!doctype html>
       padding: 5px;
       border: 1px solid rgba(99,102,241,.25);
       border-radius: 10px;
-      background: rgba(15,23,42,.98);
-      box-shadow: 0 18px 40px rgba(0,0,0,.42);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
+      background: #0b1324;
+      box-shadow: 0 18px 40px rgba(0,0,0,.55), 0 4px 12px rgba(0,0,0,.28);
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
       scrollbar-width: thin;
       scrollbar-color: rgba(20,184,166,.42) transparent;
       display: none;
@@ -8751,27 +8753,13 @@ function toggleCustomFilter(selectId, event) {
   if (opening) {
     const menu = $(cfg.menu);
     if (menu) {
+      /* Toolbar menus are positioned relative to their trigger. This avoids
+         viewport/fixed-position calculations and keeps the menu attached to
+         the correct filter while the page is scrolling. */
       menu.style.left = "";
       menu.style.top = "";
       menu.style.bottom = "";
       menu.style.width = "";
-      requestAnimationFrame(() => {
-        const rect = widget.getBoundingClientRect();
-        const menuHeight = Math.min(menu.scrollHeight || 320, Math.max(180, window.innerHeight - 40));
-        const spaceBelow = window.innerHeight - rect.bottom - 12;
-        const openUp = menuHeight > 0 && spaceBelow < menuHeight && rect.top > menuHeight + 12;
-        const width = Math.max(rect.width, menu.offsetWidth || 0);
-        const left = Math.min(rect.left, Math.max(8, window.innerWidth - width - 8));
-        menu.style.left = left + "px";
-        menu.style.width = width + "px";
-        if (openUp) {
-          menu.style.top = Math.max(8, rect.top - menuHeight - 8) + "px";
-          menu.style.bottom = "auto";
-        } else {
-          menu.style.top = Math.min(window.innerHeight - menuHeight - 8, rect.bottom + 8) + "px";
-          menu.style.bottom = "auto";
-        }
-      });
     }
     const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
     if (active) active.scrollIntoView({block:"nearest"});
