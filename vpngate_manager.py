@@ -5963,6 +5963,9 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select-label {
       min-width: 0;
       max-width: calc(100% - 24px);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -5972,9 +5975,46 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-option-label {
       min-width: 0;
       flex: 1 1 auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
       overflow-wrap: anywhere;
       word-break: break-word;
       line-height: 1.35;
+    }
+    .toolbar-custom-option-name,
+    .toolbar-custom-selected-count {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .toolbar-custom-selected-count {
+      flex: 0 0 auto;
+      color: var(--text-secondary);
+    }
+    .country-flag-img {
+      width: 28px;
+      height: 20px;
+      min-width: 28px;
+      object-fit: cover;
+      object-position: center;
+      display: inline-block;
+      flex: 0 0 28px;
+      border-radius: 3px;
+      box-shadow: 0 0 0 1px rgba(255,255,255,.12), 0 2px 6px rgba(0,0,0,.22);
+      background: rgba(255,255,255,.08);
+      vertical-align: middle;
+    }
+    .country-flag-fallback {
+      width: 28px;
+      height: 20px;
+      min-width: 28px;
+      display: inline-flex;
+      flex: 0 0 28px;
+      align-items: center;
+      justify-content: center;
+      font-size: 19px;
+      line-height: 1;
     }
     .toolbar-custom-select-arrow {
       color: var(--text-secondary);
@@ -8385,45 +8425,52 @@ function bindUnifiedSelectEvents() {
 
 function syncUnifiedSelect(selectId) { renderUnifiedSelect(selectId); }
 
-function countryFlag(country) {
+const COUNTRY_FLAG_CODES = {
+  "日本":"JP","韩国":"KR","美国":"US","俄罗斯":"RU","中国":"CN","台湾":"TW","香港":"HK","澳门":"MO",
+  "新加坡":"SG","马来西亚":"MY","印度尼西亚":"ID","印度":"IN","菲律宾":"PH","泰国":"TH","越南":"VN",
+  "澳大利亚":"AU","新西兰":"NZ","加拿大":"CA","英国":"GB","法国":"FR","德国":"DE","荷兰":"NL","瑞典":"SE",
+  "挪威":"NO","芬兰":"FI","丹麦":"DK","冰岛":"IS","爱尔兰":"IE","西班牙":"ES","葡萄牙":"PT","意大利":"IT",
+  "瑞士":"CH","比利时":"BE","奥地利":"AT","希腊":"GR","土耳其":"TR","波兰":"PL","捷克":"CZ","斯洛伐克":"SK",
+  "匈牙利":"HU","罗马尼亚":"RO","保加利亚":"BG","克罗地亚":"HR","塞尔维亚":"RS","斯洛文尼亚":"SI","爱沙尼亚":"EE",
+  "拉脱维亚":"LV","立陶宛":"LT","乌克兰":"UA","格鲁吉亚":"GE","哈萨克斯坦":"KZ","亚美尼亚":"AM","阿塞拜疆":"AZ",
+  "吉尔吉斯斯坦":"KG","蒙古":"MN","以色列":"IL","阿联酋":"AE","沙特阿拉伯":"SA","伊朗":"IR","伊拉克":"IQ","卡塔尔":"QA","阿曼":"OM",
+  "埃及":"EG","南非":"ZA","尼日利亚":"NG","肯尼亚":"KE","摩洛哥":"MA","突尼斯":"TN","巴西":"BR","阿根廷":"AR","智利":"CL",
+  "墨西哥":"MX","哥伦比亚":"CO","秘鲁":"PE","厄瓜多尔":"EC","乌拉圭":"UY","巴拿马":"PA","哥斯达黎加":"CR","多米尼加共和国":"DO",
+  "波多黎各":"PR","阿尔巴尼亚":"AL","阿尔及利亚":"DZ","安哥拉":"AO","白俄罗斯":"BY","波斯尼亚和黑塞哥维那":"BA","博茨瓦纳":"BW",
+  "文莱":"BN","喀麦隆":"CM","塞浦路斯":"CY","萨尔瓦多":"SV","埃塞俄比亚":"ET","斐济":"FJ","危地马拉":"GT","海地":"HT","牙买加":"JM",
+  "约旦":"JO","科威特":"KW","黎巴嫩":"LB","利比亚":"LY","列支敦士登":"LI","马耳他":"MT","毛里求斯":"MU","摩尔多瓦":"MD","黑山":"ME",
+  "缅甸":"MM","尼泊尔":"NP","巴基斯坦":"PK","巴拉圭":"PY","马达加斯加":"MG","斯里兰卡":"LK","乌干达":"UG","乌兹别克斯坦":"UZ","津巴布韦":"ZW",
+  "巴哈马":"BS","玻利维亚":"BO","洪都拉斯":"HN","尼加拉瓜":"NI","特立尼达和多巴哥":"TT","圭亚那":"GY","苏里南":"SR","马尔代夫":"MV",
+  "巴勒斯坦":"PS","百慕大":"BM","直布罗陀":"GI","马恩岛":"IM","泽西岛":"JE","根西岛":"GG","新喀里多尼亚":"NC","塞舌尔":"SC",
+  "卢森堡":"LU","毛里塔尼亚":"MR","纳米比亚":"NA","刚果共和国":"CG","刚果民主共和国":"CD","加纳":"GH","坦桑尼亚":"TZ","赞比亚":"ZM",
+  "塞内加尔":"SN","科特迪瓦":"CI","佛得角":"CV","莫桑比克":"MZ","马拉维":"MW","科索沃":"XK"
+};
+
+const COUNTRY_FLAG_ALIASES = {
+  "Korea Republic of":"KR","Republic of Korea":"KR","Korea":"KR","Russian Federation":"RU","Russian":"RU",
+  "Viet Nam":"VN","Vietnam":"VN","United States":"US","United States of America":"US","USA":"US","United Kingdom":"GB","UK":"GB",
+  "Taiwan Province of China":"TW","Czech Republic":"CZ","Czechia":"CZ","Türkiye":"TR","Turkey":"TR","Brunei Darussalam":"BN",
+  "Lao People's Democratic Republic":"LA","Laos":"LA","Côte d'Ivoire":"CI","Ivory Coast":"CI","Eswatini":"SZ","Swaziland":"SZ",
+  "Moldova, Republic of":"MD","Palestine, State of":"PS","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ",
+  "Bolivia, Plurinational State of":"BO","Venezuela, Bolivarian Republic of":"VE","Cabo Verde":"CV","Cape Verde":"CV",
+  "Curacao":"CW","Curaçao":"CW","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK"
+};
+
+function countryFlagCode(country) {
   const raw = String(country || "").trim();
   const name = translateCountry(raw);
-  const flagCodes = {
-    "日本":"JP","韩国":"KR","美国":"US","俄罗斯":"RU","中国":"CN","台湾":"TW","香港":"HK","澳门":"MO",
-    "新加坡":"SG","马来西亚":"MY","印度尼西亚":"ID","印度":"IN","菲律宾":"PH","泰国":"TH","越南":"VN",
-    "澳大利亚":"AU","新西兰":"NZ","加拿大":"CA","英国":"GB","法国":"FR","德国":"DE","荷兰":"NL","瑞典":"SE",
-    "挪威":"NO","芬兰":"FI","丹麦":"DK","冰岛":"IS","爱尔兰":"IE","西班牙":"ES","葡萄牙":"PT","意大利":"IT",
-    "瑞士":"CH","比利时":"BE","奥地利":"AT","希腊":"GR","土耳其":"TR","波兰":"PL","捷克":"CZ","斯洛伐克":"SK",
-    "匈牙利":"HU","罗马尼亚":"RO","保加利亚":"BG","克罗地亚":"HR","塞尔维亚":"RS","斯洛文尼亚":"SI","爱沙尼亚":"EE",
-    "拉脱维亚":"LV","立陶宛":"LT","乌克兰":"UA","格鲁吉亚":"GE","哈萨克斯坦":"KZ","亚美尼亚":"AM","阿塞拜疆":"AZ",
-    "吉尔吉斯斯坦":"KG","蒙古":"MN","以色列":"IL","阿联酋":"AE","沙特阿拉伯":"SA","伊朗":"IR","伊拉克":"IQ","卡塔尔":"QA","阿曼":"OM",
-    "埃及":"EG","南非":"ZA","尼日利亚":"NG","肯尼亚":"KE","摩洛哥":"MA","突尼斯":"TN","巴西":"BR","阿根廷":"AR","智利":"CL",
-    "墨西哥":"MX","哥伦比亚":"CO","秘鲁":"PE","厄瓜多尔":"EC","乌拉圭":"UY","巴拿马":"PA","哥斯达黎加":"CR","多米尼加共和国":"DO",
-    "波多黎各":"PR","阿尔巴尼亚":"AL","阿尔及利亚":"DZ","安哥拉":"AO","白俄罗斯":"BY","波斯尼亚和黑塞哥维那":"BA","博茨瓦纳":"BW",
-    "文莱":"BN","喀麦隆":"CM","塞浦路斯":"CY","萨尔瓦多":"SV","埃塞俄比亚":"ET","斐济":"FJ","危地马拉":"GT","海地":"HT","牙买加":"JM",
-    "约旦":"JO","科威特":"KW","黎巴嫩":"LB","利比亚":"LY","列支敦士登":"LI","马耳他":"MT","毛里求斯":"MU","摩尔多瓦":"MD","黑山":"ME",
-    "缅甸":"MM","尼泊尔":"NP","巴基斯坦":"PK","巴拉圭":"PY","马达加斯加":"MG","斯里兰卡":"LK","乌干达":"UG","乌兹别克斯坦":"UZ","津巴布韦":"ZW",
-    "巴哈马":"BS","玻利维亚":"BO","洪都拉斯":"HN","尼加拉瓜":"NI","特立尼达和多巴哥":"TT","圭亚那":"GY","苏里南":"SR","马尔代夫":"MV",
-    "巴勒斯坦":"PS","百慕大":"BM","直布罗陀":"GI","马恩岛":"IM","泽西岛":"JE","根西岛":"GG","新喀里多尼亚":"NC","塞舌尔":"SC",
-    "卢森堡":"LU","毛里塔尼亚":"MR","纳米比亚":"NA","刚果共和国":"CG","刚果民主共和国":"CD","加纳":"GH","坦桑尼亚":"TZ","赞比亚":"ZM",
-    "塞内加尔":"SN","科特迪瓦":"CI","佛得角":"CV","莫桑比克":"MZ","马拉维":"MW","科索沃":"XK"
-  };
-  if (/^[A-Z]{2}$/.test(flagCodes[name] || "")) {
-    return String.fromCodePoint(...flagCodes[name].split("").map(ch => 127397 + ch.charCodeAt(0)));
-  }
-  const rawAliases = {
-    "Korea Republic of":"KR","Republic of Korea":"KR","Korea":"KR","Russian Federation":"RU","Russian":"RU",
-    "Viet Nam":"VN","Vietnam":"VN","United States":"US","United States of America":"US","USA":"US","United Kingdom":"GB","UK":"GB",
-    "Taiwan Province of China":"TW","Czech Republic":"CZ","Czechia":"CZ","Türkiye":"TR","Turkey":"TR","Brunei Darussalam":"BN",
-    "Lao People's Democratic Republic":"LA","Laos":"LA","Côte d'Ivoire":"CI","Ivory Coast":"CI","Eswatini":"SZ","Swaziland":"SZ",
-    "Moldova, Republic of":"MD","Palestine, State of":"PS","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ",
-    "Bolivia, Plurinational State of":"BO","Venezuela, Bolivarian Republic of":"VE","Cabo Verde":"CV","Cape Verde":"CV",
-    "Curacao":"CW","Curaçao":"CW","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK"
-  };
-  const code = rawAliases[raw] || rawAliases[name] || "";
-  return /^[A-Z]{2}$/.test(code)
-    ? String.fromCodePoint(...code.split("").map(ch => 127397 + ch.charCodeAt(0)))
-    : "🌐";
+  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
+  return COUNTRY_FLAG_CODES[name] || COUNTRY_FLAG_ALIASES[raw] || COUNTRY_FLAG_ALIASES[name] || "";
+}
+
+function countryFlag(country, title = "", loading = "lazy") {
+  const code = countryFlagCode(country);
+  if (!code) return '<span class="country-flag-fallback" aria-hidden="true">🌐</span>';
+  const safeCode = code.toLowerCase();
+  const label = esc(title || translateCountry(country) || country || "");
+  const safeLoading = loading === "eager" ? "eager" : "lazy";
+  return '<img class="country-flag-img" src="https://flagcdn.com/24x18/' + safeCode + '.png" alt="" title="' + label + '" width="24" height="18" loading="' + safeLoading + '" decoding="async" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline-flex\';">' +
+    '<span class="country-flag-fallback" aria-hidden="true" style="display:none;">🌐</span>';
 }
 
 function renderCustomFilter(selectId, withCount = false) {
@@ -8444,10 +8491,13 @@ function renderCustomFilter(selectId, withCount = false) {
   const selectedParts = withCount ? String(nextRawLabel).split(" · ") : [String(nextRawLabel)];
   const selectedName = selectedParts.shift() || nextRawLabel;
   const selectedCount = selectedParts.join(" · ");
+  const selectedFlag = withCount
+    ? (String(select.value || "") ? countryFlag(select.value, selectedName, "eager") : countryFlag(""))
+    : "";
   const selectedDisplay = withCount
-    ? ((String(select.value || "") ? countryFlag(select.value) + " " : "🌐 ") + selectedName + (selectedCount ? " · " + selectedCount : ""))
-    : nextRawLabel;
-  if (label.textContent !== selectedDisplay) label.textContent = selectedDisplay;
+    ? selectedFlag + '<span class="toolbar-custom-option-name">' + esc(selectedName) + '</span>' + (selectedCount ? '<span class="toolbar-custom-selected-count">· ' + esc(selectedCount) + '</span>' : '')
+    : esc(nextRawLabel);
+  if (label.innerHTML !== selectedDisplay) label.innerHTML = selectedDisplay;
 
   const html = Array.from(select.options).map(option => {
     const value = String(option.value || "");
@@ -8456,14 +8506,14 @@ function renderCustomFilter(selectId, withCount = false) {
     const parts = withCount ? textValue.split(" · ") : [textValue];
     const name = parts.shift() || textValue;
     const count = parts.join(" · ");
-    const displayName = withCount
-      ? ((value ? countryFlag(value) + " " : "🌐 ") + name)
-      : name;
+    const flagMarkup = withCount ? (value ? countryFlag(value, name, "lazy") : countryFlag("")) : "";
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') +
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
       '" data-filter-option="1" data-filter-value="' + esc(value) + '"' +
       ' onclick="event.preventDefault();event.stopPropagation();chooseCustomFilter(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
-      '<span class="toolbar-custom-option-label">' + esc(displayName) + '</span>' +
+      '<span class="toolbar-custom-option-label">' +
+      flagMarkup + '<span class="toolbar-custom-option-name">' + esc(name) + '</span>' +
+      '</span>' +
       (count ? '<span class="toolbar-custom-option-count">' + esc(count) + '</span>' : '') +
       '</button>';
   }).join("");
@@ -8781,7 +8831,7 @@ function render(){
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
               <span>协议: <strong>${esc(protocolName)}</strong></span>
-              <span style="margin-left: 12px;">物理位置: <strong>${esc(ep.location || translateCountry(ep.country || "-"))}</strong></span>
+              <span class="active-location-meta">物理位置: <strong><span class="active-location-with-flag">${countryFlag(ep.country || ep.location || "-", ep.location || translateCountry(ep.country || "-"), "eager")}<span>${esc(ep.location || translateCountry(ep.country || "-"))}</span></span></strong></span>
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(ep.owner || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(ep.ip_type))}</strong></span>
@@ -8798,6 +8848,7 @@ function render(){
     const latencyClass = getLatencyClass(activeLatencyValue);
     const latencyText = activeLatencyValue ? `<span class="latency-val ${latencyClass}">${activeLatencyValue} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
+    const displayLocationFlag = countryFlag(activeNode.country || displayLocation, displayLocation, "eager");
     const clientBadge = state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证");
     const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
     activeCardContainer.innerHTML = `
@@ -8816,7 +8867,7 @@ function render(){
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
               <span>协议: <strong>${esc(translateProtocol(activeNode.protocol || "openvpn"))}</strong></span>
-              <span style="margin-left: 12px;">物理位置: <strong>${esc(displayLocation)}</strong></span>
+              <span class="active-location-meta">物理位置: <strong><span class="active-location-with-flag">${displayLocationFlag}<span>${esc(displayLocation)}</span></span></strong></span>
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
@@ -9011,6 +9062,7 @@ function render(){
       const latencyClass = getLatencyClass(rowLatencyValue);
       const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}">${rowLatencyValue} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
+      const displayLocationFlag = countryFlag(n.country || displayLocation, displayLocation, "lazy");
       const protocolName = translateProtocol(n.protocol || "openvpn");
       const nodeHost = n.ip || n.remote_host || "-";
       const nodePort = Number(n.remote_port || 0) > 0 ? ":" + String(n.remote_port) : "";
@@ -9056,7 +9108,7 @@ function render(){
         <td class="node-protocol-cell">${renderProtocolCell(n)}</td>
         <td class="node-address-cell" title="${esc(nodeAddress)}"><div class="node-cell-ellipsis mono">${esc(nodeAddress)}</div></td>
         <td style="white-space:nowrap;text-align:center;">${latencyText}</td>
-        <td title="${esc(displayLocation)}"><div class="node-cell-ellipsis">${esc(displayLocation)}</div></td>
+        <td title="${esc(displayLocation)}"><div class="node-location-cell">${displayLocationFlag}<span class="node-cell-ellipsis">${esc(displayLocation)}</span></div></td>
         <td title="${esc(n.owner||n.as_name||"-")}"><div class="node-cell-ellipsis">${esc(n.owner||n.as_name||"-")}</div></td>
         <td title="${esc(translateIpType(n.ip_type))}"><div class="node-cell-ellipsis">${esc(translateIpType(n.ip_type))}</div></td>
         <td>
