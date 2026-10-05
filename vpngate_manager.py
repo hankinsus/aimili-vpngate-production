@@ -9514,13 +9514,20 @@ function updateStatusFilterOptions() {
   ));
   const total = Number(counts.available || 0) + Number(counts.testing || 0) +
     Number(counts.not_checked || 0) + Number(counts.unavailable || 0);
+  const countsReady = counts && Object.keys(counts).length > 0 && !filterCountsLoading;
+  const shownTotal = countsReady ? total : "加载中";
+  const shownAvailable = countsReady ? Number(counts.available || 0) : "加载中";
+  const shownConnected = countsReady ? connected : "加载中";
+  const shownNotChecked = countsReady ? Number(counts.not_checked || 0) : "加载中";
+  const shownTesting = countsReady ? Number(counts.testing || 0) : "加载中";
+  const shownUnavailable = countsReady ? Number(counts.unavailable || 0) : "加载中";
   const labels = {
-    all: `全部节点 · ${total}`,
-    available: `可用节点 · ${Number(counts.available || 0)}`,
-    connected: `已连接 · ${connected}`,
-    not_checked: `待检测 · ${Number(counts.not_checked || 0)}`,
-    testing: `检测中 · ${Number(counts.testing || 0)}`,
-    unavailable: `失效节点 · ${Number(counts.unavailable || 0)}`
+    all: `全部节点 · ${shownTotal}`,
+    available: `可用节点 · ${shownAvailable}`,
+    connected: `已连接 · ${shownConnected}`,
+    not_checked: `待检测 · ${shownNotChecked}`,
+    testing: `检测中 · ${shownTesting}`,
+    unavailable: `失效节点 · ${shownUnavailable}`
   };
   Array.from(select.options).forEach(option => {
     const next = labels[option.value];
@@ -9738,10 +9745,14 @@ function updateCountryFilter() {
     if(country && !merged.has(country)) merged.set(country,{ip_count:0,server_count:0});
   });
 
-  const countries = Array.from(merged.entries()).sort((a,b) => {
-    const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
-    return diff || a[0].localeCompare(b[0], "zh-CN");
-  });
+  // Zero-IP countries never trigger a node-data request and are not rendered
+  // into the filter menu. The global registry remains the authoritative universe.
+  const countries = Array.from(merged.entries())
+    .filter(([, item]) => Number(item?.ip_count || 0) > 0)
+    .sort((a,b) => {
+      const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
+      return diff || a[0].localeCompare(b[0], "zh-CN");
+    });
 
   const total = Number(catalog.total_ip_count || 0);
   const globalLabel = "全球国家 · " + total + " IP";
@@ -10150,11 +10161,11 @@ function render(){
   // a false "no matching nodes" result.
   if (currentPageNodes.length === 0) {
     const hasServerInventory = Number(totalNodeCount || 0) > 0;
-    const resourceLoading = hasServerInventory && (nodes.length === 0 || nodeCacheBuilding || state.global_pool_refresh_running);
+    const resourceLoading = !!nodeListLoading || (hasServerInventory && (nodes.length === 0 || nodeCacheBuilding || state.global_pool_refresh_running));
     const emptyText = resourceLoading
-      ? `<span class="badge not_checked"><span class="badge-pulse"></span>资源获取中</span><div style="margin-top:8px;">已发现 ${Number(totalNodeCount || 0)} 个资源记录，正在从 Master Pool 获取节点详情，请稍候……</div>`
+      ? `<span class="badge not_checked"><span class="badge-pulse"></span>资源加载中</span><div style="margin-top:8px;">正在读取当前筛选范围的节点资源，请稍候……</div>`
       : "未找到符合过滤条件的备选节点。";
-    $("rows").innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyText}</td></tr>`;
+    $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyText}</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
       if (!n) return '';
@@ -10240,7 +10251,7 @@ function render(){
   // Render pagination controls
   $("page_start").textContent = totalNodeCount > 0 && shown.length > 0 ? startIndex + 1 : 0;
   $("page_end").textContent = endIndex;
-  $("filtered_count").textContent = totalNodeCount;
+  $("filtered_count").textContent = nodeListLoading ? "加载中" : totalNodeCount;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
   const poolSummary = $("pool_summary");
@@ -10503,9 +10514,9 @@ function updateNodeLoadProgress(done, total, finished = false) {
 
 async function loadScopedNodes(country, generation) {
   const myGeneration = generation;
+  nodeListLoading = true;
   nodes = [];
   currentPage = 1;
-  totalNodeCount = 0;
   nodeCacheBuilding = false;
   activeCountryScope = String(country || "").trim();
 
@@ -10514,6 +10525,7 @@ async function loadScopedNodes(country, generation) {
   if (myGeneration !== scopeLoadGeneration) return;
 
   totalNodeCount = Number(first?.total || 0);
+  nodeListLoading = false;
   nodeCacheBuilding = !!first?.cache_building;
   const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
   if (firstNodes.length) mergeLoadedNodePage(firstNodes);
@@ -10538,6 +10550,7 @@ async function loadServerPage(page) {
 
   const generation = ++scopeLoadGeneration;
   pageLoadBusy = true;
+  nodeListLoading = true;
   currentPage = targetPage;
   nodes = [];
   render();
@@ -10549,12 +10562,14 @@ async function loadServerPage(page) {
     if (generation !== scopeLoadGeneration) return;
     totalNodeCount = Number(data?.total || totalNodeCount || 0);
     nodeCacheBuilding = !!data?.cache_building;
+    nodeListLoading = false;
     const pageNodes = Array.isArray(data?.nodes) ? data.nodes : [];
     mergeLoadedNodePage(pageNodes);
     updateNodeLoadProgress(pageNodes.length, totalNodeCount, true);
     render();
   } catch (e) {
     if (generation !== scopeLoadGeneration) return;
+    nodeListLoading = false;
     console.warn("分页节点读取失败", e);
     updateNodeLoadProgress(0, totalNodeCount, true);
     render();
@@ -10567,8 +10582,8 @@ async function loadScope(country, {preserveState = true} = {}) {
   const generation = ++scopeLoadGeneration;
   const scope = String(country || "").trim();
   activeCountryScope = scope;
+  nodeListLoading = true;
   nodes = [];
-  totalNodeCount = 0;
   currentPage = 1;
 
   if (!preserveState) {
@@ -10580,9 +10595,27 @@ async function loadScope(country, {preserveState = true} = {}) {
 
   render();
   try {
+    // A country with zero inventory is a terminal empty scope: do not issue a
+    // node-data request just to rediscover that it has no IPs.
+    if (scope && countryCatalogData && countryCatalogKey === currentFilterKey()) {
+      const selected = Object.entries(countryCatalogData.countries || {}).find(([rawCountry]) => {
+        const a = translateCountry(rawCountry) || rawCountry;
+        const b = translateCountry(scope) || scope;
+        return a === scope || b === rawCountry || a === b;
+      });
+      const ipCount = Number(selected?.[1]?.ip_count || 0);
+      if (!selected || ipCount <= 0) {
+        totalNodeCount = 0;
+        nodeListLoading = false;
+        updateNodeLoadProgress(0, 0, true);
+        render();
+        return;
+      }
+    }
     await loadScopedNodes(scope, generation);
   } catch (e) {
     if (generation !== scopeLoadGeneration) return;
+    nodeListLoading = false;
     console.warn("按范围加载节点失败", e);
     updateNodeLoadProgress(nodes.length, totalNodeCount, true);
     render();
@@ -10600,7 +10633,9 @@ async function load(){
     console.warn("状态读取失败，继续尝试读取节点范围", e);
   }
   if (generation !== scopeLoadGeneration) return;
+  nodeListLoading = true;
   render();
+  refreshFilterCounts();
 
   // Phase 2: country catalog is independent and must never block the first page.
   const catalogPromise = refreshCountryCatalog(false).catch(e => {
@@ -10633,6 +10668,7 @@ async function load(){
     await loadScopedNodes(serverCountry, generation);
   } catch (e) {
     if (generation !== scopeLoadGeneration) return;
+    nodeListLoading = false;
     console.warn("首屏节点范围读取失败", e);
     updateNodeLoadProgress(nodes.length, totalNodeCount, true);
     render();
@@ -11167,8 +11203,13 @@ async function loadLegacy(){
   startBackendStatePolling();
 }
 let filterCountsRequestSeq = 0;
+let filterCountsLoading = true;
+let nodeListLoading = false;
 async function refreshFilterCounts() {
   const seq = ++filterCountsRequestSeq;
+  filterCountsLoading = true;
+  updateStatusFilterOptions();
+  renderCustomFilter("status_filter");
   const params = new URLSearchParams();
   const country = String($("country_filter")?.value || "").trim();
   const protocol = String($("protocol_filter")?.value || "").trim();
@@ -11183,27 +11224,31 @@ async function refreshFilterCounts() {
     if (seq !== filterCountsRequestSeq) return;
     if (data?.status_counts) state.status_counts = data.status_counts;
     state.connected_count = Number(data?.connected_count || 0);
+    filterCountsLoading = false;
     updateStatusFilterOptions();
     renderCustomFilter("status_filter");
   } catch (_) {
+    if (seq !== filterCountsRequestSeq) return;
+    filterCountsLoading = false;
     // Keep the last known counts; node filtering itself remains server-side.
+    updateStatusFilterOptions();
+    renderCustomFilter("status_filter");
   }
 }
 
 async function applyNodeFilterChange() {
   currentPage = 1;
-  refreshFilterCounts();
-
-  // Filters are independent dimensions. The currently selected country is
-  // only a scope; when it is "全球国家" (empty), keep the query global.
-  // IMPORTANT: do not wait for the country catalog here. The catalog is a
-  // secondary display/index request and must never block node data.
+  const countsPromise = refreshFilterCounts();
+  // The country catalog is a lightweight index query. Wait for it before
+  // loading a selected country so a zero-IP country never triggers node data.
+  const catalogPromise = refreshCountryCatalog(false);
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
 
-  refreshCountryCatalog(false).catch(e => {
+  await catalogPromise.catch(e => {
     console.warn("筛选后的国家目录读取失败", e);
   });
+  countsPromise.catch(() => {});
 
   // Immediately query the Master Pool with the selected filter(s). This lets
   // "移动网 / 住宅IP / 机房IP" work directly while country remains global.
@@ -11214,17 +11259,22 @@ $("country_filter").onchange=async()=>{
   const country = String($("country_filter").value || "").trim();
   activeCountryScope = country;
   currentPage = 1;
-  refreshFilterCounts();
+  const countsPromise = refreshFilterCounts();
+  const catalogPromise = refreshCountryCatalog(false);
 
   // Empty country is the explicit “全球国家” action and is the only path
   // allowed to request the complete global node list.
   if (!country) {
+    await catalogPromise.catch(() => {});
+    countsPromise.catch(() => {});
     await loadScope("", {preserveState:true});
     return;
   }
 
-  // Country selection loads that country only; priority probing is started
-  // after its rows are visible instead of blocking the dropdown itself.
+  // Country selection loads that country only; zero-IP countries are
+  // rejected before the node-data endpoint is called.
+  await catalogPromise.catch(() => {});
+  countsPromise.catch(() => {});
   await loadScope(country, {preserveState:true});
   prioritizeCountry(country);
 };
