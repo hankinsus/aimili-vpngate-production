@@ -27,7 +27,9 @@ DNS_CACHE_TTL_SECONDS = 60.0
 DNS_NEGATIVE_TTL_SECONDS = 5.0
 DNS_CACHE: dict[str, tuple[float, str | None]] = {}
 DNS_CACHE_LOCK = threading.Lock()
-PROXY_SOCKET_BUFFER_BYTES = 131072
+PROXY_SOCKET_BUFFER_BYTES = 262144
+PROXY_UDP_ASSOCIATION_IDLE_SECONDS = 600
+PROXY_UDP_MAX_PACKET_BYTES = 65535
 
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else Path(__file__).resolve().parent / "vpngate_data"
 ACTIVE_IFACE_FILE = DATA_DIR / "active_iface.txt"
@@ -148,6 +150,151 @@ def check_credentials(username: str | None, password: str | None) -> bool:
     if expected_user is None or expected_pass is None:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
+
+def _socks5_pack_udp(destination: tuple[str, int], payload: bytes) -> bytes:
+    host, port = destination
+    try:
+        ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv4Address):
+            addr = b"\x01" + ip.packed
+        else:
+            addr = b"\x04" + ip.packed
+    except ValueError:
+        raw = host.encode("idna")
+        if len(raw) > 255:
+            raise ValueError("UDP destination hostname too long")
+        addr = b"\x03" + bytes([len(raw)]) + raw
+    return b"\x00\x00\x00" + addr + int(port).to_bytes(2, "big") + payload
+
+
+def _socks5_unpack_udp(packet: bytes) -> tuple[str, int, bytes] | None:
+    if len(packet) < 4 or packet[0:2] != b"\x00\x00" or packet[2] != 0:
+        return None
+    offset = 4
+    atyp = packet[3]
+    try:
+        if atyp == 1:
+            if len(packet) < offset + 4 + 2:
+                return None
+            host = socket.inet_ntoa(packet[offset:offset + 4])
+            offset += 4
+        elif atyp == 3:
+            if len(packet) < offset + 1:
+                return None
+            size = packet[offset]
+            offset += 1
+            if len(packet) < offset + size + 2:
+                return None
+            host = packet[offset:offset + size].decode("idna")
+            offset += size
+        elif atyp == 4:
+            if len(packet) < offset + 16 + 2:
+                return None
+            host = socket.inet_ntop(socket.AF_INET6, packet[offset:offset + 16])
+            offset += 16
+        else:
+            return None
+        port = int.from_bytes(packet[offset:offset + 2], "big")
+        payload = packet[offset + 2:]
+        if not payload:
+            return None
+        return host, port, payload
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]) -> None:
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    upstream = None
+    client_ip = control_address[0]
+    last_activity = time.monotonic()
+    try:
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, PROXY_SOCKET_BUFFER_BYTES)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, PROXY_SOCKET_BUFFER_BYTES)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
+        udp.bind(("127.0.0.1", 0))
+        bind_port = int(udp.getsockname()[1])
+        client.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + bind_port.to_bytes(2, "big"))
+        udp.setblocking(False)
+        client.setblocking(False)
+        while time.monotonic() - last_activity < PROXY_UDP_ASSOCIATION_IDLE_SECONDS:
+            readable, _, errored = select.select([client, udp], [], [client, udp], 5)
+            if errored:
+                return
+            if not readable:
+                continue
+            for source in readable:
+                if source is client:
+                    try:
+                        data = client.recv(1)
+                    except BlockingIOError:
+                        data = b""
+                    if not data:
+                        return
+                    # The SOCKS5 control connection normally carries no more
+                    # data after UDP ASSOCIATE; any data means the client is
+                    # still alive, so simply refresh the association timer.
+                    last_activity = time.monotonic()
+                    continue
+                try:
+                    packet, peer = udp.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
+                except BlockingIOError:
+                    continue
+                if peer[0] != client_ip and not (
+                    client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and peer[0] == "127.0.0.1"
+                ):
+                    continue
+                decoded = _socks5_unpack_udp(packet)
+                if not decoded:
+                    continue
+                host, port, payload = decoded
+                resolved = resolve_dns_over_active_tunnel(host)
+                if not resolved:
+                    try:
+                        resolved = socket.gethostbyname(host)
+                    except OSError:
+                        continue
+                destination = (resolved, port)
+                if upstream is None:
+                    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, PROXY_SOCKET_BUFFER_BYTES)
+                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, PROXY_SOCKET_BUFFER_BYTES)
+                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
+                    upstream.bind(("0.0.0.0", 0))
+                    upstream.setblocking(False)
+                upstream.sendto(payload, destination)
+                last_activity = time.monotonic()
+                # Drain one response immediately when available. The outer
+                # select loop will handle subsequent responses.
+                try:
+                    response, source_addr = upstream.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
+                    udp.sendto(_socks5_pack_udp(source_addr, response), peer)
+                except BlockingIOError:
+                    pass
+            if upstream is not None:
+                try:
+                    while True:
+                        response, source_addr = upstream.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
+                        udp.sendto(_socks5_pack_udp(source_addr, response), (client_ip, peer[1]))
+                        last_activity = time.monotonic()
+                except BlockingIOError:
+                    pass
+    except Exception as exc:
+        print(f"[SOCKS5 UDP] UDP ASSOCIATE 失败: {exc}", flush=True)
+    finally:
+        try:
+            udp.close()
+        except Exception:
+            pass
+        if upstream is not None:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
 
 def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
     import random
@@ -374,7 +521,13 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         else:
             client.sendall(b"\x05\x00")
         version, command, _, address_type = recv_exact(client, 4)
-        if version != 5 or command != 1:
+        if version != 5:
+            client.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
+        if command == 3:  # UDP ASSOCIATE (RFC 1928)
+            socks5_udp_associate(client, ("127.0.0.1", client.getpeername()[1]))
+            return
+        if command != 1:
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         if address_type == 1:
@@ -529,8 +682,8 @@ def start_proxy_server(host: str, port: int) -> None:
                 pass
         _tune_socket(server)
         server.bind((host, port))
-        server.listen(1024)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
+        server.listen(256)
+        print(f"HTTP/SOCKS5 proxy listening on {host}:{port} (SOCKS5 TCP + UDP ASSOCIATE)", flush=True)
     except Exception as e:
         if server is not None:
             try:
