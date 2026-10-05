@@ -9187,7 +9187,7 @@ function renderProtocolCell(n) {
   return `<a class="protocol-badge protocol-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="打开 VPN Gate ${esc(label)} 官方连接页面">${esc(label)}</a>`;
 }
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
-function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
+function speed(v){return v?`${(Number(v)/1000000).toFixed(1)} Mbps`:"-"}
 
 const translateQuality = q => {
   const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
