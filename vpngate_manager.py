@@ -131,13 +131,13 @@ COUNTRY_AVAILABLE_MIN = env_int("COUNTRY_AVAILABLE_MIN", 5, 1, 10)
 COUNTRY_AVAILABLE_TARGET = env_int("COUNTRY_AVAILABLE_TARGET", 10, 5, 10)
 COUNTRY_PRIORITY_BATCH = env_int("COUNTRY_PRIORITY_BATCH", 5, 1, 10)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
-BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 24, 5, 100)
-ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 6, 1, 30)
-PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 5, 1, 20)
+BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 8, 2, 50)
+ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 2, 1, 12)
+PROTOCOL_PROBE_BATCH = env_int("PROTOCOL_PROBE_BATCH", 2, 1, 10)
 PROTOCOL_PROBE_INTERVAL_SECONDS = env_int("PROTOCOL_PROBE_INTERVAL_SECONDS", 300, 60, 3600)
 # Scheduler tick only. Actual Peer synchronization uses each Peer’s hour/day/week interval.
 RESOURCE_SHARE_SYNC_INTERVAL_SECONDS = env_int("RESOURCE_SHARE_SYNC_INTERVAL_SECONDS", 300, 60, 3600)
-PROXY_HEALTH_INTERVAL_SECONDS = env_int("PROXY_HEALTH_INTERVAL_SECONDS", 15, 5, 120)
+PROXY_HEALTH_INTERVAL_SECONDS = env_int("PROXY_HEALTH_INTERVAL_SECONDS", 20, 10, 120)
 PROXY_HEALTH_CONFIRM_DELAY_SECONDS = env_int("PROXY_HEALTH_CONFIRM_DELAY_SECONDS", 2, 1, 10)
 HOT_POOL_TARGET = env_int("HOT_POOL_TARGET", 8, 5, 10)
 LINK_PROBE_MAX_BYTES = env_int("LINK_PROBE_MAX_BYTES", 1048576, 65536, 4194304)
@@ -162,13 +162,13 @@ DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
 ENABLE_COLLECTOR_LOOP = env_flag("ENABLE_COLLECTOR_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROXY_HEALTH_LOOP = env_flag("ENABLE_PROXY_HEALTH_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_FAST_LIVENESS_LOOP = env_flag("ENABLE_FAST_LIVENESS_LOOP", not DISABLE_BACKGROUND_LOOPS)
-FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 2, 1, 10)
+FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 5, 2, 15)
 ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.10"
+APP_VERSION = "V1.0.11"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -940,6 +940,7 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
+    # UI endpoints only expose backend state; they never initiate VPN actions.
 
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -15050,9 +15051,9 @@ def main() -> None:
             "local_proxy": f"socks5://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",
-            "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
-            "is_connecting": True,
-            "active_node_latency": "正在准备",
+            "last_check_message": "服务已启动；后台连接状态由实际 VPN 隧道决定。",
+            "is_connecting": False,
+            "active_node_latency": "等待后台状态",
             "blacklisted_nodes": 0,
             "isolated_instance": ISOLATED_INSTANCE,
             "background_loops_disabled": DISABLE_BACKGROUND_LOOPS,
