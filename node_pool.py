@@ -1117,7 +1117,10 @@ class NodePool:
         ip_type = str(ip_type or "").strip().lower()
         offset = max(0, int(offset or 0))
         limit = max(1, min(int(limit or 100), 200))
-        where = ["TRIM(COALESCE(s.country, '')) <> '', "TRIM(COALESCE(s.current_ip, '')) <> ''"]
+        where = [
+            "TRIM(COALESCE(s.country, '')) <> ''",
+            "TRIM(COALESCE(s.current_ip, '')) <> ''",
+        ]
         params: list[Any] = []
         if country:
             variants = {country}
@@ -1138,7 +1141,7 @@ class NodePool:
             where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
             params.append(ip_type)
         base = "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
-        with self.lock, closing(self._connect()) as db:
+        with closing(self._connect()) as db:
             total = int(db.execute("SELECT COUNT(*) " + base, params).fetchone()[0] or 0)
             rows = db.execute(
                 """
@@ -1194,7 +1197,7 @@ class NodePool:
             params.append(ip_type)
 
         base = " FROM servers s WHERE " + " AND ".join(where)
-        with self.lock, closing(self._connect()) as db:
+        with closing(self._connect()) as db:
             rows = db.execute(
                 "SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, COUNT(DISTINCT s.server_key) AS server_count" + base + " GROUP BY s.country",
                 params,
@@ -1226,7 +1229,7 @@ class NodePool:
         cached = self._stats_cache
         if cached and cached[0] > now:
             return dict(cached[1])
-        with self.lock, closing(self._connect()) as db:
+        with closing(self._connect()) as db:
             servers = int(db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"] or 0)
             endpoints = int(db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"] or 0)
             states = {
