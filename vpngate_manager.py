@@ -7057,13 +7057,6 @@ INDEX_HTML = r"""<!doctype html>
       letter-spacing: -.2px;
       overflow-wrap: anywhere;
     }
-    .footer-brand-version-number {
-      color: rgba(154,163,177,.88);
-      font-size: 11.5px;
-      font-weight: 520;
-      letter-spacing: 0;
-      white-space: nowrap;
-    }
     .footer-channels {
       display: flex;
       flex-wrap: wrap;
@@ -9695,7 +9688,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number" id="footer_brand_version">· {APP_VERSION}</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span></span>
           </span>
         </div>
       </div>
@@ -12171,8 +12164,6 @@ async function loadGithubCurrentVersion() {
     const versionLabel = String(result.current_version || "未知");
     const el = $("github_current_version");
     if (el) el.textContent = versionLabel;
-    const footer = $("footer_brand_version");
-    if (footer && /^V\\d+\\.\\d+(?:\\.\\d+)?$/i.test(versionLabel)) footer.textContent = "· " + versionLabel;
   } catch (e) {
     const el = $("github_current_version");
     if (el) el.textContent = "未知";
