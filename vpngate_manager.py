@@ -3997,7 +3997,8 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 manual_connection_active = False
             manual_connection_lock.release()
             manual_guard = False
-            raise    with lock:
+            raise
+    with lock:
         if is_connecting and not manual:
             if manual_guard:
                 manual_connection_active = False
@@ -7996,7 +7997,8 @@ INDEX_HTML = r"""<!doctype html>
     </select>
     <div id="status_filter_widget" class="toolbar-custom-select" data-filter-id="status_filter" aria-label="状态筛选">
       <button id="status_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
-        <span id="status_filter_label" class="toolbar-custom-select-label">全部节点</span>        <span class="toolbar-custom-select-arrow">⌄</span>
+        <span id="status_filter_label" class="toolbar-custom-select-label">全部节点</span>
+        <span class="toolbar-custom-select-arrow">⌄</span>
       </button>
       <div id="status_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
     </div>
@@ -11996,6 +11998,7 @@ async function joinResourcePeer() {
 function editResourceRelationship(relationId) {
   openResourceShareEditModal("relationship", relationId);
 }
+
 async function deleteResourceRelationship(peerIds) {
   const ids = Array.isArray(peerIds) ? peerIds.filter(Boolean) : [String(peerIds || "")].filter(Boolean);
   if (!ids.length) return;
