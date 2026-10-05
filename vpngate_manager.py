@@ -144,6 +144,7 @@ COUNTRY_FULL_SWEEP_IDLE_CONCURRENCY = env_int("COUNTRY_FULL_SWEEP_IDLE_CONCURREN
 COUNTRY_FULL_SWEEP_REUSE_SECONDS = env_int("COUNTRY_FULL_SWEEP_REUSE_SECONDS", 6 * 3600, 300, 7 * 24 * 3600)
 SPEED_TEST_BYTES = env_int("SPEED_TEST_BYTES", 524288, 131072, 1048576)
 SPEED_TEST_TIMEOUT_SECONDS = env_int("SPEED_TEST_TIMEOUT_SECONDS", 8, 4, 15)
+SPEED_TEST_REUSE_SECONDS = env_int("SPEED_TEST_REUSE_SECONDS", 24 * 3600, 3600, 7 * 24 * 3600)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 8, 2, 50)
 ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 2, 1, 12)
@@ -3800,7 +3801,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             latency = _openvpn_elapsed_ms(message)
             speed_table = _acquire_probe_route_table()
             speed_result = (
-                measure_interface_speed(f"tun{idx}", table=speed_table)
+                measure_or_reuse_ip_speed(f"tun{idx}", speed_endpoint_id, table=speed_table)
                 if speed_table is not None
                 else {"ok": False, "speed_bps": 0, "error": "无可用测速策略路由表"}
             )
@@ -3930,7 +3931,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 latency = _openvpn_elapsed_ms(message)
                 speed_table = _acquire_probe_route_table()
                 speed_result = (
-                    measure_interface_speed(dev_name, table=speed_table)
+                    measure_or_reuse_ip_speed(dev_name, speed_endpoint_id, table=speed_table)
                     if speed_table is not None
                     else {"ok": False, "speed_bps": 0, "error": "无可用测速策略路由表"}
                 )
@@ -4686,7 +4687,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             return {"ok": False, "protocol": protocol, "interface": result.interface, "error": message}
 
         latency_ms = parse_int(egress.get("latency_ms"))
-        speed_result = measure_interface_speed(result.interface, gateway=result.gateway or "", table=probe_table)
+        speed_result = measure_or_reuse_ip_speed(result.interface, endpoint_id, gateway=result.gateway or "", table=probe_table)
         speed_bps = int(speed_result.get("speed_bps") or 0)
         probe_message = "background egress probe ok"
         if speed_result.get("ok"):
@@ -6737,17 +6738,17 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-select {
       position: relative;
-      width: 200px;
-      height: 46px;
+      width: 164px;
+      height: 42px;
       flex: 0 0 auto;
       z-index: 100;
       overflow: visible !important;
     }
     .toolbar-custom-select[data-filter-id="country_filter"] {
-      width: min(270px, 42vw);
+      width: min(220px, 42vw);
     }
-    .toolbar-custom-select[data-filter-id="country_filter"] {
-      width: min(270px, 42vw);
+    .toolbar-custom-select[data-filter-id="speed_filter"] {
+      width: 156px;
     }
     .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
     .unified-select-full { width: 100%; height: 40px; }
@@ -7156,7 +7157,18 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .node-address-cell .mono {
-      font-size: 13px;
+      font-size: 12.5px;
+    }
+    .node-speed-val {
+      font-weight: 650;
+      color: var(--text-primary);
+    }
+    @media (min-width: 1101px) {
+      .toolbar { padding: 10px 12px; }
+      .toolbar-custom-select { width: 164px; }
+      .toolbar-custom-select[data-filter-id="country_filter"] { width: 220px; }
+      .toolbar-custom-select[data-filter-id="speed_filter"] { width: 156px; }
+      .toolbar > #btn_favorites { margin-left: auto !important; flex: 0 0 auto; }
     }
 
     .node-table td:nth-child(5),
@@ -8451,13 +8463,14 @@ INDEX_HTML = r"""<!doctype html>
         <thead>
           <tr>
             <th style="width: 8%;">状态</th>
-            <th style="width: 10%;">协议</th>
-            <th style="width: 17%;">IP 地址 : 端口</th>
+            <th style="width: 9%;">协议</th>
+            <th style="width: 18%;">IP 地址 : 端口</th>
             <th style="width: 7%;">延迟</th>
-            <th style="width: 19%;">物理位置</th>
-            <th style="width: 16%;">运营主体 / ISP</th>
-            <th style="width: 10%;">IP 类型</th>
-            <th style="width: 13%;">操作</th>
+            <th style="width: 8%;">速度</th>
+            <th style="width: 16%;">物理位置</th>
+            <th style="width: 14%;">运营主体 / ISP</th>
+            <th style="width: 8%;">IP 类型</th>
+            <th style="width: 12%;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -9204,6 +9217,8 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedIpType === "hosting" && ipType !== "hosting") return false;
   if (selectedIpType === "mobile" && ipType !== "mobile") return false;
 
+  if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) < selectedSpeed) return false;
+
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
   if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
   if (selectedStatus === "testing" && n.probe_status !== "testing") return false;
@@ -9467,6 +9482,7 @@ function renderAllCustomFilters() {
   renderCustomCountryFilter();
   renderCustomFilter("protocol_filter");
   renderCustomFilter("ip_type_filter");
+  renderCustomFilter("speed_filter");
 }
 
 function closeCustomFilters(exceptId = "") {
@@ -9626,11 +9642,12 @@ async function refreshCountryCatalog(force = false) {
     return countryCatalogData;
   }
   if (countryCatalogPromise) return countryCatalogPromise;
-  const [status, protocol, ipType] = key.split("|");
+  const [status, protocol, ipType, speedMinBps] = key.split("|");
   const params = new URLSearchParams();
   if (status) params.set("status", status);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
+  if (speedMinBps && Number(speedMinBps) > 0) params.set("speed_min_bps", speedMinBps);
 
   countryCatalogPromise = fetchJsonWithTimeout("./api/ui/country_catalog" + (params.toString() ? "?" + params.toString() : ""), {}, 8000)
     .then(data => {
@@ -10151,6 +10168,7 @@ function render(){
         <td class="node-protocol-cell">${renderProtocolCell(n)}</td>
         <td class="node-address-cell" title="${esc(nodeAddress)}"><div class="node-cell-ellipsis mono">${esc(nodeAddress)}</div></td>
         <td style="white-space:nowrap;text-align:center;">${latencyText}</td>
+        <td style="white-space:nowrap;text-align:center;">${rowSpeedText}</td>
         <td title="${esc(displayLocation)}"><div class="node-location-cell">${displayLocationFlag}<span class="node-cell-ellipsis">${esc(displayLocation)}</span></div></td>
         <td title="${esc(n.owner||n.as_name||"-")}"><div class="node-cell-ellipsis">${esc(n.owner||n.as_name||"-")}</div></td>
         <td title="${esc(translateIpType(n.ip_type))}"><div class="node-cell-ellipsis">${esc(translateIpType(n.ip_type))}</div></td>
@@ -11098,9 +11116,11 @@ async function refreshFilterCounts() {
   const country = String($("country_filter")?.value || "").trim();
   const protocol = String($("protocol_filter")?.value || "").trim();
   const ipType = String($("ip_type_filter")?.value || "").trim();
+  const speedMinBps = Number($("speed_filter")?.value || 0);
   if (country) params.set("country", country);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
+  if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
   try {
     const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), {}, 4000);
     if (seq !== filterCountsRequestSeq) return;
@@ -11241,7 +11261,7 @@ async function loadGithubCurrentVersion() {
     const el = $("github_current_version");
     if (el) el.textContent = versionLabel;
     const footer = $("footer_brand_version");
-    if (footer) footer.textContent = "· " + String(versionLabel).split(" · ")[0];
+    if (footer && /^V\\d+\\.\\d+(?:\\.\\d+)?$/i.test(versionLabel)) footer.textContent = "· " + versionLabel;
   } catch (e) {
     const el = $("github_current_version");
     if (el) el.textContent = "未知";
@@ -13645,7 +13665,7 @@ class Handler(BaseHTTPRequestHandler):
                     ep = node_pool.get_endpoint(active_pool_endpoint_id)
                     if ep:
                         node = protocol_endpoint_to_ui_node(ep)
-                        if _node_matches_ui_scope(node, country, "", protocol, ip_type):
+                        if _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps):
                             connected_nodes = [node]
                 elif active_openvpn_node_id:
                     try:
@@ -13673,7 +13693,7 @@ class Handler(BaseHTTPRequestHandler):
                 "total": total_nodes,
                 "has_more": offset + len(page_nodes) < total_nodes,
                 "cache_building": cache_building,
-                "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type},
+                "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps},
                 "generated_at": time.time(),
             })
         elif effective_path == "/api/ui/filter_counts":
@@ -13691,7 +13711,8 @@ class Handler(BaseHTTPRequestHandler):
                 status = str((query.get("status") or [""])[0]).strip().lower()
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-                self.send_json({"ok": True, **_get_ui_country_catalog(status, protocol, ip_type)})
+                speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
+                self.send_json({"ok": True, **_get_ui_country_catalog(status, protocol, ip_type, speed_min_bps)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/protocol_capabilities":
@@ -15181,6 +15202,9 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     if ip_type and node_ip_type != ip_type:
         return False
 
+    if speed_min_bps > 0 and int(node.get("speed_bps") or node.get("speed") or 0) < speed_min_bps:
+        return False
+
     if status == "available":
         return str(node.get("probe_status") or "").lower() == "available" or bool(node.get("active"))
     if status == "testing":
@@ -15199,6 +15223,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     """
     offset = max(0, int(offset or 0))
     limit = max(1, min(200, int(limit or 100)))
+    speed_min_bps = max(0, int(speed_min_bps or 0))
 
     # Do not start/build the heavyweight global UI snapshot here. The Master
     # Pool is the normal source for this endpoint, so a country/filter request
@@ -15218,6 +15243,11 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
             ip_type=ip_type,
             offset=offset,
             limit=limit,
+            speed_min_bps=speed_min_bps,
+            active_endpoint_id=active_endpoint_id,
+            active_ip=active_ip,
+            active_protocol=active_protocol,
+            active_port=active_port,
         )
         scoped_nodes = [
             protocol_endpoint_to_ui_node(endpoint)
@@ -15265,7 +15295,7 @@ def _get_ui_filter_counts(country="", protocol="", ip_type=""):
             if active:
                 active = dict(active)
                 active["active"] = True
-                connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type) else 0
+                connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type, speed_min_bps) else 0
     except Exception:
         connected_count = 0
     return {
