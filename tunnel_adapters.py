@@ -36,7 +36,12 @@ def list_interfaces() -> set[str]:
     except Exception:
         return set()
 
-def wait_for_new_interface(before: set[str], prefixes: tuple[str, ...], timeout: float = 15.0) -> str:
+def wait_for_new_interface(
+    before: set[str],
+    prefixes: tuple[str, ...],
+    timeout: float = 15.0,
+    allow_reuse: bool = True,
+) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
         current = list_interfaces()
@@ -46,10 +51,11 @@ def wait_for_new_interface(before: set[str], prefixes: tuple[str, ...], timeout:
         )
         if candidates:
             return candidates[0]
-        # A client may reuse an already-created adapter.
-        reused = sorted(iface for iface in current if iface.startswith(prefixes))
-        if reused:
-            return reused[0]
+        if allow_reuse:
+            # A client may reuse an already-created adapter.
+            reused = sorted(iface for iface in current if iface.startswith(prefixes))
+            if reused:
+                return reused[0]
         time.sleep(0.5)
     return ""
 
@@ -447,7 +453,7 @@ class SSTPAdapter:
     def available() -> bool:
         return command_exists("sstpc") and command_exists("pppd")
 
-    def connect(self, hostname: str, username: str = "vpn", password: str = "vpn", timeout: int = 20) -> TunnelResult:
+    def connect(self, hostname: str, username: str = "vpn", password: str = "vpn", timeout: int = 20, reuse_existing: bool = True) -> TunnelResult:
         if not self.available():
             return TunnelResult(False, self.protocol, message="sstpc/pppd not installed")
         before = list_interfaces()
@@ -477,7 +483,9 @@ class SSTPAdapter:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            iface = wait_for_new_interface(before, ("ppp",), timeout=float(timeout))
+            iface = wait_for_new_interface(
+                before, ("ppp",), timeout=float(timeout), allow_reuse=bool(reuse_existing)
+            )
             if not iface or proc.poll() is not None:
                 output = ""
                 try:

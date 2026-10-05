@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -50,7 +51,9 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 
 class DualStackHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
-    request_queue_size = 64
+    # Management/API plane only: absorb short bursts from mobile/desktop
+    # clients and concurrent filter requests without touching VPN data plane.
+    request_queue_size = 256
     allow_reuse_address = True
 
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
@@ -135,6 +138,12 @@ COUNTRY_INVENTORY_TARGET = env_int("COUNTRY_INVENTORY_TARGET", 20, 5, 100)
 COUNTRY_AVAILABLE_MIN = env_int("COUNTRY_AVAILABLE_MIN", 5, 1, 10)
 COUNTRY_AVAILABLE_TARGET = env_int("COUNTRY_AVAILABLE_TARGET", 10, 5, 10)
 COUNTRY_PRIORITY_BATCH = env_int("COUNTRY_PRIORITY_BATCH", 5, 1, 10)
+COUNTRY_FULL_SWEEP_BATCH = env_int("COUNTRY_FULL_SWEEP_BATCH", 4, 1, 12)
+COUNTRY_FULL_SWEEP_ACTIVE_CONCURRENCY = env_int("COUNTRY_FULL_SWEEP_ACTIVE_CONCURRENCY", 2, 1, 4)
+COUNTRY_FULL_SWEEP_IDLE_CONCURRENCY = env_int("COUNTRY_FULL_SWEEP_IDLE_CONCURRENCY", 4, 1, 6)
+COUNTRY_FULL_SWEEP_REUSE_SECONDS = env_int("COUNTRY_FULL_SWEEP_REUSE_SECONDS", 6 * 3600, 300, 7 * 24 * 3600)
+SPEED_TEST_BYTES = env_int("SPEED_TEST_BYTES", 524288, 131072, 1048576)
+SPEED_TEST_TIMEOUT_SECONDS = env_int("SPEED_TEST_TIMEOUT_SECONDS", 8, 4, 15)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 BACKGROUND_PROBE_BATCH = env_int("BACKGROUND_PROBE_BATCH", 8, 2, 50)
 ACTIVE_BACKGROUND_PROBE_BATCH = env_int("ACTIVE_BACKGROUND_PROBE_BATCH", 2, 1, 12)
@@ -234,10 +243,21 @@ global_country_coverage_last_attempt: dict[str, float] = {}
 global_coverage_pick_cache_country = ""
 global_coverage_pick_cache_at = 0.0
 country_priority_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+country_full_sweep_completed_at: dict[str, float] = {}
+country_full_sweep_lock = threading.Lock()
+speed_test_lock = threading.BoundedSemaphore(1)
 fast_state_cache_lock = threading.Lock()
 fast_state_cache: dict[str, Any] | None = None
 fast_state_cache_at = 0.0
+ui_config_cache_lock = threading.Lock()
+ui_config_cache: dict[str, Any] | None = None
+ui_config_cache_at = 0.0
 is_connecting = False
+# Production connection state is intentionally independent from background
+# probing. Detection must never mask a real production tunnel failure.
+probe_engine_running = False
+probe_engine_message = ""
+probe_engine_target_country = ""
 # Separate manual connection ownership from background node detection.
 # Manual switching is allowed while a background detection/refresh is running,
 # but two manual connection operations can never overlap.
@@ -576,6 +596,13 @@ def generate_random_username() -> str:
                 return uname
 
 def load_ui_config() -> dict[str, Any]:
+    global ui_config_cache, ui_config_cache_at
+    now_mono = time.monotonic()
+    with ui_config_cache_lock:
+        if ui_config_cache is not None and now_mono - ui_config_cache_at < 1.0:
+            cached = dict(ui_config_cache)
+            cached["favorite_node_ids"] = list(cached.get("favorite_node_ids") or [])
+            return cached
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
         config = {
@@ -643,7 +670,11 @@ def load_ui_config() -> dict[str, Any]:
             except Exception:
                 pass
 
-        return config
+        with ui_config_cache_lock:
+            ui_config_cache = dict(config)
+            ui_config_cache["favorite_node_ids"] = list(config.get("favorite_node_ids") or [])
+            ui_config_cache_at = time.monotonic()
+        return dict(config)
 
 # 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
@@ -859,6 +890,7 @@ def read_nodes() -> list[dict[str, Any]]:
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, active_pool_endpoint_id, is_connecting, manual_connection_active, manual_connection_epoch
+    global probe_engine_running, probe_engine_message, probe_engine_target_country
     global global_pool_refresh_running, global_pool_refresh_last_at, global_pool_refresh_status
     global global_pool_refresh_message, global_pool_refresh_servers, global_pool_refresh_sources
     state = read_json(STATE_FILE, {})
@@ -909,6 +941,8 @@ def get_state() -> dict[str, Any]:
                     "ip_type": server_meta.get("ip_type") or "",
                     "quality": server_meta.get("quality") or "",
                     "speed": endpoint.get("latest_speed", 0),
+                    "speed_bps": endpoint.get("latest_speed", 0),
+                    "speed_source": "vpngate_observation" if int(endpoint.get("latest_speed") or 0) > 0 else "not_measured",
                     "latency_ms": endpoint.get("latency_ewma", 0),
                     "jitter_ms": endpoint.get("jitter_ewma", 0),
                     "selection_score": endpoint.get("selection_score", 0),
@@ -923,6 +957,9 @@ def get_state() -> dict[str, Any]:
     else:
         state["active_tunnel_protocol"] = ""
     state["is_connecting"] = is_connecting
+    state["probe_engine_running"] = probe_engine_running
+    state["probe_engine_message"] = probe_engine_message
+    state["probe_engine_target_country"] = probe_engine_target_country
     state["manual_connection_active"] = manual_connection_active
     state["manual_connection_epoch"] = manual_connection_epoch
     state["maintenance_running"] = maintenance_lock.locked()
@@ -951,6 +988,8 @@ def get_state() -> dict[str, Any]:
         state["pool_states"] = pool_stats.get("states") or {}
         state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
         state["hot_pool_target"] = HOT_POOL_TARGET
+        state["hot_pool_deficit"] = max(0, HOT_POOL_TARGET - state["hot_pool_size"])
+        state["status_counts"] = node_pool.status_counts()
     except Exception:
         state.setdefault("pool_servers", 0)
         state.setdefault("pool_endpoints", 0)
@@ -3420,15 +3459,199 @@ def _test_pool_reference(ref: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "kind": kind, "node": test_node_by_id(ident)}
     if kind == "pool":
         endpoint_id = ident.removeprefix("pool:")
+        endpoint = node_pool.get_endpoint(endpoint_id)
+        if endpoint is None:
+            return {"ok": False, "kind": kind, "error": "端点不存在"}
+        if str(endpoint.get("protocol") or "").lower() == "openvpn":
+            node_id = ensure_openvpn_node_from_pool(endpoint)
+            node = test_node_by_id(node_id)
+            return {"ok": node.get("probe_status") == "available", "kind": kind, "node": node}
         result = probe_pool_endpoint(endpoint_id)
         endpoint = node_pool.get_endpoint(endpoint_id)
         node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
         return {"ok": bool(result.get("ok")), "kind": kind, "node": node, "result": result}
     return {"ok": False, "error": "未知测试类型"}
 
+def country_full_sweep(country: str) -> dict[str, Any]:
+    global probe_engine_running, probe_engine_message, probe_engine_target_country
+    """Run one complete resource-pool sweep for the selected/local country.
+
+    Every non-retired protocol endpoint is tested once before global country
+    rotation resumes. This prevents NEW/unverified mobile/residential/high-speed
+    resources from being omitted from the usable pool.
+    """
+    global country_full_sweep_running, country_full_sweep_total
+    global country_full_sweep_tested, country_full_sweep_remaining
+    global country_full_sweep_country, country_full_sweep_message
+
+    target = normalized_country_name(str(country or "").strip())
+    if not target:
+        return {"ok": False, "error": "国家不能为空"}
+
+    persisted_sweeps = read_json(STATE_FILE, {}).get("country_full_sweep_completed_at", {})
+    if isinstance(persisted_sweeps, dict) and target not in country_full_sweep_completed_at:
+        try:
+            country_full_sweep_completed_at[target] = float(persisted_sweeps.get(target) or 0)
+        except Exception:
+            pass
+    completed_at = float(country_full_sweep_completed_at.get(target, 0) or 0)
+    if completed_at and time.time() - completed_at < COUNTRY_FULL_SWEEP_REUSE_SECONDS:
+        return {
+            "ok": True,
+            "skipped": True,
+            "country": target,
+            "reason": "recently_completed",
+            "completed_at": completed_at,
+        }
+
+    with country_full_sweep_lock:
+        completed_at = float(country_full_sweep_completed_at.get(target, 0) or 0)
+        if completed_at and time.time() - completed_at < COUNTRY_FULL_SWEEP_REUSE_SECONDS:
+            return {"ok": True, "skipped": True, "country": target, "reason": "recently_completed"}
+
+        endpoint_rows, _ = node_pool.list_endpoints_scoped(
+            country=target, status="", protocol="", ip_type="", offset=0, limit=5000
+        )
+        refs = []
+        seen = set()
+        for endpoint in endpoint_rows:
+            eid = str(endpoint.get("endpoint_id") or "").strip()
+            if (
+                not eid
+                or eid in seen
+                or str(endpoint.get("status") or "").upper() == "RETIRED"
+                or (active_tunnel_running() and eid == str(active_pool_endpoint_id or ""))
+            ):
+                continue
+            seen.add(eid)
+            refs.append({
+                "kind": "pool",
+                "id": "pool:" + eid,
+                "protocol": str(endpoint.get("protocol") or "").lower(),
+                "server_key": str(endpoint.get("server_key") or ""),
+            })
+
+        country_full_sweep_running = True
+        probe_engine_running = True
+        probe_engine_target_country = target
+        country_full_sweep_total = len(refs)
+        country_full_sweep_tested = 0
+        country_full_sweep_remaining = len(refs)
+        country_full_sweep_country = target
+        country_full_sweep_message = f"{target} 资源库全量首次检测：准备检测 {len(refs)} 个协议端点"
+        set_state(
+            priority_country=target,
+            priority_running=True,
+            priority_full_sweep_running=True,
+            priority_full_sweep_total=len(refs),
+            priority_full_sweep_tested=0,
+            priority_full_sweep_remaining=len(refs),
+            priority_full_sweep_country=target,
+            priority_message=country_full_sweep_message,
+        )
+
+        cursor = 0
+        while cursor < len(refs):
+            # Production connection state is independent. Only a manual switch
+            # or explicit UI operation pauses background resource probing.
+            while manual_connection_active or ui_command_plane.is_busy():
+                time.sleep(2)
+            batch = refs[cursor:cursor + COUNTRY_FULL_SWEEP_BATCH]
+            cursor += len(batch)
+            openvpn_ids = []
+            pool_refs = []
+            for ref in batch:
+                endpoint = node_pool.get_endpoint(ref["id"].removeprefix("pool:"))
+                if not endpoint:
+                    continue
+                protocol = str(endpoint.get("protocol") or "").lower()
+                if protocol == "openvpn":
+                    try:
+                        openvpn_ids.append(ensure_openvpn_node_from_pool(endpoint))
+                    except Exception as exc:
+                        log_to_json("WARNING", "Probe", f"{target} 全量检测 OpenVPN 端点准备失败: {exc}")
+                else:
+                    pool_refs.append(ref)
+
+            if openvpn_ids:
+                # Serialize probe batches with other maintenance work, but do
+                # NOT mutate production is_connecting state.
+                maintenance_lock.acquire()
+                try:
+                    if manual_connection_active:
+                        continue
+                    test_multiple_nodes(openvpn_ids)
+                finally:
+                    maintenance_lock.release()
+
+            if pool_refs:
+                workers = COUNTRY_FULL_SWEEP_ACTIVE_CONCURRENCY if active_tunnel_running() else COUNTRY_FULL_SWEEP_IDLE_CONCURRENCY
+                workers = max(1, min(workers, len(pool_refs)))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    list(executor.map(_test_pool_reference, pool_refs))
+
+            country_full_sweep_tested = min(len(refs), cursor)
+            country_full_sweep_remaining = max(0, len(refs) - cursor)
+            country_full_sweep_message = f"{target} 资源库全量检测中：已检测 {country_full_sweep_tested}/{len(refs)}，剩余 {country_full_sweep_remaining}"
+            probe_engine_message = country_full_sweep_message
+            try:
+                snap = country_priority_snapshot(target)
+                set_state(
+                    priority_inventory=int(snap.get("inventory") or 0),
+                    priority_available=int(snap.get("available") or 0),
+                    priority_full_sweep_running=True,
+                    priority_full_sweep_total=len(refs),
+                    priority_full_sweep_tested=country_full_sweep_tested,
+                    priority_full_sweep_remaining=country_full_sweep_remaining,
+                    priority_full_sweep_country=target,
+                    priority_message=country_full_sweep_message,
+                )
+            except Exception:
+                pass
+
+        country_full_sweep_completed_at[target] = time.time()
+        country_priority_snapshot_cache.pop(normalized_country_name(target), None)
+        country_full_sweep_running = False
+        persisted_sweeps = read_json(STATE_FILE, {}).get("country_full_sweep_completed_at", {})
+        if not isinstance(persisted_sweeps, dict):
+            persisted_sweeps = {}
+        persisted_sweeps[target] = country_full_sweep_completed_at[target]
+        set_state(country_full_sweep_completed_at=persisted_sweeps)
+        country_full_sweep_message = f"{target} 资源库全量检测完成：共检测 {len(refs)} 个协议端点"
+        try:
+            snap = country_priority_snapshot(target)
+            set_state(
+                priority_inventory=int(snap.get("inventory") or 0),
+                priority_available=int(snap.get("available") or 0),
+                priority_running=False,
+                priority_full_sweep_running=False,
+                priority_full_sweep_total=len(refs),
+                priority_full_sweep_tested=len(refs),
+                priority_full_sweep_remaining=0,
+                priority_full_sweep_country=target,
+                priority_message=country_full_sweep_message,
+            )
+        except Exception:
+            set_state(
+                priority_running=False,
+                priority_full_sweep_running=False,
+                priority_full_sweep_total=len(refs),
+                priority_full_sweep_tested=len(refs),
+                priority_full_sweep_remaining=0,
+                priority_full_sweep_country=target,
+                priority_message=country_full_sweep_message,
+            )
+        return {"ok": True, "country": target, "total": len(refs), "tested": len(refs)}
+
 def country_priority_worker(country: str) -> None:
-    global country_priority_request, is_connecting
+    global country_priority_request
     try:
+        # First pass is always a complete resource-pool sweep for the target
+        # country. Only after every endpoint has been checked once do we let
+        # the normal global-country scheduler resume.
+        sweep_result = country_full_sweep(country)
+        if sweep_result.get("ok"):
+            return
         rounds = 0
         while rounds < 12:
             if manual_connection_active:
@@ -3476,20 +3699,13 @@ def country_priority_worker(country: str) -> None:
             pool_refs = [x for x in batch if x.get("kind") == "pool"]
             if openvpn_refs and maintenance_lock.acquire(blocking=False):
                 try:
-                    with lock:
-                        busy = is_connecting or manual_connection_active
-                    if not busy:
-                        with lock:
-                            is_connecting = True
-                        set_state(is_connecting=True, last_check_message=f"正在优先检测 {country}，目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
+                    if not manual_connection_active:
+                        set_state(last_check_message=f"正在优先检测 {country}，目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
                         test_multiple_nodes([str(x.get("id")) for x in openvpn_refs if x.get("id")])
                 finally:
-                    with lock:
-                        is_connecting = False
-                    set_state(is_connecting=False)
                     maintenance_lock.release()
             for ref in pool_refs:
-                if is_connecting or manual_connection_active:
+                if manual_connection_active or ui_command_plane.is_busy():
                     break
                 _test_pool_reference(ref)
             snapshot = country_priority_snapshot(country)
@@ -3522,10 +3738,24 @@ def start_country_priority(country: str) -> dict[str, Any]:
         return {"ok": False, "error": "国家不能为空"}
     snapshot = country_priority_snapshot(target)
     country_priority_request = target
-    if snapshot.get("available", 0) >= COUNTRY_AVAILABLE_TARGET:
+    recent_full_sweep = bool(
+        country_full_sweep_completed_at.get(target)
+        and time.time() - float(country_full_sweep_completed_at.get(target) or 0) < COUNTRY_FULL_SWEEP_REUSE_SECONDS
+    )
+    if recent_full_sweep:
         country_priority_request = ""
-        set_state(priority_country=target, priority_inventory=int(snapshot.get("inventory") or 0), priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=False, priority_message=f"{target} 已有 {snapshot.get('available')} 个可用节点，无需重复检测")
-        return {"ok": True, "running": False, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET}
+        set_state(
+            priority_country=target,
+            priority_inventory=int(snapshot.get("inventory") or 0),
+            priority_inventory_target=COUNTRY_INVENTORY_TARGET,
+            priority_available=int(snapshot.get("available") or 0),
+            priority_target=COUNTRY_AVAILABLE_TARGET,
+            priority_minimum=COUNTRY_AVAILABLE_MIN,
+            priority_running=False,
+            priority_full_sweep_running=False,
+            priority_message=f"{target} 已完成近期资源库全量检测，当前可用 {snapshot.get('available', 0)} 个节点"
+        )
+        return {"ok": True, "running": False, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET, "full_sweep_recent": True}
     if not country_priority_lock.acquire(blocking=False):
         return {"ok": True, "running": True, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET, "message": "已有国家优先检测任务运行中"}
     set_state(priority_country=target, priority_inventory=int(snapshot.get("inventory") or 0), priority_inventory_target=COUNTRY_INVENTORY_TARGET, priority_available=int(snapshot.get("available") or 0), priority_target=COUNTRY_AVAILABLE_TARGET, priority_minimum=COUNTRY_AVAILABLE_MIN, priority_running=True, priority_message=f"{target} 优先检测已启动：目标 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点")
@@ -3555,14 +3785,31 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     # not from VPNGate's advertised Ping value. ICMP/TCP reachability is only
     # a fast hint and is deliberately not used as the final probe metric.
     latency = 0
+    speed_bps = 0
+    speed_result: dict[str, Any] = {}
+    openvpn_process: subprocess.Popen[str] | None = None
+    speed_table: int | None = None
 
     idx = None
     try:
         idx = get_free_test_index()
-        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, openvpn_process = run_openvpn_until_ready(
+            str(temp_path), keep_alive=True, route_nopull=True, timeout=12, dev=f"tun{idx}"
+        )
         if ok:
             latency = _openvpn_elapsed_ms(message)
+            speed_table = _acquire_probe_route_table()
+            speed_result = (
+                measure_interface_speed(f"tun{idx}", table=speed_table)
+                if speed_table is not None
+                else {"ok": False, "speed_bps": 0, "error": "无可用测速策略路由表"}
+            )
+            speed_bps = int(speed_result.get("speed_bps") or 0)
     finally:
+        if openvpn_process is not None:
+            stop_process(openvpn_process)
+        if speed_table is not None:
+            _release_probe_route_table(speed_table)
         if idx is not None:
             release_test_index(idx)
         try:
@@ -3576,6 +3823,8 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         "ip": h,
         "remote_host": h,
         "remote_port": p,
+        "speed": speed_bps,
+        "speed_bps": speed_bps,
         "owner": "",
         "asn": "",
         "as_name": "",
@@ -3583,6 +3832,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         "ip_type": "",
         "quality": "",
     }
+    if speed_bps > 0:
+        message = f"{message} · 速度 {round(speed_bps / 1_000_000, 1)} Mbps"
+    elif ok and not speed_result.get("ok"):
+        message = f"{message} · 速度测试失败"
     if ok:
         vpn_utils.enrich_ip_info([temp_node])
 
@@ -3591,6 +3844,8 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
             node["latency_ms"] = latency if ok else 0
+            node["speed"] = speed_bps if ok else 0
+            node["speed_bps"] = speed_bps if ok else 0
             node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
@@ -3603,7 +3858,9 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
                 node["quality"] = temp_node["quality"]
 
             try:
-                node_pool.record_probe(node, ok=ok, latency_ms=latency, message=message)
+                node_pool.record_probe(
+                    node, ok=ok, latency_ms=latency, message=message, speed_bps=speed_bps
+                )
             except Exception as pool_exc:
                 log_to_json("WARNING", "Main", f"NodePool 单节点探测结果写入失败: {pool_exc}")
             sorted_nodes = sort_all_nodes(nodes)
@@ -3651,19 +3908,42 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 "location": "",
                 "ip_type": "",
                 "quality": "",
+                "speed": 0,
+                "speed_bps": 0,
             }
 
-        # For OpenVPN, use real tunnel establishment time as the final
-        # latency metric. The source-list Ping value may be stale or external.
+        # For OpenVPN, use real tunnel establishment time plus an isolated
+        # download throughput test as the final availability metrics.
         latency = 0
+        speed_bps = 0
+        speed_result: dict[str, Any] = {}
         tun_idx = None
+        speed_table: int | None = None
+        openvpn_process: subprocess.Popen[str] | None = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+            ok, message, openvpn_process = run_openvpn_until_ready(
+                str(temp_path), keep_alive=True, route_nopull=True, timeout=12, dev=dev_name
+            )
             if ok:
                 latency = _openvpn_elapsed_ms(message)
+                speed_table = _acquire_probe_route_table()
+                speed_result = (
+                    measure_interface_speed(dev_name, table=speed_table)
+                    if speed_table is not None
+                    else {"ok": False, "speed_bps": 0, "error": "无可用测速策略路由表"}
+                )
+                speed_bps = int(speed_result.get("speed_bps") or 0)
+                if speed_bps > 0:
+                    message = f"{message} · 速度 {round(speed_bps / 1_000_000, 1)} Mbps"
+                else:
+                    message = f"{message} · 速度测试失败"
         finally:
+            if openvpn_process is not None:
+                stop_process(openvpn_process)
+            if speed_table is not None:
+                _release_probe_route_table(speed_table)
             if tun_idx is not None:
                 release_test_index(tun_idx)
             try:
@@ -3678,6 +3958,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "remote_host": h,
             "remote_port": p,
             "latency_ms": latency,
+            "speed": speed_bps,
+            "speed_bps": speed_bps,
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
             "probed_at": time.time(),
@@ -3712,6 +3994,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                             ok=res.get("probe_status") == "available",
                             latency_ms=parse_int(res.get("latency_ms")),
                             message=str(res.get("probe_message") or ""),
+                            speed_bps=parse_int(res.get("speed_bps")),
                         )
                 except Exception as pool_exc:
                     log_to_json("WARNING", "Main", f"NodePool 批量探测结果写入失败: {pool_exc}")
@@ -4256,6 +4539,48 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
     finally:
         cleanup_probe_policy_routing(table)
 
+def measure_interface_speed(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
+    """Measure real download throughput through an isolated test tunnel."""
+    interface = str(interface or "").strip()
+    if not interface:
+        return {"ok": False, "speed_bps": 0, "error": "缺少测试网卡"}
+    route_ok, route_error = setup_probe_policy_routing(interface, gateway, table=table)
+    if not route_ok:
+        return {"ok": False, "speed_bps": 0, "error": f"临时测速路由建立失败: {route_error}"}
+    if not speed_test_lock.acquire(timeout=1.0):
+        cleanup_probe_policy_routing(table)
+        return {"ok": False, "speed_bps": 0, "error": "测速资源忙，稍后重试"}
+    try:
+        url = f"https://speed.cloudflare.com/__down?bytes={SPEED_TEST_BYTES}"
+        cmd = [
+            "curl", "-4", "-sS", "-o", "/dev/null",
+            "--interface", f"if!{interface}",
+            "-w", "%{speed_download} %{http_code}",
+            url,
+            "--connect-timeout", "3",
+            "--max-time", str(SPEED_TEST_TIMEOUT_SECONDS),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
+        if res.returncode != 0:
+            return {"ok": False, "speed_bps": 0, "error": f"curl_exit={res.returncode}: {(res.stderr or '').strip()[-300:]}"}
+        parts = (res.stdout or "").strip().split()
+        if len(parts) != 2 or parts[1] != "200":
+            return {"ok": False, "speed_bps": 0, "error": f"测速 HTTP 异常: {(res.stdout or '').strip()}"}
+        bytes_per_second = float(parts[0] or 0)
+        speed_bps = max(0, int(bytes_per_second * 8))
+        if speed_bps <= 0:
+            return {"ok": False, "speed_bps": 0, "error": "测速结果为 0"}
+        return {
+            "ok": True,
+            "speed_bps": speed_bps,
+            "speed_mbps": round(speed_bps / 1_000_000, 1),
+        }
+    except Exception as exc:
+        return {"ok": False, "speed_bps": 0, "error": str(exc)}
+    finally:
+        cleanup_probe_policy_routing(table)
+        speed_test_lock.release()
+
 def _acquire_probe_route_table() -> int | None:
     with probe_route_table_lock:
         if not probe_route_tables_free:
@@ -4273,6 +4598,16 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         return {"ok": False, "error": "endpoint_id 为空"}
     if is_connecting or manual_connection_active:
         return {"ok": False, "skipped": True, "error": "生产连接正在切换，跳过后台探测"}
+    if active_tunnel_running() and endpoint_id == str(active_pool_endpoint_id or ""):
+        endpoint = node_pool.get_endpoint(endpoint_id) or {}
+        return {
+            "ok": True,
+            "skipped": True,
+            "active": True,
+            "latency_ms": int(float(endpoint.get("latency_ewma") or 0)),
+            "speed_bps": int((endpoint.get("metadata") or {}).get("last_probe_speed_bps") or 0),
+            "message": "当前活动节点由实时连接健康检查代表，不执行并行探测",
+        }
     if not protocol_probe_lock.acquire(blocking=False):
         return {"ok": False, "skipped": True, "error": "已有协议探测任务运行中"}
 
@@ -4314,7 +4649,9 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         elif protocol == "sstp":
             adapter = tunnel_adapters.SSTPAdapter()
             target = host if port in (0, 443) else f"{host}:{port}"
-            result = adapter.connect(target, username="vpn", password="vpn", timeout=20)
+            result = adapter.connect(
+                target, username="vpn", password="vpn", timeout=20, reuse_existing=False
+            )
             cleanup = lambda: tunnel_adapters.SSTPAdapter.disconnect(
                 result.process if result else None,
                 added_routes=((result.details or {}).get("added_host_routes") if result else []),
@@ -4349,13 +4686,25 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             return {"ok": False, "protocol": protocol, "interface": result.interface, "error": message}
 
         latency_ms = parse_int(egress.get("latency_ms"))
-        node_pool.record_endpoint_probe(endpoint_id, True, latency_ms, "background egress probe ok")
+        speed_result = measure_interface_speed(result.interface, gateway=result.gateway or "", table=probe_table)
+        speed_bps = int(speed_result.get("speed_bps") or 0)
+        probe_message = "background egress probe ok"
+        if speed_result.get("ok"):
+            probe_message += f" · speed {round(speed_bps / 1_000_000, 1)} Mbps"
+        else:
+            probe_message += f" · speed test failed: {speed_result.get('error') or 'unknown'}"
+        node_pool.record_endpoint_probe(
+            endpoint_id, True, latency_ms, probe_message, speed_bps=speed_bps
+        )
         return {
             "ok": True,
             "protocol": protocol,
             "interface": result.interface,
             "ip": egress.get("ip", ""),
             "latency_ms": latency_ms,
+            "speed_bps": speed_bps,
+            "speed_mbps": round(speed_bps / 1_000_000, 1) if speed_bps > 0 else 0,
+            "speed_test_ok": bool(speed_result.get("ok")),
         }
     except Exception as exc:
         try:
@@ -4385,7 +4734,7 @@ def protocol_probe_loop() -> None:
     time.sleep(15)
     while True:
         try:
-            if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active:
+            if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or country_full_sweep_running:
                 time.sleep(5)
                 continue
             # Detection priority is independent from the browser view:
@@ -4409,22 +4758,17 @@ def protocol_probe_loop() -> None:
             if priority:
                 snap = country_priority_snapshot(priority)
                 available = int(snap.get("available") or 0)
-                candidates = snap.get("candidates") or []
-                # Strict priority gate: the configured/server-local country is
-                # considered complete only after it reaches the target reserve
-                # (normally 10 usable nodes), or after there are no more
-                # eligible candidates. Reaching the minimum 5 is enough to
-                # make the country usable, but NOT enough to release detection
-                # budget to other countries.
-                priority_complete = available >= COUNTRY_AVAILABLE_TARGET
-                if not priority_complete:
+                recent_full_sweep = bool(
+                    country_full_sweep_completed_at.get(priority)
+                    and time.time() - float(country_full_sweep_completed_at.get(priority) or 0) < COUNTRY_FULL_SWEEP_REUSE_SECONDS
+                )
+                # A country is released to normal global rotation only after
+                # its complete resource-pool first sweep has finished. The
+                # number of currently AVAILABLE endpoints no longer controls
+                # whether other countries may be detected.
+                if not recent_full_sweep:
                     if not country_priority_lock.locked() and not country_priority_request:
                         start_country_priority(priority)
-                    message = (
-                        f"{priority} 优先检测中：先完成本国 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点，再进入其它国家"
-                        if candidates else
-                        f"{priority} 优先级锁定：当前可用 {available}/{COUNTRY_AVAILABLE_TARGET}，暂无到期候选，等待资源补充/复检，不检测其它国家"
-                    )
                     set_state(
                         priority_country=priority,
                         priority_inventory=int(snap.get("inventory") or 0),
@@ -4432,16 +4776,22 @@ def protocol_probe_loop() -> None:
                         priority_target=COUNTRY_AVAILABLE_TARGET,
                         priority_minimum=COUNTRY_AVAILABLE_MIN,
                         priority_running=True,
-                        priority_message=message,
+                        priority_full_sweep_running=True,
+                        priority_message=f"{priority} 资源库全量首次检测中：未完成前不进入其它国家检测",
                     )
                     time.sleep(3)
                     continue
-                if available >= COUNTRY_AVAILABLE_MIN and candidates:
-                    result = availability_sweep_once(priority)
-                    if result.get("skipped"):
-                        time.sleep(3)
-                        continue
-            # Priority country is healthy enough; global rotation can now use
+                set_state(
+                    priority_country=priority,
+                    priority_inventory=int(snap.get("inventory") or 0),
+                    priority_available=available,
+                    priority_target=COUNTRY_AVAILABLE_TARGET,
+                    priority_minimum=COUNTRY_AVAILABLE_MIN,
+                    priority_running=False,
+                    priority_full_sweep_running=False,
+                    priority_message=f"{priority} 资源库全量首次检测已完成，进入其它国家默认检测",
+                )
+            # Priority country first-sweep is complete; global rotation can now use
             # the next-lowest-latency country with a deficit.
             global global_coverage_pick_cache_country, global_coverage_pick_cache_at
             now_cov = time.time()
@@ -9088,7 +9438,31 @@ function renderCustomCountryFilter() {
   renderCustomFilter("country_filter", true);
 }
 
+function updateStatusFilterOptions() {
+  const select = $("status_filter");
+  if (!select) return;
+  const counts = state?.status_counts || {};
+  const connected = Number(state?.connected_count ?? (
+    (state?.active_pool_endpoint_id || state?.active_openvpn_node_id) ? 1 : 0
+  ));
+  const total = Number(counts.available || 0) + Number(counts.testing || 0) +
+    Number(counts.not_checked || 0) + Number(counts.unavailable || 0);
+  const labels = {
+    all: `全部节点 · ${total}`,
+    available: `可用节点 · ${Number(counts.available || 0)}`,
+    connected: `已连接 · ${connected}`,
+    not_checked: `待检测 · ${Number(counts.not_checked || 0)}`,
+    testing: `检测中 · ${Number(counts.testing || 0)}`,
+    unavailable: `失效节点 · ${Number(counts.unavailable || 0)}`
+  };
+  Array.from(select.options).forEach(option => {
+    const next = labels[option.value];
+    if (next && option.textContent !== next) option.textContent = next;
+  });
+}
+
 function renderAllCustomFilters() {
+  updateStatusFilterOptions();
   renderCustomFilter("status_filter");
   renderCustomCountryFilter();
   renderCustomFilter("protocol_filter");
@@ -9390,6 +9764,10 @@ function render(){
         ? state.active_openvpn_node
         : null);
 
+  // Backend is authoritative for filter counts and connection statistics.
+  // The browser only formats those values; it never scans the global pool.
+  updateStatusFilterOptions();
+
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
   const switching = !!state.manual_switch_active || (!!state.is_connecting && !!state.pending_connection_id);
@@ -9481,8 +9859,8 @@ function render(){
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(ep.owner || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(ep.ip_type))}</strong></span>
-              <span style="margin-left: 12px;">带宽: <strong>${esc(speed(ep.speed))}</strong></span>
-              <span class="active-hot-pool" title="当前处于 HOT 状态的节点数量；系统目标为最低热备数量"><span>热备池</span><strong>${esc(String(state.hot_pool_size || 0))} 个</strong></span>
+              <span style="margin-left: 12px;">速度: <strong>${esc(ep.speed_bps ? speed(ep.speed_bps) : "未测")}</strong></span>
+              <span class="active-hot-pool" title="后端 Master Pool 当前 HOT 热备节点数量"><span>热备库</span><strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
             </div>
           </div>
         </div>
@@ -9517,6 +9895,8 @@ function render(){
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
+              <span style="margin-left: 12px;">速度: <strong>${esc(activeNode.speed ? speed(activeNode.speed) : "未测")}</strong></span>
+              <span class="active-hot-pool" title="后端 Master Pool 当前 HOT 热备节点数量"><span>热备库</span><strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
             </div>
           </div>
         </div>
@@ -9610,8 +9990,14 @@ function render(){
           : rawPriorityMessage);
       priorityStatusEl.style.display = "flex";
       priorityStatusEl.className = state.priority_running ? "country-priority running" : "country-priority";
+      const fullSweepRunning = !!state.priority_full_sweep_running;
+      const fullSweepTotal = Number(state.priority_full_sweep_total || 0);
+      const fullSweepTested = Number(state.priority_full_sweep_tested || 0);
+      const fullSweepRemaining = Number(state.priority_full_sweep_remaining || 0);
       priorityStatusEl.innerHTML = state.priority_running
-        ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av}/${target} · 目标 ${min}-${target}</span>`
+        ? (fullSweepRunning
+          ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 资源库全量检测中</span><span>已检测 ${fullSweepTested}/${fullSweepTotal} · 剩余 ${fullSweepRemaining} · 当前可用 ${av} · 库存 ${inventory}</span>`
+          : `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av}/${target} · 目标 ${min}-${target}</span>`)
         : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>库存 ${inventory}/${inventoryTarget} IP · ${esc(priorityMessage)}</span>`;
     } else {
       priorityStatusEl.style.display = "none";
@@ -10211,7 +10597,11 @@ function backendStateRenderSignature(s) {
     x.active_node_latency, x.proxy_ok, x.proxy_ip, x.proxy_latency_ms,
     x.last_check_message, x.priority_country, x.priority_running,
     x.priority_available, x.availability_engine_running,
-    x.resource_engine_running, x.global_pool_refresh_running
+    x.resource_engine_running, x.global_pool_refresh_running,
+    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit,
+    x.priority_full_sweep_running, x.priority_full_sweep_total,
+    x.priority_full_sweep_tested, x.priority_full_sweep_remaining,
+    x.connected_count, JSON.stringify(x.status_counts || {}), x.active_pool_endpoint?.speed_bps
   ].map(v => String(v ?? "")).join("|");
 }
 
@@ -10701,8 +11091,31 @@ async function loadLegacy(){
   }
   startBackendStatePolling();
 }
+let filterCountsRequestSeq = 0;
+async function refreshFilterCounts() {
+  const seq = ++filterCountsRequestSeq;
+  const params = new URLSearchParams();
+  const country = String($("country_filter")?.value || "").trim();
+  const protocol = String($("protocol_filter")?.value || "").trim();
+  const ipType = String($("ip_type_filter")?.value || "").trim();
+  if (country) params.set("country", country);
+  if (protocol) params.set("protocol", protocol);
+  if (ipType) params.set("ip_type", ipType);
+  try {
+    const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), {}, 4000);
+    if (seq !== filterCountsRequestSeq) return;
+    if (data?.status_counts) state.status_counts = data.status_counts;
+    state.connected_count = Number(data?.connected_count || 0);
+    updateStatusFilterOptions();
+    renderCustomFilter("status_filter");
+  } catch (_) {
+    // Keep the last known counts; node filtering itself remains server-side.
+  }
+}
+
 async function applyNodeFilterChange() {
   currentPage = 1;
+  refreshFilterCounts();
 
   // Filters are independent dimensions. The currently selected country is
   // only a scope; when it is "全球国家" (empty), keep the query global.
@@ -10724,6 +11137,7 @@ $("country_filter").onchange=async()=>{
   const country = String($("country_filter").value || "").trim();
   activeCountryScope = country;
   currentPage = 1;
+  refreshFilterCounts();
 
   // Empty country is the explicit “全球国家” action and is the only path
   // allowed to request the complete global node list.
@@ -12970,7 +13384,13 @@ class Handler(BaseHTTPRequestHandler):
         if etag:
             self.send_header("ETag", etag)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The browser/HTTP load generator may time out while the backend is
+            # still serializing a response. This is a normal client disconnect,
+            # not a server fault, and must not flood the production log.
+            return
 
     def send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         if hasattr(self, "_ui_command_token") and int(status) >= 400:
@@ -13256,6 +13676,15 @@ class Handler(BaseHTTPRequestHandler):
                 "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type},
                 "generated_at": time.time(),
             })
+        elif effective_path == "/api/ui/filter_counts":
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                country = str((query.get("country") or [""])[0]).strip()
+                protocol = str((query.get("protocol") or [""])[0]).strip().lower()
+                ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
+                self.send_json({"ok": True, **_get_ui_filter_counts(country, protocol, ip_type)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/ui/country_catalog":
             try:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -14562,6 +14991,12 @@ coverage_target = COUNTRY_RESERVE_TARGET
 coverage_last_at = 0.0
 country_priority_explicit = False
 initial_bootstrap_active = False
+country_full_sweep_running = False
+country_full_sweep_total = 0
+country_full_sweep_tested = 0
+country_full_sweep_remaining = 0
+country_full_sweep_country = ""
+country_full_sweep_message = ""
 
 _legacy_get_state_v2 = get_state
 _legacy_unified_hot_pool_candidates_v2 = unified_hot_pool_candidates
@@ -14810,6 +15245,38 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     return ordered[offset:offset + limit], total, building
 
 
+def _get_ui_filter_counts(country="", protocol="", ip_type=""):
+    """Return status counts for the currently selected filter scope."""
+    country = normalized_country_name(country) if country else ""
+    protocol = str(protocol or "").strip().lower()
+    ip_type = str(ip_type or "").strip().lower()
+    status_counts = node_pool.status_counts(country=country, protocol=protocol, ip_type=ip_type)
+    connected_count = 0
+    try:
+        if active_pool_endpoint_id:
+            endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
+            node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
+            connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type) else 0
+        elif active_openvpn_node_id:
+            active = next(
+                (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
+                None,
+            )
+            if active:
+                active = dict(active)
+                active["active"] = True
+                connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type) else 0
+    except Exception:
+        connected_count = 0
+    return {
+        "country": country,
+        "protocol": protocol,
+        "ip_type": ip_type,
+        "status_counts": status_counts,
+        "connected_count": connected_count,
+    }
+
+
 def _get_ui_country_catalog(status="", protocol="", ip_type=""):
     """Return global country/IP totals without transferring global node rows."""
     status = str(status or "").strip().lower()
@@ -14855,6 +15322,8 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
         "country_ip_count": int(catalog.get("country_ip_count") or sum(int(v.get("ip_count") or 0) for v in countries.values())),
         "countries": countries,
         "server_country": server_country,
+        "status_counts": node_pool.status_counts(protocol=protocol, ip_type=ip_type),
+        "connected_count": 1 if (status == "connected" and (active_pool_endpoint_id or active_openvpn_node_id)) else 0,
         "status": status,
         "protocol": protocol,
         "ip_type": ip_type,
@@ -14874,9 +15343,26 @@ def _get_fast_nodes_state():
     state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["probe_engine_running"] = probe_engine_running
+    state["probe_engine_message"] = probe_engine_message
+    state["probe_engine_target_country"] = probe_engine_target_country
+    state.setdefault("priority_full_sweep_running", False)
+    state.setdefault("priority_full_sweep_total", 0)
+    state.setdefault("priority_full_sweep_tested", 0)
+    state.setdefault("priority_full_sweep_remaining", 0)
+    state.setdefault("priority_full_sweep_country", "")
+    state["connected_count"] = 1 if (active_pool_endpoint_id or active_openvpn_node_id) else 0
     cached_active = state.get("active_openvpn_node")
     if isinstance(cached_active, dict) and cached_active.get("id"):
         state["active_openvpn_node"] = cached_active
+        try:
+            raw_active = next((n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)), None)
+            if raw_active:
+                state["active_openvpn_node"]["speed"] = raw_active.get("speed") or 0
+                state["active_openvpn_node"]["speed_bps"] = raw_active.get("speed") or 0
+                state["active_openvpn_node"]["speed_source"] = "vpngate_observation" if int(raw_active.get("speed") or 0) > 0 else "not_measured"
+        except Exception:
+            pass
     else:
         state["active_openvpn_node"] = None
     if active_openvpn_node_id and not state["active_openvpn_node"]:
@@ -14896,6 +15382,9 @@ def _get_fast_nodes_state():
                     "protocol": active_node.get("protocol") or "openvpn",
                     "owner": active_node.get("owner") or active_node.get("as_name") or "",
                     "ip_type": active_node.get("ip_type") or "",
+                    "speed": active_node.get("speed") or 0,
+                    "speed_bps": active_node.get("speed") or 0,
+                    "speed_source": "vpngate_observation" if int(active_node.get("speed") or 0) > 0 else "not_measured",
                     "latency_ms": active_node.get("latency_ms") or 0,
                 }
         except Exception:
@@ -14923,6 +15412,8 @@ def _get_fast_nodes_state():
                     "ip_type": meta.get("ip_type") or "",
                     "quality": meta.get("quality") or "",
                     "speed": endpoint.get("latest_speed", 0),
+                    "speed_bps": endpoint.get("latest_speed", 0),
+                    "speed_source": "vpngate_observation" if int(endpoint.get("latest_speed") or 0) > 0 else "not_measured",
                     "latency_ms": endpoint.get("latency_ewma", 0),
                 }
         except Exception:
@@ -14937,6 +15428,8 @@ def _get_fast_nodes_state():
         state["pool_states"] = pool_stats.get("states") or {}
         state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
         state["hot_pool_target"] = HOT_POOL_TARGET
+        state["hot_pool_deficit"] = max(0, HOT_POOL_TARGET - state["hot_pool_size"])
+        state["status_counts"] = node_pool.status_counts()
     except Exception:
         state.setdefault("pool_servers", 0)
         state.setdefault("pool_endpoints", 0)

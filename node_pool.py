@@ -76,14 +76,24 @@ class NodePool:
         self.lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._stats_cache: tuple[float, dict[str, Any]] | None = None
+        self._status_counts_cache: dict[tuple[str, str, str], tuple[float, dict[str, int]]] = {}
+        self._scoped_page_cache: dict[tuple, tuple[float, tuple[list[dict[str, Any]], int]]] = {}
         self._country_catalog_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+        self._scoped_query_gate_guard = threading.Lock()
+        self._scoped_query_gates: dict[tuple, threading.Lock] = {}
+        self._country_catalog_gate = threading.Lock()
+        self._status_counts_gate = threading.Lock()
         with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
             db.commit()
 
     def _invalidate_read_caches(self) -> None:
+        # Writes do not synchronously flush every UI snapshot. Status/country
+        # statistics and bounded pages are intentionally short-TTL snapshots;
+        # keeping them warm prevents a probe storm from turning every browser
+        # request into a SQLite scan. The data remains authoritative after the
+        # cache TTL and is refreshed automatically.
         self._stats_cache = None
-        self._country_catalog_cache.clear()
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(str(self.db_path), timeout=3)
@@ -311,68 +321,89 @@ class NodePool:
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         offset = max(0, int(offset or 0))
-        limit = max(1, min(int(limit or 100), 200))
-        where = ["TRIM(COALESCE(s.current_ip, '')) <> ''"]
-        params: list[Any] = []
-        if country:
-            where.append("s.country=?")
-            params.append(country)
-        if protocol and protocol != "all":
-            where.append("LOWER(e.protocol)=?")
-            params.append(protocol)
-        if ip_type and ip_type != "all":
-            where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
-            params.append(ip_type)
-        if status and status != "all":
-            groups = {
-                "available": ("HOT", "AVAILABLE"),
-                "testing": ("TESTING", "DEGRADED"),
-                "not_checked": ("NEW",),
-                "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
-            }
-            allowed = groups.get(status)
-            if allowed:
-                placeholders=','.join('?' for _ in allowed)
-                where.append(f"UPPER(e.status) IN ({placeholders})")
-                params.extend(allowed)
-        base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
-        with closing(self._connect()) as db:
-            total=int(db.execute("SELECT COUNT(*) "+base,params).fetchone()[0] or 0)
-            rows=db.execute("""
-                SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
-                       s.metadata_json AS server_metadata_json,
-                       COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_speed,
-                       COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
-                       COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
-                """ + base + """
-                ORDER BY CASE UPPER(e.status)
-                    WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'NEW' THEN 2
-                    WHEN 'DEGRADED' THEN 3 WHEN 'COOLDOWN' THEN 4 WHEN 'STALE' THEN 5
-                    WHEN 'RETIRED' THEN 6 ELSE 7 END,
-                    CASE WHEN e.latency_ewma>0 THEN e.latency_ewma ELSE 999999 END,
-                    e.next_test ASC, e.last_seen DESC
-                LIMIT ? OFFSET ?""", params+[limit,offset]).fetchall()
-        result=[]
-        for row in rows:
-            item=dict(row)
-            try: item['metadata']=json.loads(item.pop('metadata_json') or '{}')
-            except Exception: item['metadata']={}; item.pop('metadata_json',None)
-            try: item['server_metadata']=json.loads(item.pop('server_metadata_json') or '{}')
-            except Exception: item['server_metadata']={}; item.pop('server_metadata_json',None)
-            item['country']=canonical_country_name(item.get('country') or '')
-            # Completeness is explicit: zero/unknown probe metrics are not
-            # fabricated and can be rendered as “待检测/—” by the UI.
-            item['data_integrity']={
-                'country': bool(item.get('country')),
-                'ip': bool(item.get('current_ip')),
-                'protocol': bool(item.get('protocol')),
-                'port': int(item.get('port') or 0) > 0 or item.get('protocol')=='l2tp-ipsec',
-                'speed': int(item.get('latest_speed') or 0) > 0,
-                'latency': float(item.get('latency_ewma') or item.get('latest_ping') or 0) > 0,
-            }
-            result.append(item)
-        return result,total
+        # Internal callers (e.g. the country full-sweep engine) may request
+        # the complete country inventory; the HTTP layer still caps browser
+        # pages at 200 rows.
+        limit = max(1, min(int(limit or 100), 5000))
+        cache_key = (country, status, protocol, ip_type, offset, limit)
+        cached = self._scoped_page_cache.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            cached_rows, cached_total = cached[1]
+            return [dict(x) for x in cached_rows], int(cached_total)
+
+        with self._scoped_query_gate_guard:
+            gate = self._scoped_query_gates.setdefault(cache_key, threading.Lock())
+        gate.acquire()
+        try:
+            cached = self._scoped_page_cache.get(cache_key)
+            if cached and cached[0] > time.monotonic():
+                cached_rows, cached_total = cached[1]
+                return [dict(x) for x in cached_rows], int(cached_total)
+
+            where = ["TRIM(COALESCE(s.current_ip, '')) <> ''"]
+            params: list[Any] = []
+            if country:
+                where.append("s.country=?")
+                params.append(country)
+            if protocol and protocol != "all":
+                where.append("LOWER(e.protocol)=?")
+                params.append(protocol)
+            if ip_type and ip_type != "all":
+                where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
+                params.append(ip_type)
+            if status and status != "all":
+                groups = {
+                    "available": ("HOT", "AVAILABLE"),
+                    "testing": ("TESTING", "DEGRADED"),
+                    "not_checked": ("NEW",),
+                    "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
+                }
+                allowed = groups.get(status)
+                if allowed:
+                    placeholders=','.join('?' for _ in allowed)
+                    where.append(f"UPPER(e.status) IN ({placeholders})")
+                    params.extend(allowed)
+
+            base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
+            with closing(self._connect()) as db:
+                total=int(db.execute("SELECT COUNT(*) "+base,params).fetchone()[0] or 0)
+                rows=db.execute("""
+                    SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
+                           s.metadata_json AS server_metadata_json,
+                           COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
+                           COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                           COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
+                           COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
+                    """ + base + """
+                    ORDER BY CASE UPPER(e.status)
+                        WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'NEW' THEN 2
+                        WHEN 'DEGRADED' THEN 3 WHEN 'COOLDOWN' THEN 4 WHEN 'STALE' THEN 5
+                        WHEN 'RETIRED' THEN 6 ELSE 7 END,
+                        CASE WHEN e.latency_ewma>0 THEN e.latency_ewma ELSE 999999 END,
+                        e.next_test ASC, e.last_seen DESC
+                    LIMIT ? OFFSET ?""", params+[limit,offset]).fetchall()
+
+            result=[]
+            for row in rows:
+                item=dict(row)
+                try: item['metadata']=json.loads(item.pop('metadata_json') or '{}')
+                except Exception: item['metadata']={}; item.pop('metadata_json',None)
+                try: item['server_metadata']=json.loads(item.pop('server_metadata_json') or '{}')
+                except Exception: item['server_metadata']={}; item.pop('server_metadata_json',None)
+                item['country']=canonical_country_name(item.get('country') or '')
+                item['data_integrity']={
+                    'country': bool(item.get('country')),
+                    'ip': bool(item.get('current_ip')),
+                    'protocol': bool(item.get('protocol')),
+                    'port': int(item.get('port') or 0) > 0 or item.get('protocol')=='l2tp-ipsec',
+                    'speed': int(item.get('latest_speed') or 0) > 0,
+                    'latency': float(item.get('latency_ewma') or item.get('latest_ping') or 0) > 0,
+                }
+                result.append(item)
+            self._scoped_page_cache[cache_key] = (time.monotonic() + 1.0, (result, total))
+            return [dict(x) for x in result], total
+        finally:
+            gate.release()
 
     def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id=""):
         """Authoritative country/IP inventory using the same Master Pool scope as the node table."""
@@ -471,7 +502,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -514,7 +545,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -541,29 +572,31 @@ class NodePool:
             if len(out) >= limit: break
         return out
 
-    def due_endpoints(self, protocols: tuple[str, ...] | list[str], limit: int = 10) -> list[dict[str, Any]]:
+    def due_endpoints(self, protocols: tuple[str, ...] | list[str], limit: int = 10, country: str = "") -> list[dict[str, Any]]:
         protocols = [str(x or "").strip().lower() for x in protocols if str(x or "").strip()]
         if not protocols: return []
         limit = max(1, min(int(limit or 10), 100))
+        country = canonical_country_name(country) if country else ""
         placeholders = ",".join("?" for _ in protocols)
+        where_country = " AND s.country=?" if country else ""
         with closing(self._connect()) as db:
             rows = db.execute(
                 """
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
                 WHERE LOWER(e.protocol) IN (""" + placeholders + """)
                   AND UPPER(e.status) NOT IN ('RETIRED')
-                  AND e.next_test <= ?
+                  AND e.next_test <= ?""" + where_country + """
                 ORDER BY CASE UPPER(e.status) WHEN 'NEW' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'HOT' THEN 2 ELSE 3 END,
                          e.next_test ASC, e.last_seen DESC
                 LIMIT ?
                 """,
-                protocols + [time.time(), limit]
+                protocols + [time.time()] + ([country] if country else []) + [limit]
             ).fetchall()
         out = []
         for row in rows:
@@ -609,11 +642,12 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
-    def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "") -> bool:
+    def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int = 0) -> bool:
         endpoint_id = str(endpoint_id or "").strip()
         if not endpoint_id: return False
         now = time.time()
         latency = max(0, int(latency_ms or 0))
+        speed = max(0, int(speed_bps or 0))
         msg = str(message or "")[:1000]
         with self.lock, closing(self._connect()) as db:
             row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
@@ -632,6 +666,8 @@ class NodePool:
                 new_jitter = 0.35 * jitter + 0.65 * float(row["jitter_ewma"] or 0)
                 meta["last_error"] = ""
                 meta["last_probe_message"] = msg
+                meta["last_probe_speed_bps"] = speed
+                meta["last_probe_speed_at"] = now
                 db.execute(
                     """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
                        fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, metadata_json=?
@@ -650,12 +686,12 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
-    def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "") -> bool:
+    def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int = 0) -> bool:
         key = self.server_key(node)
         protocol = str(node.get("protocol") or "openvpn").strip().lower()
         transport = str(node.get("proto") or node.get("transport") or "tcp").strip().lower()
         port = int(node.get("remote_port") or 0)
-        return self.record_endpoint_probe(self.endpoint_id(key, protocol, transport, port), ok, latency_ms, message)
+        return self.record_endpoint_probe(self.endpoint_id(key, protocol, transport, port), ok, latency_ms, message, speed_bps=speed_bps)
 
     def update_server_metadata_batch(self, updates: dict[str, dict[str, Any]]) -> int:
         if not isinstance(updates, dict) or not updates: return 0
@@ -746,6 +782,49 @@ class NodePool:
             db.commit()
         self._invalidate_read_caches()
         return {"servers": repaired_servers, "endpoints": repaired_endpoints}
+
+    def status_counts(self, country: str = "", protocol: str = "", ip_type: str = "") -> dict[str, int]:
+        """Return authoritative endpoint status counts for the UI filters."""
+        country = canonical_country_name(country) if country else ""
+        protocol = str(protocol or "").strip().lower()
+        ip_type = str(ip_type or "").strip().lower()
+        cache_key = (country, protocol, ip_type)
+        cached = self._status_counts_cache.get(cache_key)
+        if cached and cached[0] > time.monotonic():
+            return dict(cached[1])
+        with self._status_counts_gate:
+            cached = self._status_counts_cache.get(cache_key)
+            if cached and cached[0] > time.monotonic():
+                return dict(cached[1])
+            where = ["TRIM(COALESCE(s.current_ip,''))<>''"]
+            params: list[Any] = []
+            if country:
+                where.append("s.country=?")
+                params.append(country)
+            if protocol and protocol != "all":
+                where.append("LOWER(e.protocol)=?")
+                params.append(protocol)
+            if ip_type and ip_type != "all":
+                where.append("LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?")
+                params.append(ip_type)
+            sql = """
+                SELECT
+                  SUM(CASE WHEN UPPER(e.status) IN ('HOT','AVAILABLE') THEN 1 ELSE 0 END) AS available,
+                  SUM(CASE WHEN UPPER(e.status)='TESTING' THEN 1 ELSE 0 END) AS testing,
+                  SUM(CASE WHEN UPPER(e.status)='NEW' THEN 1 ELSE 0 END) AS not_checked,
+                  SUM(CASE WHEN UPPER(e.status) IN ('DEGRADED','COOLDOWN','STALE','RETIRED','UNAVAILABLE') THEN 1 ELSE 0 END) AS unavailable
+                FROM endpoints e JOIN servers s ON s.server_key=e.server_key
+                WHERE """ + " AND ".join(where)
+            with closing(self._connect()) as db:
+                row = db.execute(sql, params).fetchone()
+            result = {
+                "available": int(row["available"] or 0),
+                "testing": int(row["testing"] or 0),
+                "not_checked": int(row["not_checked"] or 0),
+                "unavailable": int(row["unavailable"] or 0),
+            }
+            self._status_counts_cache[cache_key] = (time.monotonic() + 2.0, result)
+            return dict(result)
 
     def stats(self) -> dict[str, Any]:
         now = time.monotonic()
