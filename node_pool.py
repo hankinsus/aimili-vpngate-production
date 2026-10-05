@@ -226,7 +226,7 @@ class NodePool:
         # The UI is paginated; keep the backend ceiling high enough that the
         # persistent Master Pool is not accidentally truncated at 1000 endpoints.
         limit = max(1, min(int(limit), 5000))
-        with self.lock, closing(self._connect()) as db:
+        with closing(self._connect()) as db:
             params: list[Any] = []
             where = ""
             if protocol:
@@ -919,7 +919,7 @@ class NodePool:
         return selected
 
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
-        with self.lock, closing(self._connect()) as db:
+        with closing(self._connect()) as db:
             row = db.execute(
                 """
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
