@@ -75,13 +75,26 @@ class NodePool:
         self.db_path = Path(db_path)
         self.lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._stats_cache: tuple[float, dict[str, Any]] | None = None
+        self._country_catalog_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
         with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
             db.commit()
 
+    def _invalidate_read_caches(self) -> None:
+        self._stats_cache = None
+        self._country_catalog_cache.clear()
+
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(str(self.db_path), timeout=10)
+        db = sqlite3.connect(str(self.db_path), timeout=3)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=2500")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
+        db.execute("PRAGMA temp_store=MEMORY")
+        db.execute("PRAGMA cache_size=-4096")
+        db.execute("PRAGMA mmap_size=67108864")
+        db.execute("PRAGMA foreign_keys=ON")
         return db
 
     @staticmethod
@@ -566,6 +579,7 @@ class NodePool:
                     )
                 imported += 1
             db.commit()
+        self._invalidate_read_caches()
         return imported
 
     def remove_shared_peer(self, peer_id: str) -> int:
@@ -639,6 +653,7 @@ class NodePool:
                 """
             )
             db.commit()
+        self._invalidate_read_caches()
         return removed
 
     def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "") -> None:
@@ -698,6 +713,7 @@ class NodePool:
                 )
                 db.execute("UPDATE servers SET state=? WHERE server_key=?", (status, key))
             db.commit()
+        self._invalidate_read_caches()
 
     def reset_openvpn_latency_metrics(self) -> int:
         """Discard historical OpenVPN latency/status values that may have been sourced from VPNGate Ping.
@@ -1094,90 +1110,58 @@ class NodePool:
         return result
 
     def list_endpoints_scoped(self, country: str = "", status: str = "", protocol: str = "", ip_type: str = "", offset: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
-        """Fast scoped endpoint query used while the full UI snapshot is building."""
+        """Fast server-side scoped query; never materializes the whole pool."""
         country = str(country or "").strip()
         status = str(status or "").strip().lower()
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         offset = max(0, int(offset or 0))
-        # Server-side scoped reads may materialize the selected scope for UI de-duplication.
-        # This never sends the full pool to the browser; the HTTP layer still paginates.
-        limit = max(1, min(int(limit or 100), 10000))
-
-        where = [
-            "TRIM(COALESCE(s.country, '')) <> ''",
-            "TRIM(COALESCE(s.current_ip, '')) <> ''",
-        ]
+        limit = max(1, min(int(limit or 100), 200))
+        where = ["TRIM(COALESCE(s.country, '')) <> '', "TRIM(COALESCE(s.current_ip, '')) <> ''"]
         params: list[Any] = []
         if country:
-            # The UI uses the canonical Chinese country name, while the Master
-            # Pool may contain either the Chinese or source-language country.
-            # Match every known source-language variant so a country selection
-            # returns the same inventory shown in the country catalog.
             variants = {country}
             for raw_country, zh_country in COUNTRY_TRANSLATIONS.items():
-                if zh_country == country:
-                    variants.add(raw_country)
+                if zh_country == country: variants.add(raw_country)
             placeholders = ",".join("?" for _ in variants)
             where.append(f"s.country IN ({placeholders})")
             params.extend(sorted(variants))
-        if protocol:
-            where.append("e.protocol=?")
-            params.append(protocol)
-        if status == "available":
-            where.append("e.status IN ('HOT','AVAILABLE')")
-        elif status == "testing":
-            where.append("e.status IN ('NEW','DEGRADED')")
-        elif status == "unavailable":
-            where.append("e.status IN ('COOLDOWN','STALE')")
-        if ip_type:
+        if protocol and protocol != "all":
+            where.append("e.protocol=?"); params.append(protocol)
+        if status and status != "all":
+            groups = {"available": ("HOT","AVAILABLE"), "testing": ("NEW","DEGRADED"), "unavailable": ("COOLDOWN","STALE"), "not_checked": ("NEW",)}
+            allowed = groups.get(status)
+            if allowed:
+                placeholders = ",".join("?" for _ in allowed)
+                where.append(f"e.status IN ({placeholders})"); params.extend(allowed)
+        if ip_type and ip_type != "all":
             where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
             params.append(ip_type)
-
-        base = f"""
-            FROM endpoints e
-            JOIN servers s ON s.server_key=e.server_key
-            WHERE {' AND '.join(where)}
-        """
+        base = "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
         with self.lock, closing(self._connect()) as db:
-            total = int(db.execute(
-                "SELECT COUNT(*) c " + base, params
-            ).fetchone()["c"] or 0)
+            total = int(db.execute("SELECT COUNT(*) " + base, params).fetchone()[0] or 0)
             rows = db.execute(
                 """
-                SELECT e.*, s.hostname, s.current_ip, s.country,
-                       s.state AS server_state, s.metadata_json AS server_metadata_json,
+                SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
+                       s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_ping,
                        COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_server_score
                 """ + base + """
-                ORDER BY
-                  CASE e.status
-                    WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'NEW' THEN 2
-                    WHEN 'DEGRADED' THEN 3 WHEN 'COOLDOWN' THEN 4 WHEN 'STALE' THEN 5 ELSE 6 END,
-                  e.next_test ASC, e.latency_ewma ASC, e.last_seen DESC
+                ORDER BY CASE e.status WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'NEW' THEN 2 WHEN 'DEGRADED' THEN 3 WHEN 'COOLDOWN' THEN 4 WHEN 'STALE' THEN 5 ELSE 6 END,
+                         e.next_test ASC, e.latency_ewma ASC, e.last_seen DESC
                 LIMIT ? OFFSET ?
-                """,
-                params + [limit, offset]
-            ).fetchall()
-
+                """, params + [limit, offset]).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            try:
-                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
-            except Exception:
-                item["metadata"] = {}
-                item.pop("metadata_json", None)
-            try:
-                item["server_metadata"] = json.loads(item.pop("server_metadata_json") or "{}")
-            except Exception:
-                item["server_metadata"] = {}
-                item.pop("server_metadata_json", None)
+            try: item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            except Exception: item["metadata"] = {}; item.pop("metadata_json", None)
+            try: item["server_metadata"] = json.loads(item.pop("server_metadata_json") or "{}")
+            except Exception: item["server_metadata"] = {}; item.pop("server_metadata_json", None)
             result.append(item)
         return result, total
-
     def country_catalog(self, status: str = "", protocol: str = "", ip_type: str = "") -> dict[str, Any]:
         """Return distinct server-IP inventory, optionally scoped by UI filters."""
         status = str(status or "").strip().lower()
