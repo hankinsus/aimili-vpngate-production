@@ -3790,6 +3790,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     speed_result: dict[str, Any] = {}
     openvpn_process: subprocess.Popen[str] | None = None
     speed_table: int | None = None
+    speed_endpoint_id = node_pool.endpoint_id(
+        node_pool.server_key(node), "openvpn",
+        str(node.get("proto") or node.get("transport") or "tcp").strip().lower(), p
+    )
 
     idx = None
     try:
@@ -3920,6 +3924,10 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         speed_result: dict[str, Any] = {}
         tun_idx = None
         speed_table: int | None = None
+        speed_endpoint_id = node_pool.endpoint_id(
+            node_pool.server_key(n_info), "openvpn",
+            str(n_info.get("proto") or n_info.get("transport") or "tcp").strip().lower(), p
+        )
         openvpn_process: subprocess.Popen[str] | None = None
         try:
             tun_idx = get_free_test_index()
@@ -4581,6 +4589,27 @@ def measure_interface_speed(interface: str, gateway: str = "", table: int = PROB
     finally:
         cleanup_probe_policy_routing(table)
         speed_test_lock.release()
+
+def measure_or_reuse_ip_speed(interface: str, endpoint_id: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
+    """Run one real download speed test per current IP within the reuse window."""
+    endpoint_id = str(endpoint_id or "").strip()
+    if endpoint_id:
+        try:
+            cached = node_pool.get_cached_ip_speed(endpoint_id, SPEED_TEST_REUSE_SECONDS)
+        except Exception:
+            cached = {"hit": False, "speed_bps": 0}
+        if cached.get("hit"):
+            speed_bps = max(0, int(cached.get("speed_bps") or 0))
+            return {
+                "ok": speed_bps > 0,
+                "speed_bps": speed_bps,
+                "speed_mbps": round(speed_bps / 1_000_000, 1) if speed_bps > 0 else 0,
+                "reused": True,
+                "error": "" if speed_bps > 0 else "复用的最近一次 IP 测速结果为 0",
+            }
+    result = measure_interface_speed(interface, gateway=gateway, table=table)
+    result["reused"] = False
+    return result
 
 def _acquire_probe_route_table() -> int | None:
     with probe_route_table_lock:
@@ -6709,8 +6738,8 @@ INDEX_HTML = r"""<!doctype html>
       padding: 16px;
       margin-bottom: 24px;
       display: flex;
-      gap: 16px;
-      flex-wrap: wrap;
+      gap: 8px;
+      flex-wrap: nowrap;
       align-items: center;
       overflow: visible;
     }
@@ -7097,7 +7126,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     th, td {
-      padding: 11px 8px;
+      padding: 9px 6px;
       border-bottom: 1px solid var(--border-color);
       font-size: 14px;
       box-sizing: border-box;
@@ -8423,6 +8452,27 @@ INDEX_HTML = r"""<!doctype html>
       <div id="ip_type_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
     </div>
 
+      <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
+        <option value="0">不限速度</option>
+        <option value="10000000">大于 10 Mbps</option>
+        <option value="30000000">大于 30 Mbps</option>
+        <option value="50000000">大于 50 Mbps</option>
+        <option value="100000000">大于 100 Mbps</option>
+        <option value="150000000">大于 150 Mbps</option>
+        <option value="200000000">大于 200 Mbps</option>
+        <option value="300000000">大于 300 Mbps</option>
+        <option value="500000000">大于 500 Mbps</option>
+        <option value="800000000">大于 800 Mbps</option>
+        <option value="1000000000">大于 1 Gbps</option>
+      </select>
+      <div id="speed_filter_widget" class="toolbar-custom-select" data-filter-id="speed_filter" aria-label="速度筛选">
+        <button id="speed_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
+          <span id="speed_filter_label" class="toolbar-custom-select-label">不限速度</span>
+          <span class="toolbar-custom-select-arrow">⌄</span>
+        </button>
+        <div id="speed_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+      </div>
+
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
@@ -9207,6 +9257,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   const selectedCountry = $("country_filter")?.value || "";
   const selectedProtocol = $("protocol_filter")?.value || "";
   const selectedIpType = $("ip_type_filter")?.value || "";
+  const selectedSpeed = Number($("speed_filter")?.value || 0);
   const selectedStatus = $("status_filter")?.value || "";
 
   if (!ignoreCountry && selectedCountry && getNodeCountry(n) !== translateCountry(selectedCountry)) return false;
@@ -9233,7 +9284,8 @@ const CUSTOM_FILTER_CONFIG = {
   status_filter: {widget:"status_filter_widget", button:"status_filter_button", label:"status_filter_label", menu:"status_filter_menu"},
   country_filter: {widget:"country_filter_widget", button:"country_filter_button", label:"country_filter_label", menu:"country_filter_menu"},
   protocol_filter: {widget:"protocol_filter_widget", button:"protocol_filter_button", label:"protocol_filter_label", menu:"protocol_filter_menu"},
-  ip_type_filter: {widget:"ip_type_filter_widget", button:"ip_type_filter_button", label:"ip_type_filter_label", menu:"ip_type_filter_menu"}
+  ip_type_filter: {widget:"ip_type_filter_widget", button:"ip_type_filter_button", label:"ip_type_filter_label", menu:"ip_type_filter_menu"},
+  speed_filter: {widget:"speed_filter_widget", button:"speed_filter_button", label:"speed_filter_label", menu:"speed_filter_menu"}
 };
 
 
@@ -9631,7 +9683,8 @@ function currentFilterKey() {
   return [
     status === "all" ? "" : status,
     $("protocol_filter")?.value || "",
-    $("ip_type_filter")?.value || ""
+    $("ip_type_filter")?.value || "",
+    $("speed_filter")?.value || "0"
   ].join("|");
 }
 
@@ -10117,6 +10170,8 @@ function render(){
         : (n.probe_status === "available" ? Number(n.latency_ms || 0) : 0);
       const latencyClass = getLatencyClass(rowLatencyValue);
       const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}">${rowLatencyValue} ms</span>` : "-";
+      const rowSpeedValue = Number(n.speed_bps || n.speed || 0);
+      const rowSpeedText = rowSpeedValue ? `<span class="node-speed-val">${esc(speed(rowSpeedValue))}</span>` : "—";
       const displayLocation = formatNodeLocation(n);
       const displayLocationFlag = countryFlag(n.country || displayLocation, translateCountry(n.country) || displayLocation, "lazy");
       const protocolName = translateProtocol(n.protocol || "openvpn");
@@ -10386,9 +10441,11 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
   const status = $("status_filter")?.value || "";
   const protocol = $("protocol_filter")?.value || "";
   const ipType = $("ip_type_filter")?.value || "";
+  const speedMinBps = Number($("speed_filter")?.value || 0);
   if (status) params.set("status", status);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
+  if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
   return fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
 }
 
@@ -11173,6 +11230,7 @@ $("country_filter").onchange=async()=>{
 };
 $("protocol_filter").onchange=applyNodeFilterChange;
 $("ip_type_filter").onchange=applyNodeFilterChange;
+$("speed_filter").onchange=applyNodeFilterChange;
 $("status_filter").onchange=applyNodeFilterChange;
 renderAllCustomFilters();
 bindCustomFilterEvents();
@@ -13656,6 +13714,7 @@ class Handler(BaseHTTPRequestHandler):
             status = str((query.get("status") or [""])[0]).strip().lower()
             protocol = str((query.get("protocol") or [""])[0]).strip().lower()
             ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
+            speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
             if status == "connected":
                 # Connected is a runtime connection state, not a Master Pool
                 # endpoint lifecycle state. Resolve it from the active tunnel
@@ -13678,12 +13737,12 @@ class Handler(BaseHTTPRequestHandler):
                     if raw_active:
                         raw_active = dict(raw_active)
                         raw_active["active"] = True
-                        if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type):
+                        if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type, speed_min_bps):
                             connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
                 page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
             else:
                 page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
-                    offset, limit, country, status, protocol, ip_type
+                    offset, limit, country, status, protocol, ip_type, speed_min_bps
                 )
             self.send_json({
                 "ok": True,
@@ -13702,7 +13761,8 @@ class Handler(BaseHTTPRequestHandler):
                 country = str((query.get("country") or [""])[0]).strip()
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-                self.send_json({"ok": True, **_get_ui_filter_counts(country, protocol, ip_type)})
+                speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
+                self.send_json({"ok": True, **_get_ui_filter_counts(country, protocol, ip_type, speed_min_bps)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/ui/country_catalog":
@@ -15176,11 +15236,12 @@ def _get_ui_nodes_snapshot():
     return _sanitize_ui_nodes(read_nodes())
 
 
-def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str = "", protocol: str = "", ip_type: str = "") -> bool:
+def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0) -> bool:
     country = str(country or "").strip()
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
+    speed_min_bps = max(0, int(speed_min_bps or 0))
 
     if country and not country_matches(node.get("country"), country):
         # A populated canonical country is authoritative. Only fall back to
@@ -15214,7 +15275,7 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     return True
 
 
-def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type=""):
+def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type="", speed_min_bps=0):
     """Return a bounded page for the requested scope.
 
     The browser should never download the global pool merely to populate a
@@ -15236,6 +15297,26 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     # heavyweight global snapshot being complete before filters or pages work.
     # SQLite performs the scope/count query and HTTP returns only one page.
     try:
+        active_endpoint_id = str(active_pool_endpoint_id or "")
+        active_ip = active_protocol = ""
+        active_port = 0
+        if active_endpoint_id:
+            try:
+                active_ep = node_pool.get_endpoint(active_endpoint_id) or {}
+                active_ip = str(active_ep.get("current_ip") or "").strip()
+                active_protocol = str(active_ep.get("protocol") or "").strip().lower()
+                active_port = parse_int(active_ep.get("port"))
+            except Exception:
+                pass
+        elif active_openvpn_node_id:
+            try:
+                raw_active = next((n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)), None)
+                if raw_active:
+                    active_ip = str(raw_active.get("ip") or raw_active.get("remote_host") or "").strip()
+                    active_protocol = "openvpn"
+                    active_port = parse_int(raw_active.get("remote_port"))
+            except Exception:
+                pass
         scoped_endpoints, endpoint_total = node_pool.list_endpoints_scoped(
             country=country,
             status=status,
@@ -15269,24 +15350,25 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
         snapshot = [dict(x) for x in ui_nodes_cache] if ui_nodes_cache else []
     if not snapshot:
         snapshot = _sanitize_ui_nodes(read_nodes())
-    filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type)]
+    filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type, speed_min_bps)]
     ordered = _sort_ui_nodes_for_page(filtered)
     total = len(ordered)
     return ordered[offset:offset + limit], total, building
 
 
-def _get_ui_filter_counts(country="", protocol="", ip_type=""):
+def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0):
     """Return status counts for the currently selected filter scope."""
     country = normalized_country_name(country) if country else ""
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
-    status_counts = node_pool.status_counts(country=country, protocol=protocol, ip_type=ip_type)
+    speed_min_bps = max(0, int(speed_min_bps or 0))
+    status_counts = node_pool.status_counts(country=country, protocol=protocol, ip_type=ip_type, speed_min_bps=speed_min_bps)
     connected_count = 0
     try:
         if active_pool_endpoint_id:
             endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
             node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
-            connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type) else 0
+            connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps) else 0
         elif active_openvpn_node_id:
             active = next(
                 (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
@@ -15307,17 +15389,19 @@ def _get_ui_filter_counts(country="", protocol="", ip_type=""):
     }
 
 
-def _get_ui_country_catalog(status="", protocol="", ip_type=""):
+def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0):
     """Return global country/IP totals without transferring global node rows."""
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
+    speed_min_bps = max(0, int(speed_min_bps or 0))
     try:
         catalog = node_pool.country_catalog(
             status=status,
             protocol=protocol,
             ip_type=ip_type,
             connected_endpoint_id=active_pool_endpoint_id,
+            speed_min_bps=speed_min_bps,
         )
     except Exception:
         catalog = {"total_ip_count": 0, "countries": {}}
