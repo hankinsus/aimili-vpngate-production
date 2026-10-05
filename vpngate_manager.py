@@ -8451,7 +8451,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.9</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.13</span></span>
           </span>
         </div>
       </div>
@@ -8872,7 +8872,7 @@ const COUNTRY_FLAG_ALIASES = {
   "Lao People's Democratic Republic":"LA","Laos":"LA","Côte d'Ivoire":"CI","Ivory Coast":"CI","Eswatini":"SZ","Swaziland":"SZ",
   "Moldova, Republic of":"MD","Palestine, State of":"PS","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ",
   "Bolivia, Plurinational State of":"BO","Venezuela, Bolivarian Republic of":"VE","Cabo Verde":"CV","Cape Verde":"CV",
-  "Curacao":"CW","Curaçao":"CW","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK","Yemen":"YE"
+  "Curacao":"CW","Curaçao":"CW","库拉索":"CW","克利珀顿岛":"CP","克利珀顿":"CP","Clipperton Island":"CP","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK","Yemen":"YE"
 };
 
 const REGION_DISPLAY_NAMES_ZH = typeof Intl !== "undefined" && Intl.DisplayNames
@@ -14764,13 +14764,20 @@ def availability_sweep_once(priority_country=""):
         priority_ov=_due_endpoints(priority,("openvpn",),min(5,ov_limit)) if priority else []
         priority_pool=_due_endpoints(priority,("softether","sstp","l2tp-ipsec"),min(3,pool_limit)) if priority else []
         selected_ov=[]; selected_pool=[]; seen=set()
-        for ep in priority_ov+_due_endpoints("",("openvpn",),ov_limit):
+        # Strict priority: while the requested/default country still has due
+        # endpoints, do NOT spend the probe budget on other countries. This
+        # prevents the local/custom country from being starved by the global
+        # latency rotation.
+        ov_source = priority_ov if priority_ov else _due_endpoints("",("openvpn",),ov_limit)
+        for ep in ov_source:
             eid=str(ep.get("endpoint_id") or "")
             if not eid or eid in seen: continue
             seen.add(eid); selected_ov.append(ep)
             if len(selected_ov)>=ov_limit: break
         seen=set()
-        for ep in priority_pool+_due_endpoints("",("softether","sstp","l2tp-ipsec"),pool_limit):
+        # Same strict priority rule for the non-OpenVPN protocols.
+        pool_source = priority_pool if priority_pool else _due_endpoints("",("softether","sstp","l2tp-ipsec"),pool_limit)
+        for ep in pool_source:
             eid=str(ep.get("endpoint_id") or "")
             if not eid or eid in seen: continue
             seen.add(eid); selected_pool.append(ep)
