@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -177,7 +176,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.17"
+APP_VERSION = "V1.0.18"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8688,7 +8687,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· {APP_VERSION}</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number" id="footer_brand_version">· {APP_VERSION}</span></span>
           </span>
         </div>
       </div>
@@ -9067,7 +9066,9 @@ function renderCustomFilter(selectId, withCount = false) {
     const parts = withCount ? textValue.split(" · ") : [textValue];
     const name = parts.shift() || textValue;
     const count = parts.join(" · ");
-    const flagMarkup = withCount ? (value ? countryFlag(value, name, "lazy") : countryFlag("")) : "";
+    // The country menu contains the full registry. Eager-load its flags so off-screen
+    // options in the custom scroll container never fall back to 🌐 placeholders.
+    const flagMarkup = withCount ? (value ? countryFlag(value, name, "eager") : countryFlag("")) : "";
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') +
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
       '" data-filter-option="1" data-filter-value="' + esc(value) + '"' +
@@ -10825,6 +10826,8 @@ async function loadGithubCurrentVersion() {
     const versionLabel = String(result.current_version || "未知");
     const el = $("github_current_version");
     if (el) el.textContent = versionLabel;
+    const footer = $("footer_brand_version");
+    if (footer) footer.textContent = "· " + String(versionLabel).split(" · ")[0];
   } catch (e) {
     const el = $("github_current_version");
     if (el) el.textContent = "未知";
