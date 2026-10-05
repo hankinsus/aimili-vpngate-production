@@ -26,6 +26,7 @@ import concurrent.futures
 import sys
 import uuid
 import gzip
+import hashlib
 from ui_control_plane import ui_command_plane
 
 # Prefer IPv4 resolution to avoid slow AAAA DNS timeouts (e.g. in WSL),
@@ -166,6 +167,8 @@ FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 5, 2,
 ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
+FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 1, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 APP_VERSION = "V1.0.11"
@@ -223,6 +226,9 @@ global_pool_refresh_message = ""
 global_pool_refresh_servers = 0
 global_pool_refresh_sources = 0
 global_country_coverage_last_attempt: dict[str, float] = {}
+fast_state_cache_lock = threading.Lock()
+fast_state_cache: dict[str, Any] | None = None
+fast_state_cache_at = 0.0
 is_connecting = False
 # Separate manual connection ownership from background node detection.
 # Manual switching is allowed while a background detection/refresh is running,
@@ -815,9 +821,13 @@ resource_share = ResourceShareManager(
 )
 
 def set_state(**updates: Any) -> None:
+    global fast_state_cache, fast_state_cache_at
     state = get_state()
     state.update(updates)
     write_json(STATE_FILE, state)
+    with fast_state_cache_lock:
+        fast_state_cache = None
+        fast_state_cache_at = 0.0
 
 def set_manual_route_pin(*, protocol: str, endpoint_id: str = "", node_id: str = "") -> None:
     global manual_route_pin, manual_connection_quiet_until
@@ -5039,7 +5049,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
     body {
       margin: 0;
       padding: 0;
-      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
       background-color: var(--bg-dark);
       background-image:
         radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
@@ -5279,7 +5289,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Aimili VPN 多协议节点管理系统</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    /* Self-contained dashboard: no third-party font request on first load. */
 
     :root {
       --bg-dark: #0b0f19;
@@ -12158,6 +12168,8 @@ function exportLogContent() {
 </script>
 </body></html>"""
 
+INDEX_HTML_ETAG = '"' + hashlib.sha256(INDEX_HTML.encode("utf-8")).hexdigest()[:16] + '"'
+
 def local_proxy_port_reachable(timeout: float = 0.4) -> bool:
     host = LOCAL_PROXY_HOST
     candidates: list[tuple[int, str]] = []
@@ -12621,13 +12633,23 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
+        if ACCESS_LOG_ENABLED:
+            print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
-    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK, cache_control: str = "no-store", etag: str = "") -> None:
+        if etag and self.headers.get("If-None-Match") == etag:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("Cache-Control", cache_control)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
+        if etag:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(body)
 
@@ -12798,13 +12820,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         if effective_path in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8", cache_control="private, max-age=15", etag=INDEX_HTML_ETAG)
         elif effective_path in ("/footer-logo-clean.webp", "/footer-logo-clean.png"):
             try:
                 if effective_path.endswith(".webp"):
-                    self.send_bytes((ROOT_DIR / "footer-logo-clean.webp").read_bytes(), "image/webp")
+                    self.send_bytes((ROOT_DIR / "footer-logo-clean.webp").read_bytes(), "image/webp", cache_control="public, max-age=86400, immutable")
                 else:
-                    self.send_bytes((ROOT_DIR / "footer-logo-clean.png").read_bytes(), "image/png")
+                    self.send_bytes((ROOT_DIR / "footer-logo-clean.png").read_bytes(), "image/png", cache_control="public, max-age=86400, immutable")
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/link-test":
@@ -14421,6 +14443,11 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
 
 
 def _get_fast_nodes_state():
+    global fast_state_cache, fast_state_cache_at
+    now_mono = time.monotonic()
+    with fast_state_cache_lock:
+        if fast_state_cache is not None and now_mono - fast_state_cache_at < FAST_STATE_CACHE_TTL_SECONDS:
+            return dict(fast_state_cache)
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     cert_state = web_certificate.snapshot()
@@ -14523,6 +14550,9 @@ def _get_fast_nodes_state():
     state["upstream_proxy_label"] = proxy_state["label"]
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("favorite_node_ids", [])
+    with fast_state_cache_lock:
+        fast_state_cache = dict(state)
+        fast_state_cache_at = time.monotonic()
     return state
 
 def _runtime_connection_status():
