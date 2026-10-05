@@ -135,6 +135,13 @@ COUNTRY_ALIASES = {
     "Cape Verde": "佛得角",
     "Micronesia, Federated States of": "密克罗尼西亚",
     "Macedonia": "北马其顿",
+    "Korea, Republic of": "韩国",
+    "Korea Republic of": "韩国",
+    "Iran, Islamic Republic of": "伊朗",
+    "Russian Federation": "俄罗斯",
+    "United States": "美国",
+    "United States of America": "美国",
+    "United Kingdom": "英国",
 }
 COUNTRY_TRANSLATIONS.update(COUNTRY_ALIASES)
 for _alias, _zh in COUNTRY_ALIASES.items():
