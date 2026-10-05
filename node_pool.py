@@ -314,18 +314,25 @@ class NodePool:
                 result.append(item)
             return result
 
-    def list_endpoints_scoped(self, country="", status="", protocol="", ip_type="", offset=0, limit=100):
+    def list_endpoints_scoped(self, country="", status="", protocol="", ip_type="", offset=0, limit=100,
+                             speed_min_bps=0, active_endpoint_id="", active_ip="", active_protocol="", active_port=0):
         """Authoritative, bounded Master Pool query for the UI."""
         country = canonical_country_name(country) if country else ""
         status = str(status or "").strip().lower()
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
+        speed_min_bps = max(0, int(speed_min_bps or 0))
+        active_endpoint_id = str(active_endpoint_id or "").strip()
+        active_ip = str(active_ip or "").strip()
+        active_protocol = str(active_protocol or "").strip().lower()
+        active_port = max(0, int(active_port or 0))
         offset = max(0, int(offset or 0))
         # Internal callers (e.g. the country full-sweep engine) may request
         # the complete country inventory; the HTTP layer still caps browser
         # pages at 200 rows.
         limit = max(1, min(int(limit or 100), 5000))
-        cache_key = (country, status, protocol, ip_type, offset, limit)
+        cache_key = (country, status, protocol, ip_type, offset, limit,
+                     speed_min_bps, active_endpoint_id, active_ip, active_protocol, active_port)
         cached = self._scoped_page_cache.get(cache_key)
         if cached and cached[0] > time.monotonic():
             cached_rows, cached_total = cached[1]
@@ -371,17 +378,22 @@ class NodePool:
                     SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                            s.metadata_json AS server_metadata_json,
                            COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                           COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                           COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
                            COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                            COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                     """ + base + """
-                    ORDER BY CASE UPPER(e.status)
+                    ORDER BY CASE
+                        WHEN ?<>'' AND e.endpoint_id=? THEN 0
+                        WHEN ?<>'' AND s.current_ip=? AND LOWER(e.protocol)=? AND e.port=? THEN 0
+                        ELSE 1 END,
+                        CASE UPPER(e.status)
                         WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'NEW' THEN 2
                         WHEN 'DEGRADED' THEN 3 WHEN 'COOLDOWN' THEN 4 WHEN 'STALE' THEN 5
                         WHEN 'RETIRED' THEN 6 ELSE 7 END,
                         CASE WHEN e.latency_ewma>0 THEN e.latency_ewma ELSE 999999 END,
                         e.next_test ASC, e.last_seen DESC
-                    LIMIT ? OFFSET ?""", params+[limit,offset]).fetchall()
+                    LIMIT ? OFFSET ?""",
+                    params+[active_endpoint_id, active_endpoint_id, active_ip, active_ip, active_protocol, active_port, limit, offset]).fetchall()
 
             result=[]
             for row in rows:
@@ -431,6 +443,14 @@ class NodePool:
                 "LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?"
             )
             params.append(ip_type)
+
+        if speed_min_bps > 0:
+            where.append(
+                "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key "
+                "AND CAST(COALESCE(json_extract(ee.metadata_json,'$.last_probe_speed_bps'), "
+                "json_extract(s.metadata_json,'$.last_ip_speed_bps'), 0) AS INTEGER) >= ?)"
+            )
+            params.append(speed_min_bps)
 
         if status and status != "all":
             if status == "connected":
@@ -502,7 +522,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -642,12 +662,12 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
-    def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int = 0) -> bool:
+    def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = None) -> bool:
         endpoint_id = str(endpoint_id or "").strip()
         if not endpoint_id: return False
         now = time.time()
         latency = max(0, int(latency_ms or 0))
-        speed = max(0, int(speed_bps or 0))
+        speed = max(0, int(speed_bps or 0)) if speed_bps is not None else 0
         msg = str(message or "")[:1000]
         with self.lock, closing(self._connect()) as db:
             row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
@@ -783,12 +803,47 @@ class NodePool:
         self._invalidate_read_caches()
         return {"servers": repaired_servers, "endpoints": repaired_endpoints}
 
-    def status_counts(self, country: str = "", protocol: str = "", ip_type: str = "") -> dict[str, int]:
+    def get_cached_ip_speed(self, endpoint_id: str, max_age_seconds: int = 86400) -> dict[str, Any]:
+        """Return a recent real download-speed result cached per current IP."""
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return {"hit": False, "speed_bps": 0, "measured_at": 0.0}
+        max_age_seconds = max(3600, int(max_age_seconds or 86400))
+        with closing(self._connect()) as db:
+            row = db.execute(
+                """SELECT e.metadata_json AS endpoint_metadata_json,
+                          s.current_ip, s.metadata_json AS server_metadata_json
+                   FROM endpoints e JOIN servers s ON s.server_key=e.server_key
+                   WHERE e.endpoint_id=?""",
+                (endpoint_id,),
+            ).fetchone()
+        if not row:
+            return {"hit": False, "speed_bps": 0, "measured_at": 0.0}
+        try: endpoint_meta = json.loads(row["endpoint_metadata_json"] or "{}")
+        except Exception: endpoint_meta = {}
+        try: server_meta = json.loads(row["server_metadata_json"] or "{}")
+        except Exception: server_meta = {}
+        current_ip = str(row["current_ip"] or "").strip()
+        measured_at = float(server_meta.get("last_ip_speed_at") or endpoint_meta.get("last_probe_speed_at") or 0.0)
+        cached_ip = str(server_meta.get("last_ip_speed_ip") or "").strip()
+        if cached_ip and current_ip and cached_ip != current_ip:
+            measured_at = 0.0
+        speed_bps = int(server_meta.get("last_ip_speed_bps") if server_meta.get("last_ip_speed_bps") is not None
+                        else endpoint_meta.get("last_probe_speed_bps") or 0)
+        age = time.time() - measured_at if measured_at else float("inf")
+        if speed_bps <= 0:
+            return {"hit": bool(measured_at and age <= 1800), "speed_bps": 0, "measured_at": measured_at}
+        if not measured_at or age > max_age_seconds:
+            return {"hit": False, "speed_bps": max(0, speed_bps), "measured_at": measured_at}
+        return {"hit": True, "speed_bps": max(0, speed_bps), "measured_at": measured_at}
+
+    def status_counts(self, country: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0) -> dict[str, int]:
         """Return authoritative endpoint status counts for the UI filters."""
         country = canonical_country_name(country) if country else ""
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
-        cache_key = (country, protocol, ip_type)
+        speed_min_bps = max(0, int(speed_min_bps or 0))
+        cache_key = (country, protocol, ip_type, speed_min_bps)
         cached = self._status_counts_cache.get(cache_key)
         if cached and cached[0] > time.monotonic():
             return dict(cached[1])
