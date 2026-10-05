@@ -363,7 +363,7 @@ class NodePool:
                     "CAST(COALESCE(json_extract(e.metadata_json,'$.last_probe_speed_bps'), "
                     "json_extract(s.metadata_json,'$.last_ip_speed_bps'), "
                     "(SELECT o.speed * 8 FROM observations o "
-                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) > ?"
+                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
                 )
                 params.append(speed_min_bps)
             if status and status != "all":
@@ -459,7 +459,7 @@ class NodePool:
                 "AND CAST(COALESCE(json_extract(ee.metadata_json,'$.last_probe_speed_bps'), "
                 "json_extract(s.metadata_json,'$.last_ip_speed_bps'), "
                 "(SELECT o.speed * 8 FROM observations o "
-                "WHERE o.server_key=ee.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) > ?)"
+                "WHERE o.server_key=ee.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?)"
             )
             params.append(speed_min_bps)
 
@@ -894,7 +894,7 @@ class NodePool:
                     "CAST(COALESCE(json_extract(e.metadata_json,'$.last_probe_speed_bps'), "
                     "json_extract(s.metadata_json,'$.last_ip_speed_bps'), "
                     "(SELECT o.speed * 8 FROM observations o "
-                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) > ?"
+                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
                 )
                 params.append(speed_min_bps)
             sql = """
