@@ -213,6 +213,28 @@ fi
 if ! grep -q '^LOCAL_PROXY_DEFAULT_SCHEME=' "$PROXY_ENV_FILE"; then
     echo 'LOCAL_PROXY_DEFAULT_SCHEME="socks5"' >> "$PROXY_ENV_FILE"
 fi
+# Low-resource production defaults. Override per server in /etc/default/aimilivpn.
+if ! grep -q '^ACCESS_LOG_ENABLED=' "$PROXY_ENV_FILE"; then
+    echo 'ACCESS_LOG_ENABLED="false"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^BACKGROUND_PROBE_BATCH=' "$PROXY_ENV_FILE"; then
+    echo 'BACKGROUND_PROBE_BATCH="8"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^ACTIVE_BACKGROUND_PROBE_BATCH=' "$PROXY_ENV_FILE"; then
+    echo 'ACTIVE_BACKGROUND_PROBE_BATCH="2"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^PROTOCOL_PROBE_BATCH=' "$PROXY_ENV_FILE"; then
+    echo 'PROTOCOL_PROBE_BATCH="2"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^FAST_LIVENESS_INTERVAL_SECONDS=' "$PROXY_ENV_FILE"; then
+    echo 'FAST_LIVENESS_INTERVAL_SECONDS="5"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^PROXY_HEALTH_INTERVAL_SECONDS=' "$PROXY_ENV_FILE"; then
+    echo 'PROXY_HEALTH_INTERVAL_SECONDS="20"' >> "$PROXY_ENV_FILE"
+fi
+if ! grep -q '^MAX_PROXY_CONNECTIONS=' "$PROXY_ENV_FILE"; then
+    echo 'MAX_PROXY_CONNECTIONS="64"' >> "$PROXY_ENV_FILE"
+fi
 chmod 600 "$PROXY_ENV_FILE"
 echo -e "${GREEN}  -> 本地代理默认: SOCKS5 127.0.0.1:8500${PLAIN}"
 echo -e "${GREEN}  -> 账号: socks5 / 密码: ilovestudy${PLAIN}"
@@ -267,6 +289,8 @@ ExecStart=/usr/bin/python3 vpngate_manager.py
 Restart=always
 RestartSec=5
 EnvironmentFile=-/etc/default/aimilivpn
+LimitNOFILE=65535
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target
@@ -1130,6 +1154,14 @@ if [ -d "/etc/sysctl.d" ]; then
     cat > /etc/sysctl.d/99-aimilivpn.conf <<EOF
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
+# Forwarding is required when this host is used as a business traffic relay.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.core.somaxconn = 1024
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
 EOF
     sysctl -p /etc/sysctl.d/99-aimilivpn.conf >/dev/null 2>&1 || true
 else
@@ -1147,6 +1179,18 @@ fi
 # Apply to currently active interfaces dynamically (prefer native proc write for BusyBox/Alpine compatibility)
 echo "2" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
 echo "2" > /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+# Optional BBR: use only when the kernel exposes the module.
+if command -v modprobe >/dev/null 2>&1; then modprobe tcp_bbr >/dev/null 2>&1 || true; fi
+if sysctl net.ipv4.tcp_available_congestion_control >/dev/null 2>&1; then
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+    fi
+fi
+# Keep NAT-T/UDP mappings alive for Wi-Fi Calling and other long-lived UDP flows when conntrack exposes these knobs.
+for key in net.netfilter.nf_conntrack_udp_timeout_stream net.netfilter.nf_conntrack_udp_timeout; do
+    sysctl "$key" >/dev/null 2>&1 && sysctl -w "$key=600" >/dev/null 2>&1 || true
+done
+
 if [ -d "/proc/sys/net/ipv4/conf" ]; then
     for dev_dir in /proc/sys/net/ipv4/conf/*; do
         dev_name=$(basename "$dev_dir")
