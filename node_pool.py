@@ -379,15 +379,30 @@ class NodePool:
         status=str(status or '').strip().lower(); protocol=str(protocol or '').strip().lower(); ip_type=str(ip_type or '').strip().lower()
         key=(status,protocol,ip_type); now=time.monotonic(); cached=self._country_catalog_cache.get(key)
         if cached and cached[0]>now: return dict(cached[1])
-        where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''"]; params=[]
-        if protocol and protocol!='all': where.append('LOWER(e.protocol)=?'); params.append(protocol)
-        if ip_type and ip_type!='all': where.append("LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?"); params.append(ip_type)
-        if status and status!='all':
+        # Country inventory is a server/IP inventory, not an endpoint count.
+        # This keeps the global country selector aligned with Master Pool's
+        # server/IP inventory even when a server has not produced protocol
+        # endpoints yet. Protocol/status/IP-type filters still use endpoint
+        # scope because those are endpoint properties.
+        params=[]
+        if protocol and protocol!='all':
+            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''",
+                   "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND LOWER(ee.protocol)=?)"]
+            params.append(protocol)
+        elif ip_type and ip_type!='all':
+            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''",
+                   "LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?"]
+            params.append(ip_type)
+        elif status and status!='all' and status!='connected':
             groups={'available':('HOT','AVAILABLE'),'testing':('NEW','DEGRADED'),'not_checked':('NEW',),'unavailable':('COOLDOWN','STALE','RETIRED','UNAVAILABLE')}
             allowed=groups.get(status)
+            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''"]
             if allowed:
-                where.append('UPPER(e.status) IN ('+','.join('?' for _ in allowed)+')'); params.extend(allowed)
-        base=' FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE '+' AND '.join(where)
+                where.append("EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND UPPER(ee.status) IN ("+','.join('?' for _ in allowed)+"))")
+                params.extend(allowed)
+        else:
+            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''"]
+        base=' FROM servers s WHERE '+' AND '.join(where)
         with closing(self._connect()) as db:
             rows=db.execute('SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, COUNT(DISTINCT s.server_key) AS server_count'+base+' GROUP BY s.country',params).fetchall()
             total=int(db.execute('SELECT COUNT(DISTINCT s.current_ip)'+base,params).fetchone()[0] or 0)
@@ -684,10 +699,12 @@ class NodePool:
         with closing(self._connect()) as db:
             servers = int(db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"] or 0)
             endpoints = int(db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"] or 0)
+            distinct_ips = int(db.execute("SELECT COUNT(DISTINCT current_ip) c FROM servers WHERE TRIM(COALESCE(current_ip,''))<>''").fetchone()["c"] or 0)
+            country_ips = int(db.execute("SELECT COUNT(DISTINCT current_ip) c FROM servers WHERE TRIM(COALESCE(current_ip,''))<>'' AND TRIM(COALESCE(country,''))<>''").fetchone()["c"] or 0)
             states = {
                 row["state"]: row["c"]
                 for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
             }
-        result = {"servers": servers, "endpoints": endpoints, "states": states}
+        result = {"servers": servers, "endpoints": endpoints, "distinct_ips": distinct_ips, "country_ips": country_ips, "states": states}
         self._stats_cache = (now + 2.0, result)
         return dict(result)
