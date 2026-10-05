@@ -204,27 +204,65 @@ def _socks5_unpack_udp(packet: bytes) -> tuple[str, int, bytes] | None:
         return None
 
 
+def _set_udp_socket_options(sock: socket.socket) -> None:
+    for level, opt in (
+        (socket.SOL_SOCKET, socket.SO_REUSEADDR),
+        (socket.SOL_SOCKET, socket.SO_RCVBUF),
+        (socket.SOL_SOCKET, socket.SO_SNDBUF),
+    ):
+        try:
+            value = 1 if opt == socket.SO_REUSEADDR else PROXY_SOCKET_BUFFER_BYTES
+            sock.setsockopt(level, opt, value)
+        except OSError:
+            pass
+    try:
+        iface = get_active_interface()
+        if iface:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+    except OSError:
+        raise
+
+
+def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
+    try:
+        return [
+            (af, sa)
+            for af, socktype, proto, canonname, sa in socket.getaddrinfo(
+                host, port, 0, socket.SOCK_DGRAM
+            )
+            if af in (socket.AF_INET, socket.AF_INET6)
+        ]
+    except OSError:
+        return []
+
+
 def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]) -> None:
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstream = None
-    client_ip = control_address[0]
+    """RFC 1928 UDP ASSOCIATE relay over the active VPN interface."""
+    relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    upstreams: dict[int, socket.socket] = {}
+    client_ip = str(control_address[0] or "")
+    client_udp_addr: tuple[str, int] | None = None
     last_activity = time.monotonic()
     try:
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, PROXY_SOCKET_BUFFER_BYTES)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, PROXY_SOCKET_BUFFER_BYTES)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
-        udp.bind(("127.0.0.1", 0))
-        bind_port = int(udp.getsockname()[1])
-        client.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + bind_port.to_bytes(2, "big"))
-        udp.setblocking(False)
+        _set_udp_socket_options(relay)
+        relay.bind(("127.0.0.1", 0))
+        bind_port = int(relay.getsockname()[1])
+        client.sendall(
+            b"\x05\x00\x00\x01\x7f\x00\x00\x01" + bind_port.to_bytes(2, "big")
+        )
+        relay.setblocking(False)
         client.setblocking(False)
+
         while time.monotonic() - last_activity < PROXY_UDP_ASSOCIATION_IDLE_SECONDS:
-            readable, _, errored = select.select([client, udp], [], [client, udp], 5)
+            sources: list[socket.socket] = [client, relay]
+            sources.extend(upstreams.values())
+            readable, _, errored = select.select(sources, [], sources, 5)
             if errored:
                 return
+
             if not readable:
                 continue
+
             for source in readable:
                 if source is client:
                     try:
@@ -233,68 +271,76 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         data = b""
                     if not data:
                         return
-                    # The SOCKS5 control connection normally carries no more
-                    # data after UDP ASSOCIATE; any data means the client is
-                    # still alive, so simply refresh the association timer.
                     last_activity = time.monotonic()
                     continue
-                try:
-                    packet, peer = udp.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
-                except BlockingIOError:
-                    continue
-                if peer[0] != client_ip and not (
-                    client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and peer[0] == "127.0.0.1"
-                ):
-                    continue
-                decoded = _socks5_unpack_udp(packet)
-                if not decoded:
-                    continue
-                host, port, payload = decoded
-                resolved = resolve_dns_over_active_tunnel(host)
-                if not resolved:
+
+                if source is relay:
                     try:
-                        resolved = socket.gethostbyname(host)
-                    except OSError:
+                        packet, peer = relay.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
+                    except BlockingIOError:
                         continue
-                destination = (resolved, port)
-                if upstream is None:
-                    upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, PROXY_SOCKET_BUFFER_BYTES)
-                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, PROXY_SOCKET_BUFFER_BYTES)
-                    upstream.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
-                    upstream.bind(("0.0.0.0", 0))
-                    upstream.setblocking(False)
-                upstream.sendto(payload, destination)
-                last_activity = time.monotonic()
-                # Drain one response immediately when available. The outer
-                # select loop will handle subsequent responses.
-                try:
-                    response, source_addr = upstream.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
-                    udp.sendto(_socks5_pack_udp(source_addr, response), peer)
-                except BlockingIOError:
-                    pass
-            if upstream is not None:
-                try:
-                    while True:
-                        response, source_addr = upstream.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
-                        udp.sendto(_socks5_pack_udp(source_addr, response), (client_ip, peer[1]))
+                    peer_ip = str(peer[0] or "")
+                    if peer_ip != client_ip and not (
+                        client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+                        and peer_ip == "127.0.0.1"
+                    ):
+                        continue
+                    decoded = _socks5_unpack_udp(packet)
+                    if not decoded:
+                        continue
+                    host, port, payload = decoded
+                    destinations = _resolve_udp_destinations(host, port)
+                    if not destinations:
+                        continue
+                    client_udp_addr = (peer_ip, int(peer[1]))
+                    sent = False
+                    for af, sa in destinations:
+                        sock = upstreams.get(af)
+                        if sock is None:
+                            try:
+                                sock = socket.socket(af, socket.SOCK_DGRAM)
+                                _set_udp_socket_options(sock)
+                                bind_addr = ("0.0.0.0", 0) if af == socket.AF_INET else ("::", 0)
+                                sock.bind(bind_addr)
+                                sock.setblocking(False)
+                                upstreams[af] = sock
+                            except OSError:
+                                if sock is not None:
+                                    sock.close()
+                                continue
+                        try:
+                            sock.sendto(payload, sa)
+                            sent = True
+                            break
+                        except OSError:
+                            continue
+                    if sent:
                         last_activity = time.monotonic()
+                    continue
+
+                # Upstream UDP response -> SOCKS5 client UDP socket.
+                try:
+                    response, source_addr = source.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
                 except BlockingIOError:
-                    pass
+                    continue
+                if client_udp_addr is not None:
+                    relay.sendto(
+                        _socks5_pack_udp((str(source_addr[0]), int(source_addr[1])), response),
+                        client_udp_addr,
+                    )
+                    last_activity = time.monotonic()
     except Exception as exc:
         print(f"[SOCKS5 UDP] UDP ASSOCIATE 失败: {exc}", flush=True)
     finally:
         try:
-            udp.close()
+            relay.close()
         except Exception:
             pass
-        if upstream is not None:
+        for sock in upstreams.values():
             try:
-                upstream.close()
+                sock.close()
             except Exception:
                 pass
-
 
 def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
     import random
