@@ -374,48 +374,91 @@ class NodePool:
             result.append(item)
         return result,total
 
-    def country_catalog(self, status="", protocol="", ip_type=""):
-        """Authoritative country/IP inventory; one SQL aggregation, short cache."""
-        status=str(status or '').strip().lower(); protocol=str(protocol or '').strip().lower(); ip_type=str(ip_type or '').strip().lower()
-        key=(status,protocol,ip_type); now=time.monotonic(); cached=self._country_catalog_cache.get(key)
-        if cached and cached[0]>now: return dict(cached[1])
-        # Country inventory is a server/IP inventory, not an endpoint count.
-        # This keeps the global country selector aligned with Master Pool's
-        # server/IP inventory even when a server has not produced protocol
-        # endpoints yet. Protocol/status/IP-type filters still use endpoint
-        # scope because those are endpoint properties.
-        params=[]
-        if protocol and protocol!='all':
-            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''",
-                   "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND LOWER(ee.protocol)=?)"]
+    def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id=""):
+        """Authoritative country/IP inventory using the same Master Pool scope as the node table."""
+        status = str(status or "").strip().lower()
+        protocol = str(protocol or "").strip().lower()
+        ip_type = str(ip_type or "").strip().lower()
+        connected_endpoint_id = str(connected_endpoint_id or "").strip()
+        key = (status, protocol, ip_type, connected_endpoint_id)
+        now = time.monotonic()
+        cached = self._country_catalog_cache.get(key)
+        if cached and cached[0] > now:
+            return dict(cached[1])
+
+        where = ["TRIM(COALESCE(s.current_ip,''))<>''"]
+        params: list[Any] = []
+
+        if protocol and protocol != "all":
+            where.append(
+                "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND LOWER(ee.protocol)=?)"
+            )
             params.append(protocol)
-        elif ip_type and ip_type!='all':
-            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''",
-                   "LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?"]
+
+        if ip_type and ip_type != "all":
+            where.append(
+                "LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?"
+            )
             params.append(ip_type)
-        elif status and status!='all' and status!='connected':
-            groups={'available':('HOT','AVAILABLE'),'testing':('NEW','DEGRADED'),'not_checked':('NEW',),'unavailable':('COOLDOWN','STALE','RETIRED','UNAVAILABLE')}
-            allowed=groups.get(status)
-            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''"]
-            if allowed:
-                where.append("EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND UPPER(ee.status) IN ("+','.join('?' for _ in allowed)+"))")
-                params.extend(allowed)
-        else:
-            where=["TRIM(COALESCE(s.current_ip,''))<>''","TRIM(COALESCE(s.country,''))<>''"]
-        base=' FROM servers s WHERE '+' AND '.join(where)
+
+        if status and status != "all":
+            if status == "connected":
+                if connected_endpoint_id:
+                    where.append(
+                        "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND ee.endpoint_id=?)"
+                    )
+                    params.append(connected_endpoint_id)
+                else:
+                    where.append("1=0")
+            else:
+                groups = {
+                    "available": ("HOT", "AVAILABLE"),
+                    "testing": ("TESTING", "DEGRADED"),
+                    "not_checked": ("NEW",),
+                    "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
+                }
+                allowed = groups.get(status)
+                if allowed:
+                    placeholders = ",".join("?" for _ in allowed)
+                    where.append(
+                        "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key "
+                        f"AND UPPER(ee.status) IN ({placeholders}))"
+                    )
+                    params.extend(allowed)
+
+        scope = " FROM servers s WHERE " + " AND ".join(where)
         with closing(self._connect()) as db:
-            rows=db.execute('SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, COUNT(DISTINCT s.server_key) AS server_count'+base+' GROUP BY s.country',params).fetchall()
-            # Global IP total is the complete Master Pool inventory, including records whose country metadata has not been geolocated yet.
-            total=int(db.execute("SELECT COUNT(DISTINCT current_ip) FROM servers WHERE TRIM(COALESCE(current_ip,''))<>''").fetchone()[0] or 0)
-            country_total=int(db.execute("SELECT COUNT(DISTINCT current_ip) FROM servers WHERE TRIM(COALESCE(current_ip,''))<>'' AND TRIM(COALESCE(country,''))<>''").fetchone()[0] or 0)
-        countries={}
+            rows = db.execute(
+                "SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, "
+                "COUNT(DISTINCT s.server_key) AS server_count" + scope + " GROUP BY s.country",
+                params,
+            ).fetchall()
+            total = int(db.execute(
+                "SELECT COUNT(DISTINCT s.current_ip)" + scope, params
+            ).fetchone()[0] or 0)
+
+        countries: dict[str, dict[str, int]] = {}
         for row in rows:
-            country=canonical_country_name(row['country'])
-            if not country: continue
-            item=countries.setdefault(country,{'ip_count':0,'server_count':0})
-            item['ip_count']+=int(row['ip_count'] or 0); item['server_count']+=int(row['server_count'] or 0)
-        result={'total_ip_count':total,'country_ip_count':country_total,'countries':countries,'status':status,'protocol':protocol,'ip_type':ip_type}
-        self._country_catalog_cache[key]=(now+5.0,result)
+            country = canonical_country_name(row["country"])
+            if not country:
+                continue
+            item = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
+            item["ip_count"] += int(row["ip_count"] or 0)
+            item["server_count"] += int(row["server_count"] or 0)
+
+        # Known-country coverage is intentionally separate from the global
+        # distinct-IP total: an un-geolocated Master Pool IP must not disappear
+        # from the global count or be falsely assigned to a country.
+        country_total = sum(int(v.get("ip_count") or 0) for v in countries.values())
+        result = {
+            "total_ip_count": total,
+            "country_ip_count": country_total,
+            "countries": countries,
+            "status": status,
+            "protocol": protocol,
+            "ip_type": ip_type,
+        }
+        self._country_catalog_cache[key] = (now + 5.0, result)
         return dict(result)
 
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
@@ -664,6 +707,17 @@ class NodePool:
             for row in rows:
                 old = str(row["country"] or "").strip()
                 new = canonical_country_name(old)
+                # Older discovery snapshots sometimes stored the country only
+                # in the enriched location string (e.g. “日本 大阪府 大阪市”).
+                # Recover that value before the UI builds its country/IP index.
+                if not new:
+                    try:
+                        meta = json.loads(row["metadata_json"] or "{}")
+                    except Exception:
+                        meta = {}
+                    location = str((meta or {}).get("location") or "").strip()
+                    if location:
+                        new = canonical_country_name(location.split()[0])
                 if old != new:
                     db.execute("UPDATE servers SET country=? WHERE server_key=?", (new, row["server_key"]))
                     repaired_servers += 1
