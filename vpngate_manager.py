@@ -13,6 +13,7 @@ import select
 import shlex
 import signal
 import socket
+import tarfile
 import subprocess
 import threading
 import time
@@ -165,6 +166,7 @@ ACTIVE_ROUTE_TABLE = env_int("ACTIVE_ROUTE_TABLE", 100, 1, 252)
 ISOLATED_INSTANCE = env_flag("ISOLATED_INSTANCE", False)
 DISABLE_BACKGROUND_LOOPS = env_flag("DISABLE_BACKGROUND_LOOPS", False)
 ENABLE_COLLECTOR_LOOP = env_flag("ENABLE_COLLECTOR_LOOP", not DISABLE_BACKGROUND_LOOPS)
+ENABLE_RESOURCE_COLLECT_LOOP = env_flag("ENABLE_RESOURCE_COLLECT_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROXY_HEALTH_LOOP = env_flag("ENABLE_PROXY_HEALTH_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_FAST_LIVENESS_LOOP = env_flag("ENABLE_FAST_LIVENESS_LOOP", not DISABLE_BACKGROUND_LOOPS)
 FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 5, 2, 15)
@@ -172,10 +174,10 @@ ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS
 ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
-FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 1, 0, 5)
+FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.14"
+APP_VERSION = "V1.0.15"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -230,6 +232,9 @@ global_pool_refresh_message = ""
 global_pool_refresh_servers = 0
 global_pool_refresh_sources = 0
 global_country_coverage_last_attempt: dict[str, float] = {}
+global_coverage_pick_cache_country = ""
+global_coverage_pick_cache_at = 0.0
+country_priority_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 fast_state_cache_lock = threading.Lock()
 fast_state_cache: dict[str, Any] | None = None
 fast_state_cache_at = 0.0
@@ -1018,7 +1023,9 @@ def clear_active_connection_state(message: str) -> None:
     set_state(
 
         active_openvpn_node_id="",
+        active_openvpn_node={},
         active_pool_endpoint_id="",
+        active_pool_endpoint={},
         active_tunnel_protocol="",
         active_tunnel_interface="",
         is_connecting=False,
@@ -1986,7 +1993,7 @@ def stop_active_external_tunnel() -> None:
     active_external_tunnel = None
     active_pool_endpoint_id = ""
     _clear_all_node_active_flags()
-    set_state(active_pool_endpoint_id="", active_tunnel_protocol="", active_tunnel_interface="")
+    set_state(active_pool_endpoint_id="", active_pool_endpoint={}, active_openvpn_node={}, active_tunnel_protocol="", active_tunnel_interface="")
 
 def stop_all_tunnels() -> None:
     stop_active_external_tunnel()
@@ -2533,11 +2540,12 @@ def protocol_catalog_loop() -> None:
                 time.sleep(5)
                 continue
             if not ISOLATED_INSTANCE:
-                refresh_multi_protocol_catalog(force=True)
-                refresh_protocol_ip_metadata(max_ips=100)
+                # Catalog acquisition is owned by resource_collect_loop.
+                # This lightweight loop only refreshes missing ISP/IP metadata.
+                refresh_protocol_ip_metadata(max_ips=50)
         except Exception as exc:
-            log_to_json("WARNING", "Main", f"多协议目录后台刷新异常: {exc}")
-        time.sleep(600)
+            log_to_json("WARNING", "Main", f"多协议 IP/ISP 元数据后台刷新异常: {exc}")
+        time.sleep(1800)
 
 
 def resource_share_loop() -> None:
@@ -2777,8 +2785,26 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
         if manual:
             set_manual_route_pin(protocol=protocol, endpoint_id=endpoint_id)
+        endpoint_meta = endpoint.get("server_metadata") or {}
+        endpoint_summary = {
+            "endpoint_id": endpoint_id,
+            "protocol": protocol,
+            "transport": endpoint.get("transport", ""),
+            "port": endpoint.get("port", 0),
+            "hostname": endpoint.get("hostname", ""),
+            "current_ip": endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "",
+            "country": endpoint.get("country", ""),
+            "location": endpoint_meta.get("location") or endpoint.get("country", ""),
+            "owner": endpoint_meta.get("owner") or endpoint_meta.get("as_name") or "",
+            "ip_type": endpoint_meta.get("ip_type") or "",
+            "quality": endpoint_meta.get("quality") or "",
+            "speed": endpoint.get("latest_speed", 0),
+            "latency_ms": latency,
+        }
         set_state(
             active_pool_endpoint_id=endpoint_id,
+            active_pool_endpoint=endpoint_summary,
+            active_openvpn_node={},
             active_tunnel_protocol=protocol,
             manual_switch_message=("切换完成，正在确认客户端状态…" if manual else ""),
             active_tunnel_interface=result.interface,
@@ -3271,7 +3297,12 @@ def test_config_path(node_id: str) -> Path:
 
 
 def country_priority_snapshot(country: str) -> dict[str, Any]:
+    global country_priority_snapshot_cache
     target_country = str(country or "").strip()
+    cache_key = normalized_country_name(target_country)
+    cached = country_priority_snapshot_cache.get(cache_key)
+    if cached and time.time() - cached[0] < 10:
+        return dict(cached[1])
     if not target_country:
         return {"country": "", "available": 0, "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN}
     inventory_ips: set[str] = set()
@@ -3317,7 +3348,9 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
         or (float(x.get("ready_at") or 0) <= now and now - float(x.get("probed_at") or 0) >= 900)
     ]
     candidate_refs.sort(key=lambda x: (priority.get(str(x.get("status")), 4), x.get("server_key") in available_servers, x.get("probed_at") or 0, x.get("latency_ms") or 999999))
-    return {"country": target_country, "inventory": len(inventory_ips), "available": len(available_ips), "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "inventory_target": COUNTRY_INVENTORY_TARGET, "candidates": candidate_refs}
+    result = {"country": target_country, "inventory": len(inventory_ips), "available": len(available_ips), "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "inventory_target": COUNTRY_INVENTORY_TARGET, "candidates": candidate_refs}
+    country_priority_snapshot_cache[cache_key] = (time.time(), result)
+    return dict(result)
 
 def _test_pool_reference(ref: dict[str, Any]) -> dict[str, Any]:
     kind = str(ref.get("kind") or "")
@@ -3856,9 +3889,23 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
     write_json(NODES_FILE, nodes)
 
     latency = parse_int(final_health.get("latency_ms")) or parse_int(candidate_egress.get("latency_ms")) or 0
+    active_summary = {
+        "id": node_id,
+        "country": node.get("country", ""),
+        "location": node.get("location", ""),
+        "ip": node.get("ip") or node.get("remote_host") or "",
+        "remote_host": node.get("remote_host") or node.get("ip") or "",
+        "remote_port": node.get("remote_port") or 0,
+        "protocol": node.get("protocol") or "openvpn",
+        "owner": node.get("owner") or node.get("as_name") or "",
+        "ip_type": node.get("ip_type") or "",
+        "latency_ms": latency,
+    }
     set_state(
         active_openvpn_node_id=node_id,
+        active_openvpn_node=active_summary,
         active_pool_endpoint_id="",
+        active_pool_endpoint={},
         active_tunnel_protocol="openvpn",
         active_tunnel_interface=candidate_dev,
         proxy_ok=True,
@@ -4287,12 +4334,56 @@ def protocol_probe_loop() -> None:
             ui_cfg = load_ui_config()
             configured_priority = normalized_country_name(str(ui_cfg.get("force_country") or "").strip())
             default_priority = routing_target_country(ui_cfg)
+            # Detection order is strict:
+            # 1) explicit custom country;
+            # 2) this server's own country;
+            # 3) only after the priority country reaches the minimum usable
+            #    reserve do we enter global coverage rotation.
+            configured_priority = configured_priority or default_priority
             priority = (
                 country_priority_request
                 if country_priority_explicit and country_priority_request
-                else (configured_priority or default_priority or coverage_country)
+                else configured_priority
             )
-            result = availability_sweep_once(priority)
+            if priority:
+                snap = country_priority_snapshot(priority)
+                available = int(snap.get("available") or 0)
+                candidates = snap.get("candidates") or []
+                # Strict priority gate: the configured/server-local country is
+                # considered complete only after it reaches the target reserve
+                # (normally 10 usable nodes), or after there are no more
+                # eligible candidates. Reaching the minimum 5 is enough to
+                # make the country usable, but NOT enough to release detection
+                # budget to other countries.
+                priority_complete = available >= COUNTRY_AVAILABLE_TARGET or not candidates
+                if not priority_complete:
+                    if not country_priority_lock.locked() and not country_priority_request:
+                        start_country_priority(priority)
+                    set_state(
+                        priority_country=priority,
+                        priority_inventory=int(snap.get("inventory") or 0),
+                        priority_available=available,
+                        priority_target=COUNTRY_AVAILABLE_TARGET,
+                        priority_minimum=COUNTRY_AVAILABLE_MIN,
+                        priority_running=True,
+                        priority_message=f"{priority} 优先检测中：先完成本国 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点，再进入其它国家",
+                    )
+                    time.sleep(3)
+                    continue
+                if available >= COUNTRY_AVAILABLE_MIN and candidates:
+                    result = availability_sweep_once(priority)
+                    if result.get("skipped"):
+                        time.sleep(3)
+                        continue
+            # Priority country is healthy enough; global rotation can now use
+            # the next-lowest-latency country with a deficit.
+            global global_coverage_pick_cache_country, global_coverage_pick_cache_at
+            now_cov = time.time()
+            if now_cov - global_coverage_pick_cache_at >= 300 or not global_coverage_pick_cache_country:
+                global_coverage_pick_cache_country = _pick_global_country_for_coverage_v2()
+                global_coverage_pick_cache_at = now_cov
+            coverage_priority = coverage_country or global_coverage_pick_cache_country
+            result = availability_sweep_once(coverage_priority)
             if result.get("skipped"):
                 time.sleep(3)
                 continue
@@ -4588,6 +4679,33 @@ def schedule_global_country_coverage() -> dict[str, Any]:
         return {"ok": True, "running": True, "message": "手动连接正在进行，暂缓国家覆盖检测"}
     if country_priority_lock.locked() or country_priority_request:
         return {"ok": True, "running": True}
+
+    # The five-minute global coverage scheduler must obey the same strict
+    # priority gate as the main availability engine. It may never start another
+    # country's probe while the explicit/server-local priority country still has
+    # eligible candidates below the target reserve.
+    try:
+        ui_cfg = load_ui_config()
+        priority_country = normalized_country_name(
+            str(ui_cfg.get("force_country") or routing_target_country(ui_cfg) or "").strip()
+        )
+        if priority_country:
+            priority_snapshot = country_priority_snapshot(priority_country)
+            priority_available = int(priority_snapshot.get("available") or 0)
+            priority_candidates = priority_snapshot.get("candidates") or []
+            if priority_available < COUNTRY_AVAILABLE_TARGET and priority_candidates:
+                if not country_priority_lock.locked() and not country_priority_request:
+                    start_country_priority(priority_country)
+                return {
+                    "ok": True,
+                    "running": True,
+                    "priority": priority_country,
+                    "message": f"{priority_country} 尚未完成优先检测，暂不进入全球其它国家",
+                }
+    except Exception as exc:
+        log_to_json("WARNING", "Probe", f"全球覆盖调度优先级检查失败: {exc}")
+        return {"ok": True, "running": True, "message": "优先国家状态读取失败，本轮暂缓全球覆盖"}
+
     country = _pick_global_country_for_coverage()
     if not country:
         return {"ok": True, "running": False, "message": "当前资源池已有足够覆盖或暂无可补充国家"}
@@ -4813,33 +4931,17 @@ def maintain_valid_nodes(force: bool = False):
         try:
             if manual_connection_active or manual_connection_epoch != cycle_manual_epoch:
                 return "检测周期被用户手动切换打断"
-            # IMPORTANT: connection maintenance must never trigger a network-wide
-            # resource fetch on every browser refresh / 30-second recovery cycle.
-            # Master Pool is the persistent source of truth; fetch_candidates()
-            # only runs on the independent resource-sync cadence or an explicit
-            # forced refresh. Normal maintenance reuses the persisted node pool.
-            now = time.time()
-            last_fetch = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
-            should_fetch = bool(force) or (now - last_fetch >= FETCH_INTERVAL_SECONDS)
-            if should_fetch:
-                set_state(is_connecting=True, last_check_message="资源同步周期到达，正在获取新的免费 VPN 节点...")
-                candidates = fetch_candidates()
-                if manual_connection_active or manual_connection_epoch != cycle_manual_epoch:
-                    return "检测周期被用户手动切换打断"
-                threading.Thread(target=refresh_multi_protocol_catalog, args=(False,), daemon=True).start()
-            else:
-                candidates = read_nodes()
-                set_state(
-                    is_connecting=True,
-                    last_check_message="使用 Master Pool 已有节点进行状态检测，不重新拉取全球资源",
-                )
+            # Connection maintenance is strictly state/probe work. Resource
+            # acquisition is a separate daemon (resource_collect_loop), so a
+            # browser refresh, connection recovery, or node switch can never
+            # trigger a network-wide fetch or block the active VPN tunnel.
+            candidates = read_nodes()
+            set_state(
+                is_connecting=True,
+                last_check_message="使用 Master Pool 已有节点进行状态检测；资源采集由独立后台任务运行",
+            )
         except Exception as exc:
-            vpn_utils.check_and_fix_dns()
-            diag_msg = str(exc)
-            if not any(token in diag_msg for token in ["[ERR_", "错误代码"]):
-                err_code, raw_diag = vpn_utils.diagnose_api_failure(API_URL)
-                diag_msg = f"[错误代码 {err_code}] 获取节点失败: {exc} | 诊断结果: {raw_diag}"
-            set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
+            set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=f"读取 Master Pool 失败：{exc}")
             candidates = []
 
         if not candidates:
@@ -5044,6 +5146,26 @@ def maintain_valid_nodes(force: bool = False):
     finally:
         is_connecting = False
         maintenance_lock.release()
+
+
+def resource_collect_loop() -> None:
+    """Independent resource acquisition daemon.
+
+    Fetching VPNGate/multi-protocol catalogs is intentionally decoupled from
+    connection maintenance. It may add resources to Master Pool, but it never
+    owns the active tunnel and never toggles the frontend connection state.
+    """
+    # Give the web/UI and tunnel daemon a quiet startup window. Resource
+    # acquisition is intentionally not on the critical path of page opening.
+    time.sleep(120)
+    while True:
+        try:
+            if (not ISOLATED_INSTANCE and not initial_bootstrap_active
+                    and not ui_command_plane.is_busy() and not global_pool_refresh_running):
+                resource_collect_once(force=False)
+        except Exception as exc:
+            log_to_json("WARNING", "Main", f"独立资源采集循环异常: {exc}")
+        time.sleep(RESOURCE_COLLECTION_INTERVAL_SECONDS)
 
 
 def collector_loop() -> None:
@@ -8493,7 +8615,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.14</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.15</span></span>
           </span>
         </div>
       </div>
@@ -8833,7 +8955,10 @@ function countryFlagEmoji(code) {
 function countryFlag(country, title = "", loading = "lazy") {
   const code=String(countryFlagCode(country)||"").toUpperCase(); const label=esc(title||translateCountry(country)||country||"");
   if(!/^[A-Z]{2}$/.test(code)) return '<span class="country-flag-fallback" role="img" aria-label="'+label+'" title="'+label+'">🌐</span>';
-  return '<span class="country-flag-emoji" role="img" aria-label="'+label+'" title="'+label+'">'+countryFlagEmoji(code)+'</span>';
+  // Always use the local flag asset instead of OS emoji glyphs. This fixes
+  // CP/CW and keeps the visual size consistent across Windows/Chrome/iOS.
+  const mode = loading === "eager" ? "eager" : "lazy";
+  return '<img class="country-flag-img" src="./assets/flags/4x3/'+code.toLowerCase()+'.svg" alt="'+label+'" title="'+label+'" loading="'+mode+'">';
 }
 
 function renderCustomFilter(selectId, withCount = false) {
@@ -12915,6 +13040,30 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
                 return
 
+        if effective_path.startswith("/assets/flags/4x3/"):
+            # Country flags are served locally. This avoids platform-dependent
+            # emoji glyphs (notably CP/CW) and removes a network request from
+            # the first-screen node/status path.
+            filename = Path(effective_path).name.lower()
+            if not re.fullmatch(r"[a-z]{2}\.svg", filename):
+                self.send_json({"ok": False, "error": "invalid flag"}, HTTPStatus.BAD_REQUEST)
+                return
+            flag_path = ROOT_DIR / "assets" / "flags" / "4x3" / filename
+            try:
+                if flag_path.exists():
+                    data = flag_path.read_bytes()
+                else:
+                    archive = ROOT_DIR / "assets" / "aimili-flags.tar.gz"
+                    member = "4x3/" + filename
+                    with tarfile.open(archive, "r:gz") as tf:
+                        extracted = tf.extractfile(member)
+                        if extracted is None:
+                            raise FileNotFoundError(filename)
+                        data = extracted.read()
+                self.send_bytes(data, "image/svg+xml", cache_control="public, max-age=2592000, immutable")
+            except FileNotFoundError:
+                self.send_json({"ok": False, "error": "flag not found"}, HTTPStatus.NOT_FOUND)
+            return
         if effective_path in ("/", "/index.html"):
             # Dashboard HTML contains the embedded production version and UI code.
             # Never allow an old HTML shell to survive a production update.
@@ -14581,8 +14730,12 @@ def _get_fast_nodes_state():
     state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
-    state["active_openvpn_node"] = None
-    if active_openvpn_node_id:
+    cached_active = state.get("active_openvpn_node")
+    if isinstance(cached_active, dict) and cached_active.get("id"):
+        state["active_openvpn_node"] = cached_active
+    else:
+        state["active_openvpn_node"] = None
+    if active_openvpn_node_id and not state["active_openvpn_node"]:
         try:
             active_node = next(
                 (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
@@ -14603,8 +14756,12 @@ def _get_fast_nodes_state():
                 }
         except Exception:
             state["active_openvpn_node"] = None
-    state["active_pool_endpoint"] = None
-    if active_pool_endpoint_id:
+    cached_pool = state.get("active_pool_endpoint")
+    if isinstance(cached_pool, dict) and cached_pool.get("endpoint_id"):
+        state["active_pool_endpoint"] = cached_pool
+    else:
+        state["active_pool_endpoint"] = None
+    if active_pool_endpoint_id and not state["active_pool_endpoint"]:
         try:
             endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
             if endpoint:
@@ -14794,7 +14951,23 @@ def country_reserve_snapshot(country, target=COUNTRY_RESERVE_TARGET):
             "target":min(int(target),max(1,len(inventory))) if inventory else 0,"selected_endpoints":selected[:int(target)]}
 
 def _pick_global_country_for_coverage_v2():
+    """Choose the next country only after the priority country is healthy.
+
+    Ranking is primarily measured minimum latency, then remaining reserve
+    deficit. This makes the next detection country useful for actual failover
+    rather than simply cycling alphabetically or by inventory size.
+    """
     snapshot=_global_country_pool_snapshot(); now=time.time(); ranked=[]
+    endpoints = node_pool.list_endpoints(limit=5000)
+    latency_by_country={}
+    for ep in endpoints:
+        country=_endpoint_country(ep)
+        status=str(ep.get("status") or "").upper()
+        if not country or status not in ("HOT","AVAILABLE"):
+            continue
+        latency=float(ep.get("latency_ewma") or ep.get("latest_ping") or 999999)
+        if latency>0:
+            latency_by_country[country]=min(latency_by_country.get(country,999999),latency)
     for country,values in snapshot.items():
         inventory=len(values.get("inventory") or set()); available=len(values.get("available") or set())
         if inventory<=0: continue
@@ -14802,26 +14975,33 @@ def _pick_global_country_for_coverage_v2():
         if available>=target: continue
         last=float(global_country_coverage_last_attempt.get(country,0) or 0)
         if now-last<COUNTRY_COVERAGE_ROTATION_SECONDS: continue
-        ranked.append((-(target-available)/max(1,target),-inventory,last,country))
+        best_latency=latency_by_country.get(country,999999)
+        deficit=(target-available)/max(1,target)
+        ranked.append((best_latency, -deficit, -inventory, last, country))
     ranked.sort()
-    return ranked[0][3] if ranked else ""
+    return ranked[0][4] if ranked else ""
 
 
 
 def _due_endpoints(country="", protocols=("openvpn","softether","sstp","l2tp-ipsec"), limit=10):
-    now=time.time(); target=normalized_country_name(country); wanted={str(x).lower() for x in protocols}; rows=[]
-    for ep in node_pool.list_endpoints(limit=5000):
-        protocol=str(ep.get("protocol") or "").lower(); status=str(ep.get("status") or "").upper()
-        if protocol not in wanted or status in ("RETIRED","STALE"): continue
-        if target and _endpoint_country(ep)!=target: continue
-        if float(ep.get("next_test") or 0)>now: continue
-        rows.append(ep)
-    rows.sort(key=lambda x:(0 if str(x.get("status") or "").upper()=="NEW" else 1,float(x.get("next_test") or 0),float(x.get("last_success") or 0)))
+    target=normalized_country_name(country)
+    rows=node_pool.due_endpoints(tuple(protocols), limit=max(1,min(int(limit),100)), country=target)
+    rows=[ep for ep in rows if str(ep.get("status") or "").upper() not in ("STALE","RETIRED")]
+    def _probe_priority(ep):
+        meta = ep.get("server_metadata") or {}
+        ip_type = str(meta.get("ip_type") or (ep.get("metadata") or {}).get("ip_type") or "").lower()
+        speed = int(ep.get("latest_speed") or ep.get("speed") or 0)
+        preferred_fast = ip_type in ("residential", "mobile") and speed >= ROUTING_MIN_LINE_SPEED_BPS
+        preferred_type = 0 if preferred_fast else (1 if speed >= ROUTING_MIN_LINE_SPEED_BPS else 2)
+        type_rank = {"mobile": 0, "residential": 1, "hosting": 2}.get(ip_type, 3)
+        latency = float(ep.get("latency_ewma") or ep.get("latest_ping") or 999999)
+        return (0 if str(ep.get("status") or "").upper()=="NEW" else 1, preferred_type, type_rank, latency, float(ep.get("next_test") or 0), float(ep.get("last_success") or 0))
+    rows.sort(key=_probe_priority)
     return rows[:max(1,min(int(limit),5000))]
 
 def _due_counts():
-    rows=_due_endpoints("",("openvpn","softether","sstp","l2tp-ipsec"),5000)
-    return sum(1 for x in rows if str(x.get("protocol") or "").lower()=="openvpn"),sum(1 for x in rows if str(x.get("protocol") or "").lower()!="openvpn")
+    counts = node_pool.due_counts(("openvpn","softether","sstp","l2tp-ipsec"))
+    return int(counts.get("openvpn", 0)), sum(int(counts.get(p, 0)) for p in ("softether","sstp","l2tp-ipsec"))
 
 def _finish_priority_if_ready(country):
     global country_priority_request,country_priority_explicit
@@ -14850,19 +15030,27 @@ def availability_sweep_once(priority_country=""):
         priority_ov=_due_endpoints(priority,("openvpn",),min(5,ov_limit)) if priority else []
         priority_pool=_due_endpoints(priority,("softether","sstp","l2tp-ipsec"),min(3,pool_limit)) if priority else []
         selected_ov=[]; selected_pool=[]; seen=set()
-        # Strict priority: while the requested/default country still has due
-        # endpoints, do NOT spend the probe budget on other countries. This
-        # prevents the local/custom country from being starved by the global
-        # latency rotation.
-        ov_source = priority_ov if priority_ov else _due_endpoints("",("openvpn",),ov_limit)
+        # Strict priority: while the requested/default country is below the
+        # minimum usable reserve, NEVER spend this probe budget on other
+        # countries. Only an explicitly completed/healthy priority country may
+        # fall through to global rotation.
+        if priority and not priority_ov and not priority_pool:
+            snap = country_priority_snapshot(priority)
+            if int(snap.get("available") or 0) < COUNTRY_AVAILABLE_MIN:
+                availability_engine_message = f"{priority} 优先检测未完成 · 可用 {int(snap.get('available') or 0)}/{COUNTRY_AVAILABLE_MIN} · 暂不检测其它国家"
+                set_state(availability_engine_running=False, availability_engine_message=availability_engine_message, availability_queue=0)
+                return {"ok": True, "tested": 0, "priority_blocked": True, "country": priority}
+        ov_source = priority_ov if priority else _due_endpoints("",("openvpn",),ov_limit)
         for ep in ov_source:
             eid=str(ep.get("endpoint_id") or "")
             if not eid or eid in seen: continue
             seen.add(eid); selected_ov.append(ep)
             if len(selected_ov)>=ov_limit: break
         seen=set()
-        # Same strict priority rule for the non-OpenVPN protocols.
-        pool_source = priority_pool if priority_pool else _due_endpoints("",("softether","sstp","l2tp-ipsec"),pool_limit)
+        # Same strict priority rule for the non-OpenVPN protocols. If the
+        # priority country has no due items but already satisfies the minimum,
+        # global rotation is allowed.
+        pool_source = priority_pool if priority else _due_endpoints("",("softether","sstp","l2tp-ipsec"),pool_limit)
         for ep in pool_source:
             eid=str(ep.get("endpoint_id") or "")
             if not eid or eid in seen: continue
@@ -14910,6 +15098,10 @@ def availability_sweep_once(priority_country=""):
 
 def resource_collect_once(force=False):
     global resource_engine_running,resource_engine_message,resource_engine_last_at
+    if not force:
+        last_fetch = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
+        if last_fetch and time.time() - last_fetch < RESOURCE_COLLECTION_INTERVAL_SECONDS:
+            return {"ok": True, "skipped": True, "reason": "资源采集周期尚未到达"}
     if ui_command_plane.is_busy() and not force:
         return {"ok": True, "skipped": True, "reason": "用户正在执行前端指令"}
     if manual_connection_active and not force:
@@ -14927,7 +15119,8 @@ def resource_collect_once(force=False):
         after=int(node_pool.stats().get("endpoints") or 0)
         resource_engine_last_at=time.time(); added=max(0,after-before)
         resource_engine_message=f"资源采集完成 · OpenVPN {len(candidates)} · 多协议服务器 {int(catalog.get('servers') or 0)} · 新增/恢复约 {added} 个端点，立即进入检测"
-        _refresh_ui_nodes_cache_async(force=True)
+        # UI pages read Master Pool directly; do not rebuild the heavyweight
+        # global browser snapshot after every resource sync.
         set_state(resource_engine_running=False,resource_engine_message=resource_engine_message,resource_engine_last_at=resource_engine_last_at,
                   last_fetch_at=resource_engine_last_at,last_fetch_status="ok",last_fetch_message=resource_engine_message)
         return {"ok":True,"endpoints":after,"added":added}
@@ -15313,6 +15506,9 @@ def main() -> None:
     if ENABLE_COLLECTOR_LOOP:
         threading.Thread(target=collector_loop, daemon=True).start()
         enabled_loops.append("collector")
+    if ENABLE_RESOURCE_COLLECT_LOOP and not ISOLATED_INSTANCE:
+        threading.Thread(target=resource_collect_loop, daemon=True).start()
+        enabled_loops.append("resource-collector")
     if ENABLE_PROXY_HEALTH_LOOP:
         threading.Thread(target=background_proxy_checker, daemon=True).start()
         enabled_loops.append("proxy-health")
