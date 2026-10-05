@@ -3326,7 +3326,16 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
             if ip: available_ips.add(ip)
             available_servers.add(key)
         elif status in ("not_checked", "unavailable"):
-            candidate_refs.append({"kind": "openvpn", "id": str(node.get("id") or ""), "server_key": key, "status": status, "probed_at": float(node.get("probed_at") or 0), "latency_ms": parse_int(node.get("latency_ms"))})
+            candidate_refs.append({
+                "kind": "openvpn",
+                "id": str(node.get("id") or ""),
+                "server_key": key,
+                "status": status,
+                "probed_at": float(node.get("probed_at") or 0),
+                "latency_ms": parse_int(node.get("latency_ms")),
+                "ip_type": str(node.get("ip_type") or "").lower(),
+                "speed": parse_int(node.get("speed")),
+            })
     try:
         endpoints = node_pool.list_endpoints(limit=5000)
     except Exception:
@@ -3344,7 +3353,18 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
             if ip: available_ips.add(ip)
             available_servers.add(key)
         elif status in ("NEW", "DEGRADED", "COOLDOWN"):
-            candidate_refs.append({"kind": "pool", "id": "pool:" + str(endpoint.get("endpoint_id") or ""), "server_key": key, "status": status.lower(), "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0), "ready_at": float(endpoint.get("next_test") or 0), "latency_ms": parse_int(endpoint.get("latency_ewma"))})
+            meta = endpoint.get("server_metadata") or {}
+            candidate_refs.append({
+                "kind": "pool",
+                "id": "pool:" + str(endpoint.get("endpoint_id") or ""),
+                "server_key": key,
+                "status": status.lower(),
+                "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0),
+                "ready_at": float(endpoint.get("next_test") or 0),
+                "latency_ms": parse_int(endpoint.get("latency_ewma")),
+                "ip_type": str(meta.get("ip_type") or "").lower(),
+                "speed": parse_int(endpoint.get("latest_speed") or 0),
+            })
     priority = {"not_checked": 0, "new": 0, "unavailable": 1, "degraded": 2, "cooldown": 3}
     now = time.time()
     candidate_refs = [
@@ -3352,7 +3372,25 @@ def country_priority_snapshot(country: str) -> dict[str, Any]:
         if str(x.get("status")) in ("not_checked", "new")
         or (float(x.get("ready_at") or 0) <= now and now - float(x.get("probed_at") or 0) >= 900)
     ]
-    candidate_refs.sort(key=lambda x: (priority.get(str(x.get("status")), 4), x.get("server_key") in available_servers, x.get("probed_at") or 0, x.get("latency_ms") or 999999))
+    def _priority_quality(ref):
+        ip_type = str(ref.get("ip_type") or "").lower()
+        speed = int(ref.get("speed") or 0)
+        if ip_type in ("mobile", "residential") and speed >= ROUTING_MIN_LINE_SPEED_BPS:
+            return 0
+        if ip_type in ("mobile", "residential"):
+            return 1
+        if ip_type == "hosting":
+            return 2
+        return 3
+
+    candidate_refs.sort(key=lambda x: (
+        priority.get(str(x.get("status")), 4),
+        _priority_quality(x),
+        x.get("server_key") in available_servers,
+        -(int(x.get("speed") or 0)),
+        x.get("latency_ms") or 999999,
+        x.get("probed_at") or 0,
+    ))
     result = {"country": target_country, "inventory": len(inventory_ips), "available": len(available_ips), "available_servers": len(available_servers), "target": COUNTRY_AVAILABLE_TARGET, "minimum": COUNTRY_AVAILABLE_MIN, "inventory_target": COUNTRY_INVENTORY_TARGET, "candidates": candidate_refs}
     country_priority_snapshot_cache[cache_key] = (time.time(), result)
     return dict(result)
@@ -3959,8 +3997,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 manual_connection_active = False
             manual_connection_lock.release()
             manual_guard = False
-            raise
-    with lock:
+            raise    with lock:
         if is_connecting and not manual:
             if manual_guard:
                 manual_connection_active = False
@@ -4360,10 +4397,15 @@ def protocol_probe_loop() -> None:
                 # eligible candidates. Reaching the minimum 5 is enough to
                 # make the country usable, but NOT enough to release detection
                 # budget to other countries.
-                priority_complete = available >= COUNTRY_AVAILABLE_TARGET or not candidates
+                priority_complete = available >= COUNTRY_AVAILABLE_TARGET
                 if not priority_complete:
                     if not country_priority_lock.locked() and not country_priority_request:
                         start_country_priority(priority)
+                    message = (
+                        f"{priority} 优先检测中：先完成本国 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点，再进入其它国家"
+                        if candidates else
+                        f"{priority} 优先级锁定：当前可用 {available}/{COUNTRY_AVAILABLE_TARGET}，暂无到期候选，等待资源补充/复检，不检测其它国家"
+                    )
                     set_state(
                         priority_country=priority,
                         priority_inventory=int(snap.get("inventory") or 0),
@@ -4371,7 +4413,7 @@ def protocol_probe_loop() -> None:
                         priority_target=COUNTRY_AVAILABLE_TARGET,
                         priority_minimum=COUNTRY_AVAILABLE_MIN,
                         priority_running=True,
-                        priority_message=f"{priority} 优先检测中：先完成本国 {COUNTRY_AVAILABLE_MIN}-{COUNTRY_AVAILABLE_TARGET} 个可用节点，再进入其它国家",
+                        priority_message=message,
                     )
                     time.sleep(3)
                     continue
@@ -4698,14 +4740,19 @@ def schedule_global_country_coverage() -> dict[str, Any]:
             priority_snapshot = country_priority_snapshot(priority_country)
             priority_available = int(priority_snapshot.get("available") or 0)
             priority_candidates = priority_snapshot.get("candidates") or []
-            if priority_available < COUNTRY_AVAILABLE_TARGET and priority_candidates:
+            if priority_available < COUNTRY_AVAILABLE_TARGET:
                 if not country_priority_lock.locked() and not country_priority_request:
                     start_country_priority(priority_country)
+                message = (
+                    f"{priority_country} 尚未完成优先检测，暂不进入全球其它国家"
+                    if priority_candidates else
+                    f"{priority_country} 优先级锁定：暂无到期候选，等待资源补充/复检，暂不进入全球其它国家"
+                )
                 return {
                     "ok": True,
                     "running": True,
                     "priority": priority_country,
-                    "message": f"{priority_country} 尚未完成优先检测，暂不进入全球其它国家",
+                    "message": message,
                 }
     except Exception as exc:
         log_to_json("WARNING", "Probe", f"全球覆盖调度优先级检查失败: {exc}")
@@ -7949,8 +7996,7 @@ INDEX_HTML = r"""<!doctype html>
     </select>
     <div id="status_filter_widget" class="toolbar-custom-select" data-filter-id="status_filter" aria-label="状态筛选">
       <button id="status_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
-        <span id="status_filter_label" class="toolbar-custom-select-label">全部节点</span>
-        <span class="toolbar-custom-select-arrow">⌄</span>
+        <span id="status_filter_label" class="toolbar-custom-select-label">全部节点</span>        <span class="toolbar-custom-select-arrow">⌄</span>
       </button>
       <div id="status_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
     </div>
@@ -11950,7 +11996,6 @@ async function joinResourcePeer() {
 function editResourceRelationship(relationId) {
   openResourceShareEditModal("relationship", relationId);
 }
-
 async function deleteResourceRelationship(peerIds) {
   const ids = Array.isArray(peerIds) ? peerIds.filter(Boolean) : [String(peerIds || "")].filter(Boolean);
   if (!ids.length) return;
