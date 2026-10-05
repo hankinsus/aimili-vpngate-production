@@ -177,7 +177,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.16"
+APP_VERSION = "V1.0.17"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -947,6 +947,8 @@ def get_state() -> dict[str, Any]:
         pool_stats = node_pool.stats()
         state["pool_servers"] = int(pool_stats.get("servers") or 0)
         state["pool_endpoints"] = int(pool_stats.get("endpoints") or 0)
+        state["pool_distinct_ips"] = int(pool_stats.get("distinct_ips") or 0)
+        state["pool_country_ips"] = int(pool_stats.get("country_ips") or 0)
         state["pool_states"] = pool_stats.get("states") or {}
         state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
         state["hot_pool_target"] = HOT_POOL_TARGET
@@ -7937,6 +7939,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="status_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
+      <option value="connected">已连接</option>
       <option value="not_checked">待检测</option>
       <option value="testing">检测中</option>
       <option value="unavailable">失效节点</option>
@@ -8615,7 +8618,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.16</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.17</span></span>
           </span>
         </div>
       </div>
@@ -8743,7 +8746,7 @@ const translateCountry = c => {
 };
 
 const translateStatus = s => {
-  const dict = {"available": "可用", "unavailable": "不可用", "testing": "检测中", "not_checked": "待检测"};
+  const dict = {"available": "可用", "connected": "已连接", "unavailable": "不可用", "testing": "检测中", "not_checked": "待检测"};
   return dict[s] || s || "待检测";
 };
 
@@ -9711,8 +9714,9 @@ function render(){
   if (poolSummary) {
     const poolServers = Number(state.pool_servers || 0);
     const poolEndpoints = Number(state.pool_endpoints || 0);
+    const poolIps = Number(state.pool_distinct_ips || 0);
     poolSummary.textContent = poolServers
-      ? `Master Pool：${poolServers} 台服务器 · ${poolEndpoints} 个协议端点`
+      ? `Master Pool：${poolServers} 台服务器 · ${poolEndpoints} 个协议端点 · ${poolIps} 个 IP`
       : "Master Pool：—";
   }
 
@@ -13136,9 +13140,35 @@ class Handler(BaseHTTPRequestHandler):
             status = str((query.get("status") or [""])[0]).strip().lower()
             protocol = str((query.get("protocol") or [""])[0]).strip().lower()
             ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-            page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
-                offset, limit, country, status, protocol, ip_type
-            )
+            if status == "connected":
+                # Connected is a runtime connection state, not a Master Pool
+                # endpoint lifecycle state. Resolve it from the active tunnel
+                # first so the filter works for both OpenVPN and pooled protocols.
+                connected_nodes = []
+                if active_pool_endpoint_id:
+                    ep = node_pool.get_endpoint(active_pool_endpoint_id)
+                    if ep:
+                        node = protocol_endpoint_to_ui_node(ep)
+                        if _node_matches_ui_scope(node, country, "", protocol, ip_type):
+                            connected_nodes = [node]
+                elif active_openvpn_node_id:
+                    try:
+                        raw_active = next(
+                            (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
+                            None,
+                        )
+                    except Exception:
+                        raw_active = None
+                    if raw_active:
+                        raw_active = dict(raw_active)
+                        raw_active["active"] = True
+                        if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type):
+                            connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
+                page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
+            else:
+                page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
+                    offset, limit, country, status, protocol, ip_type
+                )
             self.send_json({
                 "ok": True,
                 "nodes": page_nodes,
@@ -14806,6 +14836,8 @@ def _get_fast_nodes_state():
         pool_stats = node_pool.stats()
         state["pool_servers"] = int(pool_stats.get("servers") or 0)
         state["pool_endpoints"] = int(pool_stats.get("endpoints") or 0)
+        state["pool_distinct_ips"] = int(pool_stats.get("distinct_ips") or 0)
+        state["pool_country_ips"] = int(pool_stats.get("country_ips") or 0)
         state["pool_states"] = pool_stats.get("states") or {}
         state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
         state["hot_pool_target"] = HOT_POOL_TARGET
