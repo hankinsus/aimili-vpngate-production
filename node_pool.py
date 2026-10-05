@@ -358,6 +358,12 @@ class NodePool:
             if ip_type and ip_type != "all":
                 where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
                 params.append(ip_type)
+            if speed_min_bps > 0:
+                where.append(
+                    "CAST(COALESCE(json_extract(e.metadata_json,'$.last_probe_speed_bps'), "
+                    "json_extract(s.metadata_json,'$.last_ip_speed_bps'), 0) AS INTEGER) >= ?"
+                )
+                params.append(speed_min_bps)
             if status and status != "all":
                 groups = {
                     "available": ("HOT", "AVAILABLE"),
@@ -417,13 +423,14 @@ class NodePool:
         finally:
             gate.release()
 
-    def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id=""):
+    def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id="", speed_min_bps=0):
         """Authoritative country/IP inventory using the same Master Pool scope as the node table."""
         status = str(status or "").strip().lower()
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         connected_endpoint_id = str(connected_endpoint_id or "").strip()
-        key = (status, protocol, ip_type, connected_endpoint_id)
+        speed_min_bps = max(0, int(speed_min_bps or 0))
+        key = (status, protocol, ip_type, connected_endpoint_id, speed_min_bps)
         now = time.monotonic()
         cached = self._country_catalog_cache.get(key)
         if cached and cached[0] > now:
@@ -565,7 +572,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -605,7 +612,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), (SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -686,8 +693,24 @@ class NodePool:
                 new_jitter = 0.35 * jitter + 0.65 * float(row["jitter_ewma"] or 0)
                 meta["last_error"] = ""
                 meta["last_probe_message"] = msg
-                meta["last_probe_speed_bps"] = speed
-                meta["last_probe_speed_at"] = now
+                if speed_bps is not None:
+                    meta["last_probe_speed_bps"] = speed
+                    meta["last_probe_speed_at"] = now
+                server_row = db.execute(
+                    "SELECT current_ip, metadata_json FROM servers WHERE server_key=?",
+                    (row["server_key"],),
+                ).fetchone()
+                if server_row is not None and speed_bps is not None:
+                    try: server_meta = json.loads(server_row["metadata_json"] or "{}")
+                    except Exception: server_meta = {}
+                    if not isinstance(server_meta, dict): server_meta = {}
+                    server_meta["last_ip_speed_bps"] = speed
+                    server_meta["last_ip_speed_at"] = now
+                    server_meta["last_ip_speed_ip"] = str(server_row["current_ip"] or "").strip()
+                    db.execute(
+                        "UPDATE servers SET metadata_json=? WHERE server_key=?",
+                        (json.dumps(server_meta, ensure_ascii=False), row["server_key"]),
+                    )
                 db.execute(
                     """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
                        fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, metadata_json=?
@@ -862,6 +885,12 @@ class NodePool:
             if ip_type and ip_type != "all":
                 where.append("LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?")
                 params.append(ip_type)
+            if speed_min_bps > 0:
+                where.append(
+                    "CAST(COALESCE(json_extract(e.metadata_json,'$.last_probe_speed_bps'), "
+                    "json_extract(s.metadata_json,'$.last_ip_speed_bps'), 0) AS INTEGER) >= ?"
+                )
+                params.append(speed_min_bps)
             sql = """
                 SELECT
                   SUM(CASE WHEN UPPER(e.status) IN ('HOT','AVAILABLE') THEN 1 ELSE 0 END) AS available,
