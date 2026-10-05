@@ -18,7 +18,7 @@ def parse_positive_int(value: str | None, default: int) -> int:
     except (TypeError, ValueError):
         return default
 
-MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
+MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 64)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
 # Keep DNS results for a short time so each HTTPS connection does not pay for
