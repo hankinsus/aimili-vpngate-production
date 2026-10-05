@@ -44,6 +44,35 @@ jobs:
               print(p.stats())
           PY
 
+      - name: Fast UI and SOCKS5 UDP smoke test
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from proxy_server import _socks5_pack_udp, _socks5_unpack_udp
+
+          payload = b"aimili-udp-smoke"
+          packet = _socks5_pack_udp(("198.51.100.20", 4500), payload)
+          host, port, unpacked = _socks5_unpack_udp(packet)
+          assert host == "198.51.100.20"
+          assert port == 4500
+          assert unpacked == payload
+
+          packet6 = _socks5_pack_udp(("2001:db8::20", 4500), payload)
+          host6, port6, unpacked6 = _socks5_unpack_udp(packet6)
+          assert host6 == "2001:db8::20"
+          assert port6 == 4500
+          assert unpacked6 == payload
+          print("SOCKS5 UDP framing OK")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("vpngate_manager.py").read_text(encoding="utf-8")
+          assert "fonts.googleapis.com" not in text
+          assert 'protocol_version = "HTTP/1.1"' in text
+          assert 'FAST_STATE_CACHE_TTL_SECONDS' in text
+          print("dashboard performance guards OK")
+          PY
+
       - name: Master pool metadata and hot-pool smoke test
         run: |
           python3 - <<'PY'
