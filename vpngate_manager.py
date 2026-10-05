@@ -3059,6 +3059,21 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
         endpoint["routing_speed_gate"] = routing_speed_gate(endpoint)
         endpoint["routing_web_health_rank"] = routing_web_health_rank(endpoint)
         candidates.append(endpoint)
+
+    # Default routing prefers residential/mobile only when they meet the
+    # minimum 50 Mbps line-speed requirement. If none of those preferred IP
+    # types reaches 50 Mbps, fall back to the wider pool instead of getting
+    # stuck on a very slow residential/mobile endpoint. This affects routing
+    # only; detection still measures every endpoint according to priority.
+    if str(ui_cfg.get("routing_ip_type") or "all").lower() == "all":
+        preferred_fast = [
+            ep for ep in candidates
+            if endpoint_ip_type(ep) in ("residential", "mobile")
+            and int(ep.get("latest_speed") or ep.get("speed") or 0) >= ROUTING_MIN_LINE_SPEED_BPS
+        ]
+        if preferred_fast:
+            candidates = preferred_fast
+
     candidates.sort(key=lambda endpoint: routing_service_key(endpoint, ui_cfg))
     return candidates[:max(1, min(int(limit), 100))]
 
@@ -4264,7 +4279,18 @@ def protocol_probe_loop() -> None:
             if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active:
                 time.sleep(5)
                 continue
-            priority = country_priority_request if country_priority_explicit else coverage_country
+            # Detection priority is independent from the browser view:
+            # explicit custom country > configured/default server country >
+            # global coverage rotation. The priority country gets the whole
+            # due probe budget before other countries are considered.
+            ui_cfg = load_ui_config()
+            configured_priority = normalized_country_name(str(ui_cfg.get("force_country") or "").strip())
+            default_priority = routing_target_country(ui_cfg)
+            priority = (
+                country_priority_request
+                if country_priority_explicit and country_priority_request
+                else (configured_priority or default_priority or coverage_country)
+            )
             result = availability_sweep_once(priority)
             if result.get("skipped"):
                 time.sleep(3)
