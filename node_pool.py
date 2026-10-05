@@ -405,14 +405,16 @@ class NodePool:
         base=' FROM servers s WHERE '+' AND '.join(where)
         with closing(self._connect()) as db:
             rows=db.execute('SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, COUNT(DISTINCT s.server_key) AS server_count'+base+' GROUP BY s.country',params).fetchall()
-            total=int(db.execute('SELECT COUNT(DISTINCT s.current_ip)'+base,params).fetchone()[0] or 0)
+            # Global IP total is the complete Master Pool inventory, including records whose country metadata has not been geolocated yet.
+            total=int(db.execute("SELECT COUNT(DISTINCT current_ip) FROM servers WHERE TRIM(COALESCE(current_ip,''))<>''").fetchone()[0] or 0)
+            country_total=int(db.execute("SELECT COUNT(DISTINCT current_ip) FROM servers WHERE TRIM(COALESCE(current_ip,''))<>'' AND TRIM(COALESCE(country,''))<>''").fetchone()[0] or 0)
         countries={}
         for row in rows:
             country=canonical_country_name(row['country'])
             if not country: continue
             item=countries.setdefault(country,{'ip_count':0,'server_count':0})
             item['ip_count']+=int(row['ip_count'] or 0); item['server_count']+=int(row['server_count'] or 0)
-        result={'total_ip_count':total,'countries':countries,'status':status,'protocol':protocol,'ip_type':ip_type}
+        result={'total_ip_count':total,'country_ip_count':country_total,'countries':countries,'status':status,'protocol':protocol,'ip_type':ip_type}
         self._country_catalog_cache[key]=(now+5.0,result)
         return dict(result)
 
