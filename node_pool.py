@@ -361,7 +361,9 @@ class NodePool:
             if speed_min_bps > 0:
                 where.append(
                     "CAST(COALESCE(json_extract(e.metadata_json,'$.last_probe_speed_bps'), "
-                    "json_extract(s.metadata_json,'$.last_ip_speed_bps'), 0) AS INTEGER) >= ?"
+                    "json_extract(s.metadata_json,'$.last_ip_speed_bps'), "
+                    "(SELECT o.speed * 8 FROM observations o "
+                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
                 )
                 params.append(speed_min_bps)
             if status and status != "all":
@@ -384,7 +386,7 @@ class NodePool:
                     SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                            s.metadata_json AS server_metadata_json,
                            COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                           COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
+                           COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), COALESCE((SELECT o.speed * 8 FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0), 0) AS latest_speed,
                            COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                            COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                     """ + base + """
@@ -455,7 +457,9 @@ class NodePool:
             where.append(
                 "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key "
                 "AND CAST(COALESCE(json_extract(ee.metadata_json,'$.last_probe_speed_bps'), "
-                "json_extract(s.metadata_json,'$.last_ip_speed_bps'), 0) AS INTEGER) >= ?)"
+                "json_extract(s.metadata_json,'$.last_ip_speed_bps'), "
+                "(SELECT o.speed * 8 FROM observations o "
+                "WHERE o.server_key=ee.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?)"
             )
             params.append(speed_min_bps)
 
@@ -529,7 +533,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), COALESCE((SELECT o.speed * 8 FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -572,7 +576,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), COALESCE((SELECT o.speed * 8 FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -612,7 +616,7 @@ class NodePool:
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                        s.metadata_json AS server_metadata_json,
                        COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), 0) AS latest_speed,
+                       COALESCE(CAST(json_extract(e.metadata_json,'$.last_probe_speed_bps') AS INTEGER), CAST(json_extract(s.metadata_json,'$.last_ip_speed_bps') AS INTEGER), COALESCE((SELECT o.speed * 8 FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0), 0) AS latest_speed,
                        COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
                        COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
                 FROM endpoints e JOIN servers s ON s.server_key=e.server_key
@@ -888,7 +892,9 @@ class NodePool:
             if speed_min_bps > 0:
                 where.append(
                     "CAST(COALESCE(json_extract(e.metadata_json,'$.last_probe_speed_bps'), "
-                    "json_extract(s.metadata_json,'$.last_ip_speed_bps'), 0) AS INTEGER) >= ?"
+                    "json_extract(s.metadata_json,'$.last_ip_speed_bps'), "
+                    "(SELECT o.speed * 8 FROM observations o "
+                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
                 )
                 params.append(speed_min_bps)
             sql = """
