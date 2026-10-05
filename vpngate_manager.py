@@ -5345,7 +5345,8 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
         transport = str(endpoint.get("transport") or "tcp").lower()
         ip = str(endpoint.get("current_ip") or "").strip()
         port = int(endpoint.get("port") or 0)
-        node_id = safe_name(f"{(endpoint.get("country") or "XX")}_{ip}_{port}_{transport}")
+        country = endpoint.get("country") or "XX"
+        node_id = safe_name(f"{country}_{ip}_{port}_{transport}")
     config_file = str(endpoint.get("config_ref") or metadata.get("config_file") or "").strip()
     config_text = ""
     if config_file:
