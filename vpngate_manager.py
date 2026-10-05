@@ -1474,6 +1474,9 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "fetched_at": float(endpoint.get("last_seen") or 0),
         "manual_added_at": float(metadata.get("manual_added_at") or 0),
         "probe_status": probe_status,
+        "endpoint_status": status.lower(),
+        "hot_standby": status == "HOT",
+        "connection_status": "connected" if str(endpoint.get("endpoint_id") or "") == str(active_pool_endpoint_id or "") else "not_connected",
         "probe_message": str(metadata.get("last_error") or ""),
         "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0),
         "active": str(endpoint.get("endpoint_id") or "") == str(active_pool_endpoint_id or ""),
@@ -9652,11 +9655,14 @@ function render(){
       const nodeAddress = nodeHost + nodePort;
 
       const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
+      const hotStandby = !!n.hot_standby && !isCurrentlyActive;
       const statusCell = isCurrentlyActive
         ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
-        : canRetest
-          ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="点击立即检测此节点" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
-          : `<span class="badge ${badgeClass}">${badgeText}</span>`;
+        : hotStandby
+          ? `<span class="badge available"><span class="badge-pulse"></span>热备</span>`
+          : canRetest
+            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="点击立即检测此节点" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
+            : `<span class="badge ${badgeClass}">${badgeText}</span>`;
 
       // Background detection is allowed to continue while the user manually
       // switches nodes. Only an actual manual connection operation remains
