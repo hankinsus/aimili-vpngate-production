@@ -9265,7 +9265,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedIpType === "hosting" && ipType !== "hosting") return false;
   if (selectedIpType === "mobile" && ipType !== "mobile") return false;
 
-  if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) < selectedSpeed) return false;
+  if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) <= selectedSpeed) return false;
 
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
   if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
