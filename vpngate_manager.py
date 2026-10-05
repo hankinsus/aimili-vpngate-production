@@ -168,7 +168,7 @@ ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.9"
+APP_VERSION = "V1.0.10"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -14767,14 +14767,14 @@ def _switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id="",lim
     return [],False
 
 
-def _ensure_active_client_v2():
+def _ensure_active_client_v2() -> bool:
     if active_tunnel_running() or manual_connection_active or failover_lock.locked() or is_connecting:
-        return
+        return active_tunnel_running()
     ui_cfg=load_ui_config()
     if not bool(ui_cfg.get("connection_enabled",True)):
-        return
+        return False
     if not bootstrap_connection_lock.acquire(blocking=False):
-        return
+        return active_tunnel_running()
     try:
         if ui_cfg.get("routing_mode") == "fixed_ip":
             reconnect_fixed_node_if_needed(ui_cfg)
@@ -14784,26 +14784,44 @@ def _ensure_active_client_v2():
         log_to_json("WARNING","VPN",f"启动/恢复活动 VPN 失败: {exc}")
     finally:
         bootstrap_connection_lock.release()
+    return active_tunnel_running()
 
 def startup_recovery_loop():
-    """Independent boot/restart recovery; never depends on resource collection."""
-    time.sleep(5)
-    while True:
+    """One-shot boot recovery; a failed startup must not churn forever.
+
+    A browser refresh does not restart this task. The old implementation ran
+    every 15 seconds and could spend several minutes cycling through SoftEther/
+    SSTP/L2TP candidates while the UI continuously showed a stale-looking
+    "正在连接" state. Normal maintenance/failover loops remain responsible
+    for later recovery.
+    """
+    time.sleep(8)
+    try:
+        if initial_bootstrap_active:
+            return
+        ui_cfg = load_ui_config()
+        if not bool(ui_cfg.get("connection_enabled", True)):
+            return
+        if global_pool_refresh_running or ui_command_plane.is_busy() or manual_connection_active or is_connecting or active_tunnel_running():
+            return
+        set_state(
+            last_check_message="启动恢复：正在尝试一次已验证备用节点连接；失败后交给后台维护周期重试。"
+        )
+        connected = _ensure_active_client_v2()
+        if connected:
+            set_state(last_check_message="启动恢复完成：已建立可用 VPN 出口。")
+        else:
+            set_state(
+                last_check_message="启动恢复未建立连接；不会循环占用检测，后台维护将在下一周期自动重试。"
+            )
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"启动恢复任务异常: {exc}")
         try:
-            if (
-                not initial_bootstrap_active
-                and not global_pool_refresh_running
-                and not ui_command_plane.is_busy()
-                and not manual_connection_active
-                and not is_connecting
-                and bool(load_ui_config().get("connection_enabled", True))
-                and not active_tunnel_running()
-            ):
-                set_state(last_check_message="启动恢复：正在从已验证节点中选择最佳备用节点...")
-                _ensure_active_client_v2()
-        except Exception as exc:
-            log_to_json("WARNING", "VPN", f"启动恢复守护异常: {exc}")
-        time.sleep(15)
+            set_state(
+                last_check_message=f"启动恢复未完成：{exc}；后台维护将在下一周期自动重试。"
+            )
+        except Exception:
+            pass
 
 
 
