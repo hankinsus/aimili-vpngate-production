@@ -49,6 +49,10 @@ def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = _ipv4_getaddrinfo
 
 class DualStackHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+    allow_reuse_address = True
+
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
         host, port = server_address
         if ":" in host or host == "":
@@ -12580,6 +12584,10 @@ def active_node_pinger() -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Keep-alive between Nginx and the local manager avoids a fresh backend TCP
+    # connection for every UI state/catalog request.
+    protocol_version = "HTTP/1.1"
+
     def get_secret_path(self) -> str:
         ui_cfg = load_ui_config()
         return ui_cfg.get("secret_path", "EJsW2EeBo9lY")
@@ -12619,6 +12627,7 @@ class Handler(BaseHTTPRequestHandler):
         if request_path == f"/{secret_path}":
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", f"/{secret_path}/")
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return ""
         prefix = f"/{secret_path}/"
@@ -12629,6 +12638,7 @@ class Handler(BaseHTTPRequestHandler):
         if request_path == "/resource-share" or request_path.startswith("/resource-share/"):
             return request_path
         self.send_response(HTTPStatus.NOT_FOUND)
+        self.send_header("Content-Length", "0")
         self.end_headers()
         return ""
 
