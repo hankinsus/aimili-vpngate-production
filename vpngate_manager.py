@@ -2939,6 +2939,25 @@ def routing_target_country(ui_cfg: dict[str, Any]) -> str:
             return normalized_country_name(local)
     except Exception:
         pass
+    # If the server's own location is unavailable, continue from the country
+    # of the currently active tunnel. This keeps detection continuity after a
+    # manual switch without making the browser responsible for probe state.
+    try:
+        if active_pool_endpoint_id:
+            endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
+            active_country = str((endpoint or {}).get("country") or "").strip()
+            if active_country:
+                return normalized_country_name(active_country)
+        if active_openvpn_node_id:
+            active = next(
+                (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
+                None,
+            )
+            active_country = str((active or {}).get("country") or "").strip()
+            if active_country:
+                return normalized_country_name(active_country)
+    except Exception:
+        pass
     return ""
 
 def routing_favorite_rank(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
