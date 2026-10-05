@@ -177,7 +177,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.15"
+APP_VERSION = "V1.0.16"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8615,7 +8615,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.15</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.16</span></span>
           </span>
         </div>
       </div>
@@ -10124,6 +10124,19 @@ function refreshButtonIdle() {
   btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>重新轮询全球库`;
 }
 
+function backendStateRenderSignature(s) {
+  const x = s || {};
+  return [
+    x.connection_status, x.client_status, x.connection_message,
+    x.active_openvpn_node_id, x.active_pool_endpoint_id,
+    x.is_connecting, x.manual_connection_active, x.failover_in_progress,
+    x.active_node_latency, x.proxy_ok, x.proxy_ip, x.proxy_latency_ms,
+    x.last_check_message, x.priority_country, x.priority_running,
+    x.priority_available, x.availability_engine_running,
+    x.resource_engine_running, x.global_pool_refresh_running
+  ].map(v => String(v ?? "")).join("|");
+}
+
 function startBackendStatePolling() {
   if (backendStatePollInterval) return;
   const poll = async () => {
@@ -10132,8 +10145,13 @@ function startBackendStatePolling() {
     try {
       const data = await fetchUiStateOnly(4000);
       if (data?.state) {
-        state = data.state;
-        render();
+        const next = data.state;
+        const prevSig = backendStateRenderSignature(state);
+        const nextSig = backendStateRenderSignature(next);
+        state = next;
+        // Do not rebuild the entire node table every 4 seconds. Only redraw
+        // when connection/priority/engine state actually changed.
+        if (prevSig !== nextSig) render();
       }
     } catch (_) {
       // Keep the last known backend state; the next poll retries.
@@ -15036,8 +15054,8 @@ def availability_sweep_once(priority_country=""):
         # fall through to global rotation.
         if priority and not priority_ov and not priority_pool:
             snap = country_priority_snapshot(priority)
-            if int(snap.get("available") or 0) < COUNTRY_AVAILABLE_MIN:
-                availability_engine_message = f"{priority} 优先检测未完成 · 可用 {int(snap.get('available') or 0)}/{COUNTRY_AVAILABLE_MIN} · 暂不检测其它国家"
+            if int(snap.get("available") or 0) < COUNTRY_AVAILABLE_TARGET:
+                availability_engine_message = f"{priority} 优先检测未完成 · 可用 {int(snap.get('available') or 0)}/{COUNTRY_AVAILABLE_TARGET} · 暂不检测其它国家"
                 set_state(availability_engine_running=False, availability_engine_message=availability_engine_message, availability_queue=0)
                 return {"ok": True, "tested": 0, "priority_blocked": True, "country": priority}
         ov_source = priority_ov if priority else _due_endpoints("",("openvpn",),ov_limit)
