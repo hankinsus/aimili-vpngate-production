@@ -2613,7 +2613,7 @@ def resource_share_loop() -> None:
         time.sleep(RESOURCE_SHARE_SYNC_INTERVAL_SECONDS)
 
 
-def _wait_for_automatic_connection_idle(timeout: float = 30.0) -> None:
+def _wait_for_automatic_connection_idle(timeout: float = 2.0) -> None:
     deadline = time.time() + float(timeout)
     warned = False
     while True:
@@ -2627,7 +2627,11 @@ def _wait_for_automatic_connection_idle(timeout: float = 30.0) -> None:
                 last_check_message="人工操作已获得优先权，正在等待当前自动连接任务收尾；不会再启动新的自动连接。"
             )
         if time.time() >= deadline:
-            raise RuntimeError("当前自动连接任务收尾超时，人工切换未强行并发执行。请稍后重试。")
+            set_state(
+                last_check_message="人工切换已获得优先权，自动检测仍在收尾；不再继续等待，立即建立候选隧道。",
+                manual_switch_message="正在优先建立新隧道，当前连接继续保持在线…",
+            )
+            return
         time.sleep(0.25)
 
 def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
@@ -8454,15 +8458,16 @@ INDEX_HTML = r"""<!doctype html>
 
       <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
         <option value="0">不限速度</option>
-        <option value="8000000">≥1 MB/s</option>
-        <option value="24000000">≥3 MB/s</option>
-        <option value="40000000">≥5 MB/s</option>
-        <option value="64000000">≥8 MB/s</option>
-        <option value="80000000">≥10 MB/s</option>
-        <option value="240000000">≥30 MB/s</option>
-        <option value="400000000">≥50 MB/s</option>
-        <option value="560000000">≥70 MB/s</option>
-        <option value="800000000">≥100 MB/s</option>
+        <option value="5000000">≥5 Mbps</option>
+        <option value="10000000">≥10 Mbps</option>
+        <option value="30000000">≥30 Mbps</option>
+        <option value="50000000">≥50 Mbps</option>
+        <option value="70000000">≥70 Mbps</option>
+        <option value="100000000">≥100 Mbps</option>
+        <option value="300000000">≥300 Mbps</option>
+        <option value="500000000">≥500 Mbps</option>
+        <option value="800000000">≥800 Mbps</option>
+        <option value="1000000000">≥1 Gbps</option>
       </select>
       <div id="speed_filter_widget" class="toolbar-custom-select" data-filter-id="speed_filter" aria-label="速度筛选">
         <button id="speed_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -9186,7 +9191,7 @@ function renderProtocolCell(n) {
   return `<a class="protocol-badge protocol-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="打开 VPN Gate ${esc(label)} 官方连接页面">${esc(label)}</a>`;
 }
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
-function speed(v){return v?`${(Number(v)/8000000).toFixed(2)} MB/s`:"-"}
+function speed(v){return v?`${(Number(v)/1000000).toFixed(1)} Mbps`:"-"}
 
 const translateQuality = q => {
   const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
@@ -11237,21 +11242,14 @@ async function refreshFilterCounts() {
 
 async function applyNodeFilterChange() {
   currentPage = 1;
-  const countsPromise = refreshFilterCounts();
-  // The country catalog is a lightweight index query. Wait for it before
-  // loading a selected country so a zero-IP country never triggers node data.
-  const catalogPromise = refreshCountryCatalog(false);
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
+  // Node data is the critical path. Do not issue country-catalog work for
+  // non-country filters; it can contend with the SQLite node query.
 
-  await catalogPromise.catch(e => {
-    console.warn("筛选后的国家目录读取失败", e);
-  });
-  countsPromise.catch(() => {});
-
-  // Immediately query the Master Pool with the selected filter(s). This lets
-  // "移动网 / 住宅IP / 机房IP" work directly while country remains global.
-  await loadScope(country, {preserveState:true});
+  const loadPromise = loadScope(country, {preserveState:true});
+  setTimeout(() => refreshFilterCounts().catch(() => {}), 180);
+  await loadPromise;
 }
 
 $("country_filter").onchange=async()=>{
