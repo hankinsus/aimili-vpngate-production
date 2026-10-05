@@ -1163,17 +1163,22 @@ class NodePool:
             result.append(item)
         return result, total
     def country_catalog(self, status: str = "", protocol: str = "", ip_type: str = "") -> dict[str, Any]:
-        """Return distinct server-IP inventory, optionally scoped by UI filters."""
+        """Return distinct server/IP inventory using SQL aggregation and a short cache."""
         status = str(status or "").strip().lower()
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
+        key = (status, protocol, ip_type)
+        now = time.monotonic()
+        cached = self._country_catalog_cache.get(key)
+        if cached and cached[0] > now:
+            return dict(cached[1])
 
         where = [
             "TRIM(COALESCE(s.country, '')) <> ''",
             "TRIM(COALESCE(s.current_ip, '')) <> ''",
         ]
         params: list[Any] = []
-        if protocol:
+        if protocol and protocol != "all":
             where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.protocol=?)")
             params.append(protocol)
         if status == "available":
@@ -1182,58 +1187,52 @@ class NodePool:
             where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.status IN ('NEW','DEGRADED'))")
         elif status == "unavailable":
             where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.status IN ('COOLDOWN','STALE'))")
-        if ip_type:
-            where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), '')) = ?")
+        elif status == "not_checked":
+            where.append("EXISTS (SELECT 1 FROM endpoints ep WHERE ep.server_key=s.server_key AND ep.status='NEW')")
+        if ip_type and ip_type != "all":
+            where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
             params.append(ip_type)
 
-        sql = f"""
-            SELECT s.country, s.current_ip, s.hostname, s.metadata_json
-            FROM servers s
-            WHERE {' AND '.join(where)}
-        """
+        base = " FROM servers s WHERE " + " AND ".join(where)
         with self.lock, closing(self._connect()) as db:
-            rows = db.execute(sql, params).fetchall()
+            rows = db.execute(
+                "SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, COUNT(DISTINCT s.server_key) AS server_count" + base + " GROUP BY s.country",
+                params,
+            ).fetchall()
+            total = int(db.execute("SELECT COUNT(DISTINCT s.current_ip)" + base, params).fetchone()[0] or 0)
 
-        # Canonicalize country names at the inventory boundary. The same
-        # server pool can contain "Japan"/"日本", "United States"/"美国", etc.
-        # The UI must expose one country and one real IP count, not duplicate
-        # source-language buckets.
-        result: dict[str, dict[str, set[str]]] = {}
+        countries: dict[str, dict[str, int]] = {}
         for row in rows:
-            raw_country = str(row["country"] or "").strip()
-            ip = str(row["current_ip"] or "").strip()
-            if not raw_country or not ip:
+            raw = str(row["country"] or "").strip()
+            if not raw:
                 continue
-            country = COUNTRY_TRANSLATIONS.get(raw_country, raw_country)
-            item = result.setdefault(country, {"ips": set(), "servers": set()})
-            item["ips"].add(ip)
-            item["servers"].add(str(row["hostname"] or ip).strip().lower())
+            country = COUNTRY_TRANSLATIONS.get(raw, raw)
+            item = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
+            item["ip_count"] += int(row["ip_count"] or 0)
+            item["server_count"] += int(row["server_count"] or 0)
 
-        countries = {
-            country: {
-                "ip_count": len(item["ips"]),
-                "server_count": len(item["servers"]),
-            }
-            for country, item in result.items()
-        }
-        return {
-            "total_ip_count": len({
-                ip
-                for item in result.values()
-                for ip in item["ips"]
-            }),
+        result = {
+            "total_ip_count": total,
             "countries": countries,
             "status": status,
             "protocol": protocol,
             "ip_type": ip_type,
         }
+        self._country_catalog_cache[key] = (now + 5.0, result)
+        return dict(result)
 
     def stats(self) -> dict[str, Any]:
+        now = time.monotonic()
+        cached = self._stats_cache
+        if cached and cached[0] > now:
+            return dict(cached[1])
         with self.lock, closing(self._connect()) as db:
-            servers = db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"]
-            endpoints = db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"]
+            servers = int(db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"] or 0)
+            endpoints = int(db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"] or 0)
             states = {
                 row["state"]: row["c"]
                 for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
             }
-            return {"servers": servers, "endpoints": endpoints, "states": states}
+        result = {"servers": servers, "endpoints": endpoints, "states": states}
+        self._stats_cache = (now + 2.0, result)
+        return dict(result)
