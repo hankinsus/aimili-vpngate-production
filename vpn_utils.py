@@ -86,6 +86,89 @@ COUNTRY_TRANSLATIONS = {
     "Luxembourg": "卢森堡",
 }
 
+
+COUNTRY_REGISTRY_FILE = ROOT_DIR / "country_registry.json"
+try:
+    COUNTRY_REGISTRY = json.loads(COUNTRY_REGISTRY_FILE.read_text(encoding="utf-8"))
+    if not isinstance(COUNTRY_REGISTRY, dict):
+        COUNTRY_REGISTRY = {}
+except Exception:
+    COUNTRY_REGISTRY = {}
+
+COUNTRY_CODE_TO_ZH: dict[str, str] = {}
+COUNTRY_NAME_TO_CODE: dict[str, str] = {}
+for _code, _item in COUNTRY_REGISTRY.items():
+    if not isinstance(_item, dict):
+        continue
+    _code = str(_code or "").strip().upper()
+    _zh = str(_item.get("zh") or "").strip()
+    _en = str(_item.get("en") or "").strip()
+    if _code and _zh:
+        COUNTRY_CODE_TO_ZH[_code] = _zh
+        COUNTRY_NAME_TO_CODE[_zh.casefold()] = _code
+    if _code and _en:
+        COUNTRY_NAME_TO_CODE[_en.casefold()] = _code
+        COUNTRY_TRANSLATIONS.setdefault(_en, _zh)
+
+# Real-world source variants not guaranteed to match the registry's English name exactly.
+COUNTRY_ALIASES = {
+    "Lao People's Democratic Republic": "老挝",
+    "Laos": "老挝",
+    "Bolivia": "玻利维亚",
+    "Croatia (LOCAL Name: Hrvatska)": "克罗地亚",
+    "Hrvatska": "克罗地亚",
+    "Curaçao": "库拉索",
+    "Curacao": "库拉索",
+    "Côte d'Ivoire": "科特迪瓦",
+    "Ivory Coast": "科特迪瓦",
+    "Türkiye": "土耳其",
+    "Brunei Darussalam": "文莱",
+    "Eswatini": "斯威士兰",
+    "Swaziland": "斯威士兰",
+    "Moldova, Republic of": "摩尔多瓦",
+    "Palestine, State of": "巴勒斯坦",
+    "Syrian Arab Republic": "叙利亚",
+    "Tanzania, United Republic of": "坦桑尼亚",
+    "Bolivia, Plurinational State of": "玻利维亚",
+    "Venezuela, Bolivarian Republic of": "委内瑞拉",
+    "Cabo Verde": "佛得角",
+    "Cape Verde": "佛得角",
+    "Micronesia, Federated States of": "密克罗尼西亚",
+    "Macedonia": "北马其顿",
+}
+COUNTRY_TRANSLATIONS.update(COUNTRY_ALIASES)
+for _alias, _zh in COUNTRY_ALIASES.items():
+    _code = COUNTRY_NAME_TO_CODE.get(_zh.casefold(), "")
+    if _code:
+        COUNTRY_NAME_TO_CODE[_alias.casefold()] = _code
+
+INVALID_COUNTRY_LABELS = {
+    "", "-", "—", "unknown", "unknown region", "unknown country",
+    "unclassified", "undefined", "pseudo region", "pseudo location",
+    "伪地区", "伪双向语言地区", "未知地区", "未知国家", "未分类",
+}
+
+def country_code_for_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw or raw.casefold() in INVALID_COUNTRY_LABELS:
+        return ""
+    if len(raw) == 2 and raw.isascii() and raw.isalpha():
+        code = raw.upper()
+        return code if code in COUNTRY_CODE_TO_ZH else ""
+    normalized = re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip()
+    if normalized.casefold() in INVALID_COUNTRY_LABELS:
+        return ""
+    translated = COUNTRY_ALIASES.get(normalized, COUNTRY_TRANSLATIONS.get(normalized, normalized))
+    return COUNTRY_NAME_TO_CODE.get(translated.casefold(), "") or COUNTRY_NAME_TO_CODE.get(normalized.casefold(), "")
+
+def canonical_country_name(value: Any) -> str:
+    code = country_code_for_name(value)
+    if code:
+        return COUNTRY_CODE_TO_ZH.get(code, "")
+    raw = str(value or "").strip()
+    translated = COUNTRY_ALIASES.get(raw, COUNTRY_TRANSLATIONS.get(raw, ""))
+    return translated if translated.casefold() not in INVALID_COUNTRY_LABELS else ""
+
 def _safe_int(val: Any, default: int = 0) -> int:
     try:
         return int(val)
