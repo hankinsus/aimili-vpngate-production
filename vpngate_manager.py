@@ -8621,7 +8621,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.17</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· {APP_VERSION}</span></span>
           </span>
         </div>
       </div>
@@ -14746,7 +14746,12 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
     try:
-        catalog = node_pool.country_catalog(status=status, protocol=protocol, ip_type=ip_type)
+        catalog = node_pool.country_catalog(
+            status=status,
+            protocol=protocol,
+            ip_type=ip_type,
+            connected_endpoint_id=active_pool_endpoint_id,
+        )
     except Exception:
         catalog = {"total_ip_count": 0, "countries": {}}
 
@@ -14754,6 +14759,20 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
     # promoted into the same SQLite pool when added, so the UI never has to
     # scan nodes.json or compute a second country inventory on the frontend.
     countries = dict(catalog.get("countries") or {})
+
+    if status == "connected" and not active_pool_endpoint_id and active_openvpn_node_id:
+        try:
+            active = next(
+                (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
+                None,
+            )
+            active_country = normalized_country_name((active or {}).get("country") or "")
+            if active_country:
+                countries = {active_country: {"ip_count": 1, "server_count": 1}}
+                catalog["total_ip_count"] = 1
+                catalog["country_ip_count"] = 1
+        except Exception:
+            pass
 
     bootstrap = _read_bootstrap_state()
     server_country = str(
@@ -14763,6 +14782,7 @@ def _get_ui_country_catalog(status="", protocol="", ip_type=""):
     ).strip()
     return {
         "total_ip_count": int(catalog.get("total_ip_count") or 0),
+        "country_ip_count": int(catalog.get("country_ip_count") or sum(int(v.get("ip_count") or 0) for v in countries.values())),
         "countries": countries,
         "server_country": server_country,
         "status": status,
@@ -15466,6 +15486,11 @@ def resume_web_certificate_if_needed() -> None:
 
 def main() -> None:
     ensure_dirs()
+    try:
+        repaired = node_pool.repair_data_integrity()
+        log_to_json("INFO", "Main", f"Master Pool 数据完整性校正完成：servers={repaired.get('servers', 0)} endpoints={repaired.get('endpoints', 0)}")
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"Master Pool 数据完整性校正失败：{exc}")
     migrate_openvpn_latency_metrics()
     if not ISOLATED_INSTANCE:
         kill_existing_openvpn_processes()
