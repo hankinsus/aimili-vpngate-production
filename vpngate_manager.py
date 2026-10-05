@@ -175,7 +175,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 1, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.12"
+APP_VERSION = "V1.0.13"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -950,7 +950,9 @@ def get_state() -> dict[str, Any]:
         state.setdefault("pool_endpoints", 0)
         state.setdefault("pool_states", {})
     _proxy_display = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
-    state["local_proxy"] = f"http://{_proxy_display}:8500"
+    state["local_proxy"] = f"socks5://{_proxy_display}:8500"
+    state["local_proxy_scheme"] = "socks5"
+    state["local_proxy_port"] = 8500
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
@@ -9277,7 +9279,10 @@ function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = state.active_pool_endpoint_id
     ? null
-    : nodes.find(n => n && (n.active && (!activeNodeId || n.id === activeNodeId) || n.id === activeNodeId));
+    : nodes.find(n => n && (n.active && (!activeNodeId || n.id === activeNodeId) || n.id === activeNodeId))
+      || (state.connection_status === "connected" && state.active_openvpn_node
+        ? state.active_openvpn_node
+        : null);
 
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
@@ -9816,6 +9821,8 @@ async function toggleFavorite(id, event) {
 }
 
 let pollInterval = null;
+let backendStatePollInterval = null;
+let backendStatePollBusy = false;
 let refreshPollInterval = null;
 let countryPriorityPollInterval = null;
 let countryPriorityRequestSeq = 0;
@@ -10028,7 +10035,7 @@ async function load(){
   render();
 
   // Phase 2: country catalog is independent and must never block the first page.
-  const catalogPromise = refreshCountryCatalog(true).catch(e => {
+  const catalogPromise = refreshCountryCatalog(false).catch(e => {
     console.warn("国家目录读取失败", e);
     return countryCatalogData || {server_country:"", countries:{}, total_ip_count:0};
   });
@@ -10063,11 +10070,15 @@ async function load(){
     render();
   }
 
-  if (state.global_pool_refresh_running || state.maintenance_running) {
+  if (state.global_pool_refresh_running) {
     startRefreshPolling();
   } else if (state.is_connecting || state.manual_switch_active) {
     startConnectionPolling();
   }
+  // Backend state polling is lightweight and state-only; it never fetches or
+  // reconnects nodes. It keeps the Active Node card synchronized after backend
+  // recovery/switches without tying connection lifetime to the browser.
+  startBackendStatePolling();
 }
 
 function refreshButtonBusy(message = "正在后台更新...") {
@@ -10082,6 +10093,27 @@ function refreshButtonIdle() {
   if (!btn) return;
   btn.disabled = false;
   btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>重新轮询全球库`;
+}
+
+function startBackendStatePolling() {
+  if (backendStatePollInterval) return;
+  const poll = async () => {
+    if (backendStatePollBusy || document.hidden) return;
+    backendStatePollBusy = true;
+    try {
+      const data = await fetchUiStateOnly(4000);
+      if (data?.state) {
+        state = data.state;
+        render();
+      }
+    } catch (_) {
+      // Keep the last known backend state; the next poll retries.
+    } finally {
+      backendStatePollBusy = false;
+    }
+  };
+  poll();
+  backendStatePollInterval = setInterval(poll, 4000);
 }
 
 function startRefreshPolling() {
@@ -10471,11 +10503,10 @@ async function loadLegacy(){
 
   if (state.global_pool_refresh_running) {
     startRefreshPolling();
-  } else if (state.maintenance_running) {
-    startRefreshPolling();
   } else if (state.is_connecting) {
     startConnectionPolling();
   }
+  startBackendStatePolling();
 }
 async function applyNodeFilterChange() {
   currentPage = 1;
@@ -10487,8 +10518,8 @@ async function applyNodeFilterChange() {
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
 
-  refreshCountryCatalog(true).catch(e => {
-    console.warn("筛选后的国家目录后台刷新失败", e);
+  refreshCountryCatalog(false).catch(e => {
+    console.warn("筛选后的国家目录读取失败", e);
   });
 
   // Immediately query the Master Pool with the selected filter(s). This lets
@@ -14464,6 +14495,28 @@ def _get_fast_nodes_state():
     state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["active_openvpn_node"] = None
+    if active_openvpn_node_id:
+        try:
+            active_node = next(
+                (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
+                None,
+            )
+            if active_node:
+                state["active_openvpn_node"] = {
+                    "id": active_node.get("id", ""),
+                    "country": active_node.get("country", ""),
+                    "location": active_node.get("location", ""),
+                    "ip": active_node.get("ip") or active_node.get("remote_host") or "",
+                    "remote_host": active_node.get("remote_host") or active_node.get("ip") or "",
+                    "remote_port": active_node.get("remote_port") or 0,
+                    "protocol": active_node.get("protocol") or "openvpn",
+                    "owner": active_node.get("owner") or active_node.get("as_name") or "",
+                    "ip_type": active_node.get("ip_type") or "",
+                    "latency_ms": active_node.get("latency_ms") or 0,
+                }
+        except Exception:
+            state["active_openvpn_node"] = None
     state["active_pool_endpoint"] = None
     if active_pool_endpoint_id:
         try:
