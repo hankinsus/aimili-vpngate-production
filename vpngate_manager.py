@@ -175,7 +175,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 1, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.13"
+APP_VERSION = "V1.0.14"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -1467,7 +1467,8 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "probe_status": probe_status,
         "probe_message": str(metadata.get("last_error") or ""),
         "probed_at": float(endpoint.get("last_success") or endpoint.get("last_failure") or 0),
-        "active": False,
+        "active": str(endpoint.get("endpoint_id") or "") == str(active_pool_endpoint_id or ""),
+        "data_integrity": dict(endpoint.get("data_integrity") or {}),
     }
 
 
@@ -4812,11 +4813,26 @@ def maintain_valid_nodes(force: bool = False):
         try:
             if manual_connection_active or manual_connection_epoch != cycle_manual_epoch:
                 return "检测周期被用户手动切换打断"
-            set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
-            candidates = fetch_candidates()
-            if manual_connection_active or manual_connection_epoch != cycle_manual_epoch:
-                return "检测周期被用户手动切换打断"
-            threading.Thread(target=refresh_multi_protocol_catalog, args=(False,), daemon=True).start()
+            # IMPORTANT: connection maintenance must never trigger a network-wide
+            # resource fetch on every browser refresh / 30-second recovery cycle.
+            # Master Pool is the persistent source of truth; fetch_candidates()
+            # only runs on the independent resource-sync cadence or an explicit
+            # forced refresh. Normal maintenance reuses the persisted node pool.
+            now = time.time()
+            last_fetch = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
+            should_fetch = bool(force) or (now - last_fetch >= FETCH_INTERVAL_SECONDS)
+            if should_fetch:
+                set_state(is_connecting=True, last_check_message="资源同步周期到达，正在获取新的免费 VPN 节点...")
+                candidates = fetch_candidates()
+                if manual_connection_active or manual_connection_epoch != cycle_manual_epoch:
+                    return "检测周期被用户手动切换打断"
+                threading.Thread(target=refresh_multi_protocol_catalog, args=(False,), daemon=True).start()
+            else:
+                candidates = read_nodes()
+                set_state(
+                    is_connecting=True,
+                    last_check_message="使用 Master Pool 已有节点进行状态检测，不重新拉取全球资源",
+                )
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
@@ -8477,7 +8493,7 @@ INDEX_HTML = r"""<!doctype html>
           </svg>
           <span class="footer-brand-copy">
             <strong>我爱研究.ILovestudy</strong>
-            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.13</span></span>
+            <span class="footer-brand-version"><span class="footer-brand-system">多协议节点管理系统</span><span class="footer-brand-version-number">· V1.0.14</span></span>
           </span>
         </div>
       </div>
@@ -8501,6 +8517,8 @@ INDEX_HTML = r"""<!doctype html>
         <a href="https://ilovestudycn.com" target="_blank" rel="noopener noreferrer">官网</a>
         <span class="footer-divider">|</span>
         <a href="https://ilovestudyip.com/" target="_blank" rel="noopener noreferrer">IP 节点检测</a>
+        <span class="footer-divider">|</span>
+        <a href="https://www.vpngate.net/cn/" target="_blank" rel="noopener noreferrer">公共资源</a>
       </nav>
     </div>
   </footer>
@@ -8528,22 +8546,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
 const base=p=>(p||"").split(/[\\/]/).pop();
 
-function getProtocolUrl(n) {
-  const protocol = String(n && n.protocol || "openvpn").trim().toLowerCase();
-  if (protocol === "softether") return "https://www.vpngate.net/cn/howto_softether.aspx";
-  if (protocol === "sstp") return "https://www.vpngate.net/cn/howto_sstp.aspx";
-  if (protocol === "l2tp-ipsec" || protocol === "l2tp_ipsec" || protocol === "l2tp") return "https://www.vpngate.net/cn/howto_l2tp.aspx";
-  if (protocol !== "openvpn") return "";
-  const params = new URLSearchParams();
-  const host = String(n && (n.host_name || n.remote_host) || "").trim();
-  const ip = String(n && n.ip || "").trim();
-  if (host && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) params.set("fqdn", host);
-  if (ip) params.set("ip", ip);
-  const port = Number(n && n.remote_port || 0);
-  const transport = String(n && (n.proto || n.transport) || "tcp").trim().toLowerCase();
-  if (port > 0) params.set(transport === "udp" ? "udp" : "tcp", String(port));
-  return "https://www.vpngate.net/cn/do_openvpn.aspx" + (params.toString() ? "?" + params.toString() : "");
-}
+function getProtocolUrl(n) { return ""; }
 
 function formatNodeLocation(n) {
   const country = getNodeCountry(n);
@@ -8591,102 +8594,30 @@ const translateIpType = t => {
   return dict[key] || key;
 };
 
+const COUNTRY_REGISTRY = {"AD":{"zh":"安道尔","en":"Andorra"},"AE":{"zh":"阿拉伯联合酋长国","en":"United Arab Emirates"},"AF":{"zh":"阿富汗","en":"Afghanistan"},"AG":{"zh":"安提瓜和巴布达","en":"Antigua & Barbuda"},"AI":{"zh":"安圭拉","en":"Anguilla"},"AL":{"zh":"阿尔巴尼亚","en":"Albania"},"AM":{"zh":"亚美尼亚","en":"Armenia"},"AO":{"zh":"安哥拉","en":"Angola"},"AQ":{"zh":"南极洲","en":"Antarctica"},"AR":{"zh":"阿根廷","en":"Argentina"},"AS":{"zh":"美属萨摩亚","en":"American Samoa"},"AT":{"zh":"奥地利","en":"Austria"},"AU":{"zh":"澳大利亚","en":"Australia"},"AW":{"zh":"阿鲁巴","en":"Aruba"},"AX":{"zh":"奥兰群岛","en":"Åland Islands"},"AZ":{"zh":"阿塞拜疆","en":"Azerbaijan"},"BA":{"zh":"波斯尼亚和黑塞哥维那","en":"Bosnia & Herzegovina"},"BB":{"zh":"巴巴多斯","en":"Barbados"},"BD":{"zh":"孟加拉国","en":"Bangladesh"},"BE":{"zh":"比利时","en":"Belgium"},"BF":{"zh":"布基纳法索","en":"Burkina Faso"},"BG":{"zh":"保加利亚","en":"Bulgaria"},"BH":{"zh":"巴林","en":"Bahrain"},"BI":{"zh":"布隆迪","en":"Burundi"},"BJ":{"zh":"贝宁","en":"Benin"},"BL":{"zh":"圣巴泰勒米","en":"St. Barthélemy"},"BM":{"zh":"百慕大","en":"Bermuda"},"BN":{"zh":"文莱","en":"Brunei"},"BO":{"zh":"玻利维亚","en":"Bolivia"},"BQ":{"zh":"荷属加勒比区","en":"Caribbean Netherlands"},"BR":{"zh":"巴西","en":"Brazil"},"BS":{"zh":"巴哈马","en":"Bahamas"},"BT":{"zh":"不丹","en":"Bhutan"},"BV":{"zh":"布韦岛","en":"Bouvet Island"},"BW":{"zh":"博茨瓦纳","en":"Botswana"},"BY":{"zh":"白俄罗斯","en":"Belarus"},"BZ":{"zh":"伯利兹","en":"Belize"},"CA":{"zh":"加拿大","en":"Canada"},"CC":{"zh":"科科斯（基林）群岛","en":"Cocos (Keeling) Islands"},"CD":{"zh":"刚果（金）","en":"Congo - Kinshasa"},"CF":{"zh":"中非共和国","en":"Central African Republic"},"CG":{"zh":"刚果（布）","en":"Congo - Brazzaville"},"CH":{"zh":"瑞士","en":"Switzerland"},"CI":{"zh":"科特迪瓦","en":"Côte d’Ivoire"},"CK":{"zh":"库克群岛","en":"Cook Islands"},"CL":{"zh":"智利","en":"Chile"},"CM":{"zh":"喀麦隆","en":"Cameroon"},"CN":{"zh":"中国","en":"China"},"CO":{"zh":"哥伦比亚","en":"Colombia"},"CR":{"zh":"哥斯达黎加","en":"Costa Rica"},"CU":{"zh":"古巴","en":"Cuba"},"CV":{"zh":"佛得角","en":"Cape Verde"},"CW":{"zh":"库拉索","en":"Curaçao"},"CX":{"zh":"圣诞岛","en":"Christmas Island"},"CY":{"zh":"塞浦路斯","en":"Cyprus"},"CZ":{"zh":"捷克","en":"Czechia"},"DE":{"zh":"德国","en":"Germany"},"DJ":{"zh":"吉布提","en":"Djibouti"},"DK":{"zh":"丹麦","en":"Denmark"},"DM":{"zh":"多米尼克","en":"Dominica"},"DO":{"zh":"多米尼加共和国","en":"Dominican Republic"},"DZ":{"zh":"阿尔及利亚","en":"Algeria"},"EC":{"zh":"厄瓜多尔","en":"Ecuador"},"EE":{"zh":"爱沙尼亚","en":"Estonia"},"EG":{"zh":"埃及","en":"Egypt"},"EH":{"zh":"西撒哈拉","en":"Western Sahara"},"ER":{"zh":"厄立特里亚","en":"Eritrea"},"ES":{"zh":"西班牙","en":"Spain"},"ET":{"zh":"埃塞俄比亚","en":"Ethiopia"},"FI":{"zh":"芬兰","en":"Finland"},"FJ":{"zh":"斐济","en":"Fiji"},"FK":{"zh":"福克兰群岛（马尔维纳斯群岛）","en":"Falkland Islands (Islas Malvinas)"},"FM":{"zh":"密克罗尼西亚","en":"Micronesia"},"FO":{"zh":"法罗群岛","en":"Faroe Islands"},"FR":{"zh":"法国","en":"France"},"GA":{"zh":"加蓬","en":"Gabon"},"GB":{"zh":"英国","en":"United Kingdom"},"GD":{"zh":"格林纳达","en":"Grenada"},"GE":{"zh":"格鲁吉亚","en":"Georgia"},"GF":{"zh":"法属圭亚那","en":"French Guiana"},"GG":{"zh":"根西岛","en":"Guernsey"},"GH":{"zh":"加纳","en":"Ghana"},"GI":{"zh":"直布罗陀","en":"Gibraltar"},"GL":{"zh":"格陵兰","en":"Greenland"},"GM":{"zh":"冈比亚","en":"Gambia"},"GN":{"zh":"几内亚","en":"Guinea"},"GP":{"zh":"瓜德罗普","en":"Guadeloupe"},"GQ":{"zh":"赤道几内亚","en":"Equatorial Guinea"},"GR":{"zh":"希腊","en":"Greece"},"GS":{"zh":"南乔治亚和南桑威奇群岛","en":"South Georgia & South Sandwich Islands"},"GT":{"zh":"危地马拉","en":"Guatemala"},"GU":{"zh":"关岛","en":"Guam"},"GW":{"zh":"几内亚比绍","en":"Guinea-Bissau"},"GY":{"zh":"圭亚那","en":"Guyana"},"HK":{"zh":"香港","en":"Hong Kong"},"HM":{"zh":"赫德岛和麦克唐纳群岛","en":"Heard & McDonald Islands"},"HN":{"zh":"洪都拉斯","en":"Honduras"},"HR":{"zh":"克罗地亚","en":"Croatia"},"HT":{"zh":"海地","en":"Haiti"},"HU":{"zh":"匈牙利","en":"Hungary"},"ID":{"zh":"印度尼西亚","en":"Indonesia"},"IE":{"zh":"爱尔兰","en":"Ireland"},"IL":{"zh":"以色列","en":"Israel"},"IM":{"zh":"马恩岛","en":"Isle of Man"},"IN":{"zh":"印度","en":"India"},"IO":{"zh":"英属印度洋领地","en":"British Indian Ocean Territory"},"IQ":{"zh":"伊拉克","en":"Iraq"},"IR":{"zh":"伊朗","en":"Iran"},"IS":{"zh":"冰岛","en":"Iceland"},"IT":{"zh":"意大利","en":"Italy"},"JE":{"zh":"泽西岛","en":"Jersey"},"JM":{"zh":"牙买加","en":"Jamaica"},"JO":{"zh":"约旦","en":"Jordan"},"JP":{"zh":"日本","en":"Japan"},"KE":{"zh":"肯尼亚","en":"Kenya"},"KG":{"zh":"吉尔吉斯斯坦","en":"Kyrgyzstan"},"KH":{"zh":"柬埔寨","en":"Cambodia"},"KI":{"zh":"基里巴斯","en":"Kiribati"},"KM":{"zh":"科摩罗","en":"Comoros"},"KN":{"zh":"圣基茨和尼维斯","en":"St. Kitts & Nevis"},"KP":{"zh":"朝鲜","en":"North Korea"},"KR":{"zh":"韩国","en":"South Korea"},"KW":{"zh":"科威特","en":"Kuwait"},"KY":{"zh":"开曼群岛","en":"Cayman Islands"},"KZ":{"zh":"哈萨克斯坦","en":"Kazakhstan"},"LA":{"zh":"老挝","en":"Laos"},"LB":{"zh":"黎巴嫩","en":"Lebanon"},"LC":{"zh":"圣卢西亚","en":"St. Lucia"},"LI":{"zh":"列支敦士登","en":"Liechtenstein"},"LK":{"zh":"斯里兰卡","en":"Sri Lanka"},"LR":{"zh":"利比里亚","en":"Liberia"},"LS":{"zh":"莱索托","en":"Lesotho"},"LT":{"zh":"立陶宛","en":"Lithuania"},"LU":{"zh":"卢森堡","en":"Luxembourg"},"LV":{"zh":"拉脱维亚","en":"Latvia"},"LY":{"zh":"利比亚","en":"Libya"},"MA":{"zh":"摩洛哥","en":"Morocco"},"MC":{"zh":"摩纳哥","en":"Monaco"},"MD":{"zh":"摩尔多瓦","en":"Moldova"},"ME":{"zh":"黑山","en":"Montenegro"},"MF":{"zh":"法属圣马丁","en":"St. Martin"},"MG":{"zh":"马达加斯加","en":"Madagascar"},"MH":{"zh":"马绍尔群岛","en":"Marshall Islands"},"MK":{"zh":"北马其顿","en":"North Macedonia"},"ML":{"zh":"马里","en":"Mali"},"MM":{"zh":"缅甸","en":"Myanmar (Burma)"},"MN":{"zh":"蒙古","en":"Mongolia"},"MO":{"zh":"澳门","en":"Macao"},"MP":{"zh":"北马里亚纳群岛","en":"Northern Mariana Islands"},"MQ":{"zh":"马提尼克","en":"Martinique"},"MR":{"zh":"毛里塔尼亚","en":"Mauritania"},"MS":{"zh":"蒙特塞拉特","en":"Montserrat"},"MT":{"zh":"马耳他","en":"Malta"},"MU":{"zh":"毛里求斯","en":"Mauritius"},"MV":{"zh":"马尔代夫","en":"Maldives"},"MW":{"zh":"马拉维","en":"Malawi"},"MX":{"zh":"墨西哥","en":"Mexico"},"MY":{"zh":"马来西亚","en":"Malaysia"},"MZ":{"zh":"莫桑比克","en":"Mozambique"},"NA":{"zh":"纳米比亚","en":"Namibia"},"NC":{"zh":"新喀里多尼亚","en":"New Caledonia"},"NE":{"zh":"尼日尔","en":"Niger"},"NF":{"zh":"诺福克岛","en":"Norfolk Island"},"NG":{"zh":"尼日利亚","en":"Nigeria"},"NI":{"zh":"尼加拉瓜","en":"Nicaragua"},"NL":{"zh":"荷兰","en":"Netherlands"},"NO":{"zh":"挪威","en":"Norway"},"NP":{"zh":"尼泊尔","en":"Nepal"},"NR":{"zh":"瑙鲁","en":"Nauru"},"NU":{"zh":"纽埃","en":"Niue"},"NZ":{"zh":"新西兰","en":"New Zealand"},"OM":{"zh":"阿曼","en":"Oman"},"PA":{"zh":"巴拿马","en":"Panama"},"PE":{"zh":"秘鲁","en":"Peru"},"PF":{"zh":"法属波利尼西亚","en":"French Polynesia"},"PG":{"zh":"巴布亚新几内亚","en":"Papua New Guinea"},"PH":{"zh":"菲律宾","en":"Philippines"},"PK":{"zh":"巴基斯坦","en":"Pakistan"},"PL":{"zh":"波兰","en":"Poland"},"PM":{"zh":"圣皮埃尔和密克隆群岛","en":"St. Pierre & Miquelon"},"PN":{"zh":"皮特凯恩群岛","en":"Pitcairn Islands"},"PR":{"zh":"波多黎各","en":"Puerto Rico"},"PS":{"zh":"巴勒斯坦","en":"Palestine"},"PT":{"zh":"葡萄牙","en":"Portugal"},"PW":{"zh":"帕劳","en":"Palau"},"PY":{"zh":"巴拉圭","en":"Paraguay"},"QA":{"zh":"卡塔尔","en":"Qatar"},"RE":{"zh":"留尼汪","en":"Réunion"},"RO":{"zh":"罗马尼亚","en":"Romania"},"RS":{"zh":"塞尔维亚","en":"Serbia"},"RU":{"zh":"俄罗斯","en":"Russia"},"RW":{"zh":"卢旺达","en":"Rwanda"},"SA":{"zh":"沙特阿拉伯","en":"Saudi Arabia"},"SB":{"zh":"所罗门群岛","en":"Solomon Islands"},"SC":{"zh":"塞舌尔","en":"Seychelles"},"SD":{"zh":"苏丹","en":"Sudan"},"SE":{"zh":"瑞典","en":"Sweden"},"SG":{"zh":"新加坡","en":"Singapore"},"SH":{"zh":"圣赫勒拿","en":"St. Helena"},"SI":{"zh":"斯洛文尼亚","en":"Slovenia"},"SJ":{"zh":"斯瓦尔巴和扬马延","en":"Svalbard & Jan Mayen"},"SK":{"zh":"斯洛伐克","en":"Slovakia"},"SL":{"zh":"塞拉利昂","en":"Sierra Leone"},"SM":{"zh":"圣马力诺","en":"San Marino"},"SN":{"zh":"塞内加尔","en":"Senegal"},"SO":{"zh":"索马里","en":"Somalia"},"SR":{"zh":"苏里南","en":"Suriname"},"SS":{"zh":"南苏丹","en":"South Sudan"},"ST":{"zh":"圣多美和普林西比","en":"São Tomé & Príncipe"},"SV":{"zh":"萨尔瓦多","en":"El Salvador"},"SX":{"zh":"荷属圣马丁","en":"Sint Maarten"},"SY":{"zh":"叙利亚","en":"Syria"},"SZ":{"zh":"斯威士兰","en":"Eswatini"},"TC":{"zh":"特克斯和凯科斯群岛","en":"Turks & Caicos Islands"},"TD":{"zh":"乍得","en":"Chad"},"TF":{"zh":"法属南部领地","en":"French Southern Territories"},"TG":{"zh":"多哥","en":"Togo"},"TH":{"zh":"泰国","en":"Thailand"},"TJ":{"zh":"塔吉克斯坦","en":"Tajikistan"},"TK":{"zh":"托克劳","en":"Tokelau"},"TL":{"zh":"东帝汶","en":"Timor-Leste"},"TM":{"zh":"土库曼斯坦","en":"Turkmenistan"},"TN":{"zh":"突尼斯","en":"Tunisia"},"TO":{"zh":"汤加","en":"Tonga"},"TR":{"zh":"土耳其","en":"Türkiye"},"TT":{"zh":"特立尼达和多巴哥","en":"Trinidad & Tobago"},"TV":{"zh":"图瓦卢","en":"Tuvalu"},"TW":{"zh":"台湾","en":"Taiwan"},"TZ":{"zh":"坦桑尼亚","en":"Tanzania"},"UA":{"zh":"乌克兰","en":"Ukraine"},"UG":{"zh":"乌干达","en":"Uganda"},"UM":{"zh":"美国本土外小岛屿","en":"U.S. Outlying Islands"},"US":{"zh":"美国","en":"United States"},"UY":{"zh":"乌拉圭","en":"Uruguay"},"UZ":{"zh":"乌兹别克斯坦","en":"Uzbekistan"},"VA":{"zh":"梵蒂冈","en":"Vatican City"},"VC":{"zh":"圣文森特和格林纳丁斯","en":"St. Vincent & Grenadines"},"VE":{"zh":"委内瑞拉","en":"Venezuela"},"VG":{"zh":"英属维尔京群岛","en":"British Virgin Islands"},"VI":{"zh":"美属维尔京群岛","en":"U.S. Virgin Islands"},"VN":{"zh":"越南","en":"Vietnam"},"VU":{"zh":"瓦努阿图","en":"Vanuatu"},"WF":{"zh":"瓦利斯和富图纳","en":"Wallis & Futuna"},"WS":{"zh":"萨摩亚","en":"Samoa"},"YE":{"zh":"也门","en":"Yemen"},"YT":{"zh":"马约特","en":"Mayotte"},"ZA":{"zh":"南非","en":"South Africa"},"ZM":{"zh":"赞比亚","en":"Zambia"},"ZW":{"zh":"津巴布韦","en":"Zimbabwe"},"AC":{"zh":"阿森松岛","en":"Ascension Island"},"CP":{"zh":"克利珀顿岛","en":"Clipperton Island"},"XK":{"zh":"科索沃","en":"Kosovo"},"TA":{"zh":"特里斯坦-达库尼亚群岛","en":"Tristan da Cunha"}};
+const COUNTRY_NAME_TO_CODE = Object.fromEntries(Object.entries(COUNTRY_REGISTRY).flatMap(([code,item]) => {
+  const out=[]; if(item?.zh) out.push([String(item.zh).toLowerCase(),code]); if(item?.en) out.push([String(item.en).toLowerCase(),code]); return out;
+}));
+const COUNTRY_REGISTRY_ALIASES = {
+  "Croatia (LOCAL Name: Hrvatska)":"HR","Hrvatska":"HR","Lao People's Democratic Republic":"LA","Laos":"LA",
+  "United States of America":"US","USA":"US","United States":"US","United Kingdom":"GB","UK":"GB",
+  "Korea":"KR","Korea Republic of":"KR","Republic of Korea":"KR","Viet Nam":"VN","Vietnam":"VN",
+  "Russian Federation":"RU","Russian":"RU","Curaçao":"CW","Curacao":"CW","库拉索":"CW",
+  "Clipperton Island":"CP","克利珀顿岛":"CP","克利珀顿":"CP","Bolivia":"BO","Bolivia, Plurinational State of":"BO",
+  "Côte d'Ivoire":"CI","Ivory Coast":"CI","Türkiye":"TR","Turkey":"TR","Brunei Darussalam":"BN",
+  "Eswatini":"SZ","Swaziland":"SZ","Macedonia":"MK","Micronesia":"FM","Micronesia, Federated States of":"FM",
+  "Yemen":"YE","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ"
+};
+
 const translateCountry = c => {
-  const raw = String(c || "").trim();
-  const normalized = raw.replace(/\s*\([^)]*\)\s*$/g, "").trim();
-  const dict = {
-    "Croatia": "克罗地亚",
-    "Hrvatska": "克罗地亚",
-    "Yemen": "也门",
-    "Japan": "日本",
-    "Korea Republic of": "韩国",
-    "Korea": "韩国",
-    "Republic of Korea": "韩国",
-    "Thailand": "泰国",
-    "United States": "美国",
-    "United Kingdom": "英国",
-    "Russian Federation": "俄罗斯",
-    "Russian": "俄罗斯",
-    "Viet Nam": "越南",
-    "Vietnam": "越南",
-    "China": "中国",
-    "Taiwan": "台湾",
-    "Taiwan Province of China": "台湾",
-    "Hong Kong": "香港",
-    "Singapore": "新加坡",
-    "Malaysia": "马来西亚",
-    "Indonesia": "印度尼西亚",
-    "India": "印度",
-    "Philippines": "菲律宾",
-    "Australia": "澳大利亚",
-    "New Zealand": "新西兰",
-    "Canada": "加拿大",
-    "Ukraine": "乌克兰",
-    "France": "法国",
-    "Germany": "德国",
-    "Netherlands": "荷兰",
-    "Sweden": "瑞典",
-    "Norway": "挪威",
-    "Spain": "西班牙",
-    "Turkey": "土耳其",
-    "South Africa": "南非",
-    "Brazil": "巴西",
-    "Argentina": "阿根廷",
-    "Chile": "智利",
-    "Mexico": "墨西哥",
-    "Egypt": "埃及",
-    "Romania": "罗马尼亚",
-    "Poland": "波兰",
-    "Kazakhstan": "哈萨克斯坦",
-    "Georgia": "格鲁吉亚",
-    "Mongolia": "蒙古",
-    "Saudi Arabia": "沙特阿拉伯",
-    "Iran": "伊朗",
-    "Iraq": "伊拉克",
-    "Colombia": "哥伦比亚",
-    "Cambodia": "柬埔寨",
-    "Ireland": "爱尔兰",
-    "Italy": "意大利",
-    "Switzerland": "瑞士",
-    "Belgium": "比利时",
-    "Austria": "奥地利",
-    "Denmark": "丹麦",
-    "Finland": "芬兰",
-    "Portugal": "葡萄牙",
-    "Greece": "希腊",
-    "Czech Republic": "捷克",
-    "Hungary": "匈牙利",
-    "Israel": "以色列",
-    "United Arab Emirates": "阿联酋",
-    "UAE": "阿联酋",
-    "Macao": "澳门",
-    "Macau": "澳门",
-    "Iceland": "冰岛",
-    "Luxembourg": "卢森堡"
-  };
-  const extra = {
-    "Albania":"阿尔巴尼亚","Algeria":"阿尔及利亚","Angola":"安哥拉","Armenia":"亚美尼亚",
-    "Azerbaijan":"阿塞拜疆","Bahrain":"巴林","Bangladesh":"孟加拉国","Barbados":"巴巴多斯",
-    "Belarus":"白俄罗斯","Bosnia and Herzegovina":"波斯尼亚和黑塞哥维那","Botswana":"博茨瓦纳",
-    "Brunei":"文莱","Bulgaria":"保加利亚","Cameroon":"喀麦隆","Costa Rica":"哥斯达黎加",
-    "Cyprus":"塞浦路斯","Ecuador":"厄瓜多尔","El Salvador":"萨尔瓦多","Estonia":"爱沙尼亚",
-    "Ethiopia":"埃塞俄比亚","Fiji":"斐济","Guatemala":"危地马拉","Haiti":"海地",
-    "Jamaica":"牙买加","Jordan":"约旦","Kenya":"肯尼亚","Kuwait":"科威特",
-    "Kyrgyzstan":"吉尔吉斯斯坦","Latvia":"拉脱维亚","Lebanon":"黎巴嫩","Libya":"利比亚",
-    "Liechtenstein":"列支敦士登","Lithuania":"立陶宛","Malta":"马耳他","Mauritius":"毛里求斯",
-    "Moldova":"摩尔多瓦","Montenegro":"黑山","Morocco":"摩洛哥","Myanmar":"缅甸",
-    "Nepal":"尼泊尔","Nigeria":"尼日利亚","North Macedonia":"北马其顿","Pakistan":"巴基斯坦",
-    "Panama":"巴拿马","Paraguay":"巴拉圭","Peru":"秘鲁","Slovakia":"斯洛伐克",
-    "Slovenia":"斯洛文尼亚","Serbia":"塞尔维亚","Sri Lanka":"斯里兰卡","Tunisia":"突尼斯",
-    "Uganda":"乌干达","Uruguay":"乌拉圭","Uzbekistan":"乌兹别克斯坦","Venezuela":"委内瑞拉",
-    "Zimbabwe":"津巴布韦","Bahamas":"巴哈马","Bolivia":"玻利维亚","Curaçao":"库拉索",
-    "Dominican Republic":"多米尼加共和国","Honduras":"洪都拉斯","Nicaragua":"尼加拉瓜",
-    "Trinidad and Tobago":"特立尼达和多巴哥","Guyana":"圭亚那","Suriname":"苏里南",
-    "Maldives":"马尔代夫","Oman":"阿曼","Qatar":"卡塔尔","Palestine":"巴勒斯坦",
-    "Bermuda":"百慕大","Gibraltar":"直布罗陀","Isle of Man":"马恩岛","Jersey":"泽西岛",
-    "Guernsey":"根西岛","New Caledonia":"新喀里多尼亚","Puerto Rico":"波多黎各"
-  };
-  return dict[raw] || dict[normalized] || extra[raw] || extra[normalized] || normalized || "—";
+  const raw=String(c||"").trim(); if(!raw) return "";
+  const normalized=raw.replace(/\s*\([^)]*\)\s*$/g,"").trim(); const key=normalized.toLowerCase();
+  const invalid=["unknown","unknown region","unknown country","unclassified","undefined","pseudo region","pseudo location","伪地区","伪双向语言地区","未知地区","未知国家","未分类","-","—"];
+  if(invalid.includes(key)) return "";
+  const alias=COUNTRY_REGISTRY_ALIASES[raw]||COUNTRY_REGISTRY_ALIASES[normalized];
+  if(alias && COUNTRY_REGISTRY[alias]?.zh) return COUNTRY_REGISTRY[alias].zh;
+  const code=COUNTRY_NAME_TO_CODE[key]; if(code&&COUNTRY_REGISTRY[code]?.zh) return COUNTRY_REGISTRY[code].zh;
+  return COUNTRY_REGISTRY[raw]?.zh || raw;
 };
 
 const translateStatus = s => {
@@ -8870,64 +8801,27 @@ function bindUnifiedSelectEvents() {
 
 function syncUnifiedSelect(selectId) { renderUnifiedSelect(selectId); }
 
-const COUNTRY_FLAG_CODES = {
-  "日本":"JP","韩国":"KR","美国":"US","俄罗斯":"RU","中国":"CN","台湾":"TW","香港":"HK","澳门":"MO",
-  "新加坡":"SG","马来西亚":"MY","印度尼西亚":"ID","印度":"IN","菲律宾":"PH","泰国":"TH","越南":"VN",
-  "澳大利亚":"AU","新西兰":"NZ","加拿大":"CA","英国":"GB","法国":"FR","德国":"DE","荷兰":"NL","瑞典":"SE",
-  "挪威":"NO","芬兰":"FI","丹麦":"DK","冰岛":"IS","爱尔兰":"IE","西班牙":"ES","葡萄牙":"PT","意大利":"IT",
-  "瑞士":"CH","比利时":"BE","奥地利":"AT","希腊":"GR","土耳其":"TR","波兰":"PL","捷克":"CZ","斯洛伐克":"SK",
-  "匈牙利":"HU","罗马尼亚":"RO","保加利亚":"BG","克罗地亚":"HR","塞尔维亚":"RS","斯洛文尼亚":"SI","爱沙尼亚":"EE",
-  "拉脱维亚":"LV","立陶宛":"LT","乌克兰":"UA","格鲁吉亚":"GE","哈萨克斯坦":"KZ","亚美尼亚":"AM","阿塞拜疆":"AZ",
-  "吉尔吉斯斯坦":"KG","蒙古":"MN","以色列":"IL","阿联酋":"AE","沙特阿拉伯":"SA","伊朗":"IR","伊拉克":"IQ","卡塔尔":"QA","阿曼":"OM",
-  "埃及":"EG","南非":"ZA","尼日利亚":"NG","肯尼亚":"KE","摩洛哥":"MA","突尼斯":"TN","巴西":"BR","阿根廷":"AR","智利":"CL",
-  "墨西哥":"MX","哥伦比亚":"CO","秘鲁":"PE","厄瓜多尔":"EC","乌拉圭":"UY","巴拿马":"PA","哥斯达黎加":"CR","多米尼加共和国":"DO",
-  "波多黎各":"PR","阿尔巴尼亚":"AL","阿尔及利亚":"DZ","安哥拉":"AO","白俄罗斯":"BY","波斯尼亚和黑塞哥维那":"BA","博茨瓦纳":"BW",
-  "文莱":"BN","喀麦隆":"CM","塞浦路斯":"CY","萨尔瓦多":"SV","埃塞俄比亚":"ET","斐济":"FJ","危地马拉":"GT","海地":"HT","牙买加":"JM",
-  "约旦":"JO","科威特":"KW","黎巴嫩":"LB","利比亚":"LY","列支敦士登":"LI","马耳他":"MT","毛里求斯":"MU","摩尔多瓦":"MD","黑山":"ME",
-  "缅甸":"MM","尼泊尔":"NP","巴基斯坦":"PK","巴拉圭":"PY","马达加斯加":"MG","斯里兰卡":"LK","乌干达":"UG","乌兹别克斯坦":"UZ","津巴布韦":"ZW",
-  "巴哈马":"BS","玻利维亚":"BO","洪都拉斯":"HN","尼加拉瓜":"NI","特立尼达和多巴哥":"TT","圭亚那":"GY","苏里南":"SR","马尔代夫":"MV",
-  "巴勒斯坦":"PS","百慕大":"BM","直布罗陀":"GI","马恩岛":"IM","泽西岛":"JE","根西岛":"GG","新喀里多尼亚":"NC","塞舌尔":"SC",
-  "卢森堡":"LU","毛里塔尼亚":"MR","纳米比亚":"NA","也门":"YE","刚果共和国":"CG","刚果民主共和国":"CD","加纳":"GH","坦桑尼亚":"TZ","赞比亚":"ZM",
-  "塞内加尔":"SN","科特迪瓦":"CI","佛得角":"CV","莫桑比克":"MZ","马拉维":"MW","科索沃":"XK"
-};
-
-const COUNTRY_FLAG_ALIASES = {
-  "Korea Republic of":"KR","Republic of Korea":"KR","Korea":"KR","Russian Federation":"RU","Russian":"RU",
-  "Viet Nam":"VN","Vietnam":"VN","United States":"US","United States of America":"US","USA":"US","United Kingdom":"GB","UK":"GB",
-  "Taiwan Province of China":"TW","Czech Republic":"CZ","Czechia":"CZ","Türkiye":"TR","Turkey":"TR","Brunei Darussalam":"BN",
-  "Lao People's Democratic Republic":"LA","Laos":"LA","Côte d'Ivoire":"CI","Ivory Coast":"CI","Eswatini":"SZ","Swaziland":"SZ",
-  "Moldova, Republic of":"MD","Palestine, State of":"PS","Syrian Arab Republic":"SY","Tanzania, United Republic of":"TZ",
-  "Bolivia, Plurinational State of":"BO","Venezuela, Bolivarian Republic of":"VE","Cabo Verde":"CV","Cape Verde":"CV",
-  "Curacao":"CW","Curaçao":"CW","库拉索":"CW","克利珀顿岛":"CP","克利珀顿":"CP","Clipperton Island":"CP","Micronesia, Federated States of":"FM","Micronesia":"FM","Macedonia":"MK","Yemen":"YE"
-};
-
-const REGION_DISPLAY_NAMES_ZH = typeof Intl !== "undefined" && Intl.DisplayNames
-  ? new Intl.DisplayNames(["zh-CN"], {type:"region"}) : null;
-const REGION_DISPLAY_NAMES_EN = typeof Intl !== "undefined" && Intl.DisplayNames
-  ? new Intl.DisplayNames(["en"], {type:"region"}) : null;
+const COUNTRY_FLAG_CODES = Object.fromEntries(Object.entries(COUNTRY_REGISTRY).map(([code,item]) => [String(item.zh||""),code]));
+const COUNTRY_FLAG_ALIASES = Object.assign({}, COUNTRY_REGISTRY_ALIASES);
+const REGION_DISPLAY_NAMES_ZH = null;
+const REGION_DISPLAY_NAMES_EN = null;
 
 function dynamicIsoCountryCode(country) {
-  const raw = String(country || "").trim();
-  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
-  const target = translateCountry(raw);
-  for (let a = 65; a <= 90; a++) {
-    for (let b = 65; b <= 90; b++) {
-      const code = String.fromCharCode(a, b);
-      try {
-        const zh = REGION_DISPLAY_NAMES_ZH?.of(code) || "";
-        const en = REGION_DISPLAY_NAMES_EN?.of(code) || "";
-        if (zh === target || zh === raw || en === raw || en === target) return code;
-      } catch (_) {}
-    }
-  }
-  return "";
+  const raw=String(country||"").trim();
+  if (/^[A-Za-z]{2}$/.test(raw) && COUNTRY_REGISTRY[raw.toUpperCase()]) return raw.toUpperCase();
+  const translated=translateCountry(raw); return COUNTRY_NAME_TO_CODE[String(translated||raw).toLowerCase()] || "";
 }
-
 function countryFlagCode(country) {
-  const raw = String(country || "").trim();
-  const name = translateCountry(raw);
-  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
-  return COUNTRY_FLAG_CODES[name] || COUNTRY_FLAG_ALIASES[raw] || COUNTRY_FLAG_ALIASES[name] || dynamicIsoCountryCode(raw);
+  const raw=String(country||"").trim();
+  const normalized=raw.replace(/\s*\([^)]*\)\s*$/g,"").trim();
+  const translated=translateCountry(raw);
+  const candidates=[raw,normalized,translated,String(raw).toLowerCase(),String(normalized).toLowerCase(),String(translated).toLowerCase()];
+  for(const key of candidates){
+    if(COUNTRY_FLAG_ALIASES[key]) return COUNTRY_FLAG_ALIASES[key];
+    const code=COUNTRY_NAME_TO_CODE[String(key||"").toLowerCase()];
+    if(code && COUNTRY_REGISTRY[code]) return code;
+  }
+  return dynamicIsoCountryCode(raw);
 }
 
 function countryFlagEmoji(code) {
@@ -8937,16 +8831,11 @@ function countryFlagEmoji(code) {
 }
 
 function countryFlag(country, title = "", loading = "lazy") {
-  const code = countryFlagCode(country).toLowerCase();
-  const label = esc(title || translateCountry(country) || country || "");
-  if (!code) {
-    return '<span class="country-flag-fallback" role="img" aria-label="' + label + '" title="' + label + '">🌐</span>';
-  }
-  const eager = loading === "eager" ? ' fetchpriority="high"' : ' loading="lazy"';
-  return '<img class="country-flag-img" src="https://flagcdn.com/w40/' + code + '.png" alt="" aria-hidden="true"' + eager +
-    ' referrerpolicy="no-referrer" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline-flex\';" title="' + label + '">' +
-    '<span class="country-flag-fallback" role="img" aria-label="' + label + '" title="' + label + '" style="display:none;">🌐</span>';
+  const code=String(countryFlagCode(country)||"").toUpperCase(); const label=esc(title||translateCountry(country)||country||"");
+  if(!/^[A-Z]{2}$/.test(code)) return '<span class="country-flag-fallback" role="img" aria-label="'+label+'" title="'+label+'">🌐</span>';
+  return '<span class="country-flag-emoji" role="img" aria-label="'+label+'" title="'+label+'">'+countryFlagEmoji(code)+'</span>';
 }
+
 function renderCustomFilter(selectId, withCount = false) {
   const cfg = CUSTOM_FILTER_CONFIG[selectId];
   const select = cfg ? $(selectId) : null;
@@ -9199,20 +9088,12 @@ function updateCountryFilter() {
     merged.set(country, current);
   });
 
-  // Always expose the complete ISO-3166-1 region set. Countries not yet
-  // represented in Master Pool remain visible at 0 IP, and any newly added
-  // country is automatically paired with its ISO flag through Intl.
-  if (REGION_DISPLAY_NAMES_ZH) {
-    for (let a = 65; a <= 90; a++) {
-      for (let b = 65; b <= 90; b++) {
-        const code = String.fromCharCode(a, b);
-        try {
-          const label = REGION_DISPLAY_NAMES_ZH.of(code);
-          if (label && label !== code && !merged.has(label)) merged.set(label, {ip_count:0, server_count:0});
-        } catch (_) {}
-      }
-    }
-  }
+  // The registry is the only legal country universe. It includes 253 real ISO/territory
+  // entries and never creates pseudo-regions such as “未知地区”.
+  Object.entries(COUNTRY_REGISTRY).forEach(([, item]) => {
+    const country=String(item?.zh||"").trim();
+    if(country && !merged.has(country)) merged.set(country,{ip_count:0,server_count:0});
+  });
 
   const countries = Array.from(merged.entries()).sort((a,b) => {
     const diff = Number(b[1]?.ip_count || 0) - Number(a[1]?.ip_count || 0);
@@ -9767,12 +9648,9 @@ async function prioritizeCountry(country){
       if (requestSeq !== countryPriorityRequestSeq || countryPriorityPollBusy) return;
       countryPriorityPollBusy = true;
       try {
-        const d = await fetchNodesState(8000);
+        const d = await fetchUiStateOnly(4000);
         if (requestSeq !== countryPriorityRequestSeq) return;
-        if (Array.isArray(d.nodes) && d.nodes.length > 0) mergeLoadedNodePage(d.nodes);
         if (d.state) state = d.state;
-        stableSortNodes();
-        updateCountryFilter();
         render();
         if (!state.priority_running || String(state.priority_country || "") !== selected) {
           if (countryPriorityPollInterval) { clearInterval(countryPriorityPollInterval); countryPriorityPollInterval = null; }
@@ -10149,11 +10027,8 @@ function startRefreshPolling() {
     if (refreshPollBusy) return;
     refreshPollBusy = true;
     try {
-      const data = await fetchNodesState(8000);
-      if (Array.isArray(data.nodes) && data.nodes.length > 0) mergeLoadedNodePage(data.nodes);
+      const data = await fetchUiStateOnly(4000);
       if (data.state) state = data.state;
-      stableSortNodes();
-      updateCountryFilter();
       render();
 
       if (!state.global_pool_refresh_running) {
@@ -10172,7 +10047,7 @@ function startRefreshPolling() {
     } finally {
       refreshPollBusy = false;
     }
-  }, 1500);
+  }, 2500);
 }
 
 function startConnectionPolling() {
@@ -10200,7 +10075,7 @@ function startConnectionPolling() {
     } finally {
       connectionPollBusy = false;
     }
-  }, 500);
+  }, 800);
 }
 
 async function connectNode(id){
@@ -10239,6 +10114,17 @@ async function connectNode(id){
       },
       600000
     );
+    if (result.running) {
+      if (result.state) state = result.state;
+      manualConnectionUiBusy = true;
+      state.manual_switch_active = true;
+      state.is_connecting = true;
+      state.manual_switch_message = result.message || "后台正在验证目标节点…";
+      state.last_check_message = result.message || "后台正在验证目标节点；当前连接保持在线直到新节点验证成功。";
+      render();
+      startConnectionPolling();
+      return;
+    }
     if (result.ok && result.auto_fallback) {
       state.last_check_message = result.message || "当前节点失败，正在自动切换备用节点...";
       state.active_node_latency = "自动切换";
@@ -10406,6 +10292,54 @@ function renderManualAddAttempts(data, success) {
     '</div>';
 }
 
+let manualAddPollInterval = null;
+
+function stopManualAddPolling() {
+  if (manualAddPollInterval) {
+    clearInterval(manualAddPollInterval);
+    manualAddPollInterval = null;
+  }
+}
+
+function startManualAddPolling() {
+  stopManualAddPolling();
+  const poll = async () => {
+    try {
+      const d = await fetchUiStateOnly(4000);
+      if (d?.state) state = d.state;
+      if (!state.manual_add_running && state.manual_add_finished_at) {
+        stopManualAddPolling();
+        const data = state.manual_add_result || {ok:false, attempts:[], error:state.manual_add_message || "手动节点识别失败"};
+        const box = $("add_node_result");
+        if (box) box.innerHTML = renderManualAddAttempts(data, !!data.ok);
+        const submit = $("add_node_submit");
+        if (data.ok) {
+          const addedNodes = Array.isArray(data.added_nodes) ? data.added_nodes.filter(Boolean) : [];
+          if (addedNodes.length) {
+            mergeLoadedNodePage(addedNodes);
+            totalNodeCount = Math.max(totalNodeCount, nodes.length);
+            updateCountryFilter();
+          }
+          if (submit) {
+            submit.disabled = false;
+            submit.textContent = "完成";
+            submit.onclick = closeAddNodeModal;
+          }
+        } else if (submit) {
+          submit.disabled = false;
+          submit.textContent = "重新识别";
+          submit.onclick = submitAddNode;
+        }
+        render();
+      }
+    } catch (_) {
+      // Keep the manual-add job running on the server; the next poll retries.
+    }
+  };
+  poll();
+  manualAddPollInterval = setInterval(poll, 1000);
+}
+
 async function submitAddNode(){
   const input = $("add_node_address");
   const submit = $("add_node_submit");
@@ -10435,6 +10369,18 @@ async function submitAddNode(){
       body: JSON.stringify({address: address})
     }, 60000);
 
+    if (data.running) {
+      if (resultBox) {
+        resultBox.style.display = "block";
+        resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">任务已进入后台：正在识别地址、读取协议端口并逐一验证；页面可以刷新，不会中断任务。</div>';
+      }
+      if (submit) {
+        submit.disabled = true;
+        submit.textContent = "后台识别中…";
+      }
+      startManualAddPolling();
+      return;
+    }
     if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
     if (data.ok) {
       const addedNodes = Array.isArray(data.added_nodes) ? data.added_nodes.filter(Boolean) : [];
@@ -10924,17 +10870,10 @@ function populateRoutingCountries() {
     const count = Number(item?.ip_count || 0);
     if (country) countMap[country] = Math.max(Number(countMap[country] || 0), count);
   });
-  if (REGION_DISPLAY_NAMES_ZH) {
-    for (let a = 65; a <= 90; a++) {
-      for (let b = 65; b <= 90; b++) {
-        const code = String.fromCharCode(a, b);
-        try {
-          const label = REGION_DISPLAY_NAMES_ZH.of(code);
-          if (label && label !== code && !(label in countMap)) countMap[label] = 0;
-        } catch (_) {}
-      }
-    }
-  }
+  Object.entries(COUNTRY_REGISTRY).forEach(([, item]) => {
+    const country=String(item?.zh||"").trim();
+    if(country && !(country in countMap)) countMap[country]=0;
+  });
   const countries = Object.keys(countMap).sort((a,b) => {
     const diff = countMap[b] - countMap[a];
     return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
@@ -12639,6 +12578,97 @@ def active_node_pinger() -> None:
         time.sleep(10)
 
 
+def _run_manual_connection_job(kind: str, target_ids: list[str], ui_token: str, previous_openvpn_node_id: str, previous_pool_endpoint_id: str) -> None:
+    """Run manual connect/switch outside the HTTP request thread.
+
+    The browser only gets an immediate accepted response and observes the
+    persistent backend state. This prevents Nginx 499/502 on slow VPN handshakes
+    and guarantees browser refresh does not interrupt the switch.
+    """
+    def finish(ok: bool, message: str, restored_previous: bool = False) -> None:
+        try:
+            set_state(
+                manual_switch_active=False,
+                pending_connection_id="",
+                pending_connection_pool_endpoint_id="",
+                pending_connection_protocol="",
+                pending_connection_country="",
+                pending_connection_address="",
+                manual_switch_message=message,
+                last_check_message=message,
+                is_connecting=False,
+                manual_connection_active=False,
+            )
+        except Exception:
+            pass
+        try:
+            ui_command_plane.finish(ui_token, ok=ok, message=message)
+        except Exception:
+            pass
+
+    try:
+        if kind == "pool":
+            message = connect_pool_endpoint_with_fallback(target_ids, manual=True)
+        else:
+            node_id = str(target_ids[0] or "").strip()
+            message = connect_node(node_id, enable_connection=True, manual=True)
+
+        finish(True, "人工切换完成，当前节点已验证可用。")
+        log_to_json("INFO", "VPN", f"后台人工切换完成: {message}")
+    except Exception as primary_exc:
+        log_to_json("WARNING", "VPN", f"后台人工切换失败: {primary_exc}")
+        restored, restore_msg = restore_manual_previous_connection(
+            previous_openvpn_node_id,
+            previous_pool_endpoint_id,
+        )
+        if restored:
+            message = "人工切换失败，已保留/恢复原连接：" + str(restore_msg)
+        else:
+            message = "人工切换失败，原连接恢复失败：" + str(restore_msg)
+        finish(False, message, restored_previous=restored)
+
+manual_add_lock = threading.Lock()
+manual_add_running = False
+manual_add_result: dict[str, Any] = {}
+manual_add_started_at = 0.0
+
+def _run_manual_add_job(value: str) -> None:
+    global manual_add_running, manual_add_result
+    try:
+        set_state(
+            manual_add_running=True,
+            manual_add_message="正在识别地址、读取协议端口并验证可用性……",
+            manual_add_result={},
+            manual_add_started_at=time.time(),
+        )
+        result = add_manual_vpngate_node(value)
+        manual_add_result = dict(result or {})
+        set_state(
+            manual_add_running=False,
+            manual_add_message=str(result.get("message") or ("手动节点已添加并进入检测" if result.get("ok") else "手动节点识别完成")),
+            manual_add_result=manual_add_result,
+            manual_add_finished_at=time.time(),
+            last_check_message="手动节点已入库；可用性检测模块将立即复核。",
+        )
+        try:
+            threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-probe-trigger").start()
+        except Exception:
+            pass
+    except Exception as exc:
+        manual_add_result = {"ok": False, "error": str(exc), "attempts": []}
+        set_state(
+            manual_add_running=False,
+            manual_add_message="手动节点添加失败：" + str(exc),
+            manual_add_result=manual_add_result,
+            manual_add_finished_at=time.time(),
+        )
+    finally:
+        manual_add_running = False
+        try:
+            manual_add_lock.release()
+        except RuntimeError:
+            pass
+
 class Handler(BaseHTTPRequestHandler):
     # Keep-alive between Nginx and the local manager avoids a fresh backend TCP
     # connection for every UI state/catalog request.
@@ -12886,7 +12916,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         if effective_path in ("/", "/index.html"):
-            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8", cache_control="private, max-age=15", etag=INDEX_HTML_ETAG)
+            # Dashboard HTML contains the embedded production version and UI code.
+            # Never allow an old HTML shell to survive a production update.
+            self.send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8", cache_control="no-store, max-age=0, must-revalidate")
         elif effective_path in ("/footer-logo-clean.webp", "/footer-logo-clean.png"):
             try:
                 if effective_path.endswith(".webp"):
@@ -13833,11 +13865,35 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_json_body(max_bytes=8192)
                 value = str(payload.get("address") or payload.get("node") or "").strip()
-                result = add_manual_vpngate_node(value)
-                self.send_json(result)
+                if not value:
+                    self.send_json({"ok": False, "error": "节点地址不能为空"}, HTTPStatus.BAD_REQUEST)
+                    return
+                global manual_add_running
+                if manual_add_running or not manual_add_lock.acquire(blocking=False):
+                    self.send_json({"ok": False, "running": True, "error": "已有手动节点识别任务正在运行，请稍候"}, HTTPStatus.CONFLICT)
+                    return
+                manual_add_running = True
+                threading.Thread(
+                    target=_run_manual_add_job,
+                    args=(value,),
+                    daemon=True,
+                    name="manual-add-node",
+                ).start()
+                self.send_json({
+                    "ok": True,
+                    "running": True,
+                    "accepted": True,
+                    "message": "手动节点已接收，后台正在识别与验证；页面可以刷新，不会中断任务。",
+                    "state": _get_fast_nodes_state(),
+                }, HTTPStatus.ACCEPTED)
             except ValueError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
+                try:
+                    manual_add_lock.release()
+                except Exception:
+                    pass
+                manual_add_running = False
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_nodes":
             try:
@@ -14032,29 +14088,31 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg = load_ui_config()
                 ui_cfg["connection_enabled"] = True
                 write_json(DATA_DIR / "ui_auth.json", ui_cfg)
-                try:
-                    message = connect_pool_endpoint_with_fallback(endpoint_ids, manual=True)
-                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message="切换完成", last_check_message="人工切换完成，当前节点可用。")
-                    ui_command_plane.finish(ui_cmd["token"], ok=True, message=message)
-                    self.send_json({"ok": True, "message": message, "state": get_state()})
-                except Exception as primary_exc:
-                    restored, restore_msg = restore_manual_previous_connection(
-                        previous_openvpn_node_id,
-                        previous_pool_endpoint_id,
-                    )
-                    if restored:
-                        message = "人工切换失败，已保留/恢复原连接：" + str(restore_msg)
-                    else:
-                        message = "人工切换失败，原连接恢复失败：" + str(restore_msg)
-                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message=message)
-                    ui_command_plane.finish(ui_cmd["token"], ok=False, message=message)
-                    self.send_json({
-                        "ok": False,
-                        "auto_fallback": False,
-                        "restored_previous": restored,
-                        "error": message,
-                        "state": get_state(),
-                    }, HTTPStatus.BAD_GATEWAY)
+                set_state(
+                    manual_switch_active=True,
+                    pending_connection_id="",
+                    pending_connection_pool_endpoint_id=endpoint_ids[0],
+                    pending_connection_protocol="",
+                    pending_connection_country="",
+                    pending_connection_address="",
+                    manual_switch_message="已接受切换请求，后台正在建立并验证目标隧道。",
+                    last_check_message="切换中 · 目标节点正在后台验证，当前连接保持在线直到新节点验证成功。",
+                    is_connecting=True,
+                    manual_connection_active=True,
+                )
+                threading.Thread(
+                    target=_run_manual_connection_job,
+                    args=("pool", endpoint_ids, ui_cmd["token"], previous_openvpn_node_id, previous_pool_endpoint_id),
+                    daemon=True,
+                    name="manual-pool-connect",
+                ).start()
+                self.send_json({
+                    "ok": True,
+                    "running": True,
+                    "accepted": True,
+                    "message": "切换请求已接受，后台正在验证目标节点；此页面可以刷新，不会中断后台切换。",
+                    "state": _get_fast_nodes_state(),
+                }, HTTPStatus.ACCEPTED)
             except Exception as exc:
                 if "ui_cmd" in locals():
                     ui_command_plane.finish(ui_cmd["token"], ok=False, message=str(exc))
@@ -14075,29 +14133,31 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 previous_openvpn_node_id = str(active_openvpn_node_id or "")
                 previous_pool_endpoint_id = str(active_pool_endpoint_id or "")
-                try:
-                    message = connect_node(node_id, enable_connection=True, manual=True)
-                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message="切换完成", last_check_message="人工切换完成，当前节点可用。")
-                    ui_command_plane.finish(ui_cmd["token"], ok=True, message=message)
-                    self.send_json({"ok": True, "message": message, "state": get_state()})
-                except Exception as primary_exc:
-                    restored, restore_msg = restore_manual_previous_connection(
-                        previous_openvpn_node_id,
-                        previous_pool_endpoint_id,
-                    )
-                    if restored:
-                        message = "人工切换失败，已保留/恢复原连接：" + str(restore_msg)
-                    else:
-                        message = "人工切换失败，原连接恢复失败：" + str(restore_msg)
-                    set_state(manual_switch_active=False, pending_connection_id="", pending_connection_pool_endpoint_id="", pending_connection_protocol="", pending_connection_country="", pending_connection_address="", manual_switch_message=message)
-                    ui_command_plane.finish(ui_cmd["token"], ok=False, message=message)
-                    self.send_json({
-                        "ok": False,
-                        "auto_fallback": False,
-                        "restored_previous": restored,
-                        "error": message,
-                        "state": get_state(),
-                    }, HTTPStatus.BAD_GATEWAY)
+                set_state(
+                    manual_switch_active=True,
+                    pending_connection_id=node_id,
+                    pending_connection_pool_endpoint_id="",
+                    pending_connection_protocol="openvpn",
+                    pending_connection_country="",
+                    pending_connection_address="",
+                    manual_switch_message="已接受切换请求，后台正在建立并验证目标隧道。",
+                    last_check_message="切换中 · 目标节点正在后台验证，当前连接保持在线直到新节点验证成功。",
+                    is_connecting=True,
+                    manual_connection_active=True,
+                )
+                threading.Thread(
+                    target=_run_manual_connection_job,
+                    args=("node", [node_id], ui_cmd["token"], previous_openvpn_node_id, previous_pool_endpoint_id),
+                    daemon=True,
+                    name="manual-openvpn-connect",
+                ).start()
+                self.send_json({
+                    "ok": True,
+                    "running": True,
+                    "accepted": True,
+                    "message": "切换请求已接受，后台正在验证目标节点；此页面可以刷新，不会中断后台切换。",
+                    "state": _get_fast_nodes_state(),
+                }, HTTPStatus.ACCEPTED)
             except Exception as exc:
                 if "ui_cmd" in locals():
                     ui_command_plane.finish(ui_cmd["token"], ok=False, message=str(exc))
