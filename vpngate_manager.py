@@ -3838,7 +3838,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         "quality": "",
     }
     if speed_bps > 0:
-        message = f"{message} · 速度 {round(speed_bps / 1_000_000, 1)} Mbps"
+        message = f"{message} · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
     elif ok and not speed_result.get("ok"):
         message = f"{message} · 速度测试失败"
     if ok:
@@ -3945,7 +3945,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 )
                 speed_bps = int(speed_result.get("speed_bps") or 0)
                 if speed_bps > 0:
-                    message = f"{message} · 速度 {round(speed_bps / 1_000_000, 1)} Mbps"
+                    message = f"{message} · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
                 else:
                     message = f"{message} · 速度测试失败"
         finally:
@@ -4720,7 +4720,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         speed_bps = int(speed_result.get("speed_bps") or 0)
         probe_message = "background egress probe ok"
         if speed_result.get("ok"):
-            probe_message += f" · speed {round(speed_bps / 1_000_000, 1)} Mbps"
+            probe_message += f" · speed {round(speed_bps / 8_000_000, 2)} MB/s"
         else:
             probe_message += f" · speed test failed: {speed_result.get('error') or 'unknown'}"
         node_pool.record_endpoint_probe(
@@ -8454,16 +8454,13 @@ INDEX_HTML = r"""<!doctype html>
 
       <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
         <option value="0">不限速度</option>
-        <option value="10000000">大于 10 Mbps</option>
-        <option value="30000000">大于 30 Mbps</option>
-        <option value="50000000">大于 50 Mbps</option>
-        <option value="100000000">大于 100 Mbps</option>
-        <option value="150000000">大于 150 Mbps</option>
-        <option value="200000000">大于 200 Mbps</option>
-        <option value="300000000">大于 300 Mbps</option>
-        <option value="500000000">大于 500 Mbps</option>
-        <option value="800000000">大于 800 Mbps</option>
-        <option value="1000000000">大于 1 Gbps</option>
+        <option value="8000000">>1 MB/s</option>
+        <option value="24000000">>3 MB/s</option>
+        <option value="40000000">>5 MB/s</option>
+        <option value="80000000">>10 MB/s</option>
+        <option value="240000000">>30 MB/s</option>
+        <option value="400000000">>50 MB/s</option>
+        <option value="800000000">>100 MB/s</option>
       </select>
       <div id="speed_filter_widget" class="toolbar-custom-select" data-filter-id="speed_filter" aria-label="速度筛选">
         <button id="speed_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -9976,7 +9973,7 @@ function render(){
               <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
               <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
               <span style="margin-left: 12px;">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
-              <span style="margin-left: 12px;">速度: <strong>${esc(activeNode.speed ? speed(activeNode.speed) : "未测")}</strong></span>
+              <span style="margin-left: 12px;">速度: <strong>${esc(activeNode.speed ? `${(Number(activeNode.speed)/1000000).toFixed(2)} MB/s` : "未测")}</strong></span>
               <span class="active-hot-pool" title="后端 Master Pool 当前 HOT 热备节点数量"><span>热备库</span><strong>${esc(String(state.hot_pool_size || 0))}/${esc(String(state.hot_pool_target || 0))}</strong></span>
             </div>
           </div>
