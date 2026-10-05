@@ -8454,13 +8454,15 @@ INDEX_HTML = r"""<!doctype html>
 
       <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
         <option value="0">不限速度</option>
-        <option value="8000000">>1 MB/s</option>
-        <option value="24000000">>3 MB/s</option>
-        <option value="40000000">>5 MB/s</option>
-        <option value="80000000">>10 MB/s</option>
-        <option value="240000000">>30 MB/s</option>
-        <option value="400000000">>50 MB/s</option>
-        <option value="800000000">>100 MB/s</option>
+        <option value="8000000">≥1 MB/s</option>
+        <option value="24000000">≥3 MB/s</option>
+        <option value="40000000">≥5 MB/s</option>
+        <option value="64000000">≥8 MB/s</option>
+        <option value="80000000">≥10 MB/s</option>
+        <option value="240000000">≥30 MB/s</option>
+        <option value="400000000">≥50 MB/s</option>
+        <option value="560000000">≥70 MB/s</option>
+        <option value="800000000">≥100 MB/s</option>
       </select>
       <div id="speed_filter_widget" class="toolbar-custom-select" data-filter-id="speed_filter" aria-label="速度筛选">
         <button id="speed_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -9184,7 +9186,7 @@ function renderProtocolCell(n) {
   return `<a class="protocol-badge protocol-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="打开 VPN Gate ${esc(label)} 官方连接页面">${esc(label)}</a>`;
 }
 function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
-function speed(v){return v?`${(Number(v)/1000000).toFixed(1)} Mbps`:"-"}
+function speed(v){return v?`${(Number(v)/8000000).toFixed(2)} MB/s`:"-"}
 
 const translateQuality = q => {
   const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
@@ -9265,7 +9267,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedIpType === "hosting" && ipType !== "hosting") return false;
   if (selectedIpType === "mobile" && ipType !== "mobile") return false;
 
-  if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) <= selectedSpeed) return false;
+  if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) < selectedSpeed) return false;
 
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
   if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
