@@ -777,8 +777,6 @@ class NodePool:
                         "WHEN ?<>'' AND endpoint_id=? THEN 1 "
                         "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 1 "
                         "ELSE 2 END, "
-                        "CASE WHEN CAST(COALESCE(json_extract(server_metadata_json, '$.manual_added_at'), '0') AS REAL) "
-                        "> (strftime('%s','now') - 3600) THEN 0 ELSE 1 END, "
                         "CASE UPPER(status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
                         "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
                         "CASE WHEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") BETWEEN 1 AND 1500 "

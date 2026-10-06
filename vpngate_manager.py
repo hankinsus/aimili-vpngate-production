@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.39"
+APP_VERSION = "V1.0.40"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -11320,11 +11320,16 @@ function switchTableSignature(s) {
 }
 
 function getFilteredNodes() {
-  // The visible page is already filtered by Master Pool. Re-filtering here
-  // only exists for the local favorites toggle, which is not a server query.
-  if (!showFavoritesOnly) return nodes;
+  // The page comes from Master Pool, but a late unfiltered response must not
+  // keep non-matching rows on screen. Live exit and standby stay pinned.
   const favoriteIds = new Set(Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : []);
-  return nodes.filter(n => n && favoriteIds.has(n.id));
+  return nodes.filter(n => {
+    if (!n) return false;
+    if (showFavoritesOnly && !favoriteIds.has(n.id)) return false;
+    if (nodeIsConnected(n)) return true;
+    if (state?.standby_ready && nodeIsStandby(n, state?.standby_node_id)) return true;
+    return matchesNodeFilters(n);
+  });
 }
 
 function hotPoolSummary() {
@@ -11375,12 +11380,6 @@ function stableSortNodes() {
     const value = Number(n?.latency_ms || 0);
     return value > 0 ? value : Number.MAX_SAFE_INTEGER;
   };
-  const nowSeconds = Date.now() / 1000;
-  const manualRank = n => {
-    const ts = Number(n?.manual_added_at || 0);
-    const recent = ts > 0 && (nowSeconds - ts) <= 3600;
-    return [recent ? 0 : 1, recent ? -ts : 0];
-  };
   nodes.sort((a, b) => {
     if (!a || !b) return 0;
 
@@ -11397,13 +11396,8 @@ function stableSortNodes() {
     const bRank = statusRank[b.probe_status || "not_checked"] ?? 2;
     if (aRank !== bRank) return aRank - bRank;
 
-    const am = manualRank(a);
-    const bm = manualRank(b);
-    if (am[0] !== bm[0]) return am[0] - bm[0];
-    if (am[1] !== bm[1]) return am[1] - bm[1];
-
-    // Default display order: lowest measured latency first within the same
-    // availability state, regardless of protocol.
+    // Lowest measured latency first within the same availability state.
+    // Only the live exit and its standby stay above this order.
     const aLatency = latencyValue(a);
     const bLatency = latencyValue(b);
     if (aLatency !== bLatency) return aLatency - bLatency;
@@ -12106,12 +12100,18 @@ let nodesFetchPromise = null;
 let lastGoodNodesState = null;
 let totalNodeCount = 0;
 let nodeCacheBuilding = false;
+let nodeQuerySeq = 0;
+
+function nodePageIsCurrent(data) {
+  return !!(data && data._nodeQuerySeq === nodeQuerySeq);
+}
 
 async function fetchUiStateOnly(timeoutMs = 5000) {
   return fetchJsonWithTimeout("./api/ui/state", {}, timeoutMs);
 }
 
 async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
+  const seq = ++nodeQuerySeq;
   const params = new URLSearchParams();
   params.set("offset", String(Math.max(0, Number(offset) || 0)));
   params.set("limit", String(Math.max(1, Math.min(200, Number(limit) || 100))));
@@ -12126,7 +12126,9 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
   if (ipType) params.set("ip_type", ipType);
   if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
   if (latency) params.set("latency", latency);
-  return fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
+  const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
+  if (data && typeof data === "object") data._nodeQuerySeq = seq;
+  return data;
 }
 
 async function fetchNodesState(timeoutMs = 8000) {
@@ -12216,7 +12218,7 @@ async function loadScopedNodes(country, generation) {
   // First-screen rule: one authoritative Master Pool page only.
   // Keep the previous rows on screen until this page actually arrives.
   const first = await fetchScopedNodePage(0, pageSize, 12000);
-  if (myGeneration !== scopeLoadGeneration) return;
+  if (myGeneration !== scopeLoadGeneration || !nodePageIsCurrent(first)) return;
 
   totalNodeCount = Number(first?.total || 0);
   nodeListLoading = false;
@@ -12253,7 +12255,7 @@ async function loadServerPage(page) {
   try {
     const offset = (targetPage - 1) * pageSize;
     const data = await fetchScopedNodePage(offset, pageSize, 12000);
-    if (generation !== scopeLoadGeneration) return;
+    if (generation !== scopeLoadGeneration || !nodePageIsCurrent(data)) return;
     totalNodeCount = Number(data?.total || totalNodeCount || 0);
     nodeCacheBuilding = !!data?.cache_building;
     nodeListLoading = false;
@@ -12337,7 +12339,7 @@ async function load(){
   let painted = false;
   try {
     const first = await earlyPagePromise;
-    if (generation !== scopeLoadGeneration) return;
+    if (generation !== scopeLoadGeneration || !nodePageIsCurrent(first)) return;
     totalNodeCount = Number(first?.total || 0);
     nodeListLoading = false;
     nodeCacheBuilding = !!first?.cache_building;
@@ -12501,9 +12503,10 @@ async function refreshCurrentNodePageFast() {
   // makes a completed switch feel like another full-page reload.
   try {
     const data = await fetchScopedNodePage(0, pageSize, 6000);
-    if (generation !== scopeLoadGeneration) return;
+    if (generation !== scopeLoadGeneration || !nodePageIsCurrent(data)) return;
     totalNodeCount = Number(data?.total || 0);
     nodeCacheBuilding = !!data?.cache_building;
+    nodeListLoading = false;
     nodes = [];
     const pageNodes = Array.isArray(data?.nodes) ? data.nodes : [];
     mergeLoadedNodePage(pageNodes);
@@ -12512,6 +12515,8 @@ async function refreshCurrentNodePageFast() {
   } catch (e) {
     if (generation !== scopeLoadGeneration) return;
     console.warn("切换完成后节点页刷新失败", e);
+  } finally {
+    if (generation === scopeLoadGeneration) nodeListLoading = false;
   }
 }
 
@@ -12813,12 +12818,7 @@ function startManualAddPolling() {
             submit.onclick = closeAddNodeModal;
           }
         } else if (data.ok) {
-          const addedNodes = Array.isArray(data.added_nodes) ? data.added_nodes.filter(Boolean) : [];
-          if (addedNodes.length) {
-            mergeLoadedNodePage(addedNodes);
-            totalNodeCount = Math.max(totalNodeCount, nodes.length);
-            updateCountryFilter();
-          }
+          loadScope(String($("country_filter")?.value || activeCountryScope || ""), {preserveState:true});
           if (submit) {
             submit.disabled = false;
             submit.textContent = "完成";
@@ -12894,13 +12894,7 @@ async function submitAddNode(){
     }
     if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
     if (data.ok) {
-      const addedNodes = Array.isArray(data.added_nodes) ? data.added_nodes.filter(Boolean) : [];
-      if (addedNodes.length) {
-        mergeLoadedNodePage(addedNodes);
-        currentPage = 1;
-        totalNodeCount = Math.max(totalNodeCount, nodes.length);
-        updateCountryFilter();
-      }
+      loadScope(String($("country_filter")?.value || activeCountryScope || ""), {preserveState:true});
       state.last_check_message = data.message || "新增节点已入库 · 已通知可用性检测模块";
       state.availability_engine_message = "新增节点已入库 · 已通知可用性检测模块，正在立即复核";
       state.availability_engine_running = true;
@@ -13040,6 +13034,7 @@ async function applyNodeFilterChange(event) {
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
   const loadPromise = loadScope(country, {preserveState:true});
+  render();
   refreshCountryCatalog(false).catch(() => {});
   setTimeout(() => refreshFilterCounts().catch(() => {}), 80);
   await loadPromise;
@@ -13056,6 +13051,7 @@ $("country_filter").onchange=async()=>{
   currentPage = 1;
   // Start the node page immediately. The country catalog must not block the list.
   const loadPromise = loadScope(country, {preserveState:true});
+  render();
   refreshCountryCatalog(false).catch(() => {});
   setTimeout(() => refreshFilterCounts().catch(() => {}), 180);
   await loadPromise;
@@ -13860,6 +13856,7 @@ load();
 
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
 setInterval(async () => {
+  if (nodeListLoading) return;
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
     try {
       const pageOffset = Math.max(0, (currentPage - 1) * pageSize);
@@ -13867,15 +13864,15 @@ setInterval(async () => {
         fetchScopedNodePage(pageOffset, pageSize, 8000),
         fetchUiStateOnly(4000)
       ]);
-      if (Array.isArray(d?.nodes)) {
+      if (nodePageIsCurrent(d) && Array.isArray(d?.nodes)) {
         nodes = [];
         mergeLoadedNodePage(d.nodes);
+        if (d?.total != null) totalNodeCount = Number(d.total || 0);
+        if (d?.cache_building != null) nodeCacheBuilding = !!d.cache_building;
+        stableSortNodes();
+        updateCountryFilter();
       }
-      if (d?.total != null) totalNodeCount = Number(d.total || 0);
-      if (d?.cache_building != null) nodeCacheBuilding = !!d.cache_building;
       if (stateData?.state) adoptBackendState(stateData.state);
-      stableSortNodes();
-      updateCountryFilter();
       render();
     } catch(e) {}
   }
@@ -17293,7 +17290,6 @@ def _sort_ui_nodes_for_page(nodes):
     """
     status_rank = {"available": 0, "testing": 1, "not_checked": 2, "unavailable": 3}
     protocol_rank = {"softether": 0, "sstp": 1, "l2tp-ipsec": 2, "openvpn": 3}
-    now = time.time()
 
     def key(n):
         active = 2
@@ -17312,9 +17308,6 @@ def _sort_ui_nodes_for_page(nodes):
             ):
                 active = 1
         status = str(n.get("probe_status") or "not_checked").lower()
-        manual_ts = float(n.get("manual_added_at") or 0)
-        recent = 0 if manual_ts > 0 and (now - manual_ts) <= 3600 else 1
-        recent_ts = -manual_ts if recent == 0 else 0
         latency = float(n.get("latency_ms") or 0)
         latency_key = latency if latency > 0 else float("inf")
         protocol = str(n.get("protocol") or "openvpn").lower()
@@ -17322,8 +17315,6 @@ def _sort_ui_nodes_for_page(nodes):
         return (
             active,
             status_rank.get(status, 2),
-            recent,
-            recent_ts,
             latency_key,
             protocol_rank.get(protocol, 9),
             score,
