@@ -1006,6 +1006,24 @@ class NodePool:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def manual_endpoints_missing_speed(self, limit: int = 6) -> list[str]:
+        limit = max(1, min(int(limit or 6), 12))
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                """
+                SELECT e.endpoint_id
+                FROM endpoints e
+                JOIN servers s ON s.server_key=e.server_key
+                WHERE CAST(COALESCE(json_extract(s.metadata_json, '$.manual_added_at'), '0') AS REAL) > 0
+                  AND UPPER(e.status) IN ('HOT', 'AVAILABLE')
+                  AND COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) <= 0
+                  AND CAST(COALESCE(json_extract(e.metadata_json, '$.last_probe_speed_bps'), '0') AS REAL) <= 0
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     @staticmethod
     def _selection_score(endpoint: dict[str, Any]) -> tuple[float, float, int]:
         status = str(endpoint.get("status") or "").upper()

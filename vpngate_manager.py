@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.38"
+APP_VERSION = "V1.0.39"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -1535,7 +1535,8 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "ip": ip,
         "score": int(endpoint.get("latest_server_score") or 0),
         "ping": int(endpoint.get("latest_ping") or 0),
-        "speed": int(endpoint.get("latest_speed") or 0),
+        "speed": int(endpoint.get("latest_speed") or (metadata or {}).get("last_probe_speed_bps") or server_metadata.get("last_ip_speed_bps") or 0),
+        "speed_bps": int(endpoint.get("latest_speed") or (metadata or {}).get("last_probe_speed_bps") or server_metadata.get("last_ip_speed_bps") or 0),
         "sessions": int(endpoint.get("latest_sessions") or 0),
         "owner": str(server_metadata.get("owner") or server_metadata.get("isp") or server_metadata.get("as_name") or ""),
         "asn": str(server_metadata.get("asn") or ""),
@@ -2355,6 +2356,23 @@ def _build_manual_openvpn_node(host: str, ip: str, port: int, transport: str = "
         pass
     return node
 
+def _manual_measure_speed(interface: str, gateway: str = "") -> int:
+    """Download a short sample through the still-up manual tunnel and return bits/s."""
+    interface = str(interface or "").strip()
+    if not interface or proxy_server.proxy_forwarding_busy():
+        return 0
+    table = _acquire_probe_route_table()
+    if table is None:
+        return 0
+    try:
+        measured = measure_interface_speed(interface, gateway=gateway, table=table)
+        return max(0, int(measured.get("speed_bps") or 0))
+    except Exception:
+        return 0
+    finally:
+        _release_probe_route_table(table)
+
+
 def _manual_probe_openvpn(host: str, ip: str, port: int, transport: str = "tcp", timeout: int = 6) -> dict[str, Any]:
     transport = str(transport or "tcp").strip().lower()
     if transport not in ("tcp", "udp"):
@@ -2373,23 +2391,30 @@ def _manual_probe_openvpn(host: str, ip: str, port: int, transport: str = "tcp",
     test_id = safe_name(f"MANUAL_TEST_{host}_{port}_{transport}")
     temp_path = test_config_path(test_id)
     idx = None
+    process = None
     try:
         config_text = re.sub(r"(?m)^remote\s+\S+\s+\d+\s*$", f"remote {host} {int(port)}", template, count=1)
         config_text = re.sub(r"(?m)^proto\s+\S+\s*$", f"proto {transport}", config_text, count=1)
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
         temp_path.write_text(config_text, encoding="utf-8")
         idx = get_free_test_index()
-        ok, message, _process = run_openvpn_until_ready(
-            str(temp_path), keep_alive=False, route_nopull=True, timeout=int(timeout), dev=f"tun{idx}"
+        dev = f"tun{idx}"
+        ok, message, process = run_openvpn_until_ready(
+            str(temp_path), keep_alive=True, route_nopull=True, timeout=int(timeout), dev=dev
         )
+        speed_bps = _manual_measure_speed(dev) if ok else 0
         elapsed_ms = int((time.perf_counter() - started) * 1000)
+        text = "OpenVPN 隧道建立成功" if ok else message
+        if ok and speed_bps > 0:
+            text += f" · {round(speed_bps / 1_000_000, 1)} Mbps"
         return {
             "protocol": "openvpn",
             "transport": transport,
             "port": int(port),
             "ok": bool(ok),
             "elapsed_ms": elapsed_ms,
-            "message": "OpenVPN 隧道建立成功" if ok else message,
+            "speed_bps": speed_bps,
+            "message": text,
         }
     except Exception as exc:
         return {
@@ -2401,6 +2426,8 @@ def _manual_probe_openvpn(host: str, ip: str, port: int, transport: str = "tcp",
             "message": str(exc),
         }
     finally:
+        if process is not None:
+            stop_process(process)
         if idx is not None:
             release_test_index(idx)
         try:
@@ -2427,13 +2454,18 @@ def _manual_probe_protocol(host: str, ip: str, protocol: str, port: int, transpo
             nic = f"m{token}"
             result = adapter.connect(host=host, port=int(port) if int(port or 0) > 0 else 443, account=account, nic=nic, username="vpn", password="vpn")
             ok = bool(result and result.ok and result.interface)
+            speed_bps = _manual_measure_speed(result.interface, getattr(result, "gateway", "") or "") if ok else 0
             message = result.message if result else "SSL-VPN 未建立"
+            if ok and speed_bps > 0:
+                message = f"SSL-VPN 隧道建立成功 · {round(speed_bps / 1_000_000, 1)} Mbps"
+            elif ok:
+                message = "SSL-VPN 隧道建立成功"
             if result is not None:
                 try:
                     adapter.disconnect(account=account, nic=nic, delete=True, added_routes=((result.details or {}).get("added_host_routes") if result.details else []))
                 except Exception:
                     pass
-            return {"protocol": protocol, "transport": transport, "port": int(port), "ok": ok, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": "SSL-VPN 隧道建立成功" if ok else message}
+            return {"protocol": protocol, "transport": transport, "port": int(port), "ok": ok, "speed_bps": speed_bps, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": message}
 
         if protocol == "sstp":
             if not tunnel_adapters.SSTPAdapter.available():
@@ -2442,13 +2474,18 @@ def _manual_probe_protocol(host: str, ip: str, protocol: str, port: int, transpo
             target = host if int(port or 0) in (0, 443) else f"{host}:{int(port)}"
             result = adapter.connect(target, username="vpn", password="vpn", timeout=8)
             ok = bool(result and result.ok and result.interface)
+            speed_bps = _manual_measure_speed(result.interface, getattr(result, "gateway", "") or "") if ok else 0
             message = result.message if result else "MS-SSTP 未建立"
+            if ok and speed_bps > 0:
+                message = f"MS-SSTP 隧道建立成功 · {round(speed_bps / 1_000_000, 1)} Mbps"
+            elif ok:
+                message = "MS-SSTP 隧道建立成功"
             if result is not None:
                 try:
                     tunnel_adapters.SSTPAdapter.disconnect(result.process, added_routes=((result.details or {}).get("added_host_routes") if result.details else []))
                 except Exception:
                     pass
-            return {"protocol": protocol, "transport": transport, "port": int(port), "ok": ok, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": "MS-SSTP 隧道建立成功" if ok else message}
+            return {"protocol": protocol, "transport": transport, "port": int(port), "ok": ok, "speed_bps": speed_bps, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": message}
 
         if protocol == "l2tp-ipsec":
             if not l2tp_adapter.available():
@@ -2456,13 +2493,18 @@ def _manual_probe_protocol(host: str, ip: str, protocol: str, port: int, transpo
             namespace = f"aimili-manual-{token}"
             result = l2tp_adapter.connect(host=host, username="vpn", password="vpn", psk="vpn", namespace=namespace, timeout=8)
             ok = bool(result and result.ok and result.interface)
+            speed_bps = _manual_measure_speed(result.interface, getattr(result, "gateway", "") or "") if ok else 0
             message = result.message if result else "L2TP/IPsec 未建立"
+            if ok and speed_bps > 0:
+                message = f"L2TP/IPsec 隧道建立成功 · {round(speed_bps / 1_000_000, 1)} Mbps"
+            elif ok:
+                message = "L2TP/IPsec 隧道建立成功"
             if result is not None and result.ok:
                 try:
                     l2tp_adapter.disconnect(namespace)
                 except Exception:
                     pass
-            return {"protocol": protocol, "transport": "udp", "port": 0, "ok": ok, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": "L2TP/IPsec 隧道建立成功" if ok else message}
+            return {"protocol": protocol, "transport": "udp", "port": 0, "ok": ok, "speed_bps": speed_bps, "elapsed_ms": int((time.perf_counter() - started) * 1000), "message": message}
 
         return {"protocol": protocol, "transport": transport, "port": int(port), "ok": False, "elapsed_ms": 0, "message": "不支持的手动直连协议"}
     except Exception as exc:
@@ -2519,8 +2561,11 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
         node["probe_message"] = "手动直连验证通过"
         node["probed_at"] = now
         node["latency_ms"] = int(result.get("elapsed_ms") or 0)
+        speed_bps = int(result.get("speed_bps") or 0)
+        node["speed"] = speed_bps
+        node["speed_bps"] = speed_bps
         node_pool.upsert_openvpn_snapshot([node], source="manual_direct")
-        node_pool.record_probe(node, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过")
+        node_pool.record_probe(node, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过", speed_bps=speed_bps)
         with lock:
             nodes = read_nodes()
             nodes = [item for item in nodes if str(item.get("id") or "") != str(node.get("id") or "")]
@@ -2538,12 +2583,14 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
         "trusted_observation": True,
         "_sources": list(source_info.get("sources") or ["manual_direct"]),
         "manual_added_at": now,
+        "speed": int(result.get("speed_bps") or 0),
     }
     node_pool.upsert_discovery_snapshot([server], source="manual_direct")
     if any(metadata_updates.values()) and (ip or host):
         node_pool.update_server_metadata_batch({str(ip or host): metadata_updates})
     endpoint_id = node_pool.endpoint_id(node_pool.server_key(server), protocol, transport, port)
-    node_pool.record_endpoint_probe(endpoint_id, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过")
+    speed_bps = int(result.get("speed_bps") or 0)
+    node_pool.record_endpoint_probe(endpoint_id, ok=True, latency_ms=int(result.get("elapsed_ms") or 0), message="手动直连验证通过", speed_bps=speed_bps)
     endpoint = node_pool.get_endpoint(endpoint_id)
     if not endpoint:
         raise RuntimeError("直连已通过，但写入 Master Pool 后无法读取协议端点")
@@ -2554,6 +2601,8 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
     ui_node["probe_message"] = "手动直连验证通过"
     ui_node["probed_at"] = now
     ui_node["latency_ms"] = int(result.get("elapsed_ms") or 0)
+    ui_node["speed"] = speed_bps
+    ui_node["speed_bps"] = speed_bps
     with lock:
         nodes = read_nodes()
         nodes = [item for item in nodes if not (str(item.get("pool_endpoint_id") or "") == endpoint_id or str(item.get("id") or "") == "pool:" + endpoint_id)]
@@ -5994,7 +6043,8 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
         "ip": endpoint.get("current_ip") or host,
         "score": int(endpoint.get("latest_server_score") or 0),
         "ping": int(endpoint.get("latest_ping") or 0),
-        "speed": int(endpoint.get("latest_speed") or 0),
+        "speed": int(endpoint.get("latest_speed") or (endpoint.get("metadata") or {}).get("last_probe_speed_bps") or server_meta.get("last_ip_speed_bps") or 0),
+        "speed_bps": int(endpoint.get("latest_speed") or (endpoint.get("metadata") or {}).get("last_probe_speed_bps") or server_meta.get("last_ip_speed_bps") or 0),
         "sessions": int(endpoint.get("latest_sessions") or 0),
         "owner": str(server_meta.get("owner") or ""),
         "asn": str(server_meta.get("asn") or ""),
@@ -15185,6 +15235,25 @@ manual_add_running = False
 manual_add_result: dict[str, Any] = {}
 manual_add_started_at = 0.0
 
+def backfill_manual_speeds() -> None:
+    """Measure speed for manual nodes that were saved before speed tests ran."""
+    time.sleep(20)
+    try:
+        endpoint_ids = node_pool.manual_endpoints_missing_speed(limit=6)
+    except Exception:
+        return
+    for endpoint_id in endpoint_ids:
+        try:
+            probe_pool_endpoint(endpoint_id)
+        except Exception:
+            continue
+    try:
+        node_pool.invalidate_scoped_pages()
+        _drop_ui_page_snapshots()
+    except Exception:
+        pass
+
+
 def _run_manual_add_job(value: str) -> None:
     global manual_add_running, manual_add_result
     try:
@@ -18498,6 +18567,7 @@ def main() -> None:
 
     threading.Thread(target=startup_recovery_loop, daemon=True, name="startup-recovery").start()
     enabled_loops.append("startup-recovery")
+    threading.Thread(target=backfill_manual_speeds, daemon=True, name="manual-speed-backfill").start()
 
     # First installation is a one-time bootstrap only when the persistent pool
     # is empty. Existing installations keep their saved routing preferences.
