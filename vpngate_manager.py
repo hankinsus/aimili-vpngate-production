@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.49"
+APP_VERSION = "V1.0.50"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7505,6 +7505,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .official-portal-tab {
       letter-spacing: .5px;
+      top: calc(50% + 120px);
+      z-index: 40;
     }
 
     .vps-links {
@@ -9186,6 +9188,36 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 7px;
       font-size: 13px;
       padding: 8px 10px;
+    }
+
+    #admin_dropdown {
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      margin-top: 0;
+      width: 100%;
+      min-width: 0;
+      max-width: none;
+      padding: 4px;
+      box-sizing: border-box;
+    }
+    #admin_dropdown a {
+      min-height: 40px;
+      height: 40px;
+      padding: 0 10px;
+      gap: 8px;
+      border-radius: 7px;
+      font-size: 15px;
+      font-weight: 500;
+      line-height: 1;
+      white-space: nowrap;
+      box-sizing: border-box;
+    }
+    #admin_dropdown a + a {
+      margin-top: 2px;
+    }
+    #admin_dropdown a:last-child {
+      margin-top: 6px;
     }
 
     .github-update-panel {
