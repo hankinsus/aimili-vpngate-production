@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.29"
+APP_VERSION = "V1.0.30"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2138,6 +2138,7 @@ def _clear_all_node_active_flags() -> None:
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
+    remember_connection_ended(openvpn_node_id=str(active_openvpn_node_id or ""))
     with lock:
         cleanup_policy_routing()
         config_to_delete = None
@@ -2193,6 +2194,7 @@ def _tunnel_carrier_alive() -> bool:
 
 def stop_active_external_tunnel() -> None:
     global active_external_tunnel, active_pool_endpoint_id
+    remember_connection_ended(endpoint_id=str(active_pool_endpoint_id or ""))
     tunnel = active_external_tunnel
     if tunnel is None:
         active_pool_endpoint_id = ""
@@ -3027,6 +3029,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
 
         latency = parse_int(health.get("latency_ms")) or parse_int(direct_health.get("latency_ms"))
         node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
+        remember_live_connection(endpoint_id=endpoint_id)
         if manual:
             set_manual_route_pin(protocol=protocol, endpoint_id=endpoint_id, country=str(endpoint.get("country") or ""))
         endpoint_meta = endpoint.get("server_metadata") or {}
@@ -3301,6 +3304,7 @@ def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tup
     jitter = float(endpoint.get("jitter_ewma") or 999999)
     success_streak = int(endpoint.get("success_streak") or 0)
     return (
+        1 if endpoint_is_unstable(endpoint) else 0,
         routing_preference_tier(endpoint, ui_cfg),
         routing_speed_gate(endpoint),
         # Within the same country/IP/speed tier, measured latency is preferred.
@@ -3311,6 +3315,7 @@ def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tup
         -speed,
         -float(endpoint.get("last_success") or 0),
         jitter,
+        -int(endpoint.get("last_session_seconds") or 0),
         -success_streak,
     )
 
@@ -3493,6 +3498,19 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
     if manual_route_pin or ui_command_plane.is_busy():
         return False
     ui_cfg = load_ui_config()
+    if ui_cfg.get("routing_mode") in ("fixed_ip",) or not bool(ui_cfg.get("connection_enabled", True)):
+        return False
+    if _explicit_scheme_configured(ui_cfg):
+        now = time.time()
+        last_check = float(get_state().get("last_preference_recovery_at") or 0)
+        if not force and now - last_check < 60:
+            return False
+        set_state(last_preference_recovery_at=now)
+        try:
+            return enter_explicit_scheme(immediate=bool(force))
+        except Exception as exc:
+            log_to_json("WARNING", "Routing", f"回到新方案失败: {exc}")
+            return False
     if ui_cfg.get("routing_mode") in ("fixed_ip", "favorites") or not bool(ui_cfg.get("connection_enabled", True)):
         return False
     has_preference = (
@@ -3534,6 +3552,84 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
         log_to_json("WARNING", "Routing", f"偏好路由恢复失败: {exc}")
         return False
 
+def endpoint_is_unstable(endpoint: dict[str, Any] | None) -> bool:
+    if not endpoint:
+        return False
+    if str(endpoint.get("stability") or "").lower() == "unstable":
+        return True
+    meta = endpoint.get("metadata") if isinstance(endpoint.get("metadata"), dict) else {}
+    if str(meta.get("stability") or "").lower() == "unstable":
+        return True
+    return int(endpoint.get("fail_streak") or 0) >= 3
+
+
+def _stable_candidates(endpoints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stable = [ep for ep in endpoints if not endpoint_is_unstable(ep)]
+    return stable or list(endpoints)
+
+
+def default_routing_config(ui_cfg: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(ui_cfg)
+    cfg["routing_mode"] = "auto"
+    cfg["force_country"] = ""
+    cfg["routing_ip_type"] = "all"
+    cfg["routing_protocol"] = ""
+    cfg["routing_min_speed_bps"] = 0
+    cfg["routing_latency"] = ""
+    return cfg
+
+
+def _explicit_scheme_configured(ui_cfg: dict[str, Any]) -> bool:
+    if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+        return False
+    try:
+        min_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        min_speed = 0
+    return bool(
+        str(ui_cfg.get("routing_mode") or "") in ("fixed_region", "favorites")
+        or str(ui_cfg.get("routing_ip_type") or "all") != "all"
+        or str(ui_cfg.get("routing_protocol") or "").strip()
+        or min_speed > 0
+        or str(ui_cfg.get("routing_latency") or "").strip()
+    )
+
+
+def _current_session_age() -> float:
+    started = float(get_state().get("active_connected_at") or 0)
+    if started <= 0:
+        return 10**9
+    return max(0.0, time.time() - started)
+
+
+def _resolve_openvpn_endpoint_id(node_id: str) -> str:
+    parts = str(node_id or "").rsplit("_", 2)
+    if len(parts) == 3 and str(parts[1]).isdigit():
+        return node_pool.find_endpoint_id(parts[0], int(parts[1]), "openvpn") or ""
+    return ""
+
+
+def remember_live_connection(endpoint_id: str = "", openvpn_node_id: str = "") -> None:
+    eid = str(endpoint_id or "").strip() or _resolve_openvpn_endpoint_id(openvpn_node_id)
+    set_state(active_connected_at=time.time(), active_connected_endpoint=eid)
+    if not eid:
+        return
+    try:
+        node_pool.note_connection_started(eid)
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"记录连接时间失败: {exc}")
+
+
+def remember_connection_ended(endpoint_id: str = "", openvpn_node_id: str = "") -> None:
+    eid = str(endpoint_id or "").strip() or _resolve_openvpn_endpoint_id(openvpn_node_id)
+    if not eid:
+        return
+    try:
+        node_pool.note_connection_ended(eid)
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"记录断开时间失败: {exc}")
+
+
 def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
     """True when this exit already satisfies the filters the user just saved.
 
@@ -3573,39 +3669,68 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
         return False
     return True
 
-def switch_to_explicit_routing_if_needed() -> bool:
-    """Switch now when a verified exit matches the saved filter and the current one does not.
-
-    If nothing verified matches, keep the current tunnel. Do not drop a working
-    proxy just because the preferred country still has zero nodes.
-    """
+def enter_explicit_scheme(immediate: bool = False) -> bool:
+    """Move onto the saved scheme once a stable node satisfies it."""
     ui_cfg = load_ui_config()
-    if not bool(ui_cfg.get("connection_enabled", True)):
+    if not bool(ui_cfg.get("connection_enabled", True)) or not _explicit_scheme_configured(ui_cfg):
         return False
     if ui_cfg.get("routing_mode") == "fixed_ip":
         return False
     if ui_command_plane.is_busy() or manual_connection_active:
         return False
     current = current_active_routing_endpoint()
-    if current and endpoint_matches_explicit_routing(current, ui_cfg):
+    if current and endpoint_matches_explicit_routing(current, ui_cfg) and not endpoint_is_unstable(current):
+        set_state(routing_degraded=False, last_check_message="当前出口符合新方案")
+        return False
+    if not immediate and active_tunnel_running() and bool(get_state().get("proxy_ok")) and _current_session_age() < 90:
         return False
     matching = [
-        ep for ep in unified_hot_pool_candidates(ui_cfg, limit=30)
-        if endpoint_matches_explicit_routing(ep, ui_cfg)
+        ep for ep in _stable_candidates(unified_hot_pool_candidates(ui_cfg, limit=30))
+        if endpoint_matches_explicit_routing(ep, ui_cfg) and not endpoint_is_unstable(ep)
     ]
     if not matching:
         return False
     best = matching[0]
     if current and str(best.get("endpoint_id") or "") == str(current.get("endpoint_id") or ""):
+        set_state(routing_degraded=False, last_check_message="当前出口符合新方案")
         return False
     connect_ranked_endpoint(best)
-    set_state(last_check_message="已按代理设置切换到符合筛选的出口")
-    log_to_json(
-        "INFO",
-        "Routing",
-        f"代理筛选生效，切换到 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}",
-    )
+    set_state(routing_degraded=False, last_check_message="条件已满足，已进入新方案")
+    log_to_json("INFO", "Routing", f"进入新方案 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}")
     return True
+
+
+def degrade_to_default_scheme() -> bool:
+    """Leave the saved scheme for the default pool until a stable match exists."""
+    ui_cfg = load_ui_config()
+    if not bool(ui_cfg.get("connection_enabled", True)) or ui_cfg.get("routing_mode") == "fixed_ip":
+        return False
+    if ui_command_plane.is_busy() or manual_connection_active:
+        return False
+    current = current_active_routing_endpoint()
+    if current and endpoint_matches_explicit_routing(current, ui_cfg) and not endpoint_is_unstable(current):
+        set_state(routing_degraded=False, last_check_message="当前出口符合新方案")
+        return False
+    defaults = _stable_candidates(unified_hot_pool_candidates(default_routing_config(ui_cfg), limit=30))
+    stable_defaults = [ep for ep in defaults if not endpoint_is_unstable(ep)]
+    if stable_defaults:
+        defaults = stable_defaults
+    if not defaults:
+        set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，保持当前出口")
+        return False
+    best = defaults[0]
+    if current and active_tunnel_running() and str(best.get("endpoint_id") or "") == str(current.get("endpoint_id") or ""):
+        set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，已退回默认出口")
+        return False
+    connect_ranked_endpoint(best)
+    set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，已退回默认出口")
+    log_to_json("INFO", "Routing", f"新方案无稳定节点，退回默认 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}")
+    return True
+
+
+def switch_to_explicit_routing_if_needed() -> bool:
+    return enter_explicit_scheme(immediate=True)
+
 
 def apply_user_routing_preferences() -> None:
     try:
@@ -3614,17 +3739,19 @@ def apply_user_routing_preferences() -> None:
             return
         if ui_cfg.get("routing_mode") == "fixed_ip":
             return
-        if switch_to_explicit_routing_if_needed():
+        if enter_explicit_scheme(immediate=True):
+            return
+        if degrade_to_default_scheme():
             return
         target_country = ""
         if str(ui_cfg.get("routing_mode") or "") == "fixed_region":
             target_country = str(ui_cfg.get("force_country") or "").strip()
         if target_country:
-            set_state(last_check_message=f"{target_country} 还没有符合筛选的已验证节点，保持当前出口并继续补齐")
+            set_state(routing_degraded=True, last_check_message=f"{target_country} 还没有稳定节点，已退回默认并继续补齐")
             start_country_priority(target_country)
             return
         if active_tunnel_running():
-            set_state(last_check_message="没有符合筛选的已验证节点，保持当前出口")
+            set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，保持当前出口")
             return
         auto_switch_node()
     except Exception as exc:
@@ -5151,6 +5278,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
             set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        remember_live_connection(openvpn_node_id=node_id)
         return f"Connected {node_id}"
     except Exception as exc:
         if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):

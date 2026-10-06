@@ -170,6 +170,86 @@ class NodePool:
         self._status_counts_gate = threading.Lock()
         with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
+            self._ensure_endpoint_columns(db)
+            db.commit()
+
+    @staticmethod
+    def _ensure_endpoint_columns(db: sqlite3.Connection) -> None:
+        cols = {str(row[1]) for row in db.execute("PRAGMA table_info(endpoints)")}
+        if "last_connected_at" not in cols:
+            db.execute("ALTER TABLE endpoints ADD COLUMN last_connected_at REAL NOT NULL DEFAULT 0")
+        if "last_session_seconds" not in cols:
+            db.execute("ALTER TABLE endpoints ADD COLUMN last_session_seconds INTEGER NOT NULL DEFAULT 0")
+        if "stability" not in cols:
+            db.execute("ALTER TABLE endpoints ADD COLUMN stability TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _touch_stability(meta: dict[str, Any], now: float, kind: str, fail_streak: int, success_streak: int, session_seconds: int) -> str:
+        events = meta.get("stability_events")
+        if not isinstance(events, list):
+            events = []
+        events.append({"t": now, "k": kind})
+        window = 30 * 60
+        events = [item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= window][-8:]
+        meta["stability_events"] = events
+        flaps = len(events)
+        marked = str(meta.get("stability") or "") == "unstable" or flaps >= 4 or int(fail_streak or 0) >= 3
+        if marked and int(success_streak or 0) >= 3 and flaps < 2 and int(session_seconds or 0) >= 120:
+            marked = False
+        meta["stability"] = "unstable" if marked else ("stable" if int(success_streak or 0) >= 2 else "")
+        return str(meta["stability"])
+
+    def note_connection_started(self, endpoint_id: str) -> None:
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return
+        now = time.time()
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT metadata_json, fail_streak, success_streak, last_session_seconds FROM endpoints WHERE endpoint_id=?",
+                (endpoint_id,),
+            ).fetchone()
+            if not row:
+                return
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            stability = self._touch_stability(meta, now, "up", int(row["fail_streak"] or 0), int(row["success_streak"] or 0), int(row["last_session_seconds"] or 0))
+            db.execute(
+                "UPDATE endpoints SET last_connected_at=?, stability=?, metadata_json=? WHERE endpoint_id=?",
+                (now, stability, json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+            db.commit()
+
+    def note_connection_ended(self, endpoint_id: str) -> None:
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return
+        now = time.time()
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT metadata_json, fail_streak, success_streak, last_connected_at FROM endpoints WHERE endpoint_id=?",
+                (endpoint_id,),
+            ).fetchone()
+            if not row:
+                return
+            started = float(row["last_connected_at"] or 0)
+            session = int(max(0, now - started)) if started > 0 else 0
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["last_session_seconds"] = session
+            stability = self._touch_stability(meta, now, "down", int(row["fail_streak"] or 0), int(row["success_streak"] or 0), session)
+            db.execute(
+                "UPDATE endpoints SET last_session_seconds=?, stability=?, metadata_json=? WHERE endpoint_id=?",
+                (session, stability, json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
             db.commit()
 
     def invalidate_scoped_pages(self) -> None:
@@ -908,19 +988,32 @@ class NodePool:
                         "UPDATE servers SET metadata_json=? WHERE server_key=?",
                         (json.dumps(server_meta, ensure_ascii=False), row["server_key"]),
                     )
+                session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
+                stability = str(meta.get("stability") or "")
+                if stability == "unstable":
+                    events = meta.get("stability_events") if isinstance(meta.get("stability_events"), list) else []
+                    flaps = len([item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= 30 * 60])
+                    if prev_streak + 1 >= 3 and flaps < 2 and session_seconds >= 120:
+                        stability = "stable"
+                        meta["stability"] = "stable"
+                elif prev_streak + 1 >= 2:
+                    stability = "stable"
+                    meta["stability"] = "stable"
                 db.execute(
                     """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
-                       fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, metadata_json=?
+                       fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, stability=?, metadata_json=?
                        WHERE endpoint_id=?""",
-                    (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, json.dumps(meta, ensure_ascii=False), endpoint_id)
+                    (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
                 )
             else:
                 meta["last_error"] = msg
                 meta["last_probe_message"] = msg
+                session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
+                stability = self._touch_stability(meta, now, "fail", prev_fail + 1, 0, session_seconds)
                 db.execute(
                     """UPDATE endpoints SET status='COOLDOWN', last_failure=?, failure_count=failure_count+1,
-                       fail_streak=?, success_streak=0, next_test=?, metadata_json=? WHERE endpoint_id=?""",
-                    (now, prev_fail + 1, now + 300, json.dumps(meta, ensure_ascii=False), endpoint_id)
+                       fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
+                    (now, prev_fail + 1, now + 300, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
                 )
             db.commit()
         self._invalidate_read_caches()
