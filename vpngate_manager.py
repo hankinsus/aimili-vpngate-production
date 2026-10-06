@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.36"
+APP_VERSION = "V1.0.37"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -1551,7 +1551,7 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "remote_host": host,
         "remote_port": port,
         "fetched_at": float(endpoint.get("last_seen") or 0),
-        "manual_added_at": float(metadata.get("manual_added_at") or 0),
+        "manual_added_at": float(metadata.get("manual_added_at") or server_metadata.get("manual_added_at") or 0),
         "probe_status": probe_status,
         "endpoint_status": status.lower(),
         "hot_standby": status == "HOT",
@@ -2579,6 +2579,27 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
 
     try:
         source_info = {"found": False, "sources": []}
+        existing = node_pool.find_library_matches(host, resolved_ip if resolved_ip != host else "")
+        if not existing and resolved_ip:
+            existing = node_pool.find_library_matches("", resolved_ip)
+        if existing:
+            shown = existing[0]
+            label = str(shown.get("hostname") or host or resolved_ip)
+            ip_label = str(shown.get("current_ip") or resolved_ip or "")
+            country = str(shown.get("country") or "")
+            where = "，".join(part for part in (label, ip_label, country) if part)
+            return {
+                "ok": True,
+                "already_exists": True,
+                "added": False,
+                "passed": False,
+                "input": str(value or "").strip(),
+                "hostname": host,
+                "ip": resolved_ip,
+                "existing_count": len(existing),
+                "message": f"库里已经有这个节点（{where}），没有重复添加。刷新页面后，用筛选就能看到它。",
+            }
+
         official = None
         if host.lower().endswith(".opengw.net"):
             try:
@@ -2742,7 +2763,7 @@ def add_manual_vpngate_node(value: str) -> dict[str, Any]:
         )
         threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-availability").start()
         result["detection_queued"] = True
-        result["message"] = "节点已入库，并已立即通知可用性检测模块继续复核。"
+        result["message"] = "添加成功。刷新页面后，筛选列表里就能看到刚添加的节点。"
     return result
 
 
@@ -12649,6 +12670,9 @@ function fillAddNodeExample(value){
 }
 
 function renderManualAddAttempts(data, success) {
+  if (data && data.already_exists) {
+    return '<div class="add-node-status"><div class="add-node-status-title">库里已有</div><div>' + esc(data.message || "库里已经有这个节点，没有重复添加。刷新页面后，用筛选就能看到它。") + '</div></div>';
+  }
   const rawAttempts = Array.isArray(data && data.attempts) ? data.attempts : [];
   const names = {openvpn:"OpenVPN",softether:"SSL-VPN","l2tp-ipsec":"L2TP/IPsec",sstp:"MS-SSTP"};
   const order = ["openvpn","softether","l2tp-ipsec","sstp"];
@@ -12687,7 +12711,7 @@ function renderManualAddAttempts(data, success) {
   }).join("");
 
   const title = success
-    ? "✓ 直连验证完成 · " + passedCount + "/4 协议通过，节点已加入资源池"
+    ? "添加成功"
     : "4 种 VPN Gate 接入方式均未建立成功，节点未加入资源池";
   const color = success ? "var(--success)" : "var(--danger)";
   const border = success ? "rgba(34,197,94,.22)" : "rgba(244,63,94,.20)";
@@ -12730,9 +12754,15 @@ function startManualAddPolling() {
         stopManualAddPolling();
         const data = state.manual_add_result || {ok:false, attempts:[], error:state.manual_add_message || "手动节点识别失败"};
         const box = $("add_node_result");
-        if (box) box.innerHTML = renderManualAddAttempts(data, !!data.ok);
+        if (box) box.innerHTML = renderManualAddAttempts(data, !!data.ok && !data.already_exists);
         const submit = $("add_node_submit");
-        if (data.ok) {
+        if (data.already_exists) {
+          if (submit) {
+            submit.disabled = false;
+            submit.textContent = "知道了";
+            submit.onclick = closeAddNodeModal;
+          }
+        } else if (data.ok) {
           const addedNodes = Array.isArray(data.added_nodes) ? data.added_nodes.filter(Boolean) : [];
           if (addedNodes.length) {
             mergeLoadedNodePage(addedNodes);
@@ -12801,6 +12831,15 @@ async function submitAddNode(){
         submit.textContent = "后台识别中…";
       }
       startManualAddPolling();
+      return;
+    }
+    if (data.already_exists) {
+      if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, false);
+      if (submit) {
+        submit.disabled = false;
+        submit.textContent = "知道了";
+        submit.onclick = closeAddNodeModal;
+      }
       return;
     }
     if (resultBox) resultBox.innerHTML = renderManualAddAttempts(data, !!data.ok);
@@ -15157,18 +15196,38 @@ def _run_manual_add_job(value: str) -> None:
         )
         result = add_manual_vpngate_node(value)
         manual_add_result = dict(result or {})
-        set_state(
-            manual_add_running=False,
-            manual_add_message=str(result.get("message") or ("手动节点已添加并进入检测" if result.get("ok") else "手动节点识别完成")),
-            manual_add_result=manual_add_result,
-            manual_add_finished_at=time.time(),
-            last_check_message="手动节点已入库；可用性检测模块将立即复核。",
-        )
-        if not result.get("detection_queued"):
-            try:
-                threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-probe-trigger").start()
-            except Exception:
-                pass
+        if result.get("already_exists"):
+            message = str(result.get("message") or "库里已经有这个节点，没有重复添加。")
+            set_state(
+                manual_add_running=False,
+                manual_add_message=message,
+                manual_add_result=manual_add_result,
+                manual_add_finished_at=time.time(),
+                last_check_message=message,
+            )
+        elif result.get("ok"):
+            message = str(result.get("message") or "添加成功。刷新页面后，筛选列表里就能看到刚添加的节点。")
+            set_state(
+                manual_add_running=False,
+                manual_add_message=message,
+                manual_add_result=manual_add_result,
+                manual_add_finished_at=time.time(),
+                last_check_message=message,
+            )
+            if not result.get("detection_queued"):
+                try:
+                    threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-probe-trigger").start()
+                except Exception:
+                    pass
+        else:
+            message = str(result.get("message") or result.get("error") or "手动节点识别完成")
+            set_state(
+                manual_add_running=False,
+                manual_add_message=message,
+                manual_add_result=manual_add_result,
+                manual_add_finished_at=time.time(),
+                last_check_message=message,
+            )
     except Exception as exc:
         manual_add_result = {"ok": False, "error": str(exc), "attempts": []}
         set_state(

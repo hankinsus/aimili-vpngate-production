@@ -462,6 +462,8 @@ class NodePool:
                 "protocols": [protocol],
                 "_sources": [source],
             })
+            if node.get("manual_added_at"):
+                servers[-1]["manual_added_at"] = float(node.get("manual_added_at") or 0)
         if servers:
             self.upsert_discovery_snapshot(servers, source=source)
 
@@ -775,6 +777,8 @@ class NodePool:
                         "WHEN ?<>'' AND endpoint_id=? THEN 1 "
                         "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 1 "
                         "ELSE 2 END, "
+                        "CASE WHEN CAST(COALESCE(json_extract(server_metadata_json, '$.manual_added_at'), '0') AS REAL) "
+                        "> (strftime('%s','now') - 3600) THEN 0 ELSE 1 END, "
                         "CASE UPPER(status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
                         "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
                         "CASE WHEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") BETWEEN 1 AND 1500 "
@@ -974,6 +978,33 @@ class NodePool:
                 (port, protocol, host, host, raw),
             ).fetchone()
         return str(row[0]) if row else ""
+
+    def find_library_matches(self, host: str, ip: str = "") -> list[dict[str, Any]]:
+        """Return existing endpoints for this hostname or IP. Empty means it is not in the library."""
+        host = self.canonical_host(host)
+        ip = str(ip or "").strip()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if host:
+            clauses.append("(LOWER(s.hostname)=? OR LOWER(s.server_key)=?)")
+            params.extend([host, host])
+        if ip:
+            clauses.append("s.current_ip=?")
+            params.append(ip)
+        if not clauses:
+            return []
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                f"""
+                SELECT e.protocol, e.port, e.status, s.hostname, s.current_ip, s.country
+                FROM endpoints e JOIN servers s ON s.server_key=e.server_key
+                WHERE {' OR '.join(clauses)}
+                ORDER BY e.last_seen DESC
+                LIMIT 12
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _selection_score(endpoint: dict[str, Any]) -> tuple[float, float, int]:
