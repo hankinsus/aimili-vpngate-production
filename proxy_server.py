@@ -30,7 +30,7 @@ DNS_NEGATIVE_TTL_SECONDS = 5.0
 DNS_CACHE: dict[str, tuple[float, str | None]] = {}
 DNS_CACHE_LOCK = threading.Lock()
 PROXY_SOCKET_BUFFER_BYTES = 262144
-PROXY_UDP_ASSOCIATION_IDLE_SECONDS = 600
+PROXY_UDP_ASSOCIATION_IDLE_SECONDS = 6 * 3600
 PROXY_UDP_MAX_PACKET_BYTES = 65535
 _last_forward_mono = 0.0
 _last_forward_write = 0.0
@@ -592,10 +592,13 @@ def _tune_socket(sock: socket.socket) -> socket.socket:
     except OSError:
         pass
     for name, value in (
-        ("TCP_KEEPIDLE", 30),
-        ("TCP_KEEPINTVL", 10),
-        ("TCP_KEEPCNT", 3),
-        ("TCP_USER_TIMEOUT", 20000),
+        # Refresh NAT without treating a quiet session as dead.
+        # A 20s user-timeout was aborting idle TCP as soon as the first
+        # keepalive probe was delayed by the VPN.
+        ("TCP_KEEPIDLE", 45),
+        ("TCP_KEEPINTVL", 15),
+        ("TCP_KEEPCNT", 8),
+        ("TCP_USER_TIMEOUT", 180000),
     ):
         opt = getattr(socket, name, None)
         if opt is None:
