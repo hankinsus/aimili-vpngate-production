@@ -13,12 +13,14 @@ from typing import Any
 
 from vpn_utils import COUNTRY_TRANSLATIONS, canonical_country_name
 
-# Same buckets as the node table. A badge must count the rows that filter shows.
+# Same buckets as protocol_endpoint_to_ui_node. DEGRADED and UNAVAILABLE
+# render as 不可用; only TESTING renders as 检测中. Counting DEGRADED as
+# 检测中 made the dropdown disagree with the rows.
 _UI_STATUS_GROUPS = {
     "available": ("HOT", "AVAILABLE"),
-    "testing": ("TESTING", "DEGRADED"),
+    "testing": ("TESTING",),
     "not_checked": ("NEW",),
-    "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
+    "unavailable": ("DEGRADED", "COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
 }
 
 # dedupe_ui_nodes collapses identical protocol/IP/port rows and keeps every

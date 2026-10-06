@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.18"
+APP_VERSION = "V1.0.19"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -1506,11 +1506,13 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
     probe_status = {
         "HOT": "available",
         "AVAILABLE": "available",
+        "TESTING": "testing",
         "NEW": "not_checked",
         "DEGRADED": "unavailable",
         "COOLDOWN": "unavailable",
         "STALE": "unavailable",
         "RETIRED": "unavailable",
+        "UNAVAILABLE": "unavailable",
     }.get(status, "not_checked")
     ip = str(endpoint.get("current_ip") or metadata.get("ip") or "").strip()
     host = str(metadata.get("hostname") or endpoint.get("hostname") or ip).strip()
@@ -10780,8 +10782,9 @@ function render(){
     else if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
     else if (collecting) bgText = "资源收集中 · 正在从主站、镜像和多协议目录补充 Master Pool";
     else if (probing) bgText = String(state.availability_engine_message || "可用性检测中 · 新资源优先 · 全球资源最长 4 小时滚动复检");
-    else if (priorityRunning) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + "/" + Number(state.priority_target || 10);
-    const detail = (tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "";
+    else if (priorityRunning && state.priority_full_sweep_running) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 已检测 " + Number(state.priority_full_sweep_tested || 0) + "/" + Number(state.priority_full_sweep_total || 0) + " · 待检测 " + Number(state.priority_full_sweep_remaining || 0) + " · 可用 " + Number(state.priority_available || 0);
+    else if (priorityRunning) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + " · 目标 " + Number(state.priority_target || 10);
+    const detail = (priorityRunning && state.priority_full_sweep_running) ? "" : ((tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "");
     bgActivityEl.style.display = "flex";
     bgActivityEl.className = "background-task-strip " + ((manualSwitchRunning || collecting || probing || priorityRunning || bootstrapRunning || state.failover_in_progress) ? "running" : "");
     bgActivityTextEl.textContent = bgText + detail;
@@ -10886,7 +10889,7 @@ function render(){
 
   const rowsHost = $("rows");
   const rowsSig = [
-    currentPageNodes.map(n => n ? [n.id, n.probe_status, n.latency_ms, n.speed_bps || n.speed || 0, n.hot_standby ? 1 : 0, n.ip_type || "", n.country || ""].join("~") : "").join("|"),
+    currentPageNodes.map(n => n ? [n.id, n.probe_status, n.probe_message || "", n.latency_ms, n.speed_bps || n.speed || 0, n.hot_standby ? 1 : 0, n.ip_type || "", n.country || ""].join("~") : "").join("|"),
     state.active_pool_endpoint_id || "",
     state.active_openvpn_node_id || "",
     state.manual_switch_active ? 1 : 0,
@@ -10944,7 +10947,7 @@ function render(){
         : hotStandby
           ? `<span class="badge available"><span class="badge-pulse"></span>热备</span>`
           : canRetest
-            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="点击立即检测此节点" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
+            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "点击立即检测此节点")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
             : `<span class="badge ${badgeClass}">${badgeText}</span>`;
 
       // Background detection is allowed to continue while the user manually
@@ -11056,7 +11059,7 @@ function paintPriorityStatus() {
   priorityStatusEl.innerHTML = state.priority_running
     ? (fullSweepRunning
       ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 资源库全量检测中</span><span>已检测 ${fullSweepTested}/${fullSweepTotal} · 剩余 ${fullSweepRemaining} · 当前可用 ${av} · 库存 ${inventory}</span>`
-      : `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av}/${target} · 目标 ${min}-${target}</span>`)
+      : `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av} · 目标 ${min}-${target}</span>`)
     : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>库存 ${inventory}/${inventoryTarget} IP · ${esc(priorityMessage)}</span>`;
 }
 
@@ -11140,20 +11143,23 @@ async function testNode(btn, id, event){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id })
-    }, 30000);
-    if (result.node) {
+    }, 70000);
+    if (result && result.node && result.node.id) {
       const idx = nodes.findIndex(n => n && n.id === id);
+      if (idx !== -1) nodes[idx] = result.node;
+    }
+    if (result && result.ok === false) {
+      const idx = nodes.findIndex(n => n && n.id === id);
+      const msg = result.error || (result.result && result.result.error) || "检测没有执行";
       if (idx !== -1) {
-        nodes[idx] = result.node;
+        nodes[idx] = Object.assign({}, nodes[idx], { probe_message: msg });
       }
     }
   } catch (e) {
     const idx = nodes.findIndex(n => n && n.id === id);
     if (idx !== -1) {
       nodes[idx] = Object.assign({}, nodes[idx], {
-        probe_status: "unavailable",
-        probe_message: "手动检测失败：" + (e?.message || "请求超时"),
-        probed_at: Date.now() / 1000
+        probe_message: "手动检测失败：" + (e?.message || "请求超时")
       });
     }
   } finally {
@@ -15887,9 +15893,45 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if node_id.startswith("pool:"):
                     endpoint_id = node_id.removeprefix("pool:")
+                    endpoint = node_pool.get_endpoint(endpoint_id)
+                    if endpoint is None:
+                        self.send_json({"ok": False, "error": "端点不存在"}, HTTPStatus.NOT_FOUND)
+                        return
+                    protocol = str(endpoint.get("protocol") or "").lower()
+                    # OpenVPN is not a background multi-protocol probe. The old
+                    # path returned "skipped" and the row stayed 待检测, so the
+                    # click looked dead. Run the same real tunnel test the
+                    # full sweep uses, and write it back onto this endpoint id.
+                    if protocol == "openvpn":
+                        if not maintenance_lock.acquire(timeout=20):
+                            self.send_json({"ok": False, "error": "OpenVPN 检测正被全量检测占用，请稍后再点一次"}, HTTPStatus.CONFLICT)
+                            return
+                        try:
+                            ovpn_id = ensure_openvpn_node_from_pool(endpoint)
+                            updated = test_node_by_id(ovpn_id)
+                            ok = str((updated or {}).get("probe_status") or "") == "available"
+                            node_pool.record_endpoint_probe(
+                                endpoint_id,
+                                ok,
+                                int((updated or {}).get("latency_ms") or 0),
+                                str((updated or {}).get("probe_message") or ""),
+                                speed_bps=int((updated or {}).get("speed_bps") or (updated or {}).get("speed") or 0),
+                            )
+                            fresh = node_pool.get_endpoint(endpoint_id)
+                            node = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+                            if node and (updated or {}).get("probe_message"):
+                                node["probe_message"] = str(updated.get("probe_message") or "")
+                            self.send_json({"ok": ok, "node": node})
+                        except Exception as exc:
+                            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                        finally:
+                            maintenance_lock.release()
+                        return
                     result = probe_pool_endpoint(endpoint_id)
                     endpoint = node_pool.get_endpoint(endpoint_id)
                     node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
+                    if node and not result.get("ok"):
+                        node["probe_message"] = str(result.get("error") or node.get("probe_message") or "检测没有执行")
                     self.send_json({"ok": bool(result.get("ok")), "node": node, "result": result}, HTTPStatus.OK)
                     return
                 if not maintenance_lock.acquire(blocking=False):
