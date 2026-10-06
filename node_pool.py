@@ -192,9 +192,63 @@ class NodePool:
             return "不稳定"
         if int(seconds or 0) >= 24 * 3600:
             return "高可用"
-        if int(seconds or 0) >= 6 * 3600:
+        if int(seconds or 0) >= 3600:
             return "可用"
         return "待可用"
+
+    @staticmethod
+    def session_grade(sessions: int, speed_bps: int) -> str:
+        """0 会话且带宽够用是非常优质。10 以内优质，再按 20/30/50/80/100/100+。"""
+        sessions = int(sessions or 0)
+        speed_bps = int(speed_bps or 0)
+        if sessions <= 0 and speed_bps >= 50_000_000:
+            return "非常优质"
+        if sessions <= 10:
+            return "优质"
+        if sessions <= 20:
+            return "20"
+        if sessions <= 30:
+            return "30"
+        if sessions <= 50:
+            return "50"
+        if sessions <= 80:
+            return "80"
+        if sessions <= 100:
+            return "100"
+        return "100+"
+
+    @staticmethod
+    def session_grade_rank(sessions: int | None, speed_bps: int, known: bool) -> int:
+        if not known or sessions is None:
+            return 4
+        order = {"非常优质": 0, "优质": 1, "20": 2, "30": 3, "50": 4, "80": 5, "100": 6, "100+": 7}
+        return order.get(NodePool.session_grade(int(sessions), speed_bps), 4)
+
+    @staticmethod
+    def _stability_decision(meta: dict[str, Any], now: float, session_seconds: int, fail_streak: int) -> str:
+        """1 小时以上可标可用。1 到 6 小时里频繁掉线才标不稳定。"""
+        if not meta.get("watched_since"):
+            meta["watched_since"] = now
+        watched = max(0.0, now - float(meta.get("watched_since") or now))
+        events = meta.get("stability_events") if isinstance(meta.get("stability_events"), list) else []
+        flaps = len([item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= 30 * 60])
+        frequent = flaps >= 4 or int(fail_streak or 0) >= 3
+        seconds = int(session_seconds or 0)
+        in_watch = (3600 <= watched < 6 * 3600) or (3600 <= seconds < 6 * 3600)
+        if seconds >= 3600 and not frequent:
+            label = NodePool.availability_label(seconds, False)
+        elif in_watch and frequent:
+            label = "不稳定"
+        elif seconds < 3600 and watched < 3600:
+            label = "待可用"
+        elif str(meta.get("stability") or "") in ("不稳定", "unstable") and frequent:
+            label = "不稳定"
+        elif seconds >= 3600:
+            label = NodePool.availability_label(seconds, False)
+        else:
+            label = "待可用"
+        meta["stability"] = label
+        return label
 
     @staticmethod
     def _purge_duplicate_rows(db: sqlite3.Connection) -> int:
@@ -250,13 +304,7 @@ class NodePool:
         window = 30 * 60
         events = [item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= window][-8:]
         meta["stability_events"] = events
-        flaps = len(events)
-        previous = str(meta.get("stability") or "")
-        marked = previous in ("不稳定", "unstable") or flaps >= 4 or int(fail_streak or 0) >= 3
-        if marked and int(success_streak or 0) >= 3 and flaps < 2 and int(session_seconds or 0) >= 6 * 3600:
-            marked = False
-        label = NodePool.availability_label(int(session_seconds or 0), marked)
-        meta["stability"] = label
+        label = NodePool._stability_decision(meta, now, int(session_seconds or 0), int(fail_streak or 0))
         return label
 
     def note_connection_started(self, endpoint_id: str) -> None:
@@ -334,8 +382,7 @@ class NodePool:
             if not isinstance(meta, dict):
                 meta = {}
             current = str(row["stability"] or meta.get("stability") or "")
-            unstable = current in ("不稳定", "unstable")
-            label = self.availability_label(seconds, unstable)
+            label = self._stability_decision(meta, now, seconds, 0)
             if label == current:
                 return label
             meta["stability"] = label
@@ -435,6 +482,7 @@ class NodePool:
                     "ping": int(server.get("ping") or 0),
                     "speed": int(server.get("speed") or 0),
                     "sessions": int(server.get("sessions") or 0),
+                    "session_grade": NodePool.session_grade(int(server.get("sessions") or 0), int(server.get("speed") or 0)),
                     "score": int(server.get("score") or 0),
                     "source_count": int(server.get("source_count") or 0),
                     "trusted_observation": bool(server.get("trusted_observation")),
@@ -450,7 +498,10 @@ class NodePool:
                     try:
                         previous_meta = json.loads(existing_server["metadata_json"] or "{}")
                         if isinstance(previous_meta, dict):
-                            previous_meta.update({k: v for k, v in metadata.items() if v not in (None, "")})
+                            previous_meta.update({
+                                k: v for k, v in metadata.items()
+                                if k in ("sessions", "session_grade") or v not in (None, "")
+                            })
                             metadata = previous_meta
                     except Exception:
                         pass
@@ -1101,14 +1152,7 @@ class NodePool:
                         (json.dumps(server_meta, ensure_ascii=False), row["server_key"]),
                     )
                 session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
-                current = str(meta.get("stability") or "")
-                unstable = current in ("不稳定", "unstable")
-                if unstable:
-                    events = meta.get("stability_events") if isinstance(meta.get("stability_events"), list) else []
-                    flaps = len([item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= 30 * 60])
-                    if prev_streak + 1 >= 3 and flaps < 2 and session_seconds >= 6 * 3600:
-                        unstable = False
-                stability = self.availability_label(session_seconds, unstable)
+                stability = self._stability_decision(meta, now, session_seconds, 0)
                 meta["stability"] = stability
                 db.execute(
                     """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,

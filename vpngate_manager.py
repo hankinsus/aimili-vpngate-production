@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.33"
+APP_VERSION = "V1.0.34"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -3297,16 +3297,16 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
     return country_rank * 10000 + favorite_rank * 1000 + ip_rank * 100 + speed_gate * 10
 
 def routing_session_rank(endpoint: dict[str, Any]) -> int:
-    """VPN Gate session count: 1-10 is lightly loaded and preferred. Unknown stays neutral."""
+    """0 会话且带宽够用最优先。10 以内优质，其后 20/30/50/80/100/100+。没有会话数据时保持中性。"""
+    meta = endpoint.get("server_metadata") if isinstance(endpoint.get("server_metadata"), dict) else {}
+    if "sessions" not in meta:
+        return 4
     try:
-        sessions = int(endpoint.get("latest_sessions") or endpoint.get("sessions") or 0)
+        sessions = int(meta.get("sessions") or 0)
     except (TypeError, ValueError):
-        sessions = 0
-    if 1 <= sessions <= 10:
-        return 0
-    if sessions <= 0:
-        return 1
-    return 2
+        return 4
+    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or meta.get("speed") or 0)
+    return NodePool.session_grade_rank(sessions, speed, True)
 
 
 def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple:
@@ -3368,6 +3368,8 @@ def openvpn_node_to_routing_endpoint(node: dict[str, Any]) -> dict[str, Any]:
             "location": node.get("location") or "",
             "ip_type": node.get("ip_type") or "",
             "quality": node.get("quality") or "",
+            "sessions": int(node.get("sessions") or 0),
+            "speed": int(node.get("speed") or 0),
         },
     }
 
