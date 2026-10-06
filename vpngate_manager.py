@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.40"
+APP_VERSION = "V1.0.41"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -9872,11 +9872,12 @@ INDEX_HTML = r"""<!doctype html>
       </table>
     </div>
 
+    <div id="pool_summary" style="display:block; width:100%; box-sizing:border-box; padding: 10px 16px 0; font-size: 13px; line-height: 1.6; color: var(--text-secondary); white-space: normal; overflow: visible;">全球资源库：—</div>
+
     <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">1</span> 页 · 本页 <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条 · 共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条 <span style="margin-left: 10px; color: var(--primary);">每页 60 条</span>
-        <span id="pool_summary" style="margin-left: 14px; color: var(--text-secondary);">Master Pool：—</span>
         <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
       </div>
       <div class="pagination-controls-right" style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
@@ -10833,25 +10834,42 @@ function chooseUnifiedSelect(selectId, value) {
 
 function placeAnchoredMenu(menu, trigger) {
   const rect = trigger.getBoundingClientRect();
-  const width = Math.max(1, Math.round(rect.width));
-  const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - 12);
-  const spaceAbove = Math.max(0, rect.top - 12);
-  const openUp = spaceBelow < 200 && spaceAbove > spaceBelow;
-  const room = Math.floor(openUp ? spaceAbove : spaceBelow);
-  const maxH = Math.max(96, Math.min(320, room || 160));
+  const width = Math.max(148, Math.round(rect.width));
+  const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - 8);
+  const spaceAbove = Math.max(0, rect.top - 8);
+  // Keep the menu on the button. Only lift it when there is almost no room
+  // underneath; never reserve a tall empty gap above the control.
+  const openUp = spaceBelow < 72 && spaceAbove > spaceBelow + 80;
+  const left = Math.max(8, Math.min(Math.round(rect.left), window.innerWidth - width - 8));
   menu.style.position = "fixed";
   menu.style.boxSizing = "border-box";
-  menu.style.left = Math.round(rect.left) + "px";
+  menu.style.left = left + "px";
   menu.style.right = "auto";
   menu.style.width = width + "px";
   menu.style.minWidth = width + "px";
-  menu.style.maxWidth = width + "px";
-  menu.style.maxHeight = maxH + "px";
+  menu.style.maxWidth = Math.max(width, 280) + "px";
   menu.style.overflowY = "auto";
   menu.style.zIndex = "200000";
   menu.style.display = "block";
-  menu.style.top = Math.round(openUp ? Math.max(8, rect.top - maxH - 4) : rect.bottom + 4) + "px";
-  menu.style.bottom = "auto";
+  if (openUp) {
+    menu.style.maxHeight = Math.max(96, Math.min(320, spaceAbove)) + "px";
+    menu.style.top = "auto";
+    menu.style.bottom = Math.round(window.innerHeight - rect.top + 6) + "px";
+  } else {
+    menu.style.maxHeight = Math.min(320, Math.max(96, spaceBelow || 320)) + "px";
+    menu.style.bottom = "auto";
+    menu.style.top = Math.round(rect.bottom + 6) + "px";
+  }
+}
+
+function repositionOpenMenus() {
+  document.querySelectorAll(".toolbar-custom-select.open").forEach(widget => {
+    const selectId = widget.dataset.filterId || "";
+    const cfg = CUSTOM_FILTER_CONFIG[selectId];
+    const menu = cfg ? $(cfg.menu) : null;
+    const button = cfg ? $(cfg.button) : null;
+    if (menu && button && menu.style.display !== "none") placeAnchoredMenu(menu, button);
+  });
 }
 
 function bindUnifiedSelectEvents() {
@@ -11257,7 +11275,8 @@ function updateCountryFilter() {
     return '<option value="' + esc(country) + '">' + esc(label) + ' · ' + count + ' IP</option>';
   }).join("");
 
-  select.innerHTML = '<option value="">' + globalLabel + '</option>' + options;
+  const nextHtml = '<option value="">' + globalLabel + '</option>' + options;
+  if (select.innerHTML !== nextHtml) select.innerHTML = nextHtml;
   // The native <select> is hidden; the visible country dropdown is a custom
   // widget. Keep both in sync whenever the catalog arrives or changes.
   renderCustomCountryFilter();
@@ -11874,14 +11893,15 @@ function render(){
     const poolEndpoints = Number(state.pool_endpoints || 0);
     const poolIps = Number(state.pool_distinct_ips || 0);
     poolSummary.textContent = poolServers
-      ? `Master Pool：${poolServers} 台服务器 · ${poolEndpoints} 个协议端点 · ${poolIps} 个 IP`
-      : "Master Pool：—";
+      ? `全球资源库：${poolServers} 台服务器 · ${poolEndpoints} 个协议端点 · ${poolIps} 个 IP`
+      : "全球资源库：—";
   }
 
   $("btn_first_page").disabled = currentPage === 1;
   $("btn_prev_page").disabled = currentPage === 1;
   $("btn_next_page").disabled = currentPage === totalPages;
   $("btn_last_page").disabled = currentPage === totalPages;
+  repositionOpenMenus();
 }
 
 // Hook up page buttons events
@@ -13034,7 +13054,6 @@ async function applyNodeFilterChange(event) {
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
   const loadPromise = loadScope(country, {preserveState:true});
-  render();
   refreshCountryCatalog(false).catch(() => {});
   setTimeout(() => refreshFilterCounts().catch(() => {}), 80);
   await loadPromise;
@@ -13051,7 +13070,6 @@ $("country_filter").onchange=async()=>{
   currentPage = 1;
   // Start the node page immediately. The country catalog must not block the list.
   const loadPromise = loadScope(country, {preserveState:true});
-  render();
   refreshCountryCatalog(false).catch(() => {});
   setTimeout(() => refreshFilterCounts().catch(() => {}), 180);
   await loadPromise;

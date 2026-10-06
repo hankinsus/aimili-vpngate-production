@@ -1424,7 +1424,7 @@ class NodePool:
                     for row in db.execute("SELECT state, COUNT(*) c FROM servers GROUP BY state").fetchall()
                 }
             result = {"servers": servers, "endpoints": endpoints, "distinct_ips": distinct_ips, "country_ips": country_ips, "states": states}
-            self._stats_cache = (now + 15.0, result)
+            self._stats_cache = (now + 30.0, result)
             return dict(result)
         except sqlite3.OperationalError:
             if cached:
