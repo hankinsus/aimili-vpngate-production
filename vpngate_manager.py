@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.51"
+APP_VERSION = "V1.0.52"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7505,8 +7505,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .official-portal-tab {
       letter-spacing: .5px;
-      top: calc(50% + 120px);
-      z-index: 40;
+      top: 50%;
+      z-index: 80;
     }
 
     .vps-links {
