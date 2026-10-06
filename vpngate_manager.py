@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.48"
+APP_VERSION = "V1.0.49"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8014,7 +8014,8 @@ INDEX_HTML = r"""<!doctype html>
     .net-filter-grid > .form-group { margin-bottom: 0 !important; min-width: 0; overflow: visible; }
     .net-filter-grid .form-label { font-size: 12px; }
     #network_modal .net-filter-grid .toolbar-custom-select-button {
-      font-size: 14px;
+      height: 40px;
+      font-size: 15px;
       font-weight: 500;
       line-height: 1;
       padding: 0 8px 0 10px;
@@ -8029,6 +8030,9 @@ INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
       gap: 4px;
       text-overflow: clip;
+      font-size: 15px;
+      font-weight: 500;
+      line-height: 1;
     }
     #network_modal .net-filter-grid .country-flag-img,
     #network_modal .net-filter-grid .country-flag-fallback {
@@ -8421,18 +8425,22 @@ INDEX_HTML = r"""<!doctype html>
       bottom: calc(100% + 4px);
     }
     #network_modal .unified-select .toolbar-custom-option {
-      min-height: 38px;
-      height: 38px;
+      min-height: 40px;
+      height: 40px;
       padding: 0 10px;
       gap: 8px;
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 500;
       line-height: 1;
       align-items: center;
     }
+    #network_modal .unified-select .toolbar-custom-option-name,
+    #network_modal .net-filter-grid .toolbar-custom-option-name,
     #network_modal .unified-select .toolbar-custom-option-count,
-    #network_modal .net-filter-grid .toolbar-custom-selected-count {
-      font-size: 14px;
+    #network_modal .net-filter-grid .toolbar-custom-selected-count,
+    #network_modal .unified-select .toolbar-custom-selected-count {
+      font-size: 15px;
+      font-weight: 500;
     }
     #network_modal form {
       display: flex;
