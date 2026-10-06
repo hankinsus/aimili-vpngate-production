@@ -46,6 +46,26 @@ echo -e "${BLUE}==========================================================${PLAI
 echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本${PLAIN}"
 echo -e "${BLUE}==========================================================${PLAIN}"
 
+# 已上线的机器不要重跑安装器。九合一反向调用时 Aimili 还没装完，不走这条保护。
+if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -f /opt/aimilivpn/vpngate_data/state.json ] && [ "${AIMILI_ALLOW_EXISTING:-}" != "1" ]; then
+    echo -e "${RED}检测到 /opt/aimilivpn 已存在。安装器会覆盖现网，已停止。${PLAIN}"
+    echo -e "${YELLOW}确认重装请执行 AIMILI_ALLOW_EXISTING=1 bash install.sh${PLAIN}"
+    exit 1
+fi
+
+INSTALL_JIUHEYI="${INSTALL_JIUHEYI:-}"
+if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -t 0 ]; then
+    read -r -p "是否同时安装九合一？[y/N]: " INSTALL_JIUHEYI
+    if [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
+        read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
+    fi
+fi
+AIMILIVPN_DOMAIN=$(printf '%s' "${AIMILIVPN_DOMAIN:-}" | tr -d '[:space:]')
+export AIMILIVPN_DOMAIN
+if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -z "${AIMILIVPN_DOMAIN}" ]; then
+    export AIMILIVPN_IP_CERT_FOREVER=1
+fi
+
 # 3. Configure GitHub Repository URL
 # Default public repository (hankinsus/aimili-vpngate-production)
 DEFAULT_USER="hankinsus"
@@ -1226,6 +1246,22 @@ if [ -x "${INSTALL_DIR}/scripts/setup_https.sh" ]; then
     bash "${INSTALL_DIR}/scripts/setup_https.sh"
 fi
 
+if [ -n "${AIMILIVPN_DOMAIN:-}" ]; then
+    echo -e "\n${YELLOW}正在为 ${AIMILIVPN_DOMAIN} 申请 Let's Encrypt 证书（约 90 天，自动续期）...${PLAIN}"
+    if ! python3 - "${INSTALL_DIR}" "${AIMILIVPN_DOMAIN}" <<'PY'
+import sys
+from pathlib import Path
+root, domain = sys.argv[1], sys.argv[2]
+sys.path.insert(0, root)
+from web_certificate import WebCertificateManager
+WebCertificateManager(Path(root) / "vpngate_data" / "web_certificate.json")._worker(domain)
+print("域名证书已安装")
+PY
+    then
+        echo -e "${YELLOW}域名证书申请失败，面板继续使用自签证书。请把域名解析到本机并放开 80 端口后，在网页里重试。${PLAIN}"
+    fi
+fi
+
 # Wait and poll for node loading and active connection
 echo -e "\n正在等待 AimiliVPN 首次获取节点并建立加密通道 (此过程可能需要 5-30 秒)..."
 ACTIVE_ID=""
@@ -1305,3 +1341,12 @@ echo -e "  * 停止服务:       ${YELLOW}ml stop${PLAIN}"
 echo -e "  * 重启服务:       ${YELLOW}ml restart${PLAIN}"
 echo -e "=========================================================="
 echo
+
+if [ "${INSTALL_JIUHEYI:-}" = "y" ] || [ "${INSTALL_JIUHEYI:-}" = "Y" ]; then
+    echo -e "${YELLOW}开始安装九合一...${PLAIN}"
+    if ! curl -fsSL "https://raw.githubusercontent.com/hankinsus/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh \
+        || ! grep -q "九合一 V1.0.1" /tmp/jiuheyi-install.sh; then
+        curl -fsSL "https://raw.githubusercontent.com/ilovestudyus-sketch/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh
+    fi
+    JIUHEYI_FROM_AIMILI=1 JIUHEYI_EGRESS=aimili JIUHEYI_ONECLICK=1 domain="${AIMILIVPN_DOMAIN:-}" bash /tmp/jiuheyi-install.sh
+fi
