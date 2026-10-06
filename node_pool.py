@@ -1296,7 +1296,7 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
-    def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int = 0) -> bool:
+    def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = 0) -> bool:
         key = self.server_key(node)
         protocol = str(node.get("protocol") or "openvpn").strip().lower()
         transport = str(node.get("proto") or node.get("transport") or "tcp").strip().lower()

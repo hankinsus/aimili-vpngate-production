@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.52"
+APP_VERSION = "V1.0.53"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4215,11 +4215,18 @@ def country_full_sweep(country: str) -> dict[str, Any]:
 
         cursor = 0
         while cursor < len(refs):
-            # Probes open extra tunnels and download speed samples. While a
-            # client is actually moving bytes on 8500, do not start another batch.
-            while manual_connection_active or ui_command_plane.is_busy() or proxy_server.proxy_forwarding_busy() or ui_query_active():
+            # A live tunnel, an open page, or a catalog refresh owns the small
+            # VM. Wait here instead of opening another tunnel on top of them.
+            while (
+                manual_connection_active
+                or ui_command_plane.is_busy()
+                or proxy_server.proxy_forwarding_busy(20)
+                or ui_query_active()
+                or global_pool_refresh_running
+            ):
                 time.sleep(0.4)
-            batch = refs[cursor:cursor + COUNTRY_FULL_SWEEP_BATCH]
+            batch_size = 1 if active_tunnel_running() else COUNTRY_FULL_SWEEP_BATCH
+            batch = refs[cursor:cursor + batch_size]
             cursor += len(batch)
             openvpn_ids = []
             pool_refs = []
@@ -4252,6 +4259,9 @@ def country_full_sweep(country: str) -> dict[str, Any]:
                 workers = max(1, min(workers, len(pool_refs)))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                     list(executor.map(_test_pool_reference, pool_refs))
+
+            if active_tunnel_running():
+                time.sleep(1.5)
 
             country_full_sweep_tested = min(len(refs), cursor)
             country_full_sweep_remaining = max(0, len(refs) - cursor)
@@ -4609,8 +4619,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             )
             if ok:
                 latency = usable_latency_ms(tcp_connect_ms(h, p), fallback_ping)
-                if proxy_server.proxy_forwarding_busy():
-                    speed_result = {"ok": False, "speed_bps": 0, "error": "客户端正在转发，跳过测速"}
+                if proxy_server.proxy_forwarding_busy(8) or active_tunnel_running():
+                    speed_result = {"ok": False, "skipped": True, "speed_bps": 0, "error": "在线隧道占用中，跳过测速"}
                 else:
                     speed_table = _acquire_probe_route_table()
                     speed_result = (
@@ -4621,6 +4631,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 speed_bps = int(speed_result.get("speed_bps") or 0)
                 if speed_bps > 0:
                     message = f"{message} · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
+                elif speed_result.get("skipped"):
+                    message = f"{message} · 在线隧道占用中，未测速"
                 else:
                     message = f"{message} · 速度测试失败"
         finally:
@@ -4647,6 +4659,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
             "probed_at": time.time(),
+            "record_speed_bps": None if speed_result.get("skipped") else speed_bps,
             "owner": "",
             "asn": "",
             "as_name": "",
@@ -4677,12 +4690,15 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 try:
                     original_node = next((item for item in to_test if item.get("id") == nid), None)
                     if original_node:
+                        recorded_speed = res.get("record_speed_bps") if "record_speed_bps" in res else parse_int(res.get("speed_bps"))
+                        if recorded_speed is not None:
+                            recorded_speed = parse_int(recorded_speed)
                         node_pool.record_probe(
                             original_node,
                             ok=res.get("probe_status") == "available",
                             latency_ms=parse_int(res.get("latency_ms")),
                             message=str(res.get("probe_message") or ""),
-                            speed_bps=parse_int(res.get("speed_bps")),
+                            speed_bps=recorded_speed,
                         )
                 except Exception as pool_exc:
                     log_to_json("WARNING", "Main", f"NodePool 批量探测结果写入失败: {pool_exc}")
@@ -5848,15 +5864,22 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             return {"ok": False, "protocol": protocol, "interface": result.interface, "error": message}
 
         latency_ms = parse_int(egress.get("latency_ms"))
-        speed_result = measure_or_reuse_ip_speed(result.interface, endpoint_id, gateway=result.gateway or "", table=probe_table)
-        speed_bps = int(speed_result.get("speed_bps") or 0)
-        probe_message = "background egress probe ok"
-        if speed_result.get("ok"):
-            probe_message += f" · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
+        speed_result = {"ok": False}
+        if active_tunnel_running() or proxy_server.proxy_forwarding_busy(20):
+            speed_bps = 0
+            recorded_speed = None
+            probe_message = "background egress probe ok · 在线隧道占用中，跳过测速"
         else:
-            probe_message += f" · speed test failed: {speed_result.get('error') or 'unknown'}"
+            speed_result = measure_or_reuse_ip_speed(result.interface, endpoint_id, gateway=result.gateway or "", table=probe_table)
+            speed_bps = int(speed_result.get("speed_bps") or 0)
+            recorded_speed = speed_bps
+            probe_message = "background egress probe ok"
+            if speed_result.get("ok"):
+                probe_message += f" · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
+            else:
+                probe_message += f" · speed test failed: {speed_result.get('error') or 'unknown'}"
         node_pool.record_endpoint_probe(
-            endpoint_id, True, latency_ms, probe_message, speed_bps=speed_bps
+            endpoint_id, True, latency_ms, probe_message, speed_bps=recorded_speed
         )
         return {
             "ok": True,
@@ -6303,8 +6326,8 @@ def schedule_global_country_coverage() -> dict[str, Any]:
 
 def global_probe_sweep_once() -> dict[str, Any]:
     """Probe due OpenVPN and non-OpenVPN resources without touching the active tunnel."""
-    if ui_command_plane.is_busy():
-        return {"ok": True, "skipped": True, "reason": "用户正在执行前端指令"}
+    if ui_command_plane.is_busy() or country_full_sweep_running or active_tunnel_running() or proxy_server.proxy_forwarding_busy(20):
+        return {"ok": True, "skipped": True, "reason": "在线连接或全量检测优先，本轮不额外拉隧道"}
     if maintenance_lock.locked() or is_connecting:
         return {"ok": True, "skipped": True, "reason": "busy"}
     openvpn_limit = 6 if active_tunnel_running() else 10
@@ -12972,7 +12995,7 @@ function startConnectionPolling() {
       if (data.state) {
         const prevTable = switchTableSignature(state);
         const prevSig = backendStateRenderSignature(state);
-        state = data.state;
+        adoptBackendState(data.state);
         const tableChanged = switchTableSignature(state) !== prevTable;
         const stateChanged = backendStateRenderSignature(state) !== prevSig;
         if (tableChanged) render();
@@ -13039,7 +13062,7 @@ async function connectNode(id){
       600000
     );
     if (result.running) {
-      if (result.state) state = result.state;
+      if (result.state) adoptBackendState(result.state);
       manualConnectionUiBusy = true;
       state.manual_switch_active = true;
       state.is_connecting = true;
@@ -13055,7 +13078,7 @@ async function connectNode(id){
       render();
     }
     if (result.ok) {
-      if (result.state) state = result.state;
+      if (result.state) adoptBackendState(result.state);
       state.pending_connection_id = "";
       state.pending_connection_protocol = "";
       state.pending_connection_country = "";
@@ -13069,7 +13092,7 @@ async function connectNode(id){
       refreshFilterCounts().catch(() => {});
     }
     if (!result.ok) {
-      if (result.state) state = result.state;
+      if (result.state) adoptBackendState(result.state);
       manualConnectionUiBusy = false;
       state.is_connecting = false;
       state.manual_connection_active = false;
@@ -13393,7 +13416,7 @@ async function loadLegacy(){
       const poolEndpoints = Number(d?.state?.pool_endpoints || 0);
       if (!restored && poolEndpoints > 0 && initialNodeLoadRetryCount < 12) {
         initialNodeLoadRetryCount += 1;
-        state = d.state || state || {};
+        adoptBackendState(d.state || state || {});
         state.last_check_message = "节点资源正在恢复；首页先显示可用数据，后台继续读取其余节点...";
         render();
         setTimeout(() => load(), 600);
@@ -13473,6 +13496,9 @@ async function applyNodeFilterChange(event) {
   currentPage = 1;
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
+  nodes = [];
+  nodeListLoading = true;
+  render();
   const loadPromise = loadScope(country, {preserveState:true});
   refreshCountryCatalog(false).catch(() => {});
   setTimeout(() => refreshFilterCounts().catch(() => {}), 80);
@@ -13489,6 +13515,9 @@ $("country_filter").onchange=async()=>{
   activeCountryScope = country;
   forgetStaleCountryCounts();
   currentPage = 1;
+  nodes = [];
+  nodeListLoading = true;
+  render();
   // Start the node page immediately. The country catalog must not block the list.
   const loadPromise = loadScope(country, {preserveState:true});
   refreshCountryCatalog(false).catch(() => {});
@@ -18224,7 +18253,6 @@ def _get_fast_nodes_state():
         state["hot_pool_size"] = int((pool_stats.get("states") or {}).get("HOT") or 0)
         state["hot_pool_target"] = HOT_POOL_TARGET
         state["hot_pool_deficit"] = max(0, HOT_POOL_TARGET - state["hot_pool_size"])
-        state["status_counts"] = node_pool.status_counts()
     except Exception:
         state.setdefault("pool_servers", 0)
         state.setdefault("pool_endpoints", 0)
