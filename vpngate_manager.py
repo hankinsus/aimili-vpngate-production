@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.34"
+APP_VERSION = "V1.0.35"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7867,13 +7867,23 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar .toolbar-custom-select-button { font-size: 13px; padding: 0 8px; }
     .net-filter-grid {
       display: grid;
-      grid-template-columns: minmax(176px, 1.6fr) minmax(104px, 1fr) minmax(92px, 0.85fr) minmax(92px, 0.85fr);
+      grid-template-columns: minmax(132px, 1.15fr) minmax(96px, 0.9fr) minmax(118px, 1fr) minmax(108px, 0.95fr);
       gap: 8px;
       margin-bottom: 16px;
     }
     .net-filter-grid > .form-group { margin-bottom: 0 !important; min-width: 0; }
     .net-filter-grid .form-label { font-size: 12px; }
-    .net-filter-grid .toolbar-custom-select-button { font-size: 12px; padding: 0 8px; }
+    #network_modal .net-filter-grid .toolbar-custom-select-button {
+      font-size: 13px;
+      padding: 0 8px;
+      gap: 4px;
+    }
+    #network_modal .net-filter-grid .toolbar-custom-select-label {
+      max-width: none;
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: clip;
+    }
     .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
     .unified-select-full { width: 100%; height: 40px; }
     #network_modal .toolbar-custom-select.unified-select-full {
