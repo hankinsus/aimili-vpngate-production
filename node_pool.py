@@ -172,6 +172,10 @@ class NodePool:
             db.executescript(_SCHEMA)
             db.commit()
 
+    def invalidate_scoped_pages(self) -> None:
+        self._scoped_page_cache.clear()
+        self._scoped_page_stale.clear()
+
     def _invalidate_read_caches(self) -> None:
         # Writes do not synchronously flush every UI snapshot. Status/country
         # statistics and bounded pages are intentionally short-TTL snapshots;
@@ -452,7 +456,7 @@ class NodePool:
 
     def list_endpoints_scoped(self, country="", status="", protocol="", ip_type="", offset=0, limit=100,
                              speed_min_bps=0, active_endpoint_id="", active_ip="", active_protocol="", active_port=0,
-                             latency=""):
+                             latency="", standby_endpoint_id="", standby_ip="", standby_protocol="", standby_port=0):
         """Authoritative, bounded Master Pool query for the UI."""
         country = canonical_country_name(country) if country else ""
         status = str(status or "").strip().lower()
@@ -463,6 +467,10 @@ class NodePool:
         active_ip = str(active_ip or "").strip()
         active_protocol = str(active_protocol or "").strip().lower()
         active_port = max(0, int(active_port or 0))
+        standby_endpoint_id = str(standby_endpoint_id or "").strip()
+        standby_ip = str(standby_ip or "").strip()
+        standby_protocol = str(standby_protocol or "").strip().lower()
+        standby_port = max(0, int(standby_port or 0))
         latency = normalize_latency_filter(latency)
         offset = max(0, int(offset or 0))
         # Internal callers (e.g. the country full-sweep engine) may request
@@ -470,7 +478,8 @@ class NodePool:
         # pages at 200 rows.
         limit = max(1, min(int(limit or 100), 5000))
         cache_key = (country, status, protocol, ip_type, offset, limit,
-                     speed_min_bps, latency, active_endpoint_id, active_ip, active_protocol, active_port)
+                     speed_min_bps, latency, active_endpoint_id, active_ip, active_protocol, active_port,
+                     standby_endpoint_id, standby_ip, standby_protocol, standby_port)
         cached = self._scoped_page_cache.get(cache_key)
         if cached and cached[0] > time.monotonic():
             cached_rows, cached_total = cached[1]
@@ -520,14 +529,20 @@ class NodePool:
                         "ORDER BY CASE "
                         "WHEN ?<>'' AND endpoint_id=? THEN 0 "
                         "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 0 "
-                        "ELSE 1 END, "
+                        "WHEN ?<>'' AND endpoint_id=? THEN 1 "
+                        "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 1 "
+                        "ELSE 2 END, "
                         "CASE UPPER(status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
                         "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
                         "CASE WHEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") BETWEEN 1 AND 1500 "
                         "THEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") ELSE 999999 END, "
                         "endpoint_id "
                         "LIMIT ? OFFSET ?",
-                        params+[active_endpoint_id, active_endpoint_id, active_ip, active_ip, active_protocol, active_port, limit, offset]).fetchall()
+                        params+[
+                            active_endpoint_id, active_endpoint_id, active_ip, active_ip, active_protocol, active_port,
+                            standby_endpoint_id, standby_endpoint_id, standby_ip, standby_ip, standby_protocol, standby_port,
+                            limit, offset,
+                        ]).fetchall()
             except sqlite3.OperationalError as exc:
                 if stale and "lock" in str(exc).lower():
                     cached_rows, cached_total = stale

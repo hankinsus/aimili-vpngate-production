@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.24"
+APP_VERSION = "V1.0.25"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4648,7 +4648,13 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
         # confirm the exit on a later pass, instead of leaving the card at 0.
         with standby_guard:
             standby_slot.update(node_id=node_id, process=process, dev=STANDBY_DEV, ready=True, country=str(node.get("country") or ""))
-        set_state(standby_ready=True, standby_node_id=node_id)
+        set_state(
+            standby_ready=True,
+            standby_node_id=node_id,
+            standby_ip=str(node.get("ip") or node.get("remote_host") or ""),
+            standby_port=parse_int(node.get("remote_port")),
+            standby_protocol=str(node.get("protocol") or "openvpn"),
+        )
         return True
     egress = check_interface_egress(STANDBY_DEV, table=101)
     if not egress.get("ok"):
@@ -4661,7 +4667,14 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
     with standby_guard:
         standby_slot.update(node_id=node_id, process=process, dev=STANDBY_DEV, ready=True, country=str(node.get("country") or ""))
     log_to_json("INFO", "Standby", f"热备隧道已就绪 {node_id} · {egress.get('latency_ms') or 0} ms")
-    set_state(standby_ready=True, standby_node_id=node_id, standby_latency_ms=parse_int(egress.get("latency_ms")))
+    set_state(
+        standby_ready=True,
+        standby_node_id=node_id,
+        standby_latency_ms=parse_int(egress.get("latency_ms")),
+        standby_ip=str(node.get("ip") or node.get("remote_host") or ""),
+        standby_port=parse_int(node.get("remote_port")),
+        standby_protocol=str(node.get("protocol") or "openvpn"),
+    )
     return True
 
 _first_page_snapshot: dict[tuple[str, str], dict[str, Any]] = {}
@@ -7521,7 +7534,7 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar .toolbar-custom-select-button { font-size: 13px; padding: 0 8px; }
     .net-filter-grid {
       display: grid;
-      grid-template-columns: 1.25fr 1fr 0.9fr 0.9fr;
+      grid-template-columns: minmax(176px, 1.6fr) minmax(104px, 1fr) minmax(92px, 0.85fr) minmax(92px, 0.85fr);
       gap: 8px;
       margin-bottom: 16px;
     }
@@ -7610,9 +7623,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-option-name,
     .toolbar-custom-selected-count {
-      min-width: 0;
+      min-width: 3.2em;
       overflow: hidden;
       text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .toolbar-custom-selected-count {
       flex: 0 0 auto;
@@ -9229,10 +9243,10 @@ INDEX_HTML = r"""<!doctype html>
       <option value="usable" selected>可用·检测·待检</option>
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
-      <option value="connected">已连接</option>
-      <option value="standby">备连接</option>
       <option value="testing">检测中</option>
       <option value="not_checked">待检测</option>
+      <option value="connected">已连接</option>
+      <option value="standby">备连接</option>
       <option value="unavailable">失效节点</option>
     </select>
     <div id="status_filter_widget" class="toolbar-custom-select" data-filter-id="status_filter" aria-label="状态筛选">
@@ -9321,7 +9335,7 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
       </svg>
-      收藏菜单
+      收藏节点
     </button>
   </section>
   <div id="global_refresh_status" class="country-priority" style="display:none;"></div>
@@ -10323,7 +10337,7 @@ function toggleUnifiedSelect(selectId, event) {
       const top = openUp ? Math.max(8, rect.top - menuHeight - 8) : Math.min(window.innerHeight - menuHeight - 8, rect.bottom + 8);
       const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - rect.width - 8));
       menu.style.position = "fixed";
-      const menuWidth = Math.min(rect.width, window.innerWidth - 16);
+      const menuWidth = Math.max(rect.width, selectId === "net_force_country" ? 280 : 160);
       const safeLeft = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - menuWidth - 8));
       menu.style.left = safeLeft + "px";
       menu.style.width = menuWidth + "px";
@@ -10357,6 +10371,7 @@ function bindUnifiedSelectEvents() {
     });
   });
   document.addEventListener("click", event => {
+    if (event.target?.closest?.(".toolbar-custom-select-menu")) return;
     if (!event.target?.closest?.(".unified-select")) closeUnifiedSelects("");
   });
   window.addEventListener("resize", () => closeUnifiedSelects(""));
@@ -10516,8 +10531,10 @@ function closeCustomFilters(exceptId = "") {
     const cfg = CUSTOM_FILTER_CONFIG[id];
     const widget = $(cfg.widget);
     const button = $(cfg.button);
+    const menu = $(cfg.menu);
     if (widget) widget.classList.remove("open");
     if (button) button.setAttribute("aria-expanded", "false");
+    if (menu) menu.style.display = "none";
   });
 }
 
@@ -10540,14 +10557,19 @@ function toggleCustomFilter(selectId, event) {
     const menu = $(cfg.menu);
     const trigger = button || widget;
     if (menu && trigger) {
+      if (menu.parentElement !== document.body) document.body.appendChild(menu);
       const rect = trigger.getBoundingClientRect();
-      const width = Math.max(rect.width, 148);
+      const width = Math.max(rect.width, selectId === "country_filter" ? 220 : 148);
       const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+      const spaceBelow = window.innerHeight - rect.bottom - 12;
+      const openUp = spaceBelow < 220 && rect.top > spaceBelow;
       menu.style.position = "fixed";
       menu.style.left = left + "px";
-      menu.style.top = (rect.bottom + 6) + "px";
       menu.style.width = width + "px";
       menu.style.zIndex = "200000";
+      menu.style.display = "block";
+      const menuHeight = Math.min(menu.scrollHeight || 280, 360);
+      menu.style.top = (openUp ? Math.max(8, rect.top - menuHeight - 6) : rect.bottom + 6) + "px";
     }
     const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
     if (active) active.scrollIntoView({block:"nearest"});
@@ -10599,6 +10621,7 @@ function bindCustomFilterEvents() {
       return;
     }
 
+    if (event.target?.closest?.(".toolbar-custom-select-menu")) return;
     if (!event.target?.closest?.(".toolbar-custom-select")) closeCustomFilters();
   });
 
@@ -10868,6 +10891,11 @@ function stableSortNodes() {
     const aActive = nodeIsConnected(a);
     const bActive = nodeIsConnected(b);
     if (aActive !== bActive) return aActive ? -1 : 1;
+
+    const standbyId = String(state?.standby_node_id || "");
+    const aStandby = !aActive && !!state?.standby_ready && nodeIsStandby(a, standbyId);
+    const bStandby = !bActive && !!state?.standby_ready && nodeIsStandby(b, standbyId);
+    if (aStandby !== bStandby) return aStandby ? -1 : 1;
 
     const aRank = statusRank[a.probe_status || "not_checked"] ?? 2;
     const bRank = statusRank[b.probe_status || "not_checked"] ?? 2;
@@ -11490,22 +11518,31 @@ async function testNode(btn, id, event){
       body: JSON.stringify({ id })
     }, 70000);
     if (result && result.node && result.node.id) {
+      if (!result.node.probe_status || result.node.probe_status === "not_checked") {
+        result.node.probe_status = result.ok ? "available" : "unavailable";
+      }
+      holdManualProbe(result.node);
       const idx = nodes.findIndex(n => n && n.id === id);
       if (idx !== -1) nodes[idx] = result.node;
     }
-    if (result && result.ok === false) {
+    if (result && result.ok === false && !(result.node && result.node.probe_status && result.node.probe_status !== "not_checked")) {
       const idx = nodes.findIndex(n => n && n.id === id);
       const msg = result.error || (result.result && result.result.error) || "检测没有执行";
       if (idx !== -1) {
-        nodes[idx] = Object.assign({}, nodes[idx], { probe_message: msg });
+        const next = Object.assign({}, nodes[idx], { probe_status: "unavailable", probe_message: msg });
+        holdManualProbe(next);
+        nodes[idx] = next;
       }
     }
   } catch (e) {
     const idx = nodes.findIndex(n => n && n.id === id);
     if (idx !== -1) {
-      nodes[idx] = Object.assign({}, nodes[idx], {
+      const next = Object.assign({}, nodes[idx], {
+        probe_status: "unavailable",
         probe_message: "手动检测失败：" + (e?.message || "请求超时")
       });
+      holdManualProbe(next);
+      nodes[idx] = next;
     }
   } finally {
     testingNodeIds.delete(id);
@@ -11619,13 +11656,39 @@ function nodeLoadYield() {
   });
 }
 
+function nodeIsStandby(n, standbyId) {
+  if (!n || !standbyId) return false;
+  if (n.id === standbyId || n.pool_endpoint_id === standbyId) return true;
+  const ip = String(state?.standby_ip || "").trim();
+  const port = String(state?.standby_port || "");
+  const nodeIp = String(n.ip || n.remote_host || "").trim();
+  const nodePort = String(displayNodePort(n) || n.remote_port || n.port || "");
+  return !!(ip && nodeIp === ip && (!port || nodePort === port));
+}
+
+const manualProbeHold = new Map();
+function holdManualProbe(node) {
+  if (!node || !node.id) return;
+  manualProbeHold.set(node.id, { until: Date.now() + 20000, node });
+}
+function applyManualProbeHold(pageNodes) {
+  const now = Date.now();
+  return pageNodes.map(n => {
+    const hold = n && manualProbeHold.get(n.id);
+    if (hold && hold.until > now) return Object.assign({}, n, hold.node);
+    if (hold && hold.until <= now) manualProbeHold.delete(n.id);
+    return n;
+  });
+}
+
 function mergeLoadedNodePage(pageNodes) {
   if (!Array.isArray(pageNodes) || !pageNodes.length) return;
-  const incoming = new Map(pageNodes.map((n, idx) => [
+  const page = applyManualProbeHold(pageNodes);
+  const incoming = new Map(page.map((n, idx) => [
     String(n?.id || n?.pool_endpoint_id || "__page_" + idx), n
   ]));
   nodes = nodes.filter(n => !incoming.has(String(n?.id || n?.pool_endpoint_id || "")));
-  nodes.push(...pageNodes);
+  nodes.push(...page);
   stableSortNodes();
 }
 
@@ -12445,7 +12508,15 @@ async function refreshFilterCounts() {
   }
 }
 
-async function applyNodeFilterChange() {
+async function applyNodeFilterChange(event) {
+  const fromStatus = event?.target?.id === "status_filter";
+  if (!fromStatus) {
+    const select = $("status_filter");
+    if (select && select.value !== "all") {
+      select.value = "all";
+      renderCustomFilter("status_filter");
+    }
+  }
   currentPage = 1;
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
@@ -12456,6 +12527,11 @@ async function applyNodeFilterChange() {
 }
 
 $("country_filter").onchange=async()=>{
+  const statusSelect = $("status_filter");
+  if (statusSelect && statusSelect.value !== "all") {
+    statusSelect.value = "all";
+    renderCustomFilter("status_filter");
+  }
   const country = String($("country_filter").value || "").trim();
   activeCountryScope = country;
   currentPage = 1;
@@ -16349,35 +16425,47 @@ class Handler(BaseHTTPRequestHandler):
                     # click looked dead. Run the same real tunnel test the
                     # full sweep uses, and write it back onto this endpoint id.
                     if protocol == "openvpn":
-                        if not maintenance_lock.acquire(timeout=20):
-                            self.send_json({"ok": False, "error": "OpenVPN 检测正被全量检测占用，请稍后再点一次"}, HTTPStatus.CONFLICT)
-                            return
+                        locked = maintenance_lock.acquire(timeout=1.5)
+                        updated = {}
+                        ok = False
                         try:
                             ovpn_id = ensure_openvpn_node_from_pool(endpoint)
-                            updated = test_node_by_id(ovpn_id)
-                            ok = str((updated or {}).get("probe_status") or "") == "available"
+                            updated = test_node_by_id(ovpn_id) or {}
+                            ok = str(updated.get("probe_status") or "") == "available"
                             node_pool.record_endpoint_probe(
                                 endpoint_id,
                                 ok,
-                                int((updated or {}).get("latency_ms") or 0),
-                                str((updated or {}).get("probe_message") or ""),
-                                speed_bps=int((updated or {}).get("speed_bps") or (updated or {}).get("speed") or 0),
+                                int(updated.get("latency_ms") or 0),
+                                str(updated.get("probe_message") or ""),
+                                speed_bps=int(updated.get("speed_bps") or updated.get("speed") or 0),
                             )
-                            fresh = node_pool.get_endpoint(endpoint_id)
-                            node = protocol_endpoint_to_ui_node(fresh) if fresh else {}
-                            if node and (updated or {}).get("probe_message"):
-                                node["probe_message"] = str(updated.get("probe_message") or "")
-                            self.send_json({"ok": ok, "node": node})
                         except Exception as exc:
-                            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                            ok = False
+                            try:
+                                node_pool.record_endpoint_probe(endpoint_id, False, 0, str(exc))
+                            except Exception:
+                                pass
+                            updated = {"probe_status": "unavailable", "probe_message": str(exc)}
                         finally:
-                            maintenance_lock.release()
+                            if locked:
+                                maintenance_lock.release()
+                        _drop_ui_page_snapshots()
+                        fresh = node_pool.get_endpoint(endpoint_id)
+                        node = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+                        if node:
+                            node["probe_message"] = str(updated.get("probe_message") or node.get("probe_message") or "")
+                            if str(node.get("probe_status") or "") == "not_checked":
+                                node["probe_status"] = "available" if ok else "unavailable"
+                        self.send_json({"ok": ok, "node": node})
                         return
                     result = probe_pool_endpoint(endpoint_id)
+                    _drop_ui_page_snapshots()
                     endpoint = node_pool.get_endpoint(endpoint_id)
                     node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
                     if node and not result.get("ok"):
                         node["probe_message"] = str(result.get("error") or node.get("probe_message") or "检测没有执行")
+                    if node and str(node.get("probe_status") or "") == "not_checked":
+                        node["probe_status"] = "available" if result.get("ok") else "unavailable"
                     self.send_json({"ok": bool(result.get("ok")), "node": node, "result": result}, HTTPStatus.OK)
                     return
                 if not maintenance_lock.acquire(blocking=False):
@@ -16590,6 +16678,14 @@ def _refresh_ui_nodes_cache_async(force=False):
         ui_nodes_cache_building = True
     threading.Thread(target=_build_ui_nodes_cache, daemon=True, name="ui-node-cache").start()
 
+def _drop_ui_page_snapshots() -> None:
+    with _first_page_snapshot_lock:
+        _first_page_snapshot.clear()
+    try:
+        node_pool.invalidate_scoped_pages()
+    except Exception:
+        pass
+
 def _invalidate_ui_nodes_cache() -> None:
     global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
     with ui_nodes_cache_lock:
@@ -16609,13 +16705,21 @@ def _sort_ui_nodes_for_page(nodes):
     now = time.time()
 
     def key(n):
-        active = 0
+        active = 2
         if active_pool_endpoint_id and n.get("pool_endpoint_id") == active_pool_endpoint_id:
             active = 0
         elif (not active_pool_endpoint_id and n.get("id") == active_openvpn_node_id):
             active = 0
         else:
-            active = 1
+            standby = get_state()
+            standby_id = str(standby.get("standby_node_id") or "")
+            standby_ip = str(standby.get("standby_ip") or "")
+            standby_port = parse_int(standby.get("standby_port"))
+            if standby.get("standby_ready") and standby_id and (
+                n.get("id") == standby_id or n.get("pool_endpoint_id") == standby_id
+                or (standby_ip and str(n.get("ip") or "") == standby_ip and (not standby_port or parse_int(n.get("remote_port")) == standby_port))
+            ):
+                active = 1
         status = str(n.get("probe_status") or "not_checked").lower()
         manual_ts = float(n.get("manual_added_at") or 0)
         recent = 0 if manual_ts > 0 and (now - manual_ts) <= 3600 else 1
@@ -16731,6 +16835,27 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
                 active_ip = parts[0].strip()
                 active_port = int(parts[1])
                 active_protocol = "openvpn"
+        standby_state = get_state()
+        standby_endpoint_id = ""
+        standby_ip = str(standby_state.get("standby_ip") or "").strip()
+        standby_protocol = str(standby_state.get("standby_protocol") or "openvpn").strip().lower()
+        standby_port = parse_int(standby_state.get("standby_port"))
+        if standby_state.get("standby_ready"):
+            standby_id = str(standby_state.get("standby_node_id") or "")
+            if standby_id.startswith("pool:"):
+                standby_endpoint_id = standby_id[5:]
+            else:
+                found = node_pool.get_endpoint(standby_id) if standby_id else None
+                if found:
+                    standby_endpoint_id = standby_id
+                    standby_ip = standby_ip or str(found.get("current_ip") or "")
+                    standby_port = standby_port or parse_int(found.get("port"))
+                    standby_protocol = str(found.get("protocol") or standby_protocol)
+                else:
+                    parts = standby_id.rsplit("_", 2)
+                    if len(parts) == 3 and str(parts[1]).isdigit():
+                        standby_ip = standby_ip or parts[0].strip()
+                        standby_port = standby_port or int(parts[1])
         scoped_endpoints, endpoint_total = node_pool.list_endpoints_scoped(
             country=country,
             status=status,
@@ -16744,6 +16869,10 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
             active_ip=active_ip,
             active_protocol=active_protocol,
             active_port=active_port,
+            standby_endpoint_id=standby_endpoint_id,
+            standby_ip=standby_ip,
+            standby_protocol=standby_protocol,
+            standby_port=standby_port,
         )
         scoped_nodes = [
             protocol_endpoint_to_ui_node(endpoint)
