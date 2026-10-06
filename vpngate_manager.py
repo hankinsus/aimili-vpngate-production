@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.27"
+APP_VERSION = "V1.0.28"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7733,14 +7733,28 @@ INDEX_HTML = r"""<!doctype html>
     }
     .toolbar-custom-option-count {
       color: var(--text-secondary);
-      font-size: 13px;
+      font-size: 12px;
       font-weight: 500;
       line-height: 1;
-      min-width: 58px;
+      min-width: 0;
       text-align: right;
-      flex: 0 0 62px;
+      flex: 0 0 auto;
       white-space: nowrap;
     }
+    .toolbar-custom-select-menu .toolbar-custom-option {
+      min-height: 34px;
+      padding: 0 8px;
+      gap: 6px;
+      font-size: 13px;
+    }
+    .toolbar-custom-select-menu .country-flag-img,
+    .toolbar-custom-select-menu .country-flag-fallback {
+      width: 18px;
+      height: 13px;
+      min-width: 18px;
+      flex-basis: 18px;
+    }
+    #network_modal .modal-content { max-width: 560px; padding: 22px 18px; }
 
     .toolbar input {
       flex: 1;
@@ -10280,7 +10294,7 @@ function renderUnifiedSelect(selectId) {
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') + '"' +
       (disabled ? ' disabled style="opacity:.45;cursor:not-allowed;"' : '') +
       ' role="option" aria-selected="' + (active ? 'true' : 'false') + '"' +
-      ' onclick="event.preventDefault();event.stopPropagation();chooseUnifiedSelect(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
+      ' data-unified-option="1" data-select-id="' + esc(selectId) + '" data-value="' + esc(value) + '">' +
       unifiedOptionMarkup(selectId, value, textValue, active) + '</button>';
   }).join("");
   if (menu.innerHTML !== html) menu.innerHTML = html;
@@ -10330,25 +10344,7 @@ function toggleUnifiedSelect(selectId, event) {
       document.body.appendChild(menu);
     }
     menu.style.display = "block";
-    requestAnimationFrame(() => {
-      const rect = widget.getBoundingClientRect();
-      const menuHeight = Math.min(menu.scrollHeight || 280, Math.min(360, window.innerHeight - 24));
-      const spaceBelow = window.innerHeight - rect.bottom - 10;
-      const spaceAbove = rect.top - 10;
-      const openUp = menuHeight > spaceBelow && spaceAbove >= menuHeight;
-      const top = openUp ? Math.max(8, rect.top - menuHeight - 8) : Math.min(window.innerHeight - menuHeight - 8, rect.bottom + 8);
-      const left = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - rect.width - 8));
-      menu.style.position = "fixed";
-      const menuWidth = Math.max(rect.width, selectId === "net_force_country" ? 280 : 160);
-      const safeLeft = Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - menuWidth - 8));
-      menu.style.left = safeLeft + "px";
-      menu.style.width = menuWidth + "px";
-      menu.style.minWidth = "0";
-      menu.style.maxWidth = (window.innerWidth - 16) + "px";
-      menu.style.top = top + "px";
-      menu.style.bottom = "auto";
-      menu.style.zIndex = "120000";
-    });
+    placeAnchoredMenu(menu, button || widget);
   }
 }
 
@@ -10362,6 +10358,26 @@ function chooseUnifiedSelect(selectId, value) {
   if (selectId === "log_filter_select") filterAndRenderLogs();
   renderUnifiedSelect(selectId);
   closeUnifiedSelects("");
+}
+
+function placeAnchoredMenu(menu, trigger) {
+  const rect = trigger.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  menu.style.position = "fixed";
+  menu.style.boxSizing = "border-box";
+  menu.style.left = Math.round(rect.left) + "px";
+  menu.style.right = "auto";
+  menu.style.width = width + "px";
+  menu.style.minWidth = width + "px";
+  menu.style.maxWidth = width + "px";
+  menu.style.maxHeight = "280px";
+  menu.style.zIndex = "200000";
+  menu.style.display = "block";
+  const menuHeight = Math.min(menu.scrollHeight || 240, 280);
+  const spaceBelow = window.innerHeight - rect.bottom - 8;
+  const openUp = menuHeight > spaceBelow && rect.top > menuHeight + 8;
+  menu.style.top = Math.round(openUp ? Math.max(8, rect.top - menuHeight - 4) : rect.bottom + 4) + "px";
+  menu.style.bottom = "auto";
 }
 
 function bindUnifiedSelectEvents() {
@@ -10460,8 +10476,7 @@ function renderCustomFilter(selectId, withCount = false, forceMenu = false) {
     const flagMarkup = withCount ? (value ? countryFlag(value, name, active ? "eager" : "lazy") : countryFlag("")) : "";
     return '<button type="button" class="toolbar-custom-option ' + (active ? 'active' : '') +
       '" role="option" aria-selected="' + (active ? 'true' : 'false') +
-      '" data-filter-option="1" data-filter-value="' + esc(value) + '"' +
-      ' onclick="event.preventDefault();event.stopPropagation();chooseCustomFilter(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
+      '" data-filter-option="1" data-filter-id="' + esc(selectId) + '" data-filter-value="' + esc(value) + '">' +
       '<span class="toolbar-custom-option-label">' +
       flagMarkup + '<span class="toolbar-custom-option-name">' + esc(name) + '</span>' +
       '</span>' +
@@ -10560,24 +10575,8 @@ function toggleCustomFilter(selectId, event) {
     const trigger = button || widget;
     if (menu && trigger) {
       if (menu.parentElement !== document.body) document.body.appendChild(menu);
-      const rect = trigger.getBoundingClientRect();
-      const width = Math.ceil(Math.max(rect.width, selectId === "country_filter" ? 220 : 168));
-      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
-      menu.style.position = "fixed";
-      menu.style.left = left + "px";
-      menu.style.right = "auto";
-      menu.style.width = width + "px";
-      menu.style.minWidth = width + "px";
-      menu.style.maxWidth = width + "px";
-      menu.style.boxSizing = "border-box";
-      menu.style.zIndex = "200000";
-      menu.style.display = "block";
-      const menuHeight = Math.min(menu.scrollHeight || 280, 320);
-      const spaceBelow = window.innerHeight - rect.bottom - 12;
-      const openUp = menuHeight > spaceBelow && rect.top > spaceBelow;
-      menu.style.top = (openUp ? Math.max(8, rect.top - menuHeight - 6) : rect.bottom + 6) + "px";
-      const active = menu.querySelector(".toolbar-custom-option.active");
-      if (active) menu.scrollTop = Math.max(0, active.offsetTop - 6);
+      menu.dataset.filterId = selectId;
+      placeAnchoredMenu(menu, trigger);
     }
   }
 }
@@ -10608,14 +10607,19 @@ function bindCustomFilterEvents() {
   document.body.dataset.customFilterEventsBound = "1";
 
   document.addEventListener("click", event => {
+    const unified = event.target?.closest?.("[data-unified-option]");
+    if (unified && !unified.disabled) {
+      event.preventDefault();
+      event.stopPropagation();
+      chooseUnifiedSelect(unified.dataset.selectId || "", unified.dataset.value || "");
+      return;
+    }
     const option = event.target?.closest?.(".toolbar-custom-option[data-filter-option]");
     if (option) {
-      const widget = option.closest(".toolbar-custom-select");
-      const selectId = widget?.dataset?.filterId || "";
-      if (selectId) {
-        event.preventDefault();
-        chooseCustomFilter(selectId, option.dataset.filterValue || "");
-      }
+      event.preventDefault();
+      event.stopPropagation();
+      const selectId = option.dataset.filterId || option.closest(".toolbar-custom-select-menu")?.dataset?.filterId || "";
+      if (selectId) chooseCustomFilter(selectId, option.dataset.filterValue || "");
       return;
     }
 
