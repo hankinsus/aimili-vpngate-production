@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.26"
+APP_VERSION = "V1.0.27"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -10576,10 +10576,9 @@ function toggleCustomFilter(selectId, event) {
       const spaceBelow = window.innerHeight - rect.bottom - 12;
       const openUp = menuHeight > spaceBelow && rect.top > spaceBelow;
       menu.style.top = (openUp ? Math.max(8, rect.top - menuHeight - 6) : rect.bottom + 6) + "px";
+      const active = menu.querySelector(".toolbar-custom-option.active");
+      if (active) menu.scrollTop = Math.max(0, active.offsetTop - 6);
     }
-    const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
-    const menu = $(cfg.menu);
-    if (active && menu) menu.scrollTop = Math.max(0, active.offsetTop - 6);
   }
 }
 
