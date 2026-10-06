@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.28"
+APP_VERSION = "V1.0.29"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7754,7 +7754,7 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 18px;
       flex-basis: 18px;
     }
-    #network_modal .modal-content { max-width: 560px; padding: 22px 18px; }
+    #network_modal .modal-content { max-width: 560px; padding: 22px 18px 120px; }
 
     .toolbar input {
       flex: 1;
@@ -9616,7 +9616,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
 
-          <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
+          <div id="net_routing_warning" style="font-size: 13px; color: var(--text-secondary); line-height: 1.7; padding: 14px 16px; min-height: 78px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px; margin-top: 12px;">
             ℹ️ <strong>服务可用性优先</strong>：国家和 IP 类型作为偏好，不作为硬锁定。系统按“目标国家 → IP 类型 → 稳定性 → 延迟 → 带宽”选择；目标暂时不可用时自动回退到同区域或全网可用节点，目标恢复后自动切回。
           </div>
         </div>
@@ -10363,6 +10363,11 @@ function chooseUnifiedSelect(selectId, value) {
 function placeAnchoredMenu(menu, trigger) {
   const rect = trigger.getBoundingClientRect();
   const width = Math.max(1, Math.round(rect.width));
+  const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - 12);
+  const spaceAbove = Math.max(0, rect.top - 12);
+  const openUp = spaceBelow < 200 && spaceAbove > spaceBelow;
+  const room = Math.floor(openUp ? spaceAbove : spaceBelow);
+  const maxH = Math.max(96, Math.min(320, room || 160));
   menu.style.position = "fixed";
   menu.style.boxSizing = "border-box";
   menu.style.left = Math.round(rect.left) + "px";
@@ -10370,13 +10375,11 @@ function placeAnchoredMenu(menu, trigger) {
   menu.style.width = width + "px";
   menu.style.minWidth = width + "px";
   menu.style.maxWidth = width + "px";
-  menu.style.maxHeight = "280px";
+  menu.style.maxHeight = maxH + "px";
+  menu.style.overflowY = "auto";
   menu.style.zIndex = "200000";
   menu.style.display = "block";
-  const menuHeight = Math.min(menu.scrollHeight || 240, 280);
-  const spaceBelow = window.innerHeight - rect.bottom - 8;
-  const openUp = menuHeight > spaceBelow && rect.top > menuHeight + 8;
-  menu.style.top = Math.round(openUp ? Math.max(8, rect.top - menuHeight - 4) : rect.bottom + 4) + "px";
+  menu.style.top = Math.round(openUp ? Math.max(8, rect.top - maxH - 4) : rect.bottom + 4) + "px";
   menu.style.bottom = "auto";
 }
 
@@ -10393,6 +10396,18 @@ function bindUnifiedSelectEvents() {
     if (!event.target?.closest?.(".unified-select")) closeUnifiedSelects("");
   });
   window.addEventListener("resize", () => closeUnifiedSelects(""));
+  const modalBody = document.querySelector("#network_modal .modal-content");
+  if (modalBody && modalBody.dataset.menuScrollBound !== "1") {
+    modalBody.dataset.menuScrollBound = "1";
+    modalBody.addEventListener("scroll", () => {
+      document.querySelectorAll(".unified-select.open").forEach(widget => {
+        const selectId = widget.getAttribute("data-unified-select-id");
+        const menu = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].menu) : null;
+        const button = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].button) : null;
+        if (menu && button) placeAnchoredMenu(menu, button);
+      });
+    }, {passive: true});
+  }
 }
 
 function syncUnifiedSelect(selectId) { renderUnifiedSelect(selectId); }
@@ -11324,11 +11339,11 @@ function render(){
       const nodeAddress = (listIp || "-") + (displayPort ? ":" + displayPort : "");
 
       const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
-      const hotStandby = !isCurrentlyActive && (!!n.hot_standby || (!!state.standby_ready && !!state.standby_node_id && n.id === state.standby_node_id));
+      const hotStandby = !isCurrentlyActive && nodeIsStandby(n, state?.standby_node_id);
       const statusCell = isCurrentlyActive
         ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
         : hotStandby
-          ? `<span class="badge available"><span class="badge-pulse"></span>热备</span>`
+          ? `<span class="badge available"><span class="badge-pulse"></span>备连接</span>`
           : canRetest
             ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "点击立即检测此节点")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
             : `<span class="badge ${badgeClass}">${badgeText}</span>`;
@@ -11667,13 +11682,19 @@ function nodeLoadYield() {
 }
 
 function nodeIsStandby(n, standbyId) {
-  if (!n || !standbyId) return false;
-  if (n.id === standbyId || n.pool_endpoint_id === standbyId) return true;
+  if (!n) return false;
+  const id = String(standbyId || state?.standby_node_id || "");
+  const poolId = id.indexOf("pool:") === 0 ? id.slice(5) : id;
+  if (id && (n.id === id || n.pool_endpoint_id === id || n.pool_endpoint_id === poolId || n.id === poolId)) return true;
+  if (!state?.standby_ready) return false;
   const ip = String(state?.standby_ip || "").trim();
   const port = String(state?.standby_port || "");
+  const protocol = String(state?.standby_protocol || "").toLowerCase();
+  const nodeProtocol = String(n.protocol || "").toLowerCase();
+  if (protocol && nodeProtocol && protocol !== nodeProtocol) return false;
   const nodeIp = String(n.ip || n.remote_host || "").trim();
-  const nodePort = String(displayNodePort(n) || n.remote_port || n.port || "");
-  return !!(ip && nodeIp === ip && (!port || nodePort === port));
+  const nodePort = String(n.port || n.remote_port || "");
+  return !!(ip && nodeIp === ip && (!port || nodePort === port || String(displayNodePort(n) || "") === port));
 }
 
 const manualProbeHold = new Map();
@@ -13283,12 +13304,23 @@ async function saveNetwork(e) {
           window.location.reload();
         }, 4000);
       } else {
-        successDiv.textContent = "配置保存成功，已即时生效！";
+        successDiv.textContent = data.message || "配置保存成功，已即时生效！";
         successDiv.style.display = "block";
+        const countrySelect = $("country_filter");
+        if (countrySelect && routingMode === "fixed_region") countrySelect.value = forceCountry || "";
+        const protocolSelect = $("protocol_filter");
+        if (protocolSelect) protocolSelect.value = routingProtocol || "";
+        const ipSelect = $("ip_type_filter");
+        if (ipSelect) ipSelect.value = routingIpType && routingIpType !== "all" ? routingIpType : "";
+        const speedSelect = $("speed_filter");
+        if (speedSelect) speedSelect.value = String(routingMinSpeed || 0);
+        const latencySelect = $("latency_filter");
+        if (latencySelect) latencySelect.value = routingLatency || "";
+        if (typeof renderAllCustomFilters === "function") renderAllCustomFilters();
         setTimeout(() => {
           closeNetworkModal();
           load();
-        }, 1500);
+        }, data.switching ? 2200 : 800);
       }
     } else {
       errorDivEl.textContent = data.error || "保存失败，请检查输入";
@@ -15097,7 +15129,7 @@ class Handler(BaseHTTPRequestHandler):
                 snap_at = float((snap or {}).get("at") or 0)
                 if snap_body and time.time() - snap_at < 60:
                     body = dict(snap_body)
-                    body["nodes"] = list(body.get("nodes") or [])[:limit]
+                    body["nodes"] = _pin_connected_then_standby(list(body.get("nodes") or [])[:limit])
                     body["limit"] = limit
                     self.send_json(body)
                     return
@@ -15149,6 +15181,8 @@ class Handler(BaseHTTPRequestHandler):
                     page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
                         offset, limit, country, status, protocol, ip_type, speed_min_bps, latency
                     )
+                if offset == 0 and status not in ("connected", "standby"):
+                    page_nodes = _pin_connected_then_standby(page_nodes)
                 body = {
                     "ok": True,
                     "nodes": page_nodes,
@@ -15954,8 +15988,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
-                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0 or ui_cfg.get("routing_latency"):
-                    threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
+                switching = False
+                if routing_mode != "fixed_ip" and (
+                    routing_mode == "fixed_region"
+                    or routing_ip_type != "all"
+                    or ui_cfg.get("routing_protocol")
+                    or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0
+                    or ui_cfg.get("routing_latency")
+                    or routing_mode == "favorites"
+                ):
+                    current = current_active_routing_endpoint()
+                    switching = not (current and endpoint_matches_explicit_routing(current, ui_cfg))
+                    if switching:
+                        threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
                 if restart_needed:
@@ -15968,8 +16013,8 @@ class Handler(BaseHTTPRequestHandler):
 
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
-                    message = policy_message or "配置更新成功，已即时生效！"
-                    self.send_json({"ok": True, "restart_needed": False, "message": message})
+                    message = policy_message or ("配置已保存，正在按新筛选切换出口" if switching else "配置已保存，当前出口已符合筛选")
+                    self.send_json({"ok": True, "restart_needed": False, "switching": switching, "message": message})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -16804,6 +16849,71 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     if status == "unavailable":
         return str(node.get("probe_status") or "").lower() == "unavailable" and not bool(node.get("active"))
     return True
+
+
+def _ui_node_is_live_standby(node: dict[str, Any], standby_state: dict[str, Any]) -> bool:
+    if not node or not standby_state.get("standby_ready"):
+        return False
+    sid = str(standby_state.get("standby_node_id") or "")
+    pool_id = sid[5:] if sid.startswith("pool:") else sid
+    node_ids = {str(node.get("id") or ""), str(node.get("pool_endpoint_id") or "")}
+    if sid and node_ids.intersection({sid, pool_id}):
+        return True
+    ip = str(standby_state.get("standby_ip") or "").strip()
+    port = parse_int(standby_state.get("standby_port"))
+    protocol = str(standby_state.get("standby_protocol") or "").strip().lower()
+    if protocol and str(node.get("protocol") or "").strip().lower() != protocol:
+        return False
+    return bool(ip) and str(node.get("ip") or "").strip() == ip and (not port or parse_int(node.get("port")) == port)
+
+
+def _load_live_standby_ui_node(standby_state: dict[str, Any]) -> dict[str, Any] | None:
+    sid = str(standby_state.get("standby_node_id") or "")
+    if not sid:
+        return None
+    lookup = sid[5:] if sid.startswith("pool:") else sid
+    endpoint = node_pool.get_endpoint(lookup)
+    if not endpoint:
+        parts = sid.rsplit("_", 2)
+        if len(parts) == 3 and str(parts[1]).isdigit():
+            found = node_pool.find_endpoint_id(parts[0], int(parts[1]), str(standby_state.get("standby_protocol") or "openvpn"))
+            if found:
+                endpoint = node_pool.get_endpoint(found)
+    if not endpoint:
+        return None
+    node = protocol_endpoint_to_ui_node(endpoint)
+    return dict(node) if node else None
+
+
+def _pin_connected_then_standby(page_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the live exit first and its hot standby directly underneath."""
+    nodes = [dict(node) for node in (page_nodes or []) if node]
+    standby_state = get_state()
+    active_ids = {str(active_pool_endpoint_id or ""), str(active_openvpn_node_id or "")}
+    active_ids.discard("")
+
+    def is_active(node: dict[str, Any]) -> bool:
+        ids = {str(node.get("id") or ""), str(node.get("pool_endpoint_id") or "")}
+        return bool(node.get("active")) or bool(active_ids and ids.intersection(active_ids))
+
+    active = next((node for node in nodes if is_active(node)), None)
+    rest = [node for node in nodes if node is not active]
+    standby = next((node for node in rest if _ui_node_is_live_standby(node, standby_state)), None)
+    if standby is not None:
+        rest = [node for node in rest if node is not standby]
+    elif standby_state.get("standby_ready"):
+        standby = _load_live_standby_ui_node(standby_state)
+        if standby and active and {str(standby.get("id") or ""), str(standby.get("pool_endpoint_id") or "")} & {str(active.get("id") or ""), str(active.get("pool_endpoint_id") or "")}:
+            standby = None
+    ordered: list[dict[str, Any]] = []
+    if active:
+        ordered.append(active)
+    if standby:
+        standby = dict(standby)
+        standby["standby_row"] = True
+        ordered.append(standby)
+    ordered.extend(rest)
+    return ordered
 
 
 def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type="", speed_min_bps=0, latency=""):
