@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.19"
+APP_VERSION = "V1.0.20"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -636,6 +636,8 @@ def load_ui_config() -> dict[str, Any]:
             "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
+            "routing_protocol": "",
+            "routing_min_speed_bps": 0,
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
@@ -648,7 +650,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -1048,6 +1050,8 @@ def get_state() -> dict[str, Any]:
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
+    state["routing_protocol"] = str(ui_cfg.get("routing_protocol") or "")
+    state["routing_min_speed_bps"] = int(ui_cfg.get("routing_min_speed_bps") or 0)
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
@@ -3138,11 +3142,31 @@ def ip_type_preference_rank(preferred: str, actual: Any) -> int:
     ranks = {
         "all": {"mobile": 0, "residential": 1, "hosting": 2, "proxy": 3, "unknown": 4},
         "mobile": {"mobile": 0, "residential": 1, "hosting": 2, "proxy": 3, "unknown": 4},
-        "residential": {"residential": 0, "mobile": 1, "hosting": 2, "proxy": 3, "unknown": 4},
+        "residential": {"residential": 0, "mobile": 0, "hosting": 2, "proxy": 3, "unknown": 4},
         "hosting": {"hosting": 0, "mobile": 1, "residential": 2, "proxy": 3, "unknown": 4},
     }
     return ranks.get(preferred, ranks["all"]).get(actual, 4)
 
+
+ROUTING_PROTOCOL_CHOICES = {"", "openvpn", "softether", "sstp", "l2tp-ipsec"}
+ROUTING_SPEED_CHOICES = {0, 50_000_000, 100_000_000, 300_000_000, 500_000_000, 700_000_000, 1_000_000_000}
+
+def normalize_routing_protocol(value: Any) -> str:
+    protocol = str(value or "").strip().lower()
+    if protocol in ("all", "any"):
+        protocol = ""
+    if protocol not in ROUTING_PROTOCOL_CHOICES:
+        raise ValueError("无效的协议筛选")
+    return protocol
+
+def normalize_routing_min_speed(value: Any) -> int:
+    try:
+        speed = int(value or 0)
+    except (TypeError, ValueError):
+        raise ValueError("无效的速度筛选")
+    if speed not in ROUTING_SPEED_CHOICES:
+        raise ValueError("无效的速度筛选")
+    return speed
 
 def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
     meta = endpoint.get("server_metadata") or {}
@@ -3379,6 +3403,37 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
             local = [ep for ep in before_speed_preference if normalized_country_name(ep.get("country")) == pinned_country]
         if local:
             candidates = local
+
+    # 住宅 IP 同时接受移动网。两边都没有可用节点时才回退到机房。
+    ip_pref = str(ui_cfg.get("routing_ip_type") or "all").lower()
+    if ip_pref == "residential":
+        home = [
+            ep for ep in candidates
+            if str(endpoint_ip_type(ep) or "").lower() in ("residential", "mobile")
+        ]
+        if home:
+            candidates = home
+
+    # 协议和速度与首页筛选项相同，但出站不能因为筛空就断线，所以筛空时回退。
+    preferred_protocol = str(protocol or "").strip().lower() or str(ui_cfg.get("routing_protocol") or "").strip().lower()
+    if preferred_protocol and not str(protocol or "").strip():
+        matched = [
+            ep for ep in candidates
+            if str(ep.get("protocol") or "").lower() == preferred_protocol
+        ]
+        if matched:
+            candidates = matched
+    try:
+        min_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        min_speed = 0
+    if min_speed > 0:
+        fast = [
+            ep for ep in candidates
+            if int(ep.get("latest_speed") or ep.get("speed") or 0) >= min_speed
+        ]
+        if fast:
+            candidates = fast
 
     candidates.sort(key=lambda endpoint: routing_service_key(endpoint, ui_cfg))
     return candidates[:max(1, min(int(limit), 100))]
@@ -7336,6 +7391,11 @@ INDEX_HTML = r"""<!doctype html>
     }
     .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
     .unified-select-full { width: 100%; height: 40px; }
+    #network_modal .toolbar-custom-select.unified-select-full {
+      width: 100%;
+      max-width: none;
+      flex: 1 1 auto;
+    }
     .unified-select-sync { width: 112px; height: 40px; flex: 0 0 112px; }
     .unified-select-log { width: 156px; height: 32px; flex: 0 0 156px; }
     .unified-select .toolbar-custom-select-button {
@@ -9229,7 +9289,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Network Modal (代理及网络设置，包括出站路由) -->
   <div id="network_modal" class="modal">
-    <div class="modal-content" style="max-width: 480px;">
+    <div class="modal-content" style="max-width: 560px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -9289,6 +9349,44 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label" for="net_routing_protocol">协议类型</label>
+            <select id="net_routing_protocol" aria-hidden="true" tabindex="-1" style="display:none;">
+              <option value="">所有协议</option>
+              <option value="openvpn">OpenVPN</option>
+              <option value="softether">SSL-VPN</option>
+              <option value="sstp">SSTP</option>
+              <option value="l2tp-ipsec">L2TP/IPsec</option>
+            </select>
+            <div id="net_routing_protocol_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_protocol" aria-label="协议类型">
+              <button id="net_routing_protocol_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                <span id="net_routing_protocol_label" class="toolbar-custom-select-label">所有协议</span>
+                <span class="toolbar-custom-select-arrow">⌄</span>
+              </button>
+              <div id="net_routing_protocol_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label" for="net_routing_min_speed">速度</label>
+            <select id="net_routing_min_speed" aria-hidden="true" tabindex="-1" style="display:none;">
+              <option value="0">不限速度</option>
+              <option value="50000000">≥50 Mbps</option>
+              <option value="100000000">≥100 Mbps</option>
+              <option value="300000000">≥300 Mbps</option>
+              <option value="500000000">≥500 Mbps</option>
+              <option value="700000000">≥700 Mbps</option>
+              <option value="1000000000">≥1 Gbps</option>
+            </select>
+            <div id="net_routing_min_speed_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_min_speed" aria-label="速度">
+              <button id="net_routing_min_speed_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">不限速度</span>
+                <span class="toolbar-custom-select-arrow">⌄</span>
+              </button>
+              <div id="net_routing_min_speed_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">IP 出站类型偏好</label>
             <input type="hidden" id="net_routing_ip_type" value="all">
             <div class="option-group" id="routing_ip_type_group">
@@ -9298,7 +9396,7 @@ INDEX_HTML = r"""<!doctype html>
               </div>
               <div class="option-card" data-value="residential" onclick="setRoutingIpType('residential')">
                 <div class="option-card-title">住宅 IP</div>
-                <div class="option-card-desc">优先家宽，不可用自动回退</div>
+                <div class="option-card-desc">住宅和移动网均可，不可用自动回退</div>
               </div>
               <div class="option-card" data-value="hosting" onclick="setRoutingIpType('hosting')">
                 <div class="option-card-title">机房IP</div>
@@ -9917,10 +10015,23 @@ const CUSTOM_FILTER_CONFIG = {
 
 const UNIFIED_SELECT_CONFIG = {
   net_force_country: {widget:"net_force_country_widget", button:"net_force_country_button", label:"net_force_country_label", menu:"net_force_country_menu"},
+  net_routing_protocol: {widget:"net_routing_protocol_widget", button:"net_routing_protocol_button", label:"net_routing_protocol_label", menu:"net_routing_protocol_menu"},
+  net_routing_min_speed: {widget:"net_routing_min_speed_widget", button:"net_routing_min_speed_button", label:"net_routing_min_speed_label", menu:"net_routing_min_speed_menu"},
   rs_sync_interval_unit: {widget:"rs_sync_interval_unit_widget", button:"rs_sync_interval_unit_button", label:"rs_sync_interval_unit_label", menu:"rs_sync_interval_unit_menu"},
   rs_edit_sync_unit: {widget:"rs_edit_sync_unit_widget", button:"rs_edit_sync_unit_button", label:"rs_edit_sync_unit_label", menu:"rs_edit_sync_unit_menu"},
   log_filter_select: {widget:"log_filter_select_widget", button:"log_filter_select_button", label:"log_filter_select_label", menu:"log_filter_select_menu"}
 };
+
+function unifiedOptionMarkup(selectId, value, textValue, active) {
+  if (selectId !== "net_force_country") return esc(textValue);
+  const parts = String(textValue).split(" · ");
+  const name = parts.shift() || textValue;
+  const count = parts.join(" · ");
+  const flag = value ? countryFlag(value, name, active ? "eager" : "lazy") : countryFlag("");
+  return '<span class="toolbar-custom-option-label">' + flag +
+    '<span class="toolbar-custom-option-name">' + esc(name) + '</span></span>' +
+    (count ? '<span class="toolbar-custom-option-count">' + esc(count) + '</span>' : '');
+}
 
 function renderUnifiedSelect(selectId) {
   const cfg = UNIFIED_SELECT_CONFIG[selectId];
@@ -9929,7 +10040,23 @@ function renderUnifiedSelect(selectId) {
   const menu = cfg ? $(cfg.menu) : null;
   if (!cfg || !select || !label || !menu) return;
   const selected = select.options[select.selectedIndex];
-  label.textContent = selected ? selected.textContent : "";
+  const selectedValue = selected ? String(selected.value || "") : "";
+  const selectedText = selected ? selected.textContent : "";
+  const withFlag = selectId === "net_force_country";
+  if (withFlag) {
+    const parts = String(selectedText).split(" · ");
+    const name = parts.shift() || selectedText;
+    const count = parts.join(" · ");
+    const flag = selectedValue ? countryFlag(selectedValue, name, "eager") : countryFlag("");
+    const selectedDisplay = flag +
+      '<span class="toolbar-custom-option-name">' + esc(name) + '</span>' +
+      (count ? '<span class="toolbar-custom-selected-count">· ' + esc(count) + '</span>' : '');
+    if (label.innerHTML !== selectedDisplay) label.innerHTML = selectedDisplay;
+  } else if (label.textContent !== selectedText) {
+    label.textContent = selectedText;
+  }
+  const widget = $(cfg.widget);
+  if (widget && widget.classList.contains("open")) return;
   const html = Array.from(select.options).map(option => {
     const value = String(option.value || "");
     const textValue = String(option.textContent || "");
@@ -9939,7 +10066,7 @@ function renderUnifiedSelect(selectId) {
       (disabled ? ' disabled style="opacity:.45;cursor:not-allowed;"' : '') +
       ' role="option" aria-selected="' + (active ? 'true' : 'false') + '"' +
       ' onclick="event.preventDefault();event.stopPropagation();chooseUnifiedSelect(' + JSON.stringify(selectId) + ',' + JSON.stringify(value) + ')">' +
-      '<span>' + esc(textValue) + '</span></button>';
+      unifiedOptionMarkup(selectId, value, textValue, active) + '</button>';
   }).join("");
   if (menu.innerHTML !== html) menu.innerHTML = html;
 }
@@ -12375,7 +12502,9 @@ async function toggleFavRouting() {
       body: JSON.stringify({
         routing_mode: newMode,
         force_country: state.force_country || "",
-        routing_ip_type: state.routing_ip_type || "all"
+        routing_ip_type: state.routing_ip_type || "all",
+        routing_protocol: state.routing_protocol || "",
+        routing_min_speed_bps: Number(state.routing_min_speed_bps || 0)
       })
     });
     const data = await res.json();
@@ -12463,32 +12592,35 @@ function handleRoutingModeChange(mode) {
 function populateRoutingCountries() {
   const select = $("net_force_country");
   if (!select) return;
-  // Country options come from the server-computed Master Pool catalog.
-  // Never derive them from the currently loaded/paginated node rows.
-  const catalog = countryCatalogData || { countries: {} };
-  const countMap = {};
-  Object.entries(catalog.countries || {}).forEach(([rawCountry, item]) => {
-    const country = translateCountry(rawCountry) || rawCountry;
-    const count = Number(item?.ip_count || 0);
-    if (country) countMap[country] = Math.max(Number(countMap[country] || 0), count);
-  });
-  Object.entries(COUNTRY_REGISTRY).forEach(([, item]) => {
-    const country=String(item?.zh||"").trim();
-    if(country && !(country in countMap)) countMap[country]=0;
-  });
-  const countries = Object.keys(countMap).sort((a,b) => {
-    const diff = countMap[b] - countMap[a];
-    return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
-  });
-  let html = '<option value="">请选择优先国家...</option>';
-  countries.forEach(c => {
-    html += `<option value="${esc(c)}">${esc(c)} ${countMap[c]}</option>`;
-  });
-  select.innerHTML = html;
-  if (state) {
-    select.value = state.force_country ? translateCountry(state.force_country) : "";
-  }
-  syncUnifiedSelect("net_force_country");
+  const applyCatalog = (catalog) => {
+    const merged = new Map();
+    Object.entries((catalog && catalog.countries) || {}).forEach(([rawCountry, item]) => {
+      const country = translateCountry(rawCountry) || rawCountry;
+      const count = Number(item?.ip_count || 0);
+      if (!country || count <= 0) return;
+      merged.set(country, Number(merged.get(country) || 0) + count);
+    });
+    const countries = Array.from(merged.keys()).sort((a, b) => {
+      const diff = merged.get(b) - merged.get(a);
+      return diff !== 0 ? diff : a.localeCompare(b, "zh-CN");
+    });
+    const total = Number(catalog?.total_ip_count || countries.reduce((sum, country) => sum + merged.get(country), 0));
+    let html = '<option value="">全球国家 · ' + total + ' IP</option>';
+    countries.forEach(c => {
+      html += '<option value="' + esc(c) + '">' + esc(c) + ' · ' + merged.get(c) + ' IP</option>';
+    });
+    const previous = select.value;
+    select.innerHTML = html;
+    const wanted = previous || (state && state.force_country ? translateCountry(state.force_country) : "");
+    select.value = Array.from(select.options).some(option => option.value === wanted) ? wanted : "";
+    syncUnifiedSelect("net_force_country");
+  };
+  applyCatalog(countryCatalogData || {countries: {}, total_ip_count: 0});
+  fetchJsonWithTimeout("./api/ui/country_catalog", {}, 8000)
+    .then(data => {
+      if (data && data.countries) applyCatalog(data);
+    })
+    .catch(() => {});
 }
 
 
@@ -12751,6 +12883,12 @@ function openNetworkModal() {
 
     selectOptionCard('routing_mode', mode);
     selectOptionCard('routing_ip_type', ipType);
+    const protocolSelect = $("net_routing_protocol");
+    const speedSelect = $("net_routing_min_speed");
+    if (protocolSelect) protocolSelect.value = state.routing_protocol || "";
+    if (speedSelect) speedSelect.value = String(state.routing_min_speed_bps || 0);
+    syncUnifiedSelect("net_routing_protocol");
+    syncUnifiedSelect("net_routing_min_speed");
     const upstreamEl = $("net_upstream_proxy_state");
     if (upstreamEl) upstreamEl.textContent = state.upstream_proxy_label || "系统默认网络（未设置自定义上游代理）";
   }
@@ -12779,6 +12917,8 @@ async function saveNetwork(e) {
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
+  const routingProtocol = $("net_routing_protocol")?.value || "";
+  const routingMinSpeed = Number($("net_routing_min_speed")?.value || 0);
 
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -12792,11 +12932,6 @@ async function saveNetwork(e) {
     return;
   }
 
-  if (routingMode === "fixed_region" && !forceCountry) {
-    errorDivEl.textContent = "请选择一个要锁定的目标国家";
-    errorDivEl.style.display = "block";
-    return;
-  }
   if (routingMode === "fixed_ip" && !(state && (state.active_openvpn_node_id || state.fixed_node_id))) {
     errorDivEl.textContent = "启用固定 IP 前，请先连接一个要锁定的节点";
     errorDivEl.style.display = "block";
@@ -12814,7 +12949,9 @@ async function saveNetwork(e) {
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+        routing_ip_type: routingIpType,
+        routing_protocol: routingProtocol,
+        routing_min_speed_bps: routingMinSpeed
       })
     });
 
@@ -15391,6 +15528,12 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                try:
+                    routing_protocol = normalize_routing_protocol(payload.get("routing_protocol"))
+                    routing_min_speed_bps = normalize_routing_min_speed(payload.get("routing_min_speed_bps"))
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
 
                 try:
                     new_proxy_port_int = int(new_proxy_port)
@@ -15403,9 +15546,6 @@ class Handler(BaseHTTPRequestHandler):
 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
-                    return
-                if routing_mode == "fixed_region" and not force_country:
-                    self.send_json({"ok": False, "error": "启用优先地区前，请先选择一个目标国家"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting", "mobile"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
@@ -15426,6 +15566,8 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["routing_protocol"] = routing_protocol
+                ui_cfg["routing_min_speed_bps"] = routing_min_speed_bps
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = True
                 if routing_mode == "fixed_ip":
@@ -15438,7 +15580,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
-                if routing_mode == "fixed_region" or routing_ip_type != "all":
+                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0:
                     threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
@@ -15470,11 +15612,20 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
-                if routing_mode == "fixed_region" and not force_country:
-                    self.send_json({"ok": False, "error": "启用优先地区前，请先选择一个目标国家"}, HTTPStatus.BAD_REQUEST)
-                    return
                 if routing_ip_type not in ("all", "residential", "hosting", "mobile"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    if "routing_protocol" in payload:
+                        routing_protocol = normalize_routing_protocol(payload.get("routing_protocol"))
+                    else:
+                        routing_protocol = normalize_routing_protocol(ui_cfg.get("routing_protocol"))
+                    if "routing_min_speed_bps" in payload:
+                        routing_min_speed_bps = normalize_routing_min_speed(payload.get("routing_min_speed_bps"))
+                    else:
+                        routing_min_speed_bps = normalize_routing_min_speed(ui_cfg.get("routing_min_speed_bps"))
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                     return
 
                 ui_cfg = load_ui_config()
@@ -15486,6 +15637,8 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["routing_protocol"] = routing_protocol
+                ui_cfg["routing_min_speed_bps"] = routing_min_speed_bps
                 ui_cfg["fav_fail_fallback"] = fav_fail_fallback
                 if routing_mode == "fixed_ip":
                     ui_cfg["fixed_node_id"] = fixed_node_id
@@ -15498,7 +15651,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "出站路由配置已更新")
-                if routing_mode == "fixed_region" or routing_ip_type != "all":
+                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0:
                     threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
 
                 self.send_json({"ok": True, "message": policy_message or "出站路由配置更新成功，偏好已即时应用，目标恢复后会自动切回！"})
