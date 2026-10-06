@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.45"
+APP_VERSION = "V1.0.46"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8343,18 +8343,23 @@ INDEX_HTML = r"""<!doctype html>
       flex: 0 0 18px;
     }
     #network_modal.modal {
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
       overflow-x: hidden;
       overflow-y: auto;
-      align-items: flex-start;
-      padding: 24px 12px;
+      padding: 20px 16px 40px;
+      overscroll-behavior: contain;
     }
     #network_modal .modal-content {
-      max-width: 600px;
-      width: min(600px, 100%);
-      margin: auto;
-      padding: 22px 18px 16px;
-      overflow: visible;
+      width: min(720px, 100%);
+      max-width: 720px;
       max-height: none;
+      margin: 0 auto;
+      flex: 0 0 auto;
+      padding: 22px 20px 18px;
+      overflow: visible;
+      scrollbar-gutter: auto;
     }
     #network_modal .unified-select {
       position: relative;
@@ -8566,6 +8571,22 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       max-width: 100%;
       overflow: hidden !important;
+    }
+    .pagination-meta {
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: center;
+      gap: 0;
+      min-width: 0;
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    .pool-summary {
+      margin-left: 14px;
+      color: var(--text-secondary);
+      white-space: nowrap;
     }
     .table-container {
       width: 100%;
@@ -9840,9 +9861,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .option-card-desc {
-      font-size: 11px;
+      font-size: 12px;
       color: var(--text-secondary);
-      line-height: 1.3;
+      line-height: 1.45;
+      word-break: keep-all;
     }
   </style>
 </head>
@@ -10084,13 +10106,11 @@ INDEX_HTML = r"""<!doctype html>
       </table>
     </div>
 
-    <div id="pool_summary" style="display:block; width:100%; box-sizing:border-box; padding: 10px 16px 0; font-size: 13px; line-height: 1.6; color: var(--text-secondary); white-space: normal; overflow: visible;">全球资源库：—</div>
-
-    <!-- 分页控制栏 -->
-    <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
-      <div style="font-size: 13px; color: var(--text-secondary);">
+    <div class="pagination-container" style="padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 10px 16px;">
+      <div class="pagination-meta">
         第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">1</span> 页 · 本页 <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条 · 共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条 <span style="margin-left: 10px; color: var(--primary);">每页 60 条</span>
         <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
+        <span id="pool_summary" class="pool-summary">全球资源库：—</span>
       </div>
       <div class="pagination-controls-right" style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
@@ -14028,12 +14048,18 @@ function openNetworkModal() {
 
   populateRoutingCountries();
   syncUnifiedSelect("net_force_country");
-  $("network_modal").style.display = "flex";
+  document.documentElement.style.overflow = "hidden";
+  document.body.style.overflow = "hidden";
+  const networkModal = $("network_modal");
+  networkModal.style.display = "flex";
+  networkModal.scrollTop = 0;
   $("admin_dropdown").style.display = "none";
 }
 
 function closeNetworkModal() {
   $("network_modal").style.display = "none";
+  document.documentElement.style.overflow = "";
+  document.body.style.overflow = "";
 }
 
 async function saveNetwork(e) {
