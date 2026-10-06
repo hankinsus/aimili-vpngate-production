@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.30"
+APP_VERSION = "V1.0.31"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -3296,6 +3296,19 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
     speed_gate = routing_speed_gate(endpoint)
     return country_rank * 10000 + favorite_rank * 1000 + ip_rank * 100 + speed_gate * 10
 
+def routing_session_rank(endpoint: dict[str, Any]) -> int:
+    """VPN Gate session count: 1-10 is lightly loaded and preferred. Unknown stays neutral."""
+    try:
+        sessions = int(endpoint.get("latest_sessions") or endpoint.get("sessions") or 0)
+    except (TypeError, ValueError):
+        sessions = 0
+    if 1 <= sessions <= 10:
+        return 0
+    if sessions <= 0:
+        return 1
+    return 2
+
+
 def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tuple:
     latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 999999)
     if latency <= 0:
@@ -3307,6 +3320,7 @@ def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tup
         1 if endpoint_is_unstable(endpoint) else 0,
         routing_preference_tier(endpoint, ui_cfg),
         routing_speed_gate(endpoint),
+        routing_session_rank(endpoint),
         # Within the same country/IP/speed tier, measured latency is preferred.
         latency,
         # Real web usability is the next quality gate; raw speed is only a
@@ -3568,15 +3582,39 @@ def _stable_candidates(endpoints: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return stable or list(endpoints)
 
 
-def default_routing_config(ui_cfg: dict[str, Any]) -> dict[str, Any]:
+def server_home_country() -> str:
+    try:
+        local = str(get_state().get("server_country") or "").strip()
+        if local:
+            return normalized_country_name(local)
+    except Exception:
+        pass
+    return ""
+
+
+def scheme_without_country(ui_cfg: dict[str, Any], country: str = "") -> dict[str, Any]:
+    """Keep protocol, IP type, speed and latency. Only the country changes."""
     cfg = dict(ui_cfg)
-    cfg["routing_mode"] = "auto"
-    cfg["force_country"] = ""
-    cfg["routing_ip_type"] = "all"
-    cfg["routing_protocol"] = ""
-    cfg["routing_min_speed_bps"] = 0
-    cfg["routing_latency"] = ""
+    target = normalized_country_name(country)
+    if target:
+        cfg["routing_mode"] = "fixed_region"
+        cfg["force_country"] = target
+    else:
+        cfg["routing_mode"] = "auto"
+        cfg["force_country"] = ""
+    if str(cfg.get("routing_ip_type") or "all") == "all":
+        cfg["routing_ip_type"] = "residential"
+    try:
+        min_speed = int(cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        min_speed = 0
+    if min_speed < ROUTING_MIN_LINE_SPEED_BPS:
+        cfg["routing_min_speed_bps"] = ROUTING_MIN_LINE_SPEED_BPS
     return cfg
+
+
+def default_routing_config(ui_cfg: dict[str, Any]) -> dict[str, Any]:
+    return scheme_without_country(ui_cfg, server_home_country())
 
 
 def _explicit_scheme_configured(ui_cfg: dict[str, Any]) -> bool:
@@ -3701,7 +3739,7 @@ def enter_explicit_scheme(immediate: bool = False) -> bool:
 
 
 def degrade_to_default_scheme() -> bool:
-    """Leave the saved scheme for the default pool until a stable match exists."""
+    """If the chosen country has no stable node, change country and keep the rest."""
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)) or ui_cfg.get("routing_mode") == "fixed_ip":
         return False
@@ -3711,20 +3749,29 @@ def degrade_to_default_scheme() -> bool:
     if current and endpoint_matches_explicit_routing(current, ui_cfg) and not endpoint_is_unstable(current):
         set_state(routing_degraded=False, last_check_message="当前出口符合新方案")
         return False
-    defaults = _stable_candidates(unified_hot_pool_candidates(default_routing_config(ui_cfg), limit=30))
-    stable_defaults = [ep for ep in defaults if not endpoint_is_unstable(ep)]
-    if stable_defaults:
-        defaults = stable_defaults
-    if not defaults:
+
+    def pick(cfg: dict[str, Any]) -> dict[str, Any] | None:
+        found = [
+            ep for ep in _stable_candidates(unified_hot_pool_candidates(cfg, limit=40))
+            if endpoint_matches_explicit_routing(ep, cfg) and not endpoint_is_unstable(ep)
+        ]
+        return found[0] if found else None
+
+    home = server_home_country()
+    best = pick(scheme_without_country(ui_cfg, home)) if home else None
+    message = f"目标国家暂无节点，已退回{home}并保持其余筛选"
+    if best is None:
+        best = pick(scheme_without_country(ui_cfg, ""))
+        message = "目标国家暂无节点，已更换国家并保持协议、带宽和 IP 类型"
+    if best is None:
         set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，保持当前出口")
         return False
-    best = defaults[0]
     if current and active_tunnel_running() and str(best.get("endpoint_id") or "") == str(current.get("endpoint_id") or ""):
-        set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，已退回默认出口")
+        set_state(routing_degraded=True, last_check_message=message)
         return False
     connect_ranked_endpoint(best)
-    set_state(routing_degraded=True, last_check_message="新方案暂无稳定节点，已退回默认出口")
-    log_to_json("INFO", "Routing", f"新方案无稳定节点，退回默认 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}")
+    set_state(routing_degraded=True, last_check_message=message)
+    log_to_json("INFO", "Routing", f"{message} {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}")
     return True
 
 
@@ -11811,18 +11858,10 @@ function nodeLoadYield() {
 
 function nodeIsStandby(n, standbyId) {
   if (!n) return false;
+  if (n.standby_row) return true;
   const id = String(standbyId || state?.standby_node_id || "");
   const poolId = id.indexOf("pool:") === 0 ? id.slice(5) : id;
-  if (id && (n.id === id || n.pool_endpoint_id === id || n.pool_endpoint_id === poolId || n.id === poolId)) return true;
-  if (!state?.standby_ready) return false;
-  const ip = String(state?.standby_ip || "").trim();
-  const port = String(state?.standby_port || "");
-  const protocol = String(state?.standby_protocol || "").toLowerCase();
-  const nodeProtocol = String(n.protocol || "").toLowerCase();
-  if (protocol && nodeProtocol && protocol !== nodeProtocol) return false;
-  const nodeIp = String(n.ip || n.remote_host || "").trim();
-  const nodePort = String(n.port || n.remote_port || "");
-  return !!(ip && nodeIp === ip && (!port || nodePort === port || String(displayNodePort(n) || "") === port));
+  return !!(id && (n.id === id || n.pool_endpoint_id === id || n.pool_endpoint_id === poolId || n.id === poolId));
 }
 
 const manualProbeHold = new Map();
@@ -17041,7 +17080,21 @@ def _pin_connected_then_standby(page_nodes: list[dict[str, Any]]) -> list[dict[s
         standby["standby_row"] = True
         ordered.append(standby)
     ordered.extend(rest)
-    return ordered
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for node in ordered:
+        ip = str(node.get("ip") or "").strip()
+        protocol = str(node.get("protocol") or "").strip().lower()
+        try:
+            port = int(node.get("remote_port") or node.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        key = f"{protocol}|{ip}|{port}" if ip and port else "id:" + str(node.get("pool_endpoint_id") or node.get("id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(node)
+    return unique
 
 
 def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type="", speed_min_bps=0, latency=""):

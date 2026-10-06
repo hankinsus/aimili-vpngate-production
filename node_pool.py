@@ -171,6 +171,7 @@ class NodePool:
         with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
             self._ensure_endpoint_columns(db)
+            self._retire_duplicate_ip_port(db)
             db.commit()
 
     @staticmethod
@@ -182,6 +183,31 @@ class NodePool:
             db.execute("ALTER TABLE endpoints ADD COLUMN last_session_seconds INTEGER NOT NULL DEFAULT 0")
         if "stability" not in cols:
             db.execute("ALTER TABLE endpoints ADD COLUMN stability TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _retire_duplicate_ip_port(db: sqlite3.Connection) -> None:
+        """Keep one endpoint per protocol + IP + port. Hostname/IP double inserts collapse here."""
+        db.execute(
+            """
+            UPDATE endpoints SET status='RETIRED'
+            WHERE endpoint_id IN (
+                SELECT endpoint_id FROM (
+                    SELECT e.endpoint_id,
+                           ROW_NUMBER() OVER (
+                             PARTITION BY LOWER(e.protocol), s.current_ip, e.port
+                             ORDER BY CASE UPPER(e.status)
+                               WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 ELSE 3 END,
+                               e.last_success DESC, e.last_seen DESC
+                           ) AS rn
+                    FROM endpoints e
+                    JOIN servers s ON s.server_key=e.server_key
+                    WHERE COALESCE(e.port,0)>0
+                      AND TRIM(COALESCE(s.current_ip,''))<>''
+                      AND UPPER(e.status)<>'RETIRED'
+                ) WHERE rn>1
+            )
+            """
+        )
 
     @staticmethod
     def _touch_stability(meta: dict[str, Any], now: float, kind: str, fail_streak: int, success_streak: int, session_seconds: int) -> str:
@@ -386,6 +412,22 @@ class NodePool:
                         port = 0
                     if not protocol:
                         continue
+                    if ip and port > 0:
+                        duplicate = db.execute(
+                            """
+                            SELECT e.endpoint_id FROM endpoints e
+                            JOIN servers s ON s.server_key=e.server_key
+                            WHERE s.current_ip=? AND e.port=? AND LOWER(e.protocol)=?
+                            LIMIT 1
+                            """,
+                            (ip, port, protocol),
+                        ).fetchone()
+                        if duplicate:
+                            db.execute(
+                                "UPDATE endpoints SET last_seen=? WHERE endpoint_id=?",
+                                (now, duplicate["endpoint_id"]),
+                            )
+                            continue
                     eid = self.endpoint_id(key, protocol, transport, port)
                     endpoint_meta = {
                         "hostname": str(endpoint.get("hostname") or hostname or "").strip().lower(),
@@ -506,9 +548,11 @@ class NodePool:
             rows = db.execute(
                 f"""
                 SELECT e.endpoint_id, e.server_key, e.protocol, e.transport, e.port, e.status,
-                       e.latency_ewma, e.jitter_ewma, e.success_streak, e.last_success, e.metadata_json,
+                       e.latency_ewma, e.jitter_ewma, e.success_streak, e.fail_streak, e.last_success,
+                       e.last_session_seconds, e.stability, e.metadata_json,
                        s.hostname, s.current_ip, s.country, s.metadata_json AS server_metadata_json,
-                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed
+                       COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
+                       COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_sessions
                 FROM endpoints e
                 JOIN servers s ON s.server_key=e.server_key
                 WHERE {where}
