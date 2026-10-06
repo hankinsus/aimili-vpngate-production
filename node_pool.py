@@ -872,6 +872,28 @@ class NodePool:
         finally:
             gate.release()
 
+    def list_endpoint_ids(self, country: str = "", status: str = "", protocol: str = "", ip_type: str = "") -> list[dict[str, Any]]:
+        """Ids only. Country sweeps must not run the UI page query."""
+        country = canonical_country_name(country) if country else ""
+        where, params = _ui_list_filters(
+            country=country,
+            status=status,
+            protocol=protocol,
+            ip_type=ip_type,
+        )
+        sql = (
+            "SELECT endpoint_id, protocol, server_key, status FROM ("
+            "SELECT e.endpoint_id AS endpoint_id, e.protocol AS protocol, "
+            "e.server_key AS server_key, e.status AS status, "
+            "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY e.endpoint_id) AS _rn "
+            "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
+            + " AND ".join(where)
+            + ") WHERE _rn=1"
+        )
+        with closing(self._connect(800)) as db:
+            rows = db.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
     def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id="", speed_min_bps=0, latency=""):
         """Authoritative country/IP inventory using the same Master Pool scope as the node table."""
         status = str(status or "").strip().lower()

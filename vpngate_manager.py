@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.42"
+APP_VERSION = "V1.0.43"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -314,14 +314,15 @@ def _local_git_commit() -> str:
 def _remote_git_commit() -> str:
     # Prefer the Git remote ref over the GitHub REST API. The API can be
     # temporarily stale, which could otherwise make a newer production
-    # checkout look like it needs a downgrade.
+    # checkout look like it needs a downgrade. Keep the whole check inside
+    # the browser timeout: ls-remote first, API only if that fails.
     try:
         result = subprocess.run(
             ["git", "ls-remote", "origin", f"refs/heads/{GITHUB_BRANCH}"],
             cwd=str(ROOT_DIR),
             capture_output=True,
             text=True,
-            timeout=GITHUB_UPDATE_TIMEOUT_SECONDS,
+            timeout=4,
             check=False,
         )
         if result.returncode == 0:
@@ -342,10 +343,29 @@ def _remote_git_commit() -> str:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(request, timeout=GITHUB_UPDATE_TIMEOUT_SECONDS) as response:
+    with urllib.request.urlopen(request, timeout=3) as response:
         data = json.loads(response.read().decode("utf-8"))
     value = str(data.get("sha") or "").strip().lower()
     return value if re.fullmatch(r"[0-9a-f]{40}", value) else ""
+
+
+def _git_is_ancestor(ancestor: str, descendant: str) -> bool:
+    ancestor = str(ancestor or "").strip().lower()
+    descendant = str(descendant or "").strip().lower()
+    if not ancestor or not descendant:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def current_github_version() -> dict[str, Any]:
@@ -390,46 +410,15 @@ def check_github_update() -> dict[str, Any]:
             "current_version": _version_label(local),
         }
 
-    local_only = 0
-    remote_only = 0
-    relation = "different"
-    try:
-        fetched = subprocess.run(
-            ["git", "fetch", "--quiet", "--prune", "origin", GITHUB_BRANCH],
-            cwd=str(ROOT_DIR),
-            capture_output=True,
-            text=True,
-            timeout=GITHUB_UPDATE_TIMEOUT_SECONDS,
-            check=False,
-        )
-        if fetched.returncode == 0:
-            compare = subprocess.run(
-                ["git", "rev-list", "--left-right", "--count", f"{local}...origin/{GITHUB_BRANCH}"],
-                cwd=str(ROOT_DIR),
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            if compare.returncode == 0:
-                fields = compare.stdout.strip().split()
-                if len(fields) == 2:
-                    local_only, remote_only = int(fields[0]), int(fields[1])
-                    if local_only == 0 and remote_only == 0:
-                        relation = "same"
-                    elif local_only == 0 and remote_only > 0:
-                        relation = "remote_ahead"
-                    elif local_only > 0 and remote_only == 0:
-                        relation = "local_ahead"
-                    else:
-                        relation = "diverged"
-    except Exception:
-        pass
-
-    # 生产服务器以 GitHub main 为唯一代码源。只要远端提交不同且不是
-    # “服务器单独领先”的情形，就允许从 GitHub 正式版同步，解决服务器与
-    # GitHub 历史提交号不同导致“已分叉、无法更新”的问题。
-    has_update = relation in ("remote_ahead", "diverged", "different") and remote != local
+    if remote == local:
+        relation = "same"
+    elif _git_is_ancestor(remote, local):
+        relation = "local_ahead"
+    else:
+        relation = "remote_ahead"
+    # Checking must not git-fetch. A fetch blocks this request for the whole
+    # network round trip and the browser aborts at 10s while probes are busy.
+    has_update = relation == "remote_ahead"
     result = {
         "ok": True,
         "repository": GITHUB_REPOSITORY,
@@ -444,9 +433,7 @@ def check_github_update() -> dict[str, Any]:
     }
     if relation == "local_ahead":
         result["message"] = "当前服务器版本高于 GitHub 正式版，不执行降级更新。"
-    elif relation == "diverged":
-        result["message"] = "服务器与 GitHub 正式版存在本地提交差异；更新时将以 GitHub main 为准同步。"
-    elif relation == "different":
+    elif relation == "remote_ahead":
         result["message"] = "已获取 GitHub 正式版，将以 GitHub main 为准同步。"
     return result
 
@@ -4187,9 +4174,7 @@ def country_full_sweep(country: str) -> dict[str, Any]:
         if completed_at and time.time() - completed_at < COUNTRY_FULL_SWEEP_REUSE_SECONDS:
             return {"ok": True, "skipped": True, "country": target, "reason": "recently_completed"}
 
-        endpoint_rows, _ = node_pool.list_endpoints_scoped(
-            country=target, status="", protocol="", ip_type="", offset=0, limit=5000
-        )
+        endpoint_rows = node_pool.list_endpoint_ids(country=target)
         refs = []
         seen = set()
         for endpoint in endpoint_rows:
@@ -8140,6 +8125,12 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select.open .toolbar-custom-select-menu {
       display: block;
     }
+    body > .toolbar-custom-select-menu {
+      position: fixed !important;
+      margin: 0 !important;
+      transform: none !important;
+      right: auto !important;
+    }
     .toolbar-custom-select-menu::-webkit-scrollbar { width: 4px; }
     .toolbar-custom-select-menu::-webkit-scrollbar-track { background: transparent; }
     .toolbar-custom-select-menu::-webkit-scrollbar-thumb { background: rgba(20,184,166,.42); border-radius: 999px; }
@@ -10792,7 +10783,7 @@ function closeUnifiedSelects(exceptId = "") {
       menu.style.left="";
       menu.style.bottom="";
       menu.style.width="";
-      menu.style.display="none";
+      menu.style.setProperty("display", "none", "important");
     }
   });
 }
@@ -10819,6 +10810,7 @@ function toggleUnifiedSelect(selectId, event) {
     }
     menu.style.display = "block";
     placeAnchoredMenu(menu, button || widget);
+    queueMenuTrack();
   }
 }
 
@@ -10835,32 +10827,42 @@ function chooseUnifiedSelect(selectId, value) {
 }
 
 function placeAnchoredMenu(menu, trigger) {
+  if (!menu || !trigger || !trigger.getBoundingClientRect) return;
   const rect = trigger.getBoundingClientRect();
-  const width = Math.max(148, Math.round(rect.width));
-  const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - 8);
+  if (rect.width < 2 && rect.height < 2) return;
+  const viewW = window.innerWidth;
+  const viewH = window.innerHeight;
+  const width = Math.max(168, Math.round(rect.width));
+  const left = Math.max(8, Math.min(Math.round(rect.left), viewW - width - 8));
+  const set = (prop, value) => menu.style.setProperty(prop, value, "important");
+  set("position", "fixed");
+  set("box-sizing", "border-box");
+  set("left", left + "px");
+  set("right", "auto");
+  set("width", width + "px");
+  set("min-width", width + "px");
+  set("max-width", Math.max(width, 280) + "px");
+  set("margin", "0");
+  set("transform", "none");
+  set("overflow-y", "auto");
+  set("z-index", "200000");
+  set("display", "block");
+  const spaceBelow = Math.max(0, viewH - rect.bottom - 8);
   const spaceAbove = Math.max(0, rect.top - 8);
-  // Keep the menu on the button. Only lift it when there is almost no room
-  // underneath; never reserve a tall empty gap above the control.
-  const openUp = spaceBelow < 72 && spaceAbove > spaceBelow + 80;
-  const left = Math.max(8, Math.min(Math.round(rect.left), window.innerWidth - width - 8));
-  menu.style.position = "fixed";
-  menu.style.boxSizing = "border-box";
-  menu.style.left = left + "px";
-  menu.style.right = "auto";
-  menu.style.width = width + "px";
-  menu.style.minWidth = width + "px";
-  menu.style.maxWidth = Math.max(width, 280) + "px";
-  menu.style.overflowY = "auto";
-  menu.style.zIndex = "200000";
-  menu.style.display = "block";
+  set("max-height", "320px");
+  const needed = Math.min(320, Math.max(96, menu.scrollHeight || 240));
+  // Stick to the button. Open upward only when the menu cannot fit below
+  // and there is more room above. Anchor the near edge so it never floats
+  // away into the connection card.
+  const openUp = spaceBelow < Math.min(needed, 200) && spaceAbove > spaceBelow;
   if (openUp) {
-    menu.style.maxHeight = Math.max(96, Math.min(320, spaceAbove)) + "px";
-    menu.style.top = "auto";
-    menu.style.bottom = Math.round(window.innerHeight - rect.top + 6) + "px";
+    set("max-height", Math.max(96, Math.min(320, spaceAbove)) + "px");
+    set("top", "auto");
+    set("bottom", Math.round(viewH - rect.top + 6) + "px");
   } else {
-    menu.style.maxHeight = Math.min(320, Math.max(96, spaceBelow || 320)) + "px";
-    menu.style.bottom = "auto";
-    menu.style.top = Math.round(rect.bottom + 6) + "px";
+    set("max-height", Math.max(96, Math.min(320, spaceBelow || 320)) + "px");
+    set("bottom", "auto");
+    set("top", Math.round(rect.bottom + 6) + "px");
   }
 }
 
@@ -10872,6 +10874,39 @@ function repositionOpenMenus() {
     const button = cfg ? $(cfg.button) : null;
     if (menu && button && menu.style.display !== "none") placeAnchoredMenu(menu, button);
   });
+  document.querySelectorAll(".unified-select.open").forEach(widget => {
+    const selectId = widget.getAttribute("data-unified-select-id") || "";
+    const cfg = UNIFIED_SELECT_CONFIG[selectId];
+    const menu = cfg ? $(cfg.menu) : null;
+    const button = cfg ? $(cfg.button) : null;
+    if (menu && button && menu.style.display !== "none") placeAnchoredMenu(menu, button);
+  });
+}
+
+let menuTrackQueued = false;
+function queueMenuTrack() {
+  if (menuTrackQueued) return;
+  menuTrackQueued = true;
+  requestAnimationFrame(() => {
+    menuTrackQueued = false;
+    if (!document.querySelector(".toolbar-custom-select.open, .unified-select.open")) return;
+    repositionOpenMenus();
+    queueMenuTrack();
+  });
+}
+
+function ensureMenuTracking() {
+  if (document.body?.dataset.menuTrackBound === "1") return;
+  if (document.body) document.body.dataset.menuTrackBound = "1";
+  const kick = () => {
+    if (document.querySelector(".toolbar-custom-select.open, .unified-select.open")) queueMenuTrack();
+  };
+  window.addEventListener("scroll", kick, true);
+  window.addEventListener("resize", kick);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", kick);
+    window.visualViewport.addEventListener("scroll", kick);
+  }
 }
 
 function bindUnifiedSelectEvents() {
@@ -11057,7 +11092,7 @@ function closeCustomFilters(exceptId = "") {
     const menu = $(cfg.menu);
     if (widget) widget.classList.remove("open");
     if (button) button.setAttribute("aria-expanded", "false");
-    if (menu) menu.style.display = "none";
+    if (menu) menu.style.setProperty("display", "none", "important");
   });
 }
 
@@ -11083,6 +11118,7 @@ function toggleCustomFilter(selectId, event) {
       if (menu.parentElement !== document.body) document.body.appendChild(menu);
       menu.dataset.filterId = selectId;
       placeAnchoredMenu(menu, trigger);
+      queueMenuTrack();
     }
   }
 }
@@ -11111,6 +11147,7 @@ function chooseCountryFilter(value) {
 function bindCustomFilterEvents() {
   if (document.body?.dataset.customFilterEventsBound === "1") return;
   document.body.dataset.customFilterEventsBound = "1";
+  ensureMenuTracking();
 
   document.addEventListener("click", event => {
     const unified = event.target?.closest?.("[data-unified-option]");
