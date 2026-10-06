@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.25"
+APP_VERSION = "V1.0.26"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7674,7 +7674,9 @@ INDEX_HTML = r"""<!doctype html>
       top: calc(100% + 8px);
       bottom: auto;
       z-index: 10080;
-      min-width: 100%;
+      min-width: 0;
+      width: max-content;
+      max-width: 280px;
       max-height: min(360px, calc(100vh - 40px));
       overflow-y: auto;
       overscroll-behavior: contain;
@@ -10559,20 +10561,25 @@ function toggleCustomFilter(selectId, event) {
     if (menu && trigger) {
       if (menu.parentElement !== document.body) document.body.appendChild(menu);
       const rect = trigger.getBoundingClientRect();
-      const width = Math.max(rect.width, selectId === "country_filter" ? 220 : 148);
+      const width = Math.ceil(Math.max(rect.width, selectId === "country_filter" ? 220 : 168));
       const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
-      const spaceBelow = window.innerHeight - rect.bottom - 12;
-      const openUp = spaceBelow < 220 && rect.top > spaceBelow;
       menu.style.position = "fixed";
       menu.style.left = left + "px";
+      menu.style.right = "auto";
       menu.style.width = width + "px";
+      menu.style.minWidth = width + "px";
+      menu.style.maxWidth = width + "px";
+      menu.style.boxSizing = "border-box";
       menu.style.zIndex = "200000";
       menu.style.display = "block";
-      const menuHeight = Math.min(menu.scrollHeight || 280, 360);
+      const menuHeight = Math.min(menu.scrollHeight || 280, 320);
+      const spaceBelow = window.innerHeight - rect.bottom - 12;
+      const openUp = menuHeight > spaceBelow && rect.top > spaceBelow;
       menu.style.top = (openUp ? Math.max(8, rect.top - menuHeight - 6) : rect.bottom + 6) + "px";
     }
     const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
-    if (active) active.scrollIntoView({block:"nearest"});
+    const menu = $(cfg.menu);
+    if (active && menu) menu.scrollTop = Math.max(0, active.offsetTop - 6);
   }
 }
 
