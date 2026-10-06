@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.35"
+APP_VERSION = "V1.0.36"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2256,6 +2256,21 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
 
 
 
+def _tcp_port_open(host: str, port: int, timeout: float = 1.2) -> bool:
+    """Cheap gate before a full VPN handshake. A closed port should not wait out a tunnel timeout."""
+    try:
+        port = int(port or 0)
+    except (TypeError, ValueError):
+        return False
+    if port <= 0:
+        return False
+    try:
+        with socket.create_connection((str(host or "").strip(), port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def parse_manual_endpoint(value: str) -> tuple[str, int]:
     """Parse a manual VPN Gate target.
     
@@ -2340,7 +2355,7 @@ def _build_manual_openvpn_node(host: str, ip: str, port: int, transport: str = "
         pass
     return node
 
-def _manual_probe_openvpn(host: str, ip: str, port: int, transport: str = "tcp", timeout: int = 9) -> dict[str, Any]:
+def _manual_probe_openvpn(host: str, ip: str, port: int, transport: str = "tcp", timeout: int = 6) -> dict[str, Any]:
     transport = str(transport or "tcp").strip().lower()
     if transport not in ("tcp", "udp"):
         transport = "tcp"
@@ -2425,7 +2440,7 @@ def _manual_probe_protocol(host: str, ip: str, protocol: str, port: int, transpo
                 return {"protocol": protocol, "transport": transport, "port": int(port), "ok": False, "elapsed_ms": 0, "message": "MS-SSTP 组件未安装"}
             adapter = tunnel_adapters.SSTPAdapter()
             target = host if int(port or 0) in (0, 443) else f"{host}:{int(port)}"
-            result = adapter.connect(target, username="vpn", password="vpn", timeout=10)
+            result = adapter.connect(target, username="vpn", password="vpn", timeout=8)
             ok = bool(result and result.ok and result.interface)
             message = result.message if result else "MS-SSTP 未建立"
             if result is not None:
@@ -2439,7 +2454,7 @@ def _manual_probe_protocol(host: str, ip: str, protocol: str, port: int, transpo
             if not l2tp_adapter.available():
                 return {"protocol": protocol, "transport": "udp", "port": 0, "ok": False, "elapsed_ms": 0, "message": "L2TP/IPsec 组件未安装"}
             namespace = f"aimili-manual-{token}"
-            result = l2tp_adapter.connect(host=host, username="vpn", password="vpn", psk="vpn", namespace=namespace, timeout=12)
+            result = l2tp_adapter.connect(host=host, username="vpn", password="vpn", psk="vpn", namespace=namespace, timeout=8)
             ok = bool(result and result.ok and result.interface)
             message = result.message if result else "L2TP/IPsec 未建立"
             if result is not None and result.ok:
@@ -2614,8 +2629,23 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 candidates = [("udp", 0)]
             else:
                 candidates = offered if official else [(default_transport, int(port))]
+            if protocol != "l2tp-ipsec":
+                candidates = sorted(candidates, key=lambda item: 0 if str(item[0]).lower() == "tcp" else 1)
             protocol_passed = False
             for transport, test_port in candidates:
+                reachable = protocol == "l2tp-ipsec" or int(test_port or 0) <= 0 or _tcp_port_open(resolved_ip or host, int(test_port))
+                if not reachable:
+                    attempts.append({
+                        "protocol": protocol,
+                        "transport": transport,
+                        "port": int(test_port or 0),
+                        "ok": False,
+                        "skipped": True,
+                        "message": "端口未开放，已跳过完整握手",
+                    })
+                    continue
+                port_label = f" {int(test_port)}" if int(test_port or 0) > 0 else ""
+                set_state(manual_add_message=f"正在验证 {protocol}{port_label}…")
                 result = _manual_probe_protocol(host, resolved_ip, protocol, int(test_port), transport)
                 attempts.append(result)
                 if not result.get("ok"):
@@ -8098,6 +8128,33 @@ INDEX_HTML = r"""<!doctype html>
       flex-basis: 18px;
     }
     #network_modal .modal-content { max-width: 560px; padding: 22px 18px 120px; }
+    .add-node-flow,
+    .add-node-status {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      line-height: 1.65;
+      font-size: 14px;
+    }
+    .add-node-flow {
+      border: 1px solid rgba(56, 189, 248, .34);
+      background: rgba(14, 165, 233, .1);
+      color: #e7f6ff;
+    }
+    .add-node-flow-title,
+    .add-node-status-title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: .01em;
+      margin-bottom: 6px;
+    }
+    .add-node-flow-title { color: #7dd3fc; }
+    .add-node-status {
+      border: 1px solid rgba(251, 191, 36, .4);
+      background: rgba(245, 158, 11, .1);
+      color: #fff4d6;
+    }
+    .add-node-status-title { color: #fbbf24; }
 
     .toolbar input {
       flex: 1;
@@ -10079,7 +10136,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:18px;">
         <div>
           <h3 style="margin:0; font-size:20px; font-weight:700; color:var(--text-primary);">添加 VPN Gate 节点</h3>
-          <div style="margin-top:6px; font-size:12px; color:var(--text-secondary); line-height:1.5;">支持域名、域名:端口、IPv4、IPv4:端口，也支持 IPv6 [地址] / [地址]:端口。VPN Gate .opengw.net 域名不填写端口时，系统会自动读取官方公布的各协议端口，再逐一真实验证。</div>
+          <div style="margin-top:6px; font-size:13px; color:#d5dee8; line-height:1.6;">支持域名、域名:端口、IPv4、IPv4:端口，也支持 IPv6 [地址] / [地址]:端口。VPN Gate .opengw.net 域名不填写端口时，系统会自动读取官方公布的各协议端口，再逐一真实验证。</div>
         </div>
         <button type="button" onclick="closeAddNodeModal()" style="width:32px;height:32px;border:1px solid var(--border-color);background:rgba(255,255,255,.03);border-radius:8px;color:var(--text-secondary);cursor:pointer;">✕</button>
       </div>
@@ -10092,9 +10149,9 @@ INDEX_HTML = r"""<!doctype html>
         <button type="button" class="test-btn" onclick="fillAddNodeExample('203.0.113.10:1965')" style="height:30px;">示例 IPv4</button>
       </div>
 
-      <div style="margin-top:14px; padding:12px 13px; border:1px solid rgba(99,102,241,.16); background:rgba(99,102,241,.04); border-radius:9px; font-size:11px; color:var(--text-secondary); line-height:1.55;">
-        <div style="font-weight:600; color:var(--text-primary); margin-bottom:4px;">识别流程</div>
-        OpenVPN → SSL-VPN → L2TP/IPsec → MS-SSTP 依次直连验证；任一方式真正建立成功即显示“通过”，只保存通过的协议端点，并将刚添加的节点置顶。
+      <div class="add-node-flow">
+        <div class="add-node-flow-title">识别流程</div>
+        <div>先读取官方端口，再用约 1 秒确认端口是否开放。没开放的直接跳过，不再空等完整握手。开放的端口按 OpenVPN → SSL-VPN → L2TP/IPsec → MS-SSTP 真连接，通过的才入库并置顶。</div>
       </div>
 
       <div id="add_node_result" style="display:none; margin-top:14px;"></div>
@@ -12659,6 +12716,10 @@ function stopManualAddPolling() {
   }
 }
 
+function addNodeStatusHtml(message) {
+  return '<div class="add-node-status"><div class="add-node-status-title">正在识别</div><div>' + esc(message || "正在读取端口并验证已开放的协议。页面可以刷新，不会中断。") + '</div></div>';
+}
+
 function startManualAddPolling() {
   stopManualAddPolling();
   const poll = async () => {
@@ -12689,6 +12750,9 @@ function startManualAddPolling() {
           submit.onclick = submitAddNode;
         }
         render();
+      } else if (state.manual_add_running && state.manual_add_message) {
+        const box = $("add_node_result");
+        if (box) box.innerHTML = addNodeStatusHtml(state.manual_add_message);
       }
     } catch (_) {
       // Keep the manual-add job running on the server; the next poll retries.
@@ -12718,7 +12782,7 @@ async function submitAddNode(){
     if (submit) { submit.disabled = true; submit.textContent = "正在直连..."; }
     if (resultBox) {
       resultBox.style.display = "block";
-      resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">正在读取 VPN Gate 官方端口并直连验证 4 种接入方式；已公布的协议会逐一测试，所有通过的协议都会写入资源池...</div>';
+      resultBox.innerHTML = addNodeStatusHtml("正在读取官方端口。关闭的端口会直接跳过，只对开放端口做真连接。页面可以刷新，不会中断。");
     }
     const data = await fetchJsonWithTimeout("./api/add_node", {
       method: "POST",
@@ -12730,7 +12794,7 @@ async function submitAddNode(){
     if (data.running) {
       if (resultBox) {
         resultBox.style.display = "block";
-        resultBox.innerHTML = '<div style="padding:12px;color:var(--text-secondary);border:1px solid var(--border-color);border-radius:8px;">任务已进入后台：正在识别地址、读取协议端口并逐一验证；页面可以刷新，不会中断任务。</div>';
+        resultBox.innerHTML = addNodeStatusHtml("任务已在后台运行：先确认端口，再验证已开放的协议。页面可以刷新，不会中断。");
       }
       if (submit) {
         submit.disabled = true;
@@ -15100,10 +15164,11 @@ def _run_manual_add_job(value: str) -> None:
             manual_add_finished_at=time.time(),
             last_check_message="手动节点已入库；可用性检测模块将立即复核。",
         )
-        try:
-            threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-probe-trigger").start()
-        except Exception:
-            pass
+        if not result.get("detection_queued"):
+            try:
+                threading.Thread(target=_kick_manual_availability_check, daemon=True, name="manual-add-probe-trigger").start()
+            except Exception:
+                pass
     except Exception as exc:
         manual_add_result = {"ok": False, "error": str(exc), "attempts": []}
         set_state(
