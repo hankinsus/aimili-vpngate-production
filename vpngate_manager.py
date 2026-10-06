@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.50"
+APP_VERSION = "V1.0.51"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8443,6 +8443,30 @@ INDEX_HTML = r"""<!doctype html>
     #network_modal .unified-select .toolbar-custom-selected-count {
       font-size: 15px;
       font-weight: 500;
+    }
+    /* Menus are portaled to body, so they are no longer under #network_modal. */
+    #net_force_country_menu .toolbar-custom-option,
+    #net_routing_protocol_menu .toolbar-custom-option,
+    #net_routing_latency_menu .toolbar-custom-option,
+    #net_routing_min_speed_menu .toolbar-custom-option {
+      min-height: 40px;
+      height: 40px;
+      padding: 0 10px;
+      gap: 8px;
+      font-size: 15px;
+      font-weight: 500;
+      line-height: 1;
+      align-items: center;
+      box-sizing: border-box;
+    }
+    #net_force_country_menu .toolbar-custom-option-name,
+    #net_force_country_menu .toolbar-custom-option-count,
+    #net_routing_protocol_menu .toolbar-custom-option-name,
+    #net_routing_latency_menu .toolbar-custom-option-name,
+    #net_routing_min_speed_menu .toolbar-custom-option-name {
+      font-size: 15px;
+      font-weight: 500;
+      line-height: 1;
     }
     #network_modal form {
       display: flex;
