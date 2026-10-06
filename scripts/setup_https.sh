@@ -46,7 +46,16 @@ PUBLIC_IP="${PUBLIC_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org || true)
 [ -z "$PUBLIC_IP" ] && PUBLIC_IP="127.0.0.1"
 
 # 先生成可用的后备证书，保证 Nginx 即使 ACME 失败也能启动。
-openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" >/dev/null 2>&1
+# 无域名时由联合安装设置 AIMILIVPN_IP_CERT_FOREVER=1。
+# 公网 CA 不能签发永不过期的 IP 证书；这里改为 100 年自签 IP 证书，并关闭 Let's Encrypt 短效 IP 证书。
+CERT_DAYS=3650
+if [ "${AIMILIVPN_IP_CERT_FOREVER:-0}" = "1" ]; then
+  CERT_DAYS=36500
+  ENABLE_IP_ACME=0
+fi
+if ! openssl req -x509 -nodes -newkey rsa:2048 -days "$CERT_DAYS" -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" >/dev/null 2>&1; then
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -keyout "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" >/dev/null 2>&1
+fi
 chmod 600 "$KEY_FILE"; chmod 644 "$CERT_FILE"
 
 install -m 0644 "$ROOT_DIR/scripts/nginx/aimilivpn-production.conf" "$NGINX_CONF"
