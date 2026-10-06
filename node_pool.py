@@ -710,6 +710,25 @@ class NodePool:
             if len(out) >= limit: break
         return out
 
+    def due_counts(self, protocols: tuple[str, ...] | list[str]) -> dict[str, int]:
+        protocols = [str(x or "").strip().lower() for x in protocols if str(x or "").strip()]
+        if not protocols:
+            return {}
+        placeholders = ",".join("?" for _ in protocols)
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                """
+                SELECT LOWER(e.protocol) AS protocol, COUNT(*) AS n
+                FROM endpoints e
+                WHERE LOWER(e.protocol) IN (""" + placeholders + """)
+                  AND UPPER(e.status) NOT IN ('RETIRED')
+                  AND e.next_test <= ?
+                GROUP BY LOWER(e.protocol)
+                """,
+                protocols + [time.time()],
+            ).fetchall()
+        return {str(row["protocol"]): int(row["n"]) for row in rows}
+
     def due_endpoints(self, protocols: tuple[str, ...] | list[str], limit: int = 10, country: str = "") -> list[dict[str, Any]]:
         protocols = [str(x or "").strip().lower() for x in protocols if str(x or "").strip()]
         if not protocols: return []

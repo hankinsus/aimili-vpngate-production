@@ -1686,6 +1686,12 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "--pull-filter",
             "ignore",
             "ifconfig-ipv6",
+            "--pull-filter",
+            "ignore",
+            "dhcp-option",
+            "--pull-filter",
+            "ignore",
+            "redirect-gateway",
             "--route-delay",
             "2",
             "--connect-retry-max",
@@ -1988,7 +1994,9 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
                     print(f"[OpenVPN] {line_str}", flush=True)
                     level = "INFO"
                     line_lower = line_str.lower()
-                    if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+                    if "cannot be used in this context" in line_lower:
+                        level = "INFO"
+                    elif "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
                         level = "ERROR"
                     elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
                         level = "WARNING"
@@ -2039,7 +2047,9 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     for line_str in openvpn_logs:
         level = "INFO"
         line_lower = line_str.lower()
-        if "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+        if "cannot be used in this context" in line_lower:
+            level = "INFO"
+        elif "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
             level = "ERROR"
         elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
             level = "WARNING"
@@ -2151,10 +2161,27 @@ def active_external_tunnel_running() -> bool:
     tunnel = active_external_tunnel
     if tunnel is None or not tunnel.ok or not tunnel.interface:
         return False
-    return tunnel_adapters.interface_has_ipv4(tunnel.interface)
+    # unknown means iproute timed out. The tunnel may still be forwarding.
+    return tunnel_adapters.interface_ipv4_state(tunnel.interface) != "down"
 
 def active_tunnel_running() -> bool:
     return active_openvpn_running() or active_external_tunnel_running()
+
+def _tunnel_carrier_alive() -> bool:
+    """True when the tunnel process is still there, even if iproute just timed out."""
+    if active_openvpn_running():
+        return True
+    tunnel = active_external_tunnel
+    if tunnel is None:
+        return False
+    protocol = str(tunnel.protocol or "")
+    if protocol == "softether":
+        try:
+            return tunnel_adapters.SoftEtherAdapter()._vpnclient_running()
+        except Exception:
+            return False
+    process = tunnel.process
+    return process is not None and process.poll() is None
 
 def stop_active_external_tunnel() -> None:
     global active_external_tunnel, active_pool_endpoint_id
@@ -3376,6 +3403,8 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
     if not has_preference:
         return False
     state = get_state()
+    if bool(state.get("proxy_ok")) and active_tunnel_running():
+        return False
     if bool(state.get("priority_running")):
         return False
     now = time.time()
@@ -5142,6 +5171,8 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
     try:
         if probe_table is None:
             return {"ok": False, "skipped": True, "error": "探测临时路由表暂时已满"}
+        if protocol == "softether" and active_tunnel_running() and active_external_tunnel is not None and str(active_external_tunnel.protocol or "") == "softether":
+            return {"ok": False, "skipped": True, "error": "生产隧道正在使用 SoftEther，跳过并行探测以免打断 vpnclient"}
         if protocol == "softether":
             account = f"probe{token}"
             nic = f"p{token}"
@@ -5840,32 +5871,35 @@ def maintain_valid_nodes(force: bool = False):
                 stop_all_tunnels()
             reconnect_fixed_node_if_needed(load_ui_config())
         elif not active_tunnel_running():
-            ui_cfg = load_ui_config()
-            routing_mode = ui_cfg.get("routing_mode", "auto")
-            connection_enabled = ui_cfg.get("connection_enabled", True)
-            if connection_enabled:
-                if routing_mode == "fixed_ip":
-                    reconnect_fixed_node_if_needed(ui_cfg)
-                else:
-                    has_active_id = False
-                    with lock:
-                        if active_openvpn_node_id:
-                            has_active_id = True
-                            stop_all_tunnels()
-                    if has_active_id:
-                        print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
-                        is_connecting = False
-                        auto_switch_node()
-                        is_connecting = True
-                    elif routing_mode in ("auto", "fixed_region"):
-                        # Warm-start from persisted validated endpoints before
-                        # doing a fresh network-wide scan.
-                        is_connecting = False
-                        try:
-                            if try_unified_failover(attempts=3):
-                                log_to_json("INFO", "VPN", "已从持久化 Hot Pool 快速恢复生产出口")
-                        finally:
+            if bool(get_state().get("proxy_ok")) and _tunnel_carrier_alive():
+                log_to_json("WARNING", "VPN", "活动网卡地址瞬时读不到，但进程仍在且出口刚刚可用，不切换")
+            else:
+                ui_cfg = load_ui_config()
+                routing_mode = ui_cfg.get("routing_mode", "auto")
+                connection_enabled = ui_cfg.get("connection_enabled", True)
+                if connection_enabled:
+                    if routing_mode == "fixed_ip":
+                        reconnect_fixed_node_if_needed(ui_cfg)
+                    else:
+                        has_active_id = False
+                        with lock:
+                            if active_openvpn_node_id:
+                                has_active_id = True
+                                stop_all_tunnels()
+                        if has_active_id:
+                            print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
+                            is_connecting = False
+                            auto_switch_node()
                             is_connecting = True
+                        elif routing_mode in ("auto", "fixed_region"):
+                            # Warm-start from persisted validated endpoints before
+                            # doing a fresh network-wide scan.
+                            is_connecting = False
+                            try:
+                                if try_unified_failover(attempts=3):
+                                    log_to_json("INFO", "VPN", "已从持久化 Hot Pool 快速恢复生产出口")
+                            finally:
+                                is_connecting = True
 
         try:
             if manual_connection_active or manual_connection_epoch != cycle_manual_epoch:
@@ -6055,7 +6089,7 @@ def maintain_valid_nodes(force: bool = False):
                 print(warn_msg, flush=True)
                 log_to_json("WARNING", "Main", warn_msg)
 
-            if not active_tunnel_running():
+            if not active_tunnel_running() and not (bool(get_state().get("proxy_ok")) and _tunnel_carrier_alive()):
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
                 if connection_enabled:
@@ -13971,16 +14005,18 @@ def owned_tunnel_local_liveness() -> tuple[bool, str]:
         if protocol == "softether":
             details = tunnel.details or {}
             account = str(details.get("account") or "aimili")
-            ok, output = tunnel_adapters.SoftEtherAdapter().account_connected(account)
-            if not ok:
-                return False, f"SoftEther Session 已断开: {output[-500:]}"
-            if not tunnel_adapters.interface_has_ipv4(tunnel.interface):
+            state, output = tunnel_adapters.SoftEtherAdapter().account_session_state(account)
+            if state == "unknown":
+                return True, ""
+            if state != "up":
+                return False, f"SoftEther Session 已断开: {output[-240:]}"
+            if tunnel_adapters.interface_ipv4_state(tunnel.interface) == "down":
                 return False, f"SoftEther 网卡 {tunnel.interface} 没有 IPv4"
             return True, ""
         if protocol == "sstp":
             if tunnel.process is None or tunnel.process.poll() is not None:
                 return False, "SSTP/pppd 进程已退出"
-            if not tunnel_adapters.interface_has_ipv4(tunnel.interface):
+            if tunnel_adapters.interface_ipv4_state(tunnel.interface) == "down":
                 return False, f"SSTP 网卡 {tunnel.interface} 没有 IPv4"
             return True, ""
         if protocol == "l2tp-ipsec":
@@ -13997,7 +14033,7 @@ def owned_tunnel_local_liveness() -> tuple[bool, str]:
         active_iface = str(proxy_server.get_active_interface() or "tun0")
         if sys.platform.startswith("linux") and not Path("/sys/class/net").joinpath(active_iface).exists():
             return False, f"OpenVPN 活动网卡 {active_iface} 已消失"
-        if not tunnel_adapters.interface_has_ipv4(active_iface):
+        if tunnel_adapters.interface_ipv4_state(active_iface) == "down":
             return False, f"OpenVPN 活动网卡 {active_iface} 没有 IPv4"
         return True, ""
 
@@ -14043,6 +14079,7 @@ def fast_tunnel_liveness_loop() -> None:
 
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
+    proxy_health_failures = 0
     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
     while True:
         last_checker_heartbeat = time.time()
@@ -14073,6 +14110,7 @@ def background_proxy_checker() -> None:
             else:
                 res = check_proxy_health()
             if res["ok"]:
+                proxy_health_failures = 0
                 set_state(
                     proxy_ok=True,
                     proxy_ip=res["ip"],
@@ -14083,8 +14121,12 @@ def background_proxy_checker() -> None:
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 first_error = res.get("error", "未知错误")
-                # A single public endpoint hiccup must not flap the production
-                # tunnel. Confirm once more before blacklisting or switching.
+                proxy_health_failures += 1
+                if proxy_health_failures < 3:
+                    log_to_json("WARNING", "Proxy", f"出口检查失败 {proxy_health_failures}/3，保持当前隧道: {first_error}")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
+                proxy_health_failures = 0
                 time.sleep(PROXY_HEALTH_CONFIRM_DELAY_SECONDS)
                 confirm = check_proxy_health()
                 if confirm.get("ok"):
@@ -16735,6 +16777,7 @@ def availability_sweep_once(priority_country=""):
                     except Exception as exc: log_to_json("WARNING","Probe",f"V2 多协议探测异常: {exc}")
         availability_tested_total+=tested
         if (not initial_bootstrap_active and not active_tunnel_running()
+                and not (bool(get_state().get("proxy_ok")) and _tunnel_carrier_alive())
                 and not manual_connection_active and bool(load_ui_config().get("connection_enabled", True))):
             threading.Thread(target=_ensure_active_client_v2, daemon=True).start()
         ov_due,pool_due=_due_counts()

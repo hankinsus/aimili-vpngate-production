@@ -59,17 +59,33 @@ def wait_for_new_interface(
         time.sleep(0.5)
     return ""
 
-def interface_has_ipv4(iface: str) -> bool:
+def interface_ipv4_state(iface: str) -> str:
+    """Return up, down, or unknown.
+
+    A timeout or a transient iproute failure is unknown. Callers that tear
+    down a live tunnel must not treat that as a disconnect; on a 1 vCPU host
+    `ip addr` often exceeds its timeout while the tunnel is still forwarding.
+    """
     if not iface:
-        return False
+        return "down"
     try:
         res = subprocess.run(
             ["ip", "-4", "-o", "addr", "show", "dev", iface],
             capture_output=True, text=True, timeout=3,
         )
-        return res.returncode == 0 and " inet " in f" {res.stdout} "
+    except subprocess.TimeoutExpired:
+        return "unknown"
     except Exception:
-        return False
+        return "unknown"
+    stderr = (res.stderr or "").lower()
+    if res.returncode != 0:
+        if "does not exist" in stderr or "cannot find device" in stderr:
+            return "down"
+        return "unknown"
+    return "up" if " inet " in f" {res.stdout} " else "down"
+
+def interface_has_ipv4(iface: str) -> bool:
+    return interface_ipv4_state(iface) == "up"
 
 def snapshot_main_routes() -> set[str]:
     try:
@@ -256,27 +272,47 @@ class SoftEtherAdapter:
             notes.append(f"stop rc={stopped.returncode}")
         except Exception as exc:
             notes.append(f"stop exception={exc}")
-        try:
-            listed = subprocess.run(["pgrep", "-f", "vpnclient execsvc"], capture_output=True, text=True, timeout=2)
-            for pid in (listed.stdout or "").split():
-                if pid.isdigit():
-                    os.kill(int(pid), 15)
-            notes.append(f"signaled={listed.stdout.strip() or '-'}")
-        except Exception as exc:
-            notes.append(f"kill exception={exc}")
-        time.sleep(0.4)
+        for sig in (15, 9):
+            if not self._vpnclient_running():
+                break
+            try:
+                listed = subprocess.run(["pgrep", "-f", "vpnclient execsvc"], capture_output=True, text=True, timeout=2)
+                pids = [pid for pid in (listed.stdout or "").split() if pid.isdigit()]
+                for pid in pids:
+                    os.kill(int(pid), sig)
+                notes.append(f"sig{sig}={','.join(pids) or '-'}")
+            except Exception as exc:
+                notes.append(f"sig{sig} exception={exc}")
+            for _ in range(8):
+                if not self._vpnclient_running():
+                    return " | ".join(notes)
+                time.sleep(0.25)
         return " | ".join(notes)
+
+    def _vpn_iface_has_ipv4(self) -> bool:
+        for iface in list_interfaces():
+            if iface.startswith("vpn_") and interface_ipv4_state(iface) == "up":
+                return True
+        return False
 
     def _ensure_client_service(self) -> tuple[bool, str]:
         if self._client_ready():
             return True, "reused existing SoftEther VPN Client"
-        recovered = ""
+        # vpncmd often answers with only its banner when the client is busy.
+        # Killing that process drops the production session and is what made
+        # the last few hours flap between otherwise healthy SoftEther nodes.
         if self._vpnclient_running():
+            if self._vpn_iface_has_ipv4():
+                return True, "vpnclient busy while a vpn interface is up; not restarting"
             recovered = self._stop_stuck_vpnclient()
+        else:
+            recovered = ""
 
         debug: list[str] = []
         if recovered:
             debug.append(f"restart stuck client: {recovered}")
+        if self._vpnclient_running():
+            return True, " | ".join(debug + ["vpnclient still running; not starting a second copy"])
         if command_exists("systemctl"):
             try:
                 result = subprocess.run(
@@ -325,13 +361,38 @@ class SoftEtherAdapter:
         )
         return any(marker in normalized for marker in connected_markers)
 
-    def account_connected(self, account: str) -> tuple[bool, str]:
+    def account_session_state(self, account: str) -> tuple[str, str]:
+        """Return up, down, or unknown.
+
+        vpncmd often prints only its banner when the client is busy. That is
+        not a disconnect and must not tear down a working tunnel.
+        """
         try:
             status = self._vpncmd("AccountStatusGet", account, timeout=4)
-            output = (status.stdout or "") + (status.stderr or "")
-            return status.returncode == 0 and self._status_is_connected(output), output
         except Exception as exc:
-            return False, str(exc)
+            return "unknown", str(exc)
+        output = (status.stdout or "") + (status.stderr or "")
+        normalized = " ".join(output.lower().split())
+        if status.returncode == 0 and self._status_is_connected(output):
+            return "up", output
+        down_markers = (
+            "session status | idle",
+            "session status|idle",
+            "session status | disconnected",
+            "session status|disconnected",
+            "session status | connecting",
+            "session status|connecting",
+            "account does not exist",
+            "account not found",
+            "not connected",
+        )
+        if any(marker in normalized for marker in down_markers):
+            return "down", output
+        return "unknown", output
+
+    def account_connected(self, account: str) -> tuple[bool, str]:
+        state, output = self.account_session_state(account)
+        return state == "up", output
 
     def _wait_account_connected(self, account: str, timeout: float = 15.0) -> tuple[bool, str]:
         deadline = time.time() + timeout
@@ -502,7 +563,6 @@ class SSTPAdapter:
             "--password", password,
             "--save-server-route",
             hostname,
-            "usepeerdns",
             "require-mschap-v2",
             "noauth",
             "refuse-eap",

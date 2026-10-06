@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import ipaddress
 import os
+import re
 import secrets
 import select
 import socket
+import subprocess
 import threading
 import urllib.parse
 import time
@@ -91,6 +93,55 @@ def get_active_interface() -> str:
         pass
     return _iface_cache_value or "tun0"
 
+_last_tuned_iface = ""
+
+def _iptables_mss(action: str, iface: str) -> None:
+    subprocess.run(
+        [
+            "iptables", "-t", "mangle", action, "OUTPUT",
+            "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+            "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+        ],
+        capture_output=True, text=True, timeout=3,
+    )
+
+def tune_forwarding_interface(iface: str) -> None:
+    """PPP from SSTP comes up at MTU 1500 and txqueuelen 3.
+
+    That blackholes full-size TCP and drops bursts. Clamp the device and
+    TCP MSS once, when this interface becomes the 8500 egress.
+    """
+    global _last_tuned_iface
+    iface = str(iface or "").strip()
+    if not iface or not re.fullmatch(r"[A-Za-z0-9._:-]{1,15}", iface):
+        return
+    if _last_tuned_iface and _last_tuned_iface != iface:
+        try:
+            _iptables_mss("-D", _last_tuned_iface)
+        except Exception:
+            pass
+    try:
+        subprocess.run(
+            ["ip", "link", "set", "dev", iface, "mtu", "1400", "txqueuelen", "1000"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        pass
+    try:
+        check = subprocess.run(
+            [
+                "iptables", "-t", "mangle", "-C", "OUTPUT",
+                "-o", iface, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
+                "-j", "TCPMSS", "--clamp-mss-to-pmtu",
+            ],
+            capture_output=True, text=True, timeout=3,
+        )
+        if check.returncode != 0:
+            _iptables_mss("-A", iface)
+    except Exception:
+        pass
+    _last_tuned_iface = iface
+
 def set_active_interface(iface: str) -> None:
     iface = str(iface or "").strip()
     if not iface:
@@ -99,6 +150,7 @@ def set_active_interface(iface: str) -> None:
     tmp = ACTIVE_IFACE_FILE.with_suffix(".tmp")
     tmp.write_text(iface, encoding="utf-8")
     tmp.replace(ACTIVE_IFACE_FILE)
+    tune_forwarding_interface(iface)
 
 def clear_active_interface() -> None:
     try:
@@ -345,6 +397,8 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         continue
                     host, port, payload = decoded
                     destinations = _resolve_udp_destinations(host, port)
+                    destinations.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+                    destinations = [item for item in destinations if item[0] == socket.AF_INET]
                     if not destinations:
                         continue
                     client_udp_addr = (peer_ip, int(peer[1]))
@@ -517,10 +571,7 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
         if cached and cached[0] > now:
             return cached[1]
 
-    resolved = (
-        dns_query_over_active_tunnel(key, 1, dns_server, timeout)
-        or dns_query_over_active_tunnel(key, 28, dns_server, timeout)
-    )
+    resolved = dns_query_over_active_tunnel(key, 1, dns_server, timeout)
     ttl = DNS_CACHE_TTL_SECONDS if resolved else DNS_NEGATIVE_TTL_SECONDS
     with DNS_CACHE_LOCK:
         DNS_CACHE[key] = (now + ttl, resolved)
