@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.44"
+APP_VERSION = "V1.0.45"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7904,7 +7904,7 @@ INDEX_HTML = r"""<!doctype html>
       background: transparent;
       border: 1px solid rgba(148, 163, 184, 0.16);
       border-radius: 12px;
-      padding: 8px 46px 8px 8px;
+      padding: 8px;
       margin-bottom: 12px;
       display: flex;
       gap: 6px;
@@ -7954,14 +7954,54 @@ INDEX_HTML = r"""<!doctype html>
       z-index: 100;
       overflow: visible !important;
     }
-    .toolbar-custom-select[data-filter-id="status_filter"] { flex: 1.35 1 0; }
-    .toolbar-custom-select[data-filter-id="country_filter"] { flex: 1.15 1 0; max-width: 168px; }
+    .toolbar-custom-select[data-filter-id="status_filter"] { flex: 1.32 1 0; }
+    .toolbar-custom-select[data-filter-id="country_filter"] { flex: 1.18 1 0; }
     .toolbar-custom-select[data-filter-id="protocol_filter"],
     .toolbar-custom-select[data-filter-id="ip_type_filter"],
     .toolbar-custom-select[data-filter-id="latency_filter"],
-    .toolbar-custom-select[data-filter-id="speed_filter"] { flex: 0.9 1 0; }
-    #btn_favorites { flex: 0 0 auto; margin-left: 4px !important; white-space: nowrap; padding: 0 10px !important; }
-    .toolbar .toolbar-custom-select-button { font-size: 13px; padding: 0 8px; }
+    .toolbar-custom-select[data-filter-id="speed_filter"] { flex: 1 1 0; }
+    #btn_favorites { flex: 0 0 auto; margin-left: 4px !important; white-space: nowrap; padding: 0 12px !important; }
+    .toolbar .toolbar-custom-select-button {
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1;
+      padding: 0 10px 0 12px;
+      gap: 6px;
+      min-width: 0;
+      overflow: hidden;
+      justify-content: flex-start;
+    }
+    .toolbar .toolbar-custom-select-label {
+      flex: 1 1 0;
+      width: 0;
+      max-width: none;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      line-height: 1;
+    }
+    .toolbar .toolbar-custom-option-name {
+      min-width: 0;
+      flex: 1 1 auto;
+      line-height: 1;
+    }
+    .toolbar .toolbar-custom-selected-count {
+      flex: 0 0 auto;
+      min-width: 0;
+      margin-left: 0;
+      line-height: 1;
+      font-size: 12px;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+    }
+    .toolbar .toolbar-custom-select-label .country-flag-img,
+    .toolbar .toolbar-custom-select-label .country-flag-fallback {
+      width: 18px;
+      height: 13px;
+      min-width: 18px;
+      flex: 0 0 18px;
+    }
     .net-filter-grid {
       display: grid;
       grid-template-columns: minmax(0, 1.85fr) minmax(0, 0.82fr) minmax(0, 0.9fr) minmax(0, 0.92fr);
@@ -7973,8 +8013,12 @@ INDEX_HTML = r"""<!doctype html>
     .net-filter-grid .form-label { font-size: 12px; }
     #network_modal .net-filter-grid .toolbar-custom-select-button {
       font-size: 13px;
-      padding: 0 8px;
-      gap: 4px;
+      font-weight: 500;
+      line-height: 1;
+      padding: 0 8px 0 10px;
+      gap: 6px;
+      overflow: hidden;
+      align-items: center;
     }
     #network_modal .net-filter-grid .toolbar-custom-select-label {
       max-width: none;
@@ -8123,15 +8167,28 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1;
     }
     .toolbar-custom-select-arrow {
-      color: var(--text-secondary);
-      font-size: 16px;
-      line-height: 1;
-      flex: 0 0 auto;
-      transform: translateY(-1px);
-      transition: transform .18s ease;
+      width: 16px;
+      height: 16px;
+      flex: 0 0 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #93a4b8;
+      font-size: 0;
+      line-height: 0;
+      transform: none;
+    }
+    .toolbar-custom-select-arrow::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 1.6px solid currentColor;
+      border-bottom: 1.6px solid currentColor;
+      transform: translateY(-1px) rotate(45deg);
+      box-sizing: border-box;
     }
     .toolbar-custom-select.open .toolbar-custom-select-arrow {
-      transform: rotate(180deg) translateY(1px);
+      transform: rotate(180deg);
     }
     .toolbar-custom-select-menu {
       position: absolute;
@@ -8227,20 +8284,63 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu {
       position: absolute;
       left: 0;
-      right: auto;
-      top: calc(100% + 6px);
+      right: 0;
+      top: calc(100% + 4px);
       bottom: auto;
-      width: max-content;
+      width: 100%;
+      min-width: 0;
+      max-width: none;
       margin: 0;
       transform: none;
+      box-sizing: border-box;
+      padding: 4px;
     }
     .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu.open-up {
       top: auto;
-      bottom: calc(100% + 6px);
+      bottom: calc(100% + 4px);
     }
-    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu.open-left {
-      left: auto;
-      right: 0;
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option {
+      min-height: 36px;
+      height: 36px;
+      padding: 0 10px;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1;
+      align-items: center;
+      border-radius: 7px;
+    }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option-label {
+      min-width: 0;
+      gap: 8px;
+      align-items: center;
+      overflow: hidden;
+      line-height: 1;
+    }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option-name {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      line-height: 1;
+      font-weight: 500;
+    }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option-count {
+      flex: 0 0 auto;
+      min-width: 0;
+      font-size: 12px;
+      font-weight: 500;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+      color: #94a3b8;
+    }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .country-flag-img,
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .country-flag-fallback {
+      width: 18px;
+      height: 13px;
+      min-width: 18px;
+      flex: 0 0 18px;
     }
     #network_modal.modal {
       overflow-x: hidden;
@@ -8277,6 +8377,16 @@ INDEX_HTML = r"""<!doctype html>
     #network_modal .unified-select .toolbar-custom-select-menu.open-up {
       top: auto;
       bottom: calc(100% + 4px);
+    }
+    #network_modal .unified-select .toolbar-custom-option {
+      min-height: 36px;
+      height: 36px;
+      padding: 0 10px;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1;
+      align-items: center;
     }
     #network_modal form,
     #network_modal .form-group {
@@ -8581,9 +8691,9 @@ INDEX_HTML = r"""<!doctype html>
       font-variant-numeric: tabular-nums;
     }
     @media (min-width: 1101px) {
-      .toolbar { padding: 8px 46px 8px 8px; }
+      .toolbar { padding: 8px; }
       .toolbar-custom-select { width: auto; }
-      .toolbar-custom-select[data-filter-id="country_filter"] { width: auto; max-width: 168px; }
+      .toolbar-custom-select[data-filter-id="country_filter"] { width: auto; max-width: none; }
       .toolbar-custom-select[data-filter-id="speed_filter"],
       .toolbar-custom-select[data-filter-id="latency_filter"] { width: auto; }
       .toolbar > #btn_favorites { margin-left: 4px !important; flex: 0 0 auto; }
@@ -10978,6 +11088,7 @@ function placeAnchoredMenu(menu, trigger) {
 function placeFilterMenu(menu, trigger) {
   if (!menu || !trigger || !trigger.getBoundingClientRect) return;
   ["position","left","right","top","bottom","width","min-width","max-width","margin","transform","z-index","display"].forEach(prop => menu.style.removeProperty(prop));
+  menu.classList.remove("open-left");
   const rect = trigger.getBoundingClientRect();
   const headerBottom = document.querySelector("header")?.getBoundingClientRect().bottom || 0;
   const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - 10);
@@ -10987,12 +11098,6 @@ function placeFilterMenu(menu, trigger) {
   menu.classList.toggle("open-up", openUp);
   const room = openUp ? spaceAbove : spaceBelow;
   menu.style.maxHeight = Math.max(120, Math.min(320, room || 320)) + "px";
-  if (menu.closest("#network_modal")) {
-    menu.classList.remove("open-left");
-    return;
-  }
-  const menuWidth = Math.max(menu.offsetWidth || 0, menu.scrollWidth || 0);
-  menu.classList.toggle("open-left", rect.left + menuWidth > window.innerWidth - 8);
 }
 
 function repositionOpenMenus() {
