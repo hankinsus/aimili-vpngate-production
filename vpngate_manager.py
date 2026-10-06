@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.43"
+APP_VERSION = "V1.0.44"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7901,9 +7901,7 @@ INDEX_HTML = r"""<!doctype html>
       position: relative;
       z-index: 50;
       isolation: isolate;
-      background: rgba(15, 23, 42, 0.72);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
+      background: transparent;
       border: 1px solid rgba(148, 163, 184, 0.16);
       border-radius: 12px;
       padding: 8px 46px 8px 8px;
@@ -7913,6 +7911,17 @@ INDEX_HTML = r"""<!doctype html>
       flex-wrap: nowrap;
       align-items: center;
       overflow: visible;
+    }
+    .toolbar::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      border-radius: inherit;
+      background: rgba(15, 23, 42, 0.72);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      pointer-events: none;
     }
 
     .toolbar select {
@@ -7955,11 +7964,12 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar .toolbar-custom-select-button { font-size: 13px; padding: 0 8px; }
     .net-filter-grid {
       display: grid;
-      grid-template-columns: minmax(132px, 1.15fr) minmax(96px, 0.9fr) minmax(118px, 1fr) minmax(108px, 0.95fr);
+      grid-template-columns: minmax(0, 1.85fr) minmax(0, 0.82fr) minmax(0, 0.9fr) minmax(0, 0.92fr);
       gap: 8px;
       margin-bottom: 16px;
+      overflow: visible;
     }
-    .net-filter-grid > .form-group { margin-bottom: 0 !important; min-width: 0; }
+    .net-filter-grid > .form-group { margin-bottom: 0 !important; min-width: 0; overflow: visible; }
     .net-filter-grid .form-label { font-size: 12px; }
     #network_modal .net-filter-grid .toolbar-custom-select-button {
       font-size: 13px;
@@ -7969,8 +7979,33 @@ INDEX_HTML = r"""<!doctype html>
     #network_modal .net-filter-grid .toolbar-custom-select-label {
       max-width: none;
       flex: 1 1 auto;
+      min-width: 0;
       overflow: hidden;
+      gap: 4px;
       text-overflow: clip;
+    }
+    #network_modal .net-filter-grid .country-flag-img,
+    #network_modal .net-filter-grid .country-flag-fallback {
+      width: 18px;
+      height: 13px;
+      min-width: 18px;
+      flex: 0 0 18px;
+    }
+    #network_modal .net-filter-grid .toolbar-custom-option-name,
+    #network_modal .unified-select .toolbar-custom-option-name {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #network_modal .net-filter-grid .toolbar-custom-selected-count,
+    #network_modal .unified-select .toolbar-custom-option-count,
+    #network_modal .unified-select .toolbar-custom-selected-count {
+      flex: 0 0 auto;
+      overflow: visible;
+      text-overflow: clip;
+      white-space: nowrap;
     }
     .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
     .unified-select-full { width: 100%; height: 40px; }
@@ -8102,7 +8137,7 @@ INDEX_HTML = r"""<!doctype html>
       position: absolute;
       left: 0;
       right: auto;
-      top: calc(100% + 8px);
+      top: calc(100% + 6px);
       bottom: auto;
       z-index: 10080;
       min-width: 0;
@@ -8125,11 +8160,9 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select.open .toolbar-custom-select-menu {
       display: block;
     }
-    body > .toolbar-custom-select-menu {
-      position: fixed !important;
-      margin: 0 !important;
-      transform: none !important;
-      right: auto !important;
+    .toolbar-custom-select-menu.open-up {
+      top: auto;
+      bottom: calc(100% + 6px);
     }
     .toolbar-custom-select-menu::-webkit-scrollbar { width: 4px; }
     .toolbar-custom-select-menu::-webkit-scrollbar-track { background: transparent; }
@@ -8191,7 +8224,83 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 18px;
       flex-basis: 18px;
     }
-    #network_modal .modal-content { max-width: 560px; padding: 22px 18px 120px; }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu {
+      position: absolute;
+      left: 0;
+      right: auto;
+      top: calc(100% + 6px);
+      bottom: auto;
+      width: max-content;
+      margin: 0;
+      transform: none;
+    }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu.open-up {
+      top: auto;
+      bottom: calc(100% + 6px);
+    }
+    .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu.open-left {
+      left: auto;
+      right: 0;
+    }
+    #network_modal.modal {
+      overflow-x: hidden;
+      overflow-y: auto;
+      align-items: flex-start;
+      padding: 24px 12px;
+    }
+    #network_modal .modal-content {
+      max-width: 600px;
+      width: min(600px, 100%);
+      margin: auto;
+      padding: 22px 18px 16px;
+      overflow: visible;
+      max-height: none;
+    }
+    #network_modal .unified-select {
+      position: relative;
+      overflow: visible;
+    }
+    #network_modal .unified-select .toolbar-custom-select-menu {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      bottom: auto;
+      width: 100%;
+      min-width: 0;
+      max-width: none;
+      margin: 0;
+      transform: none;
+      z-index: 30;
+      box-sizing: border-box;
+    }
+    #network_modal .unified-select .toolbar-custom-select-menu.open-up {
+      top: auto;
+      bottom: calc(100% + 4px);
+    }
+    #network_modal form,
+    #network_modal .form-group {
+      overflow: visible;
+    }
+    .net-modal-footer {
+      margin-top: 18px;
+    }
+    .net-routing-warning {
+      font-size: 13px;
+      color: var(--text-secondary);
+      line-height: 1.7;
+      padding: 14px 16px;
+      min-height: 78px;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      margin: 0 0 14px;
+    }
+    .net-modal-actions {
+      display: flex;
+      gap: 12px;
+      justify-content: flex-end;
+    }
     .add-node-flow,
     .add-node-status {
       margin-top: 14px;
@@ -9943,7 +10052,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Network Modal (代理及网络设置，包括出站路由) -->
   <div id="network_modal" class="modal">
-    <div class="modal-content" style="max-width: 560px;">
+    <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -10080,15 +10189,16 @@ INDEX_HTML = r"""<!doctype html>
               </div>
             </div>
           </div>
-
-          <div id="net_routing_warning" style="font-size: 13px; color: var(--text-secondary); line-height: 1.7; padding: 14px 16px; min-height: 78px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px; margin-top: 12px;">
-            ℹ️ <strong>服务可用性优先</strong>：国家和 IP 类型作为偏好，不作为硬锁定。系统按“目标国家 → IP 类型 → 稳定性 → 延迟 → 带宽”选择；目标暂时不可用时自动回退到同区域或全网可用节点，目标恢复后自动切回。
-          </div>
         </div>
 
-        <div style="display: flex; gap: 12px; justify-content: flex-end;">
-          <button type="button" onclick="closeNetworkModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
-          <button type="submit" id="network_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
+        <div class="net-modal-footer">
+          <div id="net_routing_warning" class="net-routing-warning">
+            ℹ️ <strong>服务可用性优先</strong>：国家和 IP 类型作为偏好，不作为硬锁定。系统按“目标国家 → IP 类型 → 稳定性 → 延迟 → 带宽”选择；目标暂时不可用时自动回退到同区域或全网可用节点，目标恢复后自动切回。
+          </div>
+          <div class="net-modal-actions">
+            <button type="button" onclick="closeNetworkModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
+            <button type="submit" id="network_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
+          </div>
         </div>
       </form>
     </div>
@@ -10778,13 +10888,11 @@ function closeUnifiedSelects(exceptId = "") {
     const menu = $(cfg.menu);
     if (widget) widget.classList.remove("open");
     if (button) button.setAttribute("aria-expanded", "false");
-    if (menu) {
-      menu.style.top="";
-      menu.style.left="";
-      menu.style.bottom="";
-      menu.style.width="";
-      menu.style.setProperty("display", "none", "important");
-    }
+    if (!menu) return;
+    menu.classList.remove("open-up");
+    menu.classList.remove("open-left");
+    ["display","position","left","right","top","bottom","width","min-width","max-width","margin","transform","z-index"].forEach(prop => menu.style.removeProperty(prop));
+    if (widget && menu.parentElement !== widget) widget.appendChild(menu);
   });
 }
 
@@ -10797,21 +10905,22 @@ function toggleUnifiedSelect(selectId, event) {
   if (!cfg || !widget || !menu) return;
   const opening = !widget.classList.contains("open");
   closeCustomFilters("");
-  closeUnifiedSelects(selectId);
+  closeUnifiedSelects("");
+  if (!opening) return;
   renderUnifiedSelect(selectId);
-  widget.classList.toggle("open", opening);
-  if (button) button.setAttribute("aria-expanded", opening ? "true" : "false");
-  if (opening) {
-    // Unified menus must escape modal/scroll containers. The logs modal has
-    // an overflow-y scroll container and backdrop-filter, which can otherwise
-    // clip a fixed dropdown and make its options appear but not receive clicks.
-    if (menu.parentElement !== document.body) {
-      document.body.appendChild(menu);
-    }
+  widget.classList.add("open");
+  if (button) button.setAttribute("aria-expanded", "true");
+  // Proxy-settings menus stay inside the button so they share its edges.
+  // Logs and other modals still portal out of their overflow containers.
+  if (widget.closest("#network_modal")) {
+    if (menu.parentElement !== widget) widget.appendChild(menu);
+    placeFilterMenu(menu, button || widget);
+  } else {
+    if (menu.parentElement !== document.body) document.body.appendChild(menu);
     menu.style.display = "block";
     placeAnchoredMenu(menu, button || widget);
-    queueMenuTrack();
   }
+  queueMenuTrack();
 }
 
 function chooseUnifiedSelect(selectId, value) {
@@ -10866,20 +10975,43 @@ function placeAnchoredMenu(menu, trigger) {
   }
 }
 
+function placeFilterMenu(menu, trigger) {
+  if (!menu || !trigger || !trigger.getBoundingClientRect) return;
+  ["position","left","right","top","bottom","width","min-width","max-width","margin","transform","z-index","display"].forEach(prop => menu.style.removeProperty(prop));
+  const rect = trigger.getBoundingClientRect();
+  const headerBottom = document.querySelector("header")?.getBoundingClientRect().bottom || 0;
+  const spaceBelow = Math.max(0, window.innerHeight - rect.bottom - 10);
+  const spaceAbove = Math.max(0, rect.top - Math.max(0, headerBottom) - 10);
+  const needed = Math.min(320, Math.max(120, menu.scrollHeight || 220));
+  const openUp = spaceBelow < Math.min(needed, 180) && spaceAbove > spaceBelow;
+  menu.classList.toggle("open-up", openUp);
+  const room = openUp ? spaceAbove : spaceBelow;
+  menu.style.maxHeight = Math.max(120, Math.min(320, room || 320)) + "px";
+  if (menu.closest("#network_modal")) {
+    menu.classList.remove("open-left");
+    return;
+  }
+  const menuWidth = Math.max(menu.offsetWidth || 0, menu.scrollWidth || 0);
+  menu.classList.toggle("open-left", rect.left + menuWidth > window.innerWidth - 8);
+}
+
 function repositionOpenMenus() {
   document.querySelectorAll(".toolbar-custom-select.open").forEach(widget => {
+    if (widget.classList.contains("unified-select")) return;
     const selectId = widget.dataset.filterId || "";
     const cfg = CUSTOM_FILTER_CONFIG[selectId];
     const menu = cfg ? $(cfg.menu) : null;
     const button = cfg ? $(cfg.button) : null;
-    if (menu && button && menu.style.display !== "none") placeAnchoredMenu(menu, button);
+    if (menu && button) placeFilterMenu(menu, button);
   });
   document.querySelectorAll(".unified-select.open").forEach(widget => {
     const selectId = widget.getAttribute("data-unified-select-id") || "";
     const cfg = UNIFIED_SELECT_CONFIG[selectId];
     const menu = cfg ? $(cfg.menu) : null;
     const button = cfg ? $(cfg.button) : null;
-    if (menu && button && menu.style.display !== "none") placeAnchoredMenu(menu, button);
+    if (!menu || !button) return;
+    if (widget.closest("#network_modal")) placeFilterMenu(menu, button);
+    else if (menu.parentElement === document.body) placeAnchoredMenu(menu, button);
   });
 }
 
@@ -10891,7 +11023,6 @@ function queueMenuTrack() {
     menuTrackQueued = false;
     if (!document.querySelector(".toolbar-custom-select.open, .unified-select.open")) return;
     repositionOpenMenus();
-    queueMenuTrack();
   });
 }
 
@@ -10926,11 +11057,11 @@ function bindUnifiedSelectEvents() {
   if (modalBody && modalBody.dataset.menuScrollBound !== "1") {
     modalBody.dataset.menuScrollBound = "1";
     modalBody.addEventListener("scroll", () => {
-      document.querySelectorAll(".unified-select.open").forEach(widget => {
+      document.querySelectorAll("#network_modal .unified-select.open").forEach(widget => {
         const selectId = widget.getAttribute("data-unified-select-id");
         const menu = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].menu) : null;
         const button = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].button) : null;
-        if (menu && button) placeAnchoredMenu(menu, button);
+        if (menu && button) placeFilterMenu(menu, button);
       });
     }, {passive: true});
   }
@@ -11092,7 +11223,11 @@ function closeCustomFilters(exceptId = "") {
     const menu = $(cfg.menu);
     if (widget) widget.classList.remove("open");
     if (button) button.setAttribute("aria-expanded", "false");
-    if (menu) menu.style.setProperty("display", "none", "important");
+    if (menu) {
+      menu.classList.remove("open-up");
+      menu.classList.remove("open-left");
+      ["display","position","left","right","top","bottom","width","min-width","max-width","margin","transform","z-index"].forEach(prop => menu.style.removeProperty(prop));
+    }
   });
 }
 
@@ -11115,9 +11250,9 @@ function toggleCustomFilter(selectId, event) {
     const menu = $(cfg.menu);
     const trigger = button || widget;
     if (menu && trigger) {
-      if (menu.parentElement !== document.body) document.body.appendChild(menu);
+      if (menu.parentElement !== widget) widget.appendChild(menu);
       menu.dataset.filterId = selectId;
-      placeAnchoredMenu(menu, trigger);
+      placeFilterMenu(menu, trigger);
       queueMenuTrack();
     }
   }
