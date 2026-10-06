@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.41"
+APP_VERSION = "V1.0.42"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2572,6 +2572,7 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
             nodes.append(node)
             write_json(NODES_FILE, sort_all_nodes(nodes))
         _invalidate_ui_nodes_cache()
+        node_pool.invalidate_ui_lists()
         return node
 
     server = {
@@ -2609,6 +2610,7 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
         nodes.append(ui_node)
         write_json(NODES_FILE, sort_all_nodes(nodes))
     _invalidate_ui_nodes_cache()
+    node_pool.invalidate_ui_lists()
     return ui_node
 
 
@@ -11189,17 +11191,41 @@ let countryCatalogInflightKey = "";
 let activeCountryScope = "";
 let scopeLoadGeneration = 0;
 
-function currentFilterKey() {
+function readListScope() {
+  // One scope for the table, the status badges, and the country menu.
+  // Routing settings never write these controls.
+  const status = String($("status_filter")?.value || "").trim();
+  const protocol = String($("protocol_filter")?.value || "").trim();
+  const ipType = String($("ip_type_filter")?.value || "").trim();
+  const speedMinBps = Math.max(0, Number($("speed_filter")?.value || 0) || 0);
+  const latency = String($("latency_filter")?.value || "").trim();
+  const countrySelect = $("country_filter");
+  const country = countrySelect
+    ? String(countrySelect.value || "").trim()
+    : String(activeCountryScope || "").trim();
+  return {country, status, protocol, ipType, speedMinBps, latency};
+}
 
-  // "all" is a UI label, not a backend filter.
-  const status = $("status_filter")?.value || "";
+function currentFilterKey() {
+  const scope = readListScope();
   return [
-    status === "all" ? "" : status,
-    $("protocol_filter")?.value || "",
-    $("ip_type_filter")?.value || "",
-    $("speed_filter")?.value || "0",
-    $("latency_filter")?.value || ""
+    scope.status === "all" ? "" : scope.status,
+    scope.protocol,
+    scope.ipType,
+    String(scope.speedMinBps || 0),
+    scope.latency
   ].join("|");
+}
+
+function forgetStaleCountryCounts() {
+  if (countryCatalogKey === currentFilterKey()) return;
+  const select = $("country_filter");
+  const selected = select ? select.options[select.selectedIndex] : null;
+  if (!selected) return;
+  const name = String(selected.textContent || "").split(" · ")[0];
+  if (!name || selected.textContent === name) return;
+  selected.textContent = name;
+  renderCustomFilter("country_filter", true);
 }
 
 async function refreshCountryCatalog(force = false) {
@@ -11239,6 +11265,7 @@ async function refreshCountryCatalog(force = false) {
 function updateCountryFilter() {
   const select = $("country_filter");
   if (!select) return;
+  if (countryCatalogKey !== currentFilterKey()) return;
   const selectedValue = String(select.value || "");
   const catalog = countryCatalogData || {countries:{}, total_ip_count:0};
   const merged = new Map();
@@ -11339,16 +11366,12 @@ function switchTableSignature(s) {
 }
 
 function getFilteredNodes() {
-  // The page comes from Master Pool, but a late unfiltered response must not
-  // keep non-matching rows on screen. Live exit and standby stay pinned.
+  // The server already applied the shared filter. Re-checking here hid rows
+  // the page query had accepted. Favorites stay local because they are not
+  // a Master Pool column.
   const favoriteIds = new Set(Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : []);
-  return nodes.filter(n => {
-    if (!n) return false;
-    if (showFavoritesOnly && !favoriteIds.has(n.id)) return false;
-    if (nodeIsConnected(n)) return true;
-    if (state?.standby_ready && nodeIsStandby(n, state?.standby_node_id)) return true;
-    return matchesNodeFilters(n);
-  });
+  if (showFavoritesOnly) return nodes.filter(n => n && favoriteIds.has(n.id));
+  return nodes.filter(n => !!n);
 }
 
 function hotPoolSummary() {
@@ -12132,20 +12155,16 @@ async function fetchUiStateOnly(timeoutMs = 5000) {
 
 async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
   const seq = ++nodeQuerySeq;
+  const scope = readListScope();
   const params = new URLSearchParams();
   params.set("offset", String(Math.max(0, Number(offset) || 0)));
   params.set("limit", String(Math.max(1, Math.min(200, Number(limit) || 100))));
-  if (activeCountryScope) params.set("country", activeCountryScope);
-  const status = $("status_filter")?.value || "";
-  const protocol = $("protocol_filter")?.value || "";
-  const ipType = $("ip_type_filter")?.value || "";
-  const speedMinBps = Number($("speed_filter")?.value || 0);
-  const latency = String($("latency_filter")?.value || "");
-  if (status) params.set("status", status);
-  if (protocol) params.set("protocol", protocol);
-  if (ipType) params.set("ip_type", ipType);
-  if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
-  if (latency) params.set("latency", latency);
+  if (scope.country) params.set("country", scope.country);
+  if (scope.status) params.set("status", scope.status);
+  if (scope.protocol) params.set("protocol", scope.protocol);
+  if (scope.ipType) params.set("ip_type", scope.ipType);
+  if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
+  if (scope.latency) params.set("latency", scope.latency);
   const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
   if (data && typeof data === "object") data._nodeQuerySeq = seq;
   return data;
@@ -12838,7 +12857,10 @@ function startManualAddPolling() {
             submit.onclick = closeAddNodeModal;
           }
         } else if (data.ok) {
-          loadScope(String($("country_filter")?.value || activeCountryScope || ""), {preserveState:true});
+          const country = String($("country_filter")?.value || activeCountryScope || "");
+          loadScope(country, {preserveState:true});
+          refreshCountryCatalog(true).catch(() => {});
+          refreshFilterCounts().catch(() => {});
           if (submit) {
             submit.disabled = false;
             submit.textContent = "完成";
@@ -13013,17 +13035,13 @@ async function refreshFilterCounts() {
   filterCountsLoading = true;
   updateStatusFilterOptions();
   renderCustomFilter("status_filter");
+  const scope = readListScope();
   const params = new URLSearchParams();
-  const country = String($("country_filter")?.value || "").trim();
-  const protocol = String($("protocol_filter")?.value || "").trim();
-  const ipType = String($("ip_type_filter")?.value || "").trim();
-  const speedMinBps = Number($("speed_filter")?.value || 0);
-  const latency = String($("latency_filter")?.value || "");
-  if (country) params.set("country", country);
-  if (protocol) params.set("protocol", protocol);
-  if (ipType) params.set("ip_type", ipType);
-  if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
-  if (latency) params.set("latency", latency);
+  if (scope.country) params.set("country", scope.country);
+  if (scope.protocol) params.set("protocol", scope.protocol);
+  if (scope.ipType) params.set("ip_type", scope.ipType);
+  if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
+  if (scope.latency) params.set("latency", scope.latency);
   try {
     const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), {}, 8000);
     if (seq !== filterCountsRequestSeq) return;
@@ -13050,6 +13068,7 @@ async function applyNodeFilterChange(event) {
       renderCustomFilter("status_filter");
     }
   }
+  forgetStaleCountryCounts();
   currentPage = 1;
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
@@ -13067,6 +13086,7 @@ $("country_filter").onchange=async()=>{
   }
   const country = String($("country_filter").value || "").trim();
   activeCountryScope = country;
+  forgetStaleCountryCounts();
   currentPage = 1;
   // Start the node page immediately. The country catalog must not block the list.
   const loadPromise = loadScope(country, {preserveState:true});
@@ -13808,20 +13828,14 @@ async function saveNetwork(e) {
       } else {
         successDiv.textContent = data.message || "配置保存成功，已即时生效！";
         successDiv.style.display = "block";
-        const countrySelect = $("country_filter");
-        if (countrySelect && routingMode === "fixed_region") countrySelect.value = forceCountry || "";
-        const protocolSelect = $("protocol_filter");
-        if (protocolSelect) protocolSelect.value = routingProtocol || "";
-        const ipSelect = $("ip_type_filter");
-        if (ipSelect) ipSelect.value = routingIpType && routingIpType !== "all" ? routingIpType : "";
-        const speedSelect = $("speed_filter");
-        if (speedSelect) speedSelect.value = String(routingMinSpeed || 0);
-        const latencySelect = $("latency_filter");
-        if (latencySelect) latencySelect.value = routingLatency || "";
-        if (typeof renderAllCustomFilters === "function") renderAllCustomFilters();
-        setTimeout(() => {
+        setTimeout(async () => {
           closeNetworkModal();
-          load();
+          try {
+            const stateData = await fetchUiStateOnly(4000);
+            if (stateData?.state) adoptBackendState(stateData.state);
+          } catch (_) {}
+          if (data.switching) refreshCurrentNodePageFast().catch(() => {});
+          else render();
         }, data.switching ? 2200 : 800);
       }
     } else {

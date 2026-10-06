@@ -96,6 +96,36 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
     return where, params
 
 
+def _attach_latest_observations(db: sqlite3.Connection, rows: list[dict[str, Any]]) -> None:
+    """Fill ping/speed/sessions/score for an already limited page.
+
+    The list query used to run four observation lookups for every matching
+    endpoint before LIMIT. Only the rows actually returned need that data.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = str(row.get("server_key") or "")
+        if key and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    by_key: dict[str, sqlite3.Row] = {}
+    for key in keys:
+        obs = db.execute(
+            "SELECT ping, speed, sessions, score FROM observations "
+            "WHERE server_key=? ORDER BY seen_at DESC, id DESC LIMIT 1",
+            (key,),
+        ).fetchone()
+        if obs is not None:
+            by_key[key] = obs
+    for row in rows:
+        obs = by_key.get(str(row.get("server_key") or ""))
+        row["latest_ping"] = int(obs["ping"] or 0) if obs is not None else 0
+        row["latest_speed"] = int(obs["speed"] or 0) if obs is not None else 0
+        row["latest_sessions"] = int(obs["sessions"] or 0) if obs is not None else 0
+        row["latest_server_score"] = int(obs["score"] or 0) if obs is not None else 0
+
+
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -171,6 +201,7 @@ class NodePool:
         with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
             self._ensure_endpoint_columns(db)
+            self._ensure_ui_indexes(db)
             removed = self._purge_duplicate_rows(db)
             db.commit()
         if removed:
@@ -185,6 +216,18 @@ class NodePool:
             db.execute("ALTER TABLE endpoints ADD COLUMN last_session_seconds INTEGER NOT NULL DEFAULT 0")
         if "stability" not in cols:
             db.execute("ALTER TABLE endpoints ADD COLUMN stability TEXT NOT NULL DEFAULT ''")
+
+    @staticmethod
+    def _ensure_ui_indexes(db: sqlite3.Connection) -> None:
+        # Expression index matches _ui_list_filters ip_type predicate. Older
+        # SQLite builds skip it; the filter still works without the index.
+        try:
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_servers_ip_type_country ON servers("
+                "LOWER(COALESCE(json_extract(metadata_json,'$.ip_type'),'')), country, current_ip)"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     @staticmethod
     def availability_label(seconds: int, unstable: bool) -> str:
@@ -397,6 +440,18 @@ class NodePool:
         self._scoped_page_cache.clear()
         self._scoped_page_stale.clear()
 
+    def invalidate_ui_lists(self) -> None:
+        """Drop every cached list, badge count, and country menu.
+
+        Probe writes stay on the short TTL so a detection storm cannot turn
+        each browser refresh into a full scan. A manual insert must show up
+        on the next filter read, so that path clears these snapshots.
+        """
+        self.invalidate_scoped_pages()
+        self._country_catalog_cache.clear()
+        self._status_counts_cache.clear()
+        self._stats_cache = None
+
     def _invalidate_read_caches(self) -> None:
         # Writes do not synchronously flush every UI snapshot. Status/country
         # statistics and bounded pages are intentionally short-TTL snapshots;
@@ -412,8 +467,8 @@ class NodePool:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=NORMAL")
         db.execute("PRAGMA temp_store=MEMORY")
-        db.execute("PRAGMA cache_size=-1024")
-        db.execute("PRAGMA mmap_size=8388608")
+        db.execute("PRAGMA cache_size=-8192")
+        db.execute("PRAGMA mmap_size=33554432")
         db.execute("PRAGMA foreign_keys=ON")
         return db
 
@@ -598,6 +653,8 @@ class NodePool:
             # that remain unseen for long periods are naturally deprioritized by
             # next_test / last_seen scheduling.
             db.commit()
+        if str(source or "").startswith("manual"):
+            self.invalidate_ui_lists()
 
     def list_endpoints(self, protocol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         # The UI is paginated; keep the backend ceiling high enough that the
@@ -760,10 +817,6 @@ class NodePool:
                         "SELECT * FROM ("
                         "SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state, "
                         "s.metadata_json AS server_metadata_json, "
-                        "COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping, "
-                        "COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed, "
-                        "COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions, "
-                        "COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score, "
                         "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY "
                         "CASE UPPER(e.status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
                         "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
@@ -788,6 +841,8 @@ class NodePool:
                             standby_endpoint_id, standby_endpoint_id, standby_ip, standby_ip, standby_protocol, standby_port,
                             limit, offset,
                         ]).fetchall()
+                    page_rows = [dict(row) for row in rows]
+                    _attach_latest_observations(db, page_rows)
             except sqlite3.OperationalError as exc:
                 if stale and "lock" in str(exc).lower():
                     cached_rows, cached_total = stale
@@ -795,8 +850,7 @@ class NodePool:
                 raise
 
             result=[]
-            for row in rows:
-                item=dict(row)
+            for item in page_rows:
                 item.pop("_ui_rn", None)
                 try: item['metadata']=json.loads(item.pop('metadata_json') or '{}')
                 except Exception: item['metadata']={}; item.pop('metadata_json',None)
@@ -849,50 +903,49 @@ class NodePool:
                 where.append("1=0")
 
         scope = " FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
-        with closing(self._connect()) as db:
-            rows = db.execute(
-                "SELECT s.country AS country, s.current_ip AS ip, s.server_key AS server_key" + scope
-                + " GROUP BY s.country, s.current_ip, s.server_key",
-                params,
-            ).fetchall()
+        with self._country_catalog_gate:
+            cached = self._country_catalog_cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                return dict(cached[1])
+            with closing(self._connect(1500)) as db:
+                grouped = db.execute(
+                    "SELECT s.country AS country, "
+                    "COUNT(DISTINCT s.current_ip) AS ip_count, "
+                    "COUNT(DISTINCT s.server_key) AS server_count"
+                    + scope + " GROUP BY s.country",
+                    params,
+                ).fetchall()
+                total_ip = int(db.execute(
+                    "SELECT COUNT(DISTINCT s.current_ip) AS n" + scope,
+                    params,
+                ).fetchone()["n"] or 0)
 
-        countries: dict[str, dict[str, int]] = {}
-        ips_by_country: dict[str, set[str]] = {}
-        servers_by_country: dict[str, set[str]] = {}
-        global_ips: set[str] = set()
-        for row in rows:
-            ip = str(row["ip"] or "").strip()
-            if not ip:
-                continue
-            global_ips.add(ip)
-            country = canonical_country_name(row["country"])
-            if not country:
-                continue
-            ips_by_country.setdefault(country, set()).add(ip)
-            servers_by_country.setdefault(country, set()).add(str(row["server_key"] or ""))
-        for country, ips in ips_by_country.items():
-            countries[country] = {
-                "ip_count": len(ips),
-                "server_count": len(servers_by_country.get(country) or ()),
+            countries: dict[str, dict[str, int]] = {}
+            country_ip_count = 0
+            for row in grouped:
+                ip_count = int(row["ip_count"] or 0)
+                server_count = int(row["server_count"] or 0)
+                if ip_count <= 0:
+                    continue
+                country = canonical_country_name(row["country"])
+                if not country:
+                    continue
+                slot = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
+                slot["ip_count"] += ip_count
+                slot["server_count"] += server_count
+                country_ip_count += ip_count
+
+            result = {
+                "total_ip_count": total_ip,
+                "country_ip_count": country_ip_count,
+                "countries": countries,
+                "status": status,
+                "protocol": protocol,
+                "ip_type": ip_type,
             }
-
-        # Known-country coverage is intentionally separate from the global
-        # distinct-IP total: an un-geolocated Master Pool IP must not disappear
-        # from the global count or be falsely assigned to a country.
-        country_total = sum(int(v.get("ip_count") or 0) for v in countries.values())
-        result = {
-            "total_ip_count": len(global_ips),
-            "country_ip_count": country_total,
-            "countries": countries,
-            "status": status,
-            "protocol": protocol,
-            "ip_type": ip_type,
-        }
-        # Country inventory is not connection status. Keep it for a minute.
-        # The connected filter is one live row and stays short.
-        catalog_ttl = 5.0 if status == "connected" else 60.0
-        self._country_catalog_cache[key] = (now + catalog_ttl, result)
-        return dict(result)
+            catalog_ttl = 5.0 if status == "connected" else 60.0
+            self._country_catalog_cache[key] = (time.monotonic() + catalog_ttl, result)
+            return dict(result)
 
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
         endpoint_id = str(endpoint_id or "").strip()
