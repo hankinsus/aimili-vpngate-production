@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.22"
+APP_VERSION = "V1.0.23"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -638,6 +638,7 @@ def load_ui_config() -> dict[str, Any]:
             "routing_ip_type": "all",
             "routing_protocol": "",
             "routing_min_speed_bps": 0,
+            "routing_latency": "",
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
@@ -650,7 +651,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -1052,6 +1053,7 @@ def get_state() -> dict[str, Any]:
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["routing_protocol"] = str(ui_cfg.get("routing_protocol") or "")
     state["routing_min_speed_bps"] = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    state["routing_latency"] = str(ui_cfg.get("routing_latency") or "")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
@@ -3150,6 +3152,7 @@ def ip_type_preference_rank(preferred: str, actual: Any) -> int:
 
 ROUTING_PROTOCOL_CHOICES = {"", "openvpn", "softether", "sstp", "l2tp-ipsec"}
 ROUTING_SPEED_CHOICES = {0, 50_000_000, 100_000_000, 300_000_000, 500_000_000, 700_000_000, 1_000_000_000}
+ROUTING_LATENCY_CHOICES = {"", "100", "200", "400", "800", "1000", "gt1000"}
 
 def normalize_routing_protocol(value: Any) -> str:
     protocol = str(value or "").strip().lower()
@@ -3167,6 +3170,38 @@ def normalize_routing_min_speed(value: Any) -> int:
     if speed not in ROUTING_SPEED_CHOICES:
         raise ValueError("无效的速度筛选")
     return speed
+
+def normalize_routing_latency(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("0", "all", "any", "none"):
+        text = ""
+    if text not in ROUTING_LATENCY_CHOICES:
+        raise ValueError("无效的延迟筛选")
+    return text
+
+def latency_filter_matches(latency_ms: int, latency_filter: str) -> bool:
+    text = str(latency_filter or "").strip().lower()
+    if text in ("", "0", "all", "any", "none"):
+        return True
+    ms = int(latency_ms or 0)
+    if text == "gt1000":
+        return ms > 1000
+    return 0 < ms <= int(text)
+
+def endpoint_display_latency_ms(endpoint: dict[str, Any]) -> int:
+    meta = endpoint.get("metadata") or {}
+    measured = endpoint.get("latency_ewma")
+    if not measured:
+        measured = endpoint.get("latency_ms") or 0
+    try:
+        measured_ms = int(float(measured or 0))
+    except (TypeError, ValueError):
+        measured_ms = 0
+    try:
+        tcp_rtt_ms = int(float(meta.get("tcp_rtt_ms") or 0))
+    except (TypeError, ValueError):
+        tcp_rtt_ms = 0
+    return usable_latency_ms(measured_ms, tcp_rtt_ms=tcp_rtt_ms)
 
 def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
     meta = endpoint.get("server_metadata") or {}
@@ -3434,6 +3469,14 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
         ]
         if fast:
             candidates = fast
+    latency_filter = str(ui_cfg.get("routing_latency") or "").strip().lower()
+    if latency_filter:
+        matched = [
+            ep for ep in candidates
+            if latency_filter_matches(endpoint_display_latency_ms(ep), latency_filter)
+        ]
+        if matched:
+            candidates = matched
 
     candidates.sort(key=lambda endpoint: routing_service_key(endpoint, ui_cfg))
     return candidates[:max(1, min(int(limit), 100))]
@@ -3524,6 +3567,8 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
         speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
         if speed < min_speed:
             return False
+    if not latency_filter_matches(endpoint_display_latency_ms(endpoint), str(ui_cfg.get("routing_latency") or "")):
+        return False
     if mode == "favorites" and routing_favorite_rank(endpoint, ui_cfg) != 0:
         return False
     return True
@@ -7471,6 +7516,9 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select[data-filter-id="speed_filter"] {
       width: 176px;
     }
+    .toolbar-custom-select[data-filter-id="latency_filter"] {
+      width: 168px;
+    }
     .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
     .unified-select-full { width: 100%; height: 40px; }
     #network_modal .toolbar-custom-select.unified-select-full {
@@ -7925,6 +7973,7 @@ INDEX_HTML = r"""<!doctype html>
       .toolbar-custom-select { width: 168px; }
       .toolbar-custom-select[data-filter-id="country_filter"] { width: 248px; }
       .toolbar-custom-select[data-filter-id="speed_filter"] { width: 176px; }
+      .toolbar-custom-select[data-filter-id="latency_filter"] { width: 168px; }
       .toolbar > #btn_favorites { margin-left: auto !important; flex: 0 0 auto; }
     }
 
@@ -9223,6 +9272,23 @@ INDEX_HTML = r"""<!doctype html>
       <div id="ip_type_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
     </div>
 
+      <select id="latency_filter" aria-hidden="true" tabindex="-1" style="display:none;">
+        <option value="">不限延迟</option>
+        <option value="100">≤100 ms</option>
+        <option value="200">≤200 ms</option>
+        <option value="400">≤400 ms</option>
+        <option value="800">≤800 ms</option>
+        <option value="1000">≤1000 ms</option>
+        <option value="gt1000">＞1000 ms</option>
+      </select>
+      <div id="latency_filter_widget" class="toolbar-custom-select" data-filter-id="latency_filter" aria-label="延迟筛选">
+        <button id="latency_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
+          <span id="latency_filter_label" class="toolbar-custom-select-label">不限延迟</span>
+          <span class="toolbar-custom-select-arrow">⌄</span>
+        </button>
+        <div id="latency_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+      </div>
+
       <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
         <option value="0">不限速度</option>
         <option value="50000000">≥50 Mbps</option>
@@ -9445,6 +9511,26 @@ INDEX_HTML = r"""<!doctype html>
                 <span class="toolbar-custom-select-arrow">⌄</span>
               </button>
               <div id="net_routing_protocol_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label" for="net_routing_latency">延迟</label>
+            <select id="net_routing_latency" aria-hidden="true" tabindex="-1" style="display:none;">
+              <option value="">不限延迟</option>
+              <option value="100">≤100 ms</option>
+              <option value="200">≤200 ms</option>
+              <option value="400">≤400 ms</option>
+              <option value="800">≤800 ms</option>
+              <option value="1000">≤1000 ms</option>
+              <option value="gt1000">＞1000 ms</option>
+            </select>
+            <div id="net_routing_latency_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_latency" aria-label="延迟">
+              <button id="net_routing_latency_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                <span id="net_routing_latency_label" class="toolbar-custom-select-label">不限延迟</span>
+                <span class="toolbar-custom-select-arrow">⌄</span>
+              </button>
+              <div id="net_routing_latency_menu" class="toolbar-custom-select-menu" role="listbox"></div>
             </div>
           </div>
 
@@ -10075,6 +10161,15 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedIpType === "mobile" && ipType !== "mobile") return false;
 
   if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) < selectedSpeed) return false;
+  const latencyFilter = String($("latency_filter")?.value || "");
+  if (latencyFilter) {
+    const ms = Number(n.latency_ms || 0);
+    if (latencyFilter === "gt1000") {
+      if (!(ms > 1000)) return false;
+    } else if (!(ms > 0 && ms <= Number(latencyFilter))) {
+      return false;
+    }
+  }
 
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
   if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
@@ -10091,6 +10186,7 @@ const CUSTOM_FILTER_CONFIG = {
   country_filter: {widget:"country_filter_widget", button:"country_filter_button", label:"country_filter_label", menu:"country_filter_menu"},
   protocol_filter: {widget:"protocol_filter_widget", button:"protocol_filter_button", label:"protocol_filter_label", menu:"protocol_filter_menu"},
   ip_type_filter: {widget:"ip_type_filter_widget", button:"ip_type_filter_button", label:"ip_type_filter_label", menu:"ip_type_filter_menu"},
+  latency_filter: {widget:"latency_filter_widget", button:"latency_filter_button", label:"latency_filter_label", menu:"latency_filter_menu"},
   speed_filter: {widget:"speed_filter_widget", button:"speed_filter_button", label:"speed_filter_label", menu:"speed_filter_menu"}
 };
 
@@ -10098,6 +10194,7 @@ const CUSTOM_FILTER_CONFIG = {
 const UNIFIED_SELECT_CONFIG = {
   net_force_country: {widget:"net_force_country_widget", button:"net_force_country_button", label:"net_force_country_label", menu:"net_force_country_menu"},
   net_routing_protocol: {widget:"net_routing_protocol_widget", button:"net_routing_protocol_button", label:"net_routing_protocol_label", menu:"net_routing_protocol_menu"},
+  net_routing_latency: {widget:"net_routing_latency_widget", button:"net_routing_latency_button", label:"net_routing_latency_label", menu:"net_routing_latency_menu"},
   net_routing_min_speed: {widget:"net_routing_min_speed_widget", button:"net_routing_min_speed_button", label:"net_routing_min_speed_label", menu:"net_routing_min_speed_menu"},
   rs_sync_interval_unit: {widget:"rs_sync_interval_unit_widget", button:"rs_sync_interval_unit_button", label:"rs_sync_interval_unit_label", menu:"rs_sync_interval_unit_menu"},
   rs_edit_sync_unit: {widget:"rs_edit_sync_unit_widget", button:"rs_edit_sync_unit_button", label:"rs_edit_sync_unit_label", menu:"rs_edit_sync_unit_menu"},
@@ -10532,7 +10629,8 @@ function currentFilterKey() {
     status === "all" ? "" : status,
     $("protocol_filter")?.value || "",
     $("ip_type_filter")?.value || "",
-    $("speed_filter")?.value || "0"
+    $("speed_filter")?.value || "0",
+    $("latency_filter")?.value || ""
   ].join("|");
 }
 
@@ -10543,12 +10641,13 @@ async function refreshCountryCatalog(force = false) {
     return countryCatalogData;
   }
   if (countryCatalogPromise && countryCatalogInflightKey === key) return countryCatalogPromise;
-  const [status, protocol, ipType, speedMinBps] = key.split("|");
+  const [status, protocol, ipType, speedMinBps, latency] = key.split("|");
   const params = new URLSearchParams();
   if (status) params.set("status", status);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
   if (speedMinBps && Number(speedMinBps) > 0) params.set("speed_min_bps", speedMinBps);
+  if (latency) params.set("latency", latency);
 
   countryCatalogInflightKey = key;
   const requestKey = key;
@@ -11451,10 +11550,12 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
   const protocol = $("protocol_filter")?.value || "";
   const ipType = $("ip_type_filter")?.value || "";
   const speedMinBps = Number($("speed_filter")?.value || 0);
+  const latency = String($("latency_filter")?.value || "");
   if (status) params.set("status", status);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
   if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
+  if (latency) params.set("latency", latency);
   return fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
 }
 
@@ -12284,10 +12385,12 @@ async function refreshFilterCounts() {
   const protocol = String($("protocol_filter")?.value || "").trim();
   const ipType = String($("ip_type_filter")?.value || "").trim();
   const speedMinBps = Number($("speed_filter")?.value || 0);
+  const latency = String($("latency_filter")?.value || "");
   if (country) params.set("country", country);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
   if (speedMinBps > 0) params.set("speed_min_bps", String(speedMinBps));
+  if (latency) params.set("latency", latency);
   try {
     const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), {}, 8000);
     if (seq !== filterCountsRequestSeq) return;
@@ -12328,6 +12431,7 @@ $("country_filter").onchange=async()=>{
 };
 $("protocol_filter").onchange=applyNodeFilterChange;
 $("ip_type_filter").onchange=applyNodeFilterChange;
+$("latency_filter").onchange=applyNodeFilterChange;
 $("speed_filter").onchange=applyNodeFilterChange;
 $("status_filter").onchange=applyNodeFilterChange;
 renderAllCustomFilters();
@@ -12586,7 +12690,8 @@ async function toggleFavRouting() {
         force_country: state.force_country || "",
         routing_ip_type: state.routing_ip_type || "all",
         routing_protocol: state.routing_protocol || "",
-        routing_min_speed_bps: Number(state.routing_min_speed_bps || 0)
+        routing_min_speed_bps: Number(state.routing_min_speed_bps || 0),
+        routing_latency: state.routing_latency || ""
       })
     });
     const data = await res.json();
@@ -12967,10 +13072,13 @@ function openNetworkModal() {
     selectOptionCard('routing_ip_type', ipType);
     const protocolSelect = $("net_routing_protocol");
     const speedSelect = $("net_routing_min_speed");
+    const latencySelect = $("net_routing_latency");
     if (protocolSelect) protocolSelect.value = state.routing_protocol || "";
     if (speedSelect) speedSelect.value = String(state.routing_min_speed_bps || 0);
+    if (latencySelect) latencySelect.value = state.routing_latency || "";
     syncUnifiedSelect("net_routing_protocol");
     syncUnifiedSelect("net_routing_min_speed");
+    syncUnifiedSelect("net_routing_latency");
     const upstreamEl = $("net_upstream_proxy_state");
     if (upstreamEl) upstreamEl.textContent = state.upstream_proxy_label || "系统默认网络（未设置自定义上游代理）";
   }
@@ -13001,6 +13109,7 @@ async function saveNetwork(e) {
   const routingIpType = $("net_routing_ip_type").value;
   const routingProtocol = $("net_routing_protocol")?.value || "";
   const routingMinSpeed = Number($("net_routing_min_speed")?.value || 0);
+  const routingLatency = String($("net_routing_latency")?.value || "");
 
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -13033,7 +13142,8 @@ async function saveNetwork(e) {
         force_country: forceCountry,
         routing_ip_type: routingIpType,
         routing_protocol: routingProtocol,
-        routing_min_speed_bps: routingMinSpeed
+        routing_min_speed_bps: routingMinSpeed,
+        routing_latency: routingLatency
       })
     });
 
@@ -14851,7 +14961,11 @@ class Handler(BaseHTTPRequestHandler):
             protocol = str((query.get("protocol") or [""])[0]).strip().lower()
             ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
             speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
-            if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps:
+            try:
+                latency = normalize_routing_latency((query.get("latency") or [""])[0])
+            except ValueError:
+                latency = ""
+            if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps and not latency:
                 active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
                 country_key = normalized_country_name(country) if country else ""
                 with _first_page_snapshot_lock:
@@ -14875,7 +14989,7 @@ class Handler(BaseHTTPRequestHandler):
                         ep = node_pool.get_endpoint(active_pool_endpoint_id)
                         if ep:
                             node = protocol_endpoint_to_ui_node(ep)
-                            if _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps):
+                            if _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
                                 connected_nodes = [node]
                     elif active_openvpn_node_id:
                         try:
@@ -14888,12 +15002,12 @@ class Handler(BaseHTTPRequestHandler):
                         if raw_active:
                             raw_active = dict(raw_active)
                             raw_active["active"] = True
-                            if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type, speed_min_bps):
+                            if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type, speed_min_bps, latency):
                                 connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
                     page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
                 else:
                     page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
-                        offset, limit, country, status, protocol, ip_type, speed_min_bps
+                        offset, limit, country, status, protocol, ip_type, speed_min_bps, latency
                     )
                 body = {
                     "ok": True,
@@ -14903,10 +15017,10 @@ class Handler(BaseHTTPRequestHandler):
                     "total": total_nodes,
                     "has_more": offset + len(page_nodes) < total_nodes,
                     "cache_building": cache_building,
-                    "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps},
+                    "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps, "latency": latency},
                     "generated_at": time.time(),
                 }
-                if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps:
+                if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps and not latency:
                     country_key = normalized_country_name(country) if country else ""
                     active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
                     with _first_page_snapshot_lock:
@@ -14922,7 +15036,11 @@ class Handler(BaseHTTPRequestHandler):
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
                 speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
-                self.send_json({"ok": True, **_get_ui_filter_counts(country, protocol, ip_type, speed_min_bps)})
+                try:
+                    latency = normalize_routing_latency((query.get("latency") or [""])[0])
+                except ValueError:
+                    latency = ""
+                self.send_json({"ok": True, **_get_ui_filter_counts(country, protocol, ip_type, speed_min_bps, latency)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             finally:
@@ -14935,7 +15053,11 @@ class Handler(BaseHTTPRequestHandler):
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
                 speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
-                self.send_json({"ok": True, **_get_ui_country_catalog(status, protocol, ip_type, speed_min_bps)})
+                try:
+                    latency = normalize_routing_latency((query.get("latency") or [""])[0])
+                except ValueError:
+                    latency = ""
+                self.send_json({"ok": True, **_get_ui_country_catalog(status, protocol, ip_type, speed_min_bps, latency)})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             finally:
@@ -15641,6 +15763,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     routing_protocol = normalize_routing_protocol(payload.get("routing_protocol"))
                     routing_min_speed_bps = normalize_routing_min_speed(payload.get("routing_min_speed_bps"))
+                    routing_latency = normalize_routing_latency(payload.get("routing_latency"))
                 except ValueError as exc:
                     self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                     return
@@ -15678,6 +15801,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg["routing_protocol"] = routing_protocol
                 ui_cfg["routing_min_speed_bps"] = routing_min_speed_bps
+                ui_cfg["routing_latency"] = routing_latency
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = True
                 if routing_mode == "fixed_ip":
@@ -15690,7 +15814,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
-                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0:
+                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0 or ui_cfg.get("routing_latency"):
                     threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
@@ -15734,6 +15858,10 @@ class Handler(BaseHTTPRequestHandler):
                         routing_min_speed_bps = normalize_routing_min_speed(payload.get("routing_min_speed_bps"))
                     else:
                         routing_min_speed_bps = normalize_routing_min_speed(ui_cfg.get("routing_min_speed_bps"))
+                    if "routing_latency" in payload:
+                        routing_latency = normalize_routing_latency(payload.get("routing_latency"))
+                    else:
+                        routing_latency = normalize_routing_latency(ui_cfg.get("routing_latency"))
                 except ValueError as exc:
                     self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
                     return
@@ -15749,6 +15877,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg["routing_protocol"] = routing_protocol
                 ui_cfg["routing_min_speed_bps"] = routing_min_speed_bps
+                ui_cfg["routing_latency"] = routing_latency
                 ui_cfg["fav_fail_fallback"] = fav_fail_fallback
                 if routing_mode == "fixed_ip":
                     ui_cfg["fixed_node_id"] = fixed_node_id
@@ -15761,7 +15890,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 clear_manual_route_pin()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "出站路由配置已更新")
-                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0:
+                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0 or ui_cfg.get("routing_latency"):
                     threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
 
                 self.send_json({"ok": True, "message": policy_message or "出站路由配置更新成功，偏好已即时应用，目标恢复后会自动切回！"})
@@ -16463,7 +16592,7 @@ def _get_ui_nodes_snapshot():
     return _sanitize_ui_nodes(read_nodes())
 
 
-def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0) -> bool:
+def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0, latency: str = "") -> bool:
     country = str(country or "").strip()
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
@@ -16492,6 +16621,8 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
 
     if speed_min_bps > 0 and int(node.get("speed_bps") or node.get("speed") or 0) < speed_min_bps:
         return False
+    if not latency_filter_matches(int(node.get("latency_ms") or 0), latency):
+        return False
 
     if status == "available":
         return str(node.get("probe_status") or "").lower() == "available" or bool(node.get("active"))
@@ -16502,7 +16633,7 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     return True
 
 
-def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type="", speed_min_bps=0):
+def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type="", speed_min_bps=0, latency=""):
     """Return a bounded page for the requested scope.
 
     The browser should never download the global pool merely to populate a
@@ -16549,6 +16680,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
             offset=offset,
             limit=limit,
             speed_min_bps=speed_min_bps,
+            latency=latency,
             active_endpoint_id=active_endpoint_id,
             active_ip=active_ip,
             active_protocol=active_protocol,
@@ -16581,25 +16713,29 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
         snapshot = [dict(x) for x in ui_nodes_cache] if ui_nodes_cache else []
     if not snapshot:
         snapshot = _sanitize_ui_nodes(read_nodes())
-    filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type, speed_min_bps)]
+    filtered = [n for n in snapshot if _node_matches_ui_scope(n, country, status, protocol, ip_type, speed_min_bps, latency)]
     ordered = _sort_ui_nodes_for_page(filtered)
     total = len(ordered)
     return ordered[offset:offset + limit], total, building
 
 
-def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0):
+def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0, latency=""):
     """Return status counts for the currently selected filter scope."""
     country = normalized_country_name(country) if country else ""
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
     speed_min_bps = max(0, int(speed_min_bps or 0))
-    status_counts = node_pool.status_counts(country=country, protocol=protocol, ip_type=ip_type, speed_min_bps=speed_min_bps)
+    try:
+        latency = normalize_routing_latency(latency)
+    except ValueError:
+        latency = ""
+    status_counts = node_pool.status_counts(country=country, protocol=protocol, ip_type=ip_type, speed_min_bps=speed_min_bps, latency=latency)
     connected_count = 0
     try:
         if active_pool_endpoint_id:
             endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
             node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
-            connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps) else 0
+            connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency) else 0
         elif active_openvpn_node_id:
             active = next(
                 (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
@@ -16608,7 +16744,7 @@ def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0):
             if active:
                 active = dict(active)
                 active["active"] = True
-                connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type, speed_min_bps) else 0
+                connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type, speed_min_bps, latency) else 0
     except Exception:
         connected_count = 0
     return {
@@ -16620,12 +16756,16 @@ def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0):
     }
 
 
-def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0):
+def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0, latency=""):
     """Return global country/IP totals without transferring global node rows."""
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
     speed_min_bps = max(0, int(speed_min_bps or 0))
+    try:
+        latency = normalize_routing_latency(latency)
+    except ValueError:
+        latency = ""
     try:
         catalog = node_pool.country_catalog(
             status=status,
@@ -16633,6 +16773,7 @@ def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0)
             ip_type=ip_type,
             connected_endpoint_id=active_pool_endpoint_id,
             speed_min_bps=speed_min_bps,
+            latency=latency,
         )
     except Exception:
         catalog = {"total_ip_count": 0, "countries": {}}

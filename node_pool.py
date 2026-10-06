@@ -33,7 +33,24 @@ _UI_ROW_KEY_SQL = (
 )
 
 
-def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_bps=0):
+_UI_LATENCY_SQL = (
+    "CASE "
+    "WHEN CAST(COALESCE(json_extract(e.metadata_json,'$.tcp_rtt_ms'),0) AS INTEGER) BETWEEN 1 AND 1500 "
+    "THEN CAST(COALESCE(json_extract(e.metadata_json,'$.tcp_rtt_ms'),0) AS INTEGER) "
+    "WHEN CAST(e.latency_ewma AS INTEGER) BETWEEN 1 AND 1500 THEN CAST(e.latency_ewma AS INTEGER) "
+    "ELSE 0 END"
+)
+_LATENCY_FILTERS = {"", "100", "200", "400", "800", "1000", "gt1000"}
+
+
+def normalize_latency_filter(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("0", "all", "any", "none"):
+        return ""
+    return text if text in _LATENCY_FILTERS else ""
+
+
+def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_bps=0, latency=""):
     """WHERE clause shared by the table, the status badges, and the country menu.
 
     Every predicate is on the same endpoint. Separate EXISTS checks counted a
@@ -44,6 +61,7 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
     speed_min_bps = max(0, int(speed_min_bps or 0))
+    latency = normalize_latency_filter(latency)
     where = [
         "TRIM(COALESCE(s.current_ip,''))<>''",
         "TRIM(COALESCE(e.protocol,''))<>''",
@@ -64,6 +82,11 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
             "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
         )
         params.append(speed_min_bps)
+    if latency == "gt1000":
+        where.append("(" + _UI_LATENCY_SQL + ") > 1000")
+    elif latency:
+        where.append("(" + _UI_LATENCY_SQL + ") BETWEEN 1 AND ?")
+        params.append(int(latency))
     if status and status != "all":
         allowed = _UI_STATUS_GROUPS.get(status)
         if allowed:
@@ -427,7 +450,8 @@ class NodePool:
         return result
 
     def list_endpoints_scoped(self, country="", status="", protocol="", ip_type="", offset=0, limit=100,
-                             speed_min_bps=0, active_endpoint_id="", active_ip="", active_protocol="", active_port=0):
+                             speed_min_bps=0, active_endpoint_id="", active_ip="", active_protocol="", active_port=0,
+                             latency=""):
         """Authoritative, bounded Master Pool query for the UI."""
         country = canonical_country_name(country) if country else ""
         status = str(status or "").strip().lower()
@@ -438,13 +462,14 @@ class NodePool:
         active_ip = str(active_ip or "").strip()
         active_protocol = str(active_protocol or "").strip().lower()
         active_port = max(0, int(active_port or 0))
+        latency = normalize_latency_filter(latency)
         offset = max(0, int(offset or 0))
         # Internal callers (e.g. the country full-sweep engine) may request
         # the complete country inventory; the HTTP layer still caps browser
         # pages at 200 rows.
         limit = max(1, min(int(limit or 100), 5000))
         cache_key = (country, status, protocol, ip_type, offset, limit,
-                     speed_min_bps, active_endpoint_id, active_ip, active_protocol, active_port)
+                     speed_min_bps, latency, active_endpoint_id, active_ip, active_protocol, active_port)
         cached = self._scoped_page_cache.get(cache_key)
         if cached and cached[0] > time.monotonic():
             cached_rows, cached_total = cached[1]
@@ -465,6 +490,7 @@ class NodePool:
                 protocol=protocol,
                 ip_type=ip_type,
                 speed_min_bps=speed_min_bps,
+                latency=latency,
             )
 
             base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
@@ -527,14 +553,15 @@ class NodePool:
         finally:
             gate.release()
 
-    def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id="", speed_min_bps=0):
+    def country_catalog(self, status="", protocol="", ip_type="", connected_endpoint_id="", speed_min_bps=0, latency=""):
         """Authoritative country/IP inventory using the same Master Pool scope as the node table."""
         status = str(status or "").strip().lower()
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         connected_endpoint_id = str(connected_endpoint_id or "").strip()
         speed_min_bps = max(0, int(speed_min_bps or 0))
-        key = (status, protocol, ip_type, connected_endpoint_id, speed_min_bps)
+        latency = normalize_latency_filter(latency)
+        key = (status, protocol, ip_type, connected_endpoint_id, speed_min_bps, latency)
         now = time.monotonic()
         cached = self._country_catalog_cache.get(key)
         if cached and cached[0] > now:
@@ -547,6 +574,7 @@ class NodePool:
             protocol=protocol,
             ip_type=ip_type,
             speed_min_bps=speed_min_bps,
+            latency=latency,
         )
         if status == "connected":
             if connected_endpoint_id:
@@ -1009,13 +1037,14 @@ class NodePool:
             return {"hit": False, "speed_bps": max(0, speed_bps), "measured_at": measured_at}
         return {"hit": True, "speed_bps": max(0, speed_bps), "measured_at": measured_at}
 
-    def status_counts(self, country: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0) -> dict[str, int]:
+    def status_counts(self, country: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0, latency: str = "") -> dict[str, int]:
         """Return status counts for the same rows the node table renders."""
         country = canonical_country_name(country) if country else ""
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         speed_min_bps = max(0, int(speed_min_bps or 0))
-        cache_key = (country, protocol, ip_type, speed_min_bps)
+        latency = normalize_latency_filter(latency)
+        cache_key = (country, protocol, ip_type, speed_min_bps, latency)
         cached = self._status_counts_cache.get(cache_key)
         if cached and cached[0] > time.monotonic():
             return dict(cached[1])
@@ -1028,6 +1057,7 @@ class NodePool:
                 protocol=protocol,
                 ip_type=ip_type,
                 speed_min_bps=speed_min_bps,
+                latency=latency,
             )
             select_sql = []
             select_params: list[Any] = []
