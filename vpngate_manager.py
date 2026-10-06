@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.32"
+APP_VERSION = "V1.0.33"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4756,6 +4756,125 @@ def retire_process_later(process: subprocess.Popen[str] | None, delay: float = 2
         stop_process(process)
     threading.Thread(target=_run, daemon=True, name="retire-old-tunnel").start()
 
+def _endpoint_ip(endpoint: dict[str, Any] | None) -> str:
+    if not endpoint:
+        return ""
+    return str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
+
+
+def _active_exit_ip() -> str:
+    return _endpoint_ip(current_active_routing_endpoint())
+
+
+def _standby_speed_gap(endpoint: dict[str, Any], target: int) -> int:
+    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    if speed <= 0 or target <= 0:
+        return 10**12
+    return abs(speed - target)
+
+
+def _select_standby_endpoint() -> dict[str, Any] | None:
+    """Pick a standby on another IP. Protocol stays; speed is the first thing relaxed."""
+    ui_cfg = load_ui_config()
+    active_ip = _active_exit_ip()
+    active_eid = str(active_pool_endpoint_id or "")
+    wanted = str(ui_cfg.get("routing_protocol") or "").strip().lower()
+    if not wanted:
+        wanted = str((current_active_routing_endpoint() or {}).get("protocol") or "").strip().lower()
+    try:
+        target_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        target_speed = 0
+    wide = dict(ui_cfg)
+    wide["routing_min_speed_bps"] = 0
+    wide["routing_latency"] = ""
+    wide["routing_protocol"] = ""
+    try:
+        pool = unified_hot_pool_candidates(wide, limit=80)
+    except Exception as exc:
+        log_to_json("WARNING", "Standby", f"热备候选读取失败: {exc}")
+        return None
+    rows: list[dict[str, Any]] = []
+    for endpoint in pool:
+        ip = _endpoint_ip(endpoint)
+        eid = str(endpoint.get("endpoint_id") or "")
+        if not ip or (active_ip and ip == active_ip) or (active_eid and eid == active_eid):
+            continue
+        if endpoint_is_unstable(endpoint):
+            continue
+        rows.append(endpoint)
+    if not rows:
+        return None
+
+    def closest(items: list[dict[str, Any]]) -> dict[str, Any]:
+        items.sort(key=lambda ep: (
+            0 if not wanted or str(ep.get("protocol") or "").lower() == wanted else 1,
+            _standby_speed_gap(ep, target_speed),
+            float(ep.get("latency_ewma") or 999999),
+        ))
+        return items[0]
+
+    full = [ep for ep in rows if endpoint_matches_explicit_routing(ep, ui_cfg)]
+    if full:
+        full.sort(key=lambda ep: routing_service_key(ep, ui_cfg))
+        return full[0]
+    relaxed = dict(ui_cfg)
+    relaxed["routing_min_speed_bps"] = 0
+    near = [ep for ep in rows if endpoint_matches_explicit_routing(ep, relaxed)]
+    if wanted:
+        same = [ep for ep in near if str(ep.get("protocol") or "").lower() == wanted]
+        if same:
+            near = same
+    if near:
+        return closest(near)
+    looser = dict(relaxed)
+    looser["routing_latency"] = ""
+    near = [ep for ep in rows if endpoint_matches_explicit_routing(ep, looser)]
+    if wanted:
+        same = [ep for ep in near if str(ep.get("protocol") or "").lower() == wanted]
+        if same:
+            near = same
+    if near:
+        return closest(near)
+    if wanted:
+        same = [ep for ep in rows if str(ep.get("protocol") or "").lower() == wanted]
+        if same:
+            return closest(same)
+    return closest(rows)
+
+
+def _publish_scheme_standby(endpoint: dict[str, Any]) -> bool:
+    protocol = str(endpoint.get("protocol") or "").strip().lower()
+    if protocol == "openvpn":
+        try:
+            node_id = ensure_openvpn_node_from_pool(endpoint)
+        except Exception as exc:
+            log_to_json("WARNING", "Standby", f"热备节点准备失败: {exc}")
+            return False
+        node = next((item for item in read_nodes() if str(item.get("id") or "") == node_id), None)
+        if not node or not node.get("config_text"):
+            return False
+        chosen = dict(node)
+        chosen["country"] = normalized_country_name(endpoint.get("country") or "") or chosen.get("country") or ""
+        return _bring_up_standby(chosen)
+    if standby_slot.get("process") is not None:
+        release_standby()
+    endpoint_id = str(endpoint.get("endpoint_id") or "")
+    set_state(
+        standby_ready=True,
+        standby_node_id=f"pool:{endpoint_id}" if endpoint_id else "",
+        standby_ip=_endpoint_ip(endpoint),
+        standby_port=int(endpoint.get("port") or 0),
+        standby_protocol=protocol,
+    )
+    log_to_json(
+        "INFO",
+        "Standby",
+        f"备连接改为不同 IP {protocol} {_endpoint_ip(endpoint)}",
+    )
+    return True
+
+
 def _select_standby_openvpn_node() -> dict[str, Any] | None:
     ui_cfg = load_ui_config()
     try:
@@ -4764,16 +4883,19 @@ def _select_standby_openvpn_node() -> dict[str, Any] | None:
         log_to_json("WARNING", "Standby", f"热备候选读取失败: {exc}")
         return None
     active_id = str(active_openvpn_node_id or "")
-    active_ip, active_port = "", 0
+    active_ip, active_port = _active_exit_ip(), 0
     active_parts = active_id.rsplit("_", 2)
     if len(active_parts) == 3 and str(active_parts[1]).isdigit():
-        active_ip, active_port = active_parts[0], int(active_parts[1])
+        active_ip = active_parts[0] or active_ip
+        active_port = int(active_parts[1])
     ranked: list[tuple[float, dict[str, Any]]] = []
     for endpoint in candidates:
         if str(endpoint.get("protocol") or "").lower() != "openvpn":
             continue
         endpoint_ip = str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
         endpoint_port = int(endpoint.get("port") or 0)
+        if active_ip and endpoint_ip == active_ip:
+            continue
         if active_ip and endpoint_ip == active_ip and endpoint_port == active_port:
             continue
         latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 0)
@@ -4908,6 +5030,22 @@ def warm_standby_loop() -> None:
                 pending_id = str(standby_slot.get("node_id") or "")
             if ready:
                 sid = str(standby_slot.get("node_id") or "")
+                standby_ip = str(get_state().get("standby_ip") or "")
+                active_ip = _active_exit_ip()
+                if active_ip and standby_ip == active_ip:
+                    release_standby()
+                    set_state(standby_ready=False, standby_node_id="", standby_ip="", standby_port=0, standby_protocol="")
+                    log_to_json("INFO", "Standby", "备连接与当前出口同一 IP，已放开并改选其他 IP")
+                    continue
+                chosen = _select_standby_endpoint()
+                chosen_protocol = str((chosen or {}).get("protocol") or "").lower()
+                chosen_ip = _endpoint_ip(chosen)
+                if chosen and chosen_ip and (chosen_ip != standby_ip or (chosen_protocol and chosen_protocol != "openvpn")):
+                    release_standby()
+                    set_state(standby_ready=False, standby_node_id="")
+                    _publish_scheme_standby(chosen)
+                    time.sleep(8)
+                    continue
                 pin_country = normalized_country_name((manual_route_pin or {}).get("country") or "")
                 standby_country = normalized_country_name(standby_slot.get("country") or "")
                 if sid and sid == str(active_openvpn_node_id or ""):
@@ -4954,6 +5092,16 @@ def warm_standby_loop() -> None:
             if pending:
                 release_standby()
             node = _select_standby_openvpn_node()
+            scheme = _select_standby_endpoint()
+            if scheme and str(scheme.get("protocol") or "").lower() != "openvpn":
+                _publish_scheme_standby(scheme)
+                time.sleep(20)
+                continue
+            if scheme and str(scheme.get("protocol") or "").lower() == "openvpn":
+                published = _publish_scheme_standby(scheme)
+                if published:
+                    time.sleep(8)
+                    continue
             if not node:
                 if time.time() - float(getattr(warm_standby_loop, "empty_log_at", 0) or 0) > 300:
                     warm_standby_loop.empty_log_at = time.time()
@@ -17088,6 +17236,8 @@ def _pin_connected_then_standby(page_nodes: list[dict[str, Any]]) -> list[dict[s
         standby = _load_live_standby_ui_node(standby_state)
         if standby and active and {str(standby.get("id") or ""), str(standby.get("pool_endpoint_id") or "")} & {str(active.get("id") or ""), str(active.get("pool_endpoint_id") or "")}:
             standby = None
+    if standby and active and str(standby.get("ip") or "").strip() and str(standby.get("ip") or "").strip() == str(active.get("ip") or "").strip():
+        standby = None
     ordered: list[dict[str, Any]] = []
     if active:
         ordered.append(active)
