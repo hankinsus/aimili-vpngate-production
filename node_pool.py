@@ -171,8 +171,10 @@ class NodePool:
         with closing(self._connect()) as db:
             db.executescript(_SCHEMA)
             self._ensure_endpoint_columns(db)
-            self._retire_duplicate_ip_port(db)
+            removed = self._purge_duplicate_rows(db)
             db.commit()
+        if removed:
+            threading.Thread(target=self._vacuum_freed_space, daemon=True).start()
 
     @staticmethod
     def _ensure_endpoint_columns(db: sqlite3.Connection) -> None:
@@ -185,29 +187,59 @@ class NodePool:
             db.execute("ALTER TABLE endpoints ADD COLUMN stability TEXT NOT NULL DEFAULT ''")
 
     @staticmethod
-    def _retire_duplicate_ip_port(db: sqlite3.Connection) -> None:
-        """Keep one endpoint per protocol + IP + port. Hostname/IP double inserts collapse here."""
-        db.execute(
+    def availability_label(seconds: int, unstable: bool) -> str:
+        if unstable:
+            return "不稳定"
+        if int(seconds or 0) >= 24 * 3600:
+            return "高可用"
+        if int(seconds or 0) >= 6 * 3600:
+            return "可用"
+        return "待可用"
+
+    @staticmethod
+    def _purge_duplicate_rows(db: sqlite3.Connection) -> int:
+        """Delete duplicate protocol+IP+port rows and leftover observations."""
+        removed = 0
+        cur = db.execute(
             """
-            UPDATE endpoints SET status='RETIRED'
+            DELETE FROM endpoints
             WHERE endpoint_id IN (
                 SELECT endpoint_id FROM (
                     SELECT e.endpoint_id,
                            ROW_NUMBER() OVER (
                              PARTITION BY LOWER(e.protocol), s.current_ip, e.port
                              ORDER BY CASE UPPER(e.status)
-                               WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 ELSE 3 END,
+                               WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2
+                               WHEN 'RETIRED' THEN 9 ELSE 3 END,
                                e.last_success DESC, e.last_seen DESC
                            ) AS rn
                     FROM endpoints e
                     JOIN servers s ON s.server_key=e.server_key
-                    WHERE COALESCE(e.port,0)>0
-                      AND TRIM(COALESCE(s.current_ip,''))<>''
-                      AND UPPER(e.status)<>'RETIRED'
+                    WHERE COALESCE(e.port,0)>0 AND TRIM(COALESCE(s.current_ip,''))<>''
                 ) WHERE rn>1
             )
             """
         )
+        removed += int(cur.rowcount or 0)
+        cur = db.execute("DELETE FROM servers WHERE server_key NOT IN (SELECT DISTINCT server_key FROM endpoints)")
+        removed += int(cur.rowcount or 0)
+        cur = db.execute(
+            """
+            DELETE FROM observations
+            WHERE id NOT IN (SELECT MAX(id) FROM observations GROUP BY server_key)
+            """
+        )
+        removed += int(cur.rowcount or 0)
+        cur = db.execute("DELETE FROM observations WHERE server_key NOT IN (SELECT server_key FROM servers)")
+        removed += int(cur.rowcount or 0)
+        return removed
+
+    def _vacuum_freed_space(self) -> None:
+        try:
+            with closing(self._connect(30000)) as db:
+                db.execute("VACUUM")
+        except Exception:
+            return
 
     @staticmethod
     def _touch_stability(meta: dict[str, Any], now: float, kind: str, fail_streak: int, success_streak: int, session_seconds: int) -> str:
@@ -219,11 +251,13 @@ class NodePool:
         events = [item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= window][-8:]
         meta["stability_events"] = events
         flaps = len(events)
-        marked = str(meta.get("stability") or "") == "unstable" or flaps >= 4 or int(fail_streak or 0) >= 3
-        if marked and int(success_streak or 0) >= 3 and flaps < 2 and int(session_seconds or 0) >= 120:
+        previous = str(meta.get("stability") or "")
+        marked = previous in ("不稳定", "unstable") or flaps >= 4 or int(fail_streak or 0) >= 3
+        if marked and int(success_streak or 0) >= 3 and flaps < 2 and int(session_seconds or 0) >= 6 * 3600:
             marked = False
-        meta["stability"] = "unstable" if marked else ("stable" if int(success_streak or 0) >= 2 else "")
-        return str(meta["stability"])
+        label = NodePool.availability_label(int(session_seconds or 0), marked)
+        meta["stability"] = label
+        return label
 
     def note_connection_started(self, endpoint_id: str) -> None:
         endpoint_id = str(endpoint_id or "").strip()
@@ -277,6 +311,40 @@ class NodePool:
                 (session, stability, json.dumps(meta, ensure_ascii=False), endpoint_id),
             )
             db.commit()
+
+    def refresh_live_availability(self, endpoint_id: str) -> str:
+        """Promote the live exit as its current connection gets longer."""
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return ""
+        now = time.time()
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT last_connected_at, last_session_seconds, stability, metadata_json FROM endpoints WHERE endpoint_id=?",
+                (endpoint_id,),
+            ).fetchone()
+            if not row:
+                return ""
+            started = float(row["last_connected_at"] or 0)
+            seconds = int(max(0, now - started)) if started > 0 else int(row["last_session_seconds"] or 0)
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            current = str(row["stability"] or meta.get("stability") or "")
+            unstable = current in ("不稳定", "unstable")
+            label = self.availability_label(seconds, unstable)
+            if label == current:
+                return label
+            meta["stability"] = label
+            db.execute(
+                "UPDATE endpoints SET stability=?, metadata_json=? WHERE endpoint_id=?",
+                (label, json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+            db.commit()
+        return label
 
     def invalidate_scoped_pages(self) -> None:
         self._scoped_page_cache.clear()
@@ -1033,16 +1101,15 @@ class NodePool:
                         (json.dumps(server_meta, ensure_ascii=False), row["server_key"]),
                     )
                 session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
-                stability = str(meta.get("stability") or "")
-                if stability == "unstable":
+                current = str(meta.get("stability") or "")
+                unstable = current in ("不稳定", "unstable")
+                if unstable:
                     events = meta.get("stability_events") if isinstance(meta.get("stability_events"), list) else []
                     flaps = len([item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= 30 * 60])
-                    if prev_streak + 1 >= 3 and flaps < 2 and session_seconds >= 120:
-                        stability = "stable"
-                        meta["stability"] = "stable"
-                elif prev_streak + 1 >= 2:
-                    stability = "stable"
-                    meta["stability"] = "stable"
+                    if prev_streak + 1 >= 3 and flaps < 2 and session_seconds >= 6 * 3600:
+                        unstable = False
+                stability = self.availability_label(session_seconds, unstable)
+                meta["stability"] = stability
                 db.execute(
                     """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
                        fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, stability=?, metadata_json=?

@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.31"
+APP_VERSION = "V1.0.32"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -3317,7 +3317,7 @@ def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tup
     jitter = float(endpoint.get("jitter_ewma") or 999999)
     success_streak = int(endpoint.get("success_streak") or 0)
     return (
-        1 if endpoint_is_unstable(endpoint) else 0,
+        availability_rank(endpoint),
         routing_preference_tier(endpoint, ui_cfg),
         routing_speed_gate(endpoint),
         routing_session_rank(endpoint),
@@ -3569,12 +3569,20 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
 def endpoint_is_unstable(endpoint: dict[str, Any] | None) -> bool:
     if not endpoint:
         return False
-    if str(endpoint.get("stability") or "").lower() == "unstable":
+    label = str(endpoint.get("stability") or "").lower()
+    if label in ("不稳定", "unstable"):
         return True
     meta = endpoint.get("metadata") if isinstance(endpoint.get("metadata"), dict) else {}
-    if str(meta.get("stability") or "").lower() == "unstable":
-        return True
-    return int(endpoint.get("fail_streak") or 0) >= 3
+    return str(meta.get("stability") or "").lower() in ("不稳定", "unstable")
+
+
+def availability_rank(endpoint: dict[str, Any] | None) -> int:
+    label = ""
+    if endpoint:
+        label = str(endpoint.get("stability") or "")
+        if not label and isinstance(endpoint.get("metadata"), dict):
+            label = str(endpoint["metadata"].get("stability") or "")
+    return {"高可用": 0, "可用": 1, "待可用": 2, "不稳定": 4, "unstable": 4}.get(label, 2)
 
 
 def _stable_candidates(endpoints: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -14790,6 +14798,14 @@ def background_proxy_checker() -> None:
                     proxy_error=""
                 )
                 maybe_recover_preferred_route()
+                try:
+                    live_id = str(active_pool_endpoint_id or "")
+                    if not live_id and active_openvpn_node_id:
+                        live_id = _resolve_openvpn_endpoint_id(str(active_openvpn_node_id))
+                    if live_id:
+                        node_pool.refresh_live_availability(live_id)
+                except Exception:
+                    pass
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 first_error = res.get("error", "未知错误")
