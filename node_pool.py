@@ -17,6 +17,7 @@ from vpn_utils import COUNTRY_TRANSLATIONS, canonical_country_name
 # render as 不可用; only TESTING renders as 检测中. Counting DEGRADED as
 # 检测中 made the dropdown disagree with the rows.
 _UI_STATUS_GROUPS = {
+    "usable": ("HOT", "AVAILABLE", "TESTING", "NEW"),
     "available": ("HOT", "AVAILABLE"),
     "testing": ("TESTING",),
     "not_checked": ("NEW",),
@@ -501,28 +502,31 @@ class NodePool:
                         "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
                         params,
                     ).fetchone()[0] or 0)
-                    rows=db.execute("""
-                        SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
-                               s.metadata_json AS server_metadata_json,
-                               COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping,
-                               COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed,
-                               COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions,
-                               COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score
-                        """ + base + """
-                        ORDER BY CASE
-                            WHEN ?<>'' AND e.endpoint_id=? THEN 0
-                            WHEN ?<>'' AND s.current_ip=? AND LOWER(e.protocol)=? AND e.port=? THEN 0
-                            ELSE 1 END,
-                            CASE UPPER(e.status)
-                            WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'NEW' THEN 2
-                            WHEN 'DEGRADED' THEN 3 WHEN 'COOLDOWN' THEN 4 WHEN 'STALE' THEN 5
-                            WHEN 'RETIRED' THEN 6 ELSE 7 END,
-                            CASE
-                              WHEN e.latency_ewma BETWEEN 1 AND 1500 THEN e.latency_ewma
-                              ELSE 999999
-                            END,
-                            e.next_test ASC, e.last_seen DESC
-                        LIMIT ? OFFSET ?""",
+                    rows=db.execute(
+                        "SELECT * FROM ("
+                        "SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state, "
+                        "s.metadata_json AS server_metadata_json, "
+                        "COALESCE((SELECT o.ping FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_ping, "
+                        "COALESCE((SELECT o.speed FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed, "
+                        "COALESCE((SELECT o.sessions FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_sessions, "
+                        "COALESCE((SELECT o.score FROM observations o WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1),0) AS latest_server_score, "
+                        "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY "
+                        "CASE UPPER(e.status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
+                        "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
+                        "CASE WHEN (" + _UI_LATENCY_SQL + ") BETWEEN 1 AND 1500 THEN (" + _UI_LATENCY_SQL + ") ELSE 999999 END, "
+                        "e.endpoint_id) AS _ui_rn "
+                        + base +
+                        ") WHERE _ui_rn=1 "
+                        "ORDER BY CASE "
+                        "WHEN ?<>'' AND endpoint_id=? THEN 0 "
+                        "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 0 "
+                        "ELSE 1 END, "
+                        "CASE UPPER(status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
+                        "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
+                        "CASE WHEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") BETWEEN 1 AND 1500 "
+                        "THEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") ELSE 999999 END, "
+                        "endpoint_id "
+                        "LIMIT ? OFFSET ?",
                         params+[active_endpoint_id, active_endpoint_id, active_ip, active_ip, active_protocol, active_port, limit, offset]).fetchall()
             except sqlite3.OperationalError as exc:
                 if stale and "lock" in str(exc).lower():
@@ -533,6 +537,7 @@ class NodePool:
             result=[]
             for row in rows:
                 item=dict(row)
+                item.pop("_ui_rn", None)
                 try: item['metadata']=json.loads(item.pop('metadata_json') or '{}')
                 except Exception: item['metadata']={}; item.pop('metadata_json',None)
                 try: item['server_metadata']=json.loads(item.pop('server_metadata_json') or '{}')
@@ -1074,7 +1079,7 @@ class NodePool:
                 + " FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
                 + " AND ".join(where)
             )
-            empty = {"available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
+            empty = {"usable": 0, "available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
             try:
                 with closing(self._connect(300)) as db:
                     row = db.execute(sql, select_params + params).fetchone()
@@ -1083,6 +1088,7 @@ class NodePool:
                     return dict(cached[1])
                 return dict(empty)
             result = {
+                "usable": int(row["usable"] or 0),
                 "available": int(row["available"] or 0),
                 "testing": int(row["testing"] or 0),
                 "not_checked": int(row["not_checked"] or 0),

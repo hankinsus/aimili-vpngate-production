@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.23"
+APP_VERSION = "V1.0.24"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4681,16 +4681,16 @@ def warm_first_page_loop() -> None:
                     if country_key in seen:
                         continue
                     seen.add(country_key)
-                    nodes, total, building = _get_ui_nodes_page(0, 100, country)
+                    nodes, total, building = _get_ui_nodes_page(0, 60, country, "usable")
                     body = {
                         "ok": True,
                         "nodes": nodes,
                         "offset": 0,
-                        "limit": 100,
+                        "limit": 60,
                         "total": total,
                         "has_more": len(nodes) < int(total or 0),
                         "cache_building": bool(building),
-                        "scope": {"country": country, "status": "", "protocol": "", "ip_type": "", "speed_min_bps": 0},
+                        "scope": {"country": country, "status": "usable", "protocol": "", "ip_type": "", "speed_min_bps": 0},
                         "generated_at": time.time(),
                     }
                     with _first_page_snapshot_lock:
@@ -7472,10 +7472,10 @@ INDEX_HTML = r"""<!doctype html>
       -webkit-backdrop-filter: blur(12px);
       border: 1px solid rgba(148, 163, 184, 0.16);
       border-radius: 12px;
-      padding: 8px 48px 8px 10px;
+      padding: 8px 46px 8px 8px;
       margin-bottom: 12px;
       display: flex;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: nowrap;
       align-items: center;
       overflow: visible;
@@ -7504,21 +7504,30 @@ INDEX_HTML = r"""<!doctype html>
 
     .toolbar-custom-select {
       position: relative;
-      width: 168px;
+      width: auto;
+      min-width: 0;
       height: 40px;
-      flex: 0 0 auto;
+      flex: 1 1 0;
       z-index: 100;
       overflow: visible !important;
     }
-    .toolbar-custom-select[data-filter-id="country_filter"] {
-      width: min(248px, 42vw);
+    .toolbar-custom-select[data-filter-id="status_filter"] { flex: 1.35 1 0; }
+    .toolbar-custom-select[data-filter-id="country_filter"] { flex: 1.15 1 0; max-width: 168px; }
+    .toolbar-custom-select[data-filter-id="protocol_filter"],
+    .toolbar-custom-select[data-filter-id="ip_type_filter"],
+    .toolbar-custom-select[data-filter-id="latency_filter"],
+    .toolbar-custom-select[data-filter-id="speed_filter"] { flex: 0.9 1 0; }
+    #btn_favorites { flex: 0 0 auto; margin-left: 4px !important; white-space: nowrap; padding: 0 10px !important; }
+    .toolbar .toolbar-custom-select-button { font-size: 13px; padding: 0 8px; }
+    .net-filter-grid {
+      display: grid;
+      grid-template-columns: 1.25fr 1fr 0.9fr 0.9fr;
+      gap: 8px;
+      margin-bottom: 16px;
     }
-    .toolbar-custom-select[data-filter-id="speed_filter"] {
-      width: 176px;
-    }
-    .toolbar-custom-select[data-filter-id="latency_filter"] {
-      width: 168px;
-    }
+    .net-filter-grid > .form-group { margin-bottom: 0 !important; min-width: 0; }
+    .net-filter-grid .form-label { font-size: 12px; }
+    .net-filter-grid .toolbar-custom-select-button { font-size: 12px; padding: 0 8px; }
     .unified-select { position: relative; z-index: 100; flex: 0 0 auto; }
     .unified-select-full { width: 100%; height: 40px; }
     #network_modal .toolbar-custom-select.unified-select-full {
@@ -7969,12 +7978,12 @@ INDEX_HTML = r"""<!doctype html>
       font-variant-numeric: tabular-nums;
     }
     @media (min-width: 1101px) {
-      .toolbar { padding: 8px 48px 8px 10px; }
-      .toolbar-custom-select { width: 168px; }
-      .toolbar-custom-select[data-filter-id="country_filter"] { width: 248px; }
-      .toolbar-custom-select[data-filter-id="speed_filter"] { width: 176px; }
-      .toolbar-custom-select[data-filter-id="latency_filter"] { width: 168px; }
-      .toolbar > #btn_favorites { margin-left: auto !important; flex: 0 0 auto; }
+      .toolbar { padding: 8px 46px 8px 8px; }
+      .toolbar-custom-select { width: auto; }
+      .toolbar-custom-select[data-filter-id="country_filter"] { width: auto; max-width: 168px; }
+      .toolbar-custom-select[data-filter-id="speed_filter"],
+      .toolbar-custom-select[data-filter-id="latency_filter"] { width: auto; }
+      .toolbar > #btn_favorites { margin-left: 4px !important; flex: 0 0 auto; }
     }
 
     .node-table td:nth-child(5),
@@ -9217,16 +9226,18 @@ INDEX_HTML = r"""<!doctype html>
 
   <section class="toolbar">
     <select id="status_filter" aria-hidden="true" tabindex="-1" style="display:none;">
+      <option value="usable" selected>可用·检测·待检</option>
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
       <option value="connected">已连接</option>
-      <option value="not_checked">待检测</option>
+      <option value="standby">备连接</option>
       <option value="testing">检测中</option>
+      <option value="not_checked">待检测</option>
       <option value="unavailable">失效节点</option>
     </select>
     <div id="status_filter_widget" class="toolbar-custom-select" data-filter-id="status_filter" aria-label="状态筛选">
       <button id="status_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
-        <span id="status_filter_label" class="toolbar-custom-select-label">全部节点</span>
+        <span id="status_filter_label" class="toolbar-custom-select-label">可用·检测·待检</span>
         <span class="toolbar-custom-select-arrow">⌄</span>
       </button>
       <div id="status_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
@@ -9363,7 +9374,7 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div class="pagination-container" style="padding: 14px 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条节点 <span style="margin-left: 10px; color: var(--primary);">每页 100 条</span>
+        第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">1</span> 页 · 本页 <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条 · 共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条 <span style="margin-left: 10px; color: var(--primary);">每页 60 条</span>
         <span id="pool_summary" style="margin-left: 14px; color: var(--text-secondary);">Master Pool：—</span>
         <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
       </div>
@@ -9482,6 +9493,7 @@ INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
 
+          <div class="net-filter-grid">
           <div id="net_force_country_group" class="form-group" style="margin-bottom: 16px; display: none;">
             <label class="form-label" for="net_force_country">优先国家地区</label>
             <select id="net_force_country" aria-hidden="true" tabindex="-1" style="display:none;">
@@ -9553,6 +9565,7 @@ INDEX_HTML = r"""<!doctype html>
               <div id="net_routing_min_speed_menu" class="toolbar-custom-select-menu" role="listbox"></div>
             </div>
           </div>
+          </div>
 
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">IP 出站类型偏好</label>
@@ -9563,8 +9576,8 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-desc">机房 + 住宅均可</div>
               </div>
               <div class="option-card" data-value="residential" onclick="setRoutingIpType('residential')">
-                <div class="option-card-title">住宅 IP</div>
-                <div class="option-card-desc">住宅和移动网均可，不可用自动回退</div>
+                <div class="option-card-title">住宅 IP+移动网</div>
+                <div class="option-card-desc">家宽和移动网，不可用自动回退</div>
               </div>
               <div class="option-card" data-value="hosting" onclick="setRoutingIpType('hosting')">
                 <div class="option-card-title">机房IP</div>
@@ -10025,7 +10038,7 @@ INDEX_HTML = r"""<!doctype html>
 let nodes=[], state={}, testingNodeIds = new Set();
 const BOOT_SERVER_COUNTRY = __BOOT_SERVER_COUNTRY_JSON__;
 let currentPage = 1;
-const pageSize = 100;
+const pageSize = 60;
 let currentPageNodes = [];
 
 const translateProtocol = p => {
@@ -10171,6 +10184,13 @@ function matchesNodeFilters(n, ignoreCountry = false) {
     }
   }
 
+  if (selectedStatus === "usable") {
+    const probe = String(n.probe_status || "");
+    if (probe !== "available" && probe !== "testing" && probe !== "not_checked" && !n.active) return false;
+  }
+  if (selectedStatus === "standby") {
+    if (!(state?.standby_ready && n.id && n.id === state.standby_node_id)) return false;
+  }
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
   if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
   if (selectedStatus === "testing" && n.probe_status !== "testing") return false;
@@ -10451,17 +10471,25 @@ function updateStatusFilterOptions() {
     ? Number(counts.all)
     : (Number(counts.available || 0) + Number(counts.testing || 0) +
       Number(counts.not_checked || 0) + Number(counts.unavailable || 0));
+  const usable = counts.usable != null && counts.usable !== ""
+    ? Number(counts.usable)
+    : (Number(counts.available || 0) + Number(counts.testing || 0) + Number(counts.not_checked || 0));
+  const standby = (state?.standby_ready && state?.standby_node_id) ? 1 : 0;
   const countsReady = counts && Object.keys(counts).length > 0 && !filterCountsLoading;
+  const shownUsable = countsReady ? usable : "加载中";
   const shownTotal = countsReady ? total : "加载中";
   const shownAvailable = countsReady ? Number(counts.available || 0) : "加载中";
   const shownConnected = countsReady ? connected : "加载中";
+  const shownStandby = countsReady ? standby : "加载中";
   const shownNotChecked = countsReady ? Number(counts.not_checked || 0) : "加载中";
   const shownTesting = countsReady ? Number(counts.testing || 0) : "加载中";
   const shownUnavailable = countsReady ? Number(counts.unavailable || 0) : "加载中";
   const labels = {
+    usable: `可用·检测·待检 · ${shownUsable}`,
     all: `全部节点 · ${shownTotal}`,
     available: `可用节点 · ${shownAvailable}`,
     connected: `已连接 · ${shownConnected}`,
+    standby: `备连接 · ${shownStandby}`,
     not_checked: `待检测 · ${shownNotChecked}`,
     testing: `检测中 · ${shownTesting}`,
     unavailable: `失效节点 · ${shownUnavailable}`
@@ -10478,6 +10506,7 @@ function renderAllCustomFilters() {
   renderCustomCountryFilter();
   renderCustomFilter("protocol_filter");
   renderCustomFilter("ip_type_filter");
+  renderCustomFilter("latency_filter");
   renderCustomFilter("speed_filter");
 }
 
@@ -10509,14 +10538,16 @@ function toggleCustomFilter(selectId, event) {
   if (opening) {
     renderCustomFilter(selectId, selectId === "country_filter", true);
     const menu = $(cfg.menu);
-    if (menu) {
-      /* Toolbar menus are positioned relative to their trigger. This avoids
-         viewport/fixed-position calculations and keeps the menu attached to
-         the correct filter while the page is scrolling. */
-      menu.style.left = "";
-      menu.style.top = "";
-      menu.style.bottom = "";
-      menu.style.width = "";
+    const trigger = button || widget;
+    if (menu && trigger) {
+      const rect = trigger.getBoundingClientRect();
+      const width = Math.max(rect.width, 148);
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+      menu.style.position = "fixed";
+      menu.style.left = left + "px";
+      menu.style.top = (rect.bottom + 6) + "px";
+      menu.style.width = width + "px";
+      menu.style.zIndex = "200000";
     }
     const active = $(cfg.menu)?.querySelector(".toolbar-custom-option.active");
     if (active) active.scrollIntoView({block:"nearest"});
@@ -10717,16 +10748,22 @@ function updateCountryFilter() {
   );
   if (selectedCountry) {
     select.value = selectedCountry[0];
-  } else if (activeCountryScope) {
-    const scopeLabel = translateCountry(activeCountryScope);
-    const scopeCountry = countries.find(([country]) => country === scopeLabel);
-    select.value = scopeCountry ? scopeCountry[0] : "";
+  } else if (selectedValue || activeCountryScope) {
+    const keep = selectedValue || activeCountryScope;
+    if (!Array.from(select.options).some(option => option.value === keep)) {
+      const opt = document.createElement("option");
+      opt.value = keep;
+      opt.textContent = (translateCountry(keep) || keep) + " · 0 IP";
+      select.appendChild(opt);
+    }
+    select.value = keep;
   } else {
     select.value = "";
   }
   renderCustomCountryFilter();
   const resolvedCountry = String(select.value || "");
-  if (resolvedCountry !== String(activeCountryScope || "") && countryCatalogKey === currentFilterKey()) {
+  const resolvedExists = countries.some(([country]) => country === resolvedCountry || translateCountry(country) === translateCountry(resolvedCountry));
+  if (resolvedExists && resolvedCountry !== String(activeCountryScope || "") && countryCatalogKey === currentFilterKey()) {
     loadScope(resolvedCountry, {preserveState:true});
   }
 }
@@ -11308,8 +11345,8 @@ function render(){
   }
 
   // Render pagination controls
-  $("page_start").textContent = totalNodeCount > 0 && shown.length > 0 ? startIndex + 1 : 0;
-  $("page_end").textContent = endIndex;
+  $("page_start").textContent = totalNodeCount > 0 && shown.length > 0 ? currentPage : 0;
+  $("page_end").textContent = shown.length;
   $("filtered_count").textContent = nodeListLoading ? "加载中" : totalNodeCount;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
@@ -14965,7 +15002,7 @@ class Handler(BaseHTTPRequestHandler):
                 latency = normalize_routing_latency((query.get("latency") or [""])[0])
             except ValueError:
                 latency = ""
-            if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps and not latency:
+            if offset == 0 and status == "usable" and not protocol and not ip_type and not speed_min_bps and not latency:
                 active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
                 country_key = normalized_country_name(country) if country else ""
                 with _first_page_snapshot_lock:
@@ -15005,6 +15042,23 @@ class Handler(BaseHTTPRequestHandler):
                             if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type, speed_min_bps, latency):
                                 connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
                     page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
+                elif status == "standby":
+                    standby_state = get_state()
+                    standby_id = str(standby_state.get("standby_node_id") or "")
+                    standby_nodes = []
+                    if standby_state.get("standby_ready") and standby_id:
+                        ep = node_pool.get_endpoint(standby_id)
+                        if not ep:
+                            parts = standby_id.rsplit("_", 2)
+                            if len(parts) == 3 and str(parts[1]).isdigit():
+                                found = node_pool.find_endpoint_id(parts[0], int(parts[1]), "openvpn")
+                                if found:
+                                    ep = node_pool.get_endpoint(found)
+                        if ep:
+                            node = protocol_endpoint_to_ui_node(ep)
+                            if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
+                                standby_nodes = [node]
+                    page_nodes, total_nodes, cache_building = standby_nodes[offset:offset + limit], len(standby_nodes), False
                 else:
                     page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
                         offset, limit, country, status, protocol, ip_type, speed_min_bps, latency
@@ -15020,7 +15074,7 @@ class Handler(BaseHTTPRequestHandler):
                     "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps, "latency": latency},
                     "generated_at": time.time(),
                 }
-                if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps and not latency:
+                if offset == 0 and status == "usable" and not protocol and not ip_type and not speed_min_bps and not latency:
                     country_key = normalized_country_name(country) if country else ""
                     active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
                     with _first_page_snapshot_lock:
@@ -16624,6 +16678,11 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     if not latency_filter_matches(int(node.get("latency_ms") or 0), latency):
         return False
 
+    if status == "usable":
+        probe = str(node.get("probe_status") or "").lower()
+        return probe in ("available", "testing", "not_checked") or bool(node.get("active"))
+    if status == "standby":
+        return bool(get_state().get("standby_ready")) and str(node.get("id") or "") == str(get_state().get("standby_node_id") or "")
     if status == "available":
         return str(node.get("probe_status") or "").lower() == "available" or bool(node.get("active"))
     if status == "testing":
