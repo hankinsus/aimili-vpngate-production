@@ -10139,8 +10139,10 @@ function updateStatusFilterOptions() {
   const connected = Number(state?.connected_count ?? (
     (state?.active_pool_endpoint_id || state?.active_openvpn_node_id) ? 1 : 0
   ));
-  const total = Number(counts.available || 0) + Number(counts.testing || 0) +
-    Number(counts.not_checked || 0) + Number(counts.unavailable || 0);
+  const total = counts.all != null && counts.all !== ""
+    ? Number(counts.all)
+    : (Number(counts.available || 0) + Number(counts.testing || 0) +
+      Number(counts.not_checked || 0) + Number(counts.unavailable || 0));
   const countsReady = counts && Object.keys(counts).length > 0 && !filterCountsLoading;
   const shownTotal = countsReady ? total : "加载中";
   const shownAvailable = countsReady ? Number(counts.available || 0) : "加载中";
@@ -16267,6 +16269,11 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
         # page. The SQL query already applies the same primary status/latency
         # ordering, so we do not materialize thousands of rows in Python.
         ordered = _sort_ui_nodes_for_page(scoped_nodes)
+        # The SQL total is already one row per protocol/IP/port. If this page
+        # held every matching endpoint, the deduped payload is the number the
+        # footer must show — never a larger raw COUNT.
+        if offset == 0 and len(scoped_endpoints) < limit:
+            endpoint_total = len(ordered)
         return ordered, endpoint_total, building
     except Exception as exc:
         log_to_json("WARNING", "Main", f"按范围读取 Master Pool UI 页面失败，回退 UI 快照: {exc}")

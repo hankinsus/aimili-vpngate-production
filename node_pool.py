@@ -13,6 +13,64 @@ from typing import Any
 
 from vpn_utils import COUNTRY_TRANSLATIONS, canonical_country_name
 
+# Same buckets as the node table. A badge must count the rows that filter shows.
+_UI_STATUS_GROUPS = {
+    "available": ("HOT", "AVAILABLE"),
+    "testing": ("TESTING", "DEGRADED"),
+    "not_checked": ("NEW",),
+    "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
+}
+
+# dedupe_ui_nodes collapses identical protocol/IP/port rows and keeps every
+# port-less endpoint. Counts have to use that same identity or the dropdown
+# and the footer stay ahead of the table.
+_UI_ROW_KEY_SQL = (
+    "CASE WHEN COALESCE(e.port,0)>0 "
+    "THEN LOWER(e.protocol)||'|'||s.current_ip||'|'||CAST(e.port AS TEXT) "
+    "ELSE 'id:'||e.endpoint_id END"
+)
+
+
+def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_bps=0):
+    """WHERE clause shared by the table, the status badges, and the country menu.
+
+    Every predicate is on the same endpoint. Separate EXISTS checks counted a
+    server that had the protocol on one endpoint and the status on another.
+    """
+    country = str(country or "").strip()
+    status = str(status or "").strip().lower()
+    protocol = str(protocol or "").strip().lower()
+    ip_type = str(ip_type or "").strip().lower()
+    speed_min_bps = max(0, int(speed_min_bps or 0))
+    where = [
+        "TRIM(COALESCE(s.current_ip,''))<>''",
+        "TRIM(COALESCE(e.protocol,''))<>''",
+    ]
+    params: list[Any] = []
+    if country:
+        where.append("s.country=?")
+        params.append(country)
+    if protocol and protocol != "all":
+        where.append("LOWER(e.protocol)=?")
+        params.append(protocol)
+    if ip_type and ip_type != "all":
+        where.append("LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?")
+        params.append(ip_type)
+    if speed_min_bps > 0:
+        where.append(
+            "CAST(COALESCE((SELECT o.speed FROM observations o "
+            "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
+        )
+        params.append(speed_min_bps)
+    if status and status != "all":
+        allowed = _UI_STATUS_GROUPS.get(status)
+        if allowed:
+            where.append("UPPER(e.status) IN (" + ",".join("?" for _ in allowed) + ")")
+            params.extend(allowed)
+    return where, params
+
+
+
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -399,41 +457,22 @@ class NodePool:
                 cached_rows, cached_total = cached[1]
                 return [dict(x) for x in cached_rows], int(cached_total)
 
-            where = ["TRIM(COALESCE(s.current_ip, '')) <> ''"]
-            params: list[Any] = []
-            if country:
-                where.append("s.country=?")
-                params.append(country)
-            if protocol and protocol != "all":
-                where.append("LOWER(e.protocol)=?")
-                params.append(protocol)
-            if ip_type and ip_type != "all":
-                where.append("LOWER(COALESCE(json_extract(s.metadata_json, '$.ip_type'), ''))=?")
-                params.append(ip_type)
-            if speed_min_bps > 0:
-                where.append(
-                    "CAST(COALESCE((SELECT o.speed FROM observations o "
-                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
-                )
-                params.append(speed_min_bps)
-            if status and status != "all":
-                groups = {
-                    "available": ("HOT", "AVAILABLE"),
-                    "testing": ("TESTING", "DEGRADED"),
-                    "not_checked": ("NEW",),
-                    "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
-                }
-                allowed = groups.get(status)
-                if allowed:
-                    placeholders=','.join('?' for _ in allowed)
-                    where.append(f"UPPER(e.status) IN ({placeholders})")
-                    params.extend(allowed)
+            where, params = _ui_list_filters(
+                country=country,
+                status=status,
+                protocol=protocol,
+                ip_type=ip_type,
+                speed_min_bps=speed_min_bps,
+            )
 
             base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
             stale = self._scoped_page_stale.get(cache_key)
             try:
                 with closing(self._connect(250 if stale else 1200)) as db:
-                    total=int(db.execute("SELECT COUNT(*) "+base,params).fetchone()[0] or 0)
+                    total=int(db.execute(
+                        "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
+                        params,
+                    ).fetchone()[0] or 0)
                     rows=db.execute("""
                         SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
                                s.metadata_json AS server_metadata_json,
@@ -499,80 +538,55 @@ class NodePool:
         if cached and cached[0] > now:
             return dict(cached[1])
 
-        where = ["TRIM(COALESCE(s.current_ip,''))<>''"]
-        params: list[Any] = []
-
-        if protocol and protocol != "all":
-            where.append(
-                "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND LOWER(ee.protocol)=?)"
-            )
-            params.append(protocol)
-
-        if ip_type and ip_type != "all":
-            where.append(
-                "LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?"
-            )
-            params.append(ip_type)
-
-        if speed_min_bps > 0:
-            where.append(
-                "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key "
-                "AND CAST(COALESCE((SELECT o.speed FROM observations o "
-                "WHERE o.server_key=ee.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?)"
-            )
-            params.append(speed_min_bps)
-
-        if status and status != "all":
-            if status == "connected":
-                if connected_endpoint_id:
-                    where.append(
-                        "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key AND ee.endpoint_id=?)"
-                    )
-                    params.append(connected_endpoint_id)
-                else:
-                    where.append("1=0")
+        # "connected" is not a stored endpoint status. Keep that menu on the
+        # live endpoint itself; every other status uses the table predicate.
+        where, params = _ui_list_filters(
+            status="" if status == "connected" else status,
+            protocol=protocol,
+            ip_type=ip_type,
+            speed_min_bps=speed_min_bps,
+        )
+        if status == "connected":
+            if connected_endpoint_id:
+                where.append("e.endpoint_id=?")
+                params.append(connected_endpoint_id)
             else:
-                groups = {
-                    "available": ("HOT", "AVAILABLE"),
-                    "testing": ("TESTING", "DEGRADED"),
-                    "not_checked": ("NEW",),
-                    "unavailable": ("COOLDOWN", "STALE", "RETIRED", "UNAVAILABLE"),
-                }
-                allowed = groups.get(status)
-                if allowed:
-                    placeholders = ",".join("?" for _ in allowed)
-                    where.append(
-                        "EXISTS (SELECT 1 FROM endpoints ee WHERE ee.server_key=s.server_key "
-                        f"AND UPPER(ee.status) IN ({placeholders}))"
-                    )
-                    params.extend(allowed)
+                where.append("1=0")
 
-        scope = " FROM servers s WHERE " + " AND ".join(where)
+        scope = " FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
         with closing(self._connect()) as db:
             rows = db.execute(
-                "SELECT s.country, COUNT(DISTINCT s.current_ip) AS ip_count, "
-                "COUNT(DISTINCT s.server_key) AS server_count" + scope + " GROUP BY s.country",
+                "SELECT s.country AS country, s.current_ip AS ip, s.server_key AS server_key" + scope
+                + " GROUP BY s.country, s.current_ip, s.server_key",
                 params,
             ).fetchall()
-            total = int(db.execute(
-                "SELECT COUNT(DISTINCT s.current_ip)" + scope, params
-            ).fetchone()[0] or 0)
 
         countries: dict[str, dict[str, int]] = {}
+        ips_by_country: dict[str, set[str]] = {}
+        servers_by_country: dict[str, set[str]] = {}
+        global_ips: set[str] = set()
         for row in rows:
+            ip = str(row["ip"] or "").strip()
+            if not ip:
+                continue
+            global_ips.add(ip)
             country = canonical_country_name(row["country"])
             if not country:
                 continue
-            item = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
-            item["ip_count"] += int(row["ip_count"] or 0)
-            item["server_count"] += int(row["server_count"] or 0)
+            ips_by_country.setdefault(country, set()).add(ip)
+            servers_by_country.setdefault(country, set()).add(str(row["server_key"] or ""))
+        for country, ips in ips_by_country.items():
+            countries[country] = {
+                "ip_count": len(ips),
+                "server_count": len(servers_by_country.get(country) or ()),
+            }
 
         # Known-country coverage is intentionally separate from the global
         # distinct-IP total: an un-geolocated Master Pool IP must not disappear
         # from the global count or be falsely assigned to a country.
         country_total = sum(int(v.get("ip_count") or 0) for v in countries.values())
         result = {
-            "total_ip_count": total,
+            "total_ip_count": len(global_ips),
             "country_ip_count": country_total,
             "countries": countries,
             "status": status,
@@ -991,7 +1005,7 @@ class NodePool:
         return {"hit": True, "speed_bps": max(0, speed_bps), "measured_at": measured_at}
 
     def status_counts(self, country: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0) -> dict[str, int]:
-        """Return authoritative endpoint status counts for the UI filters."""
+        """Return status counts for the same rows the node table renders."""
         country = canonical_country_name(country) if country else ""
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
@@ -1004,43 +1018,41 @@ class NodePool:
             cached = self._status_counts_cache.get(cache_key)
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
-            where = ["TRIM(COALESCE(s.current_ip,''))<>''"]
-            params: list[Any] = []
-            if country:
-                where.append("s.country=?")
-                params.append(country)
-            if protocol and protocol != "all":
-                where.append("LOWER(e.protocol)=?")
-                params.append(protocol)
-            if ip_type and ip_type != "all":
-                where.append("LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?")
-                params.append(ip_type)
-            if speed_min_bps > 0:
-                where.append(
-                    "CAST(COALESCE((SELECT o.speed FROM observations o "
-                    "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
+            where, params = _ui_list_filters(
+                country=country,
+                protocol=protocol,
+                ip_type=ip_type,
+                speed_min_bps=speed_min_bps,
+            )
+            select_sql = []
+            select_params: list[Any] = []
+            for name, statuses in _UI_STATUS_GROUPS.items():
+                select_sql.append(
+                    "COUNT(DISTINCT CASE WHEN UPPER(e.status) IN ("
+                    + ",".join("?" for _ in statuses)
+                    + ") THEN " + _UI_ROW_KEY_SQL + " END) AS " + name
                 )
-                params.append(speed_min_bps)
-            sql = """
-                SELECT
-                  SUM(CASE WHEN UPPER(e.status) IN ('HOT','AVAILABLE') THEN 1 ELSE 0 END) AS available,
-                  SUM(CASE WHEN UPPER(e.status)='TESTING' THEN 1 ELSE 0 END) AS testing,
-                  SUM(CASE WHEN UPPER(e.status)='NEW' THEN 1 ELSE 0 END) AS not_checked,
-                  SUM(CASE WHEN UPPER(e.status) IN ('DEGRADED','COOLDOWN','STALE','RETIRED','UNAVAILABLE') THEN 1 ELSE 0 END) AS unavailable
-                FROM endpoints e JOIN servers s ON s.server_key=e.server_key
-                WHERE """ + " AND ".join(where)
+                select_params.extend(statuses)
+            select_sql.append("COUNT(DISTINCT " + _UI_ROW_KEY_SQL + ") AS all_rows")
+            sql = (
+                "SELECT " + ", ".join(select_sql)
+                + " FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
+                + " AND ".join(where)
+            )
+            empty = {"available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
             try:
                 with closing(self._connect(300)) as db:
-                    row = db.execute(sql, params).fetchone()
+                    row = db.execute(sql, select_params + params).fetchone()
             except sqlite3.OperationalError:
                 if cached:
                     return dict(cached[1])
-                return {"available": 0, "testing": 0, "not_checked": 0, "unavailable": 0}
+                return dict(empty)
             result = {
                 "available": int(row["available"] or 0),
                 "testing": int(row["testing"] or 0),
                 "not_checked": int(row["not_checked"] or 0),
                 "unavailable": int(row["unavailable"] or 0),
+                "all": int(row["all_rows"] or 0),
             }
             self._status_counts_cache[cache_key] = (time.monotonic() + 15.0, result)
             return dict(result)
