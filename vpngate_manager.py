@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.46"
+APP_VERSION = "V1.0.47"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7962,7 +7962,7 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select[data-filter-id="speed_filter"] { flex: 1 1 0; }
     #btn_favorites { flex: 0 0 auto; margin-left: 4px !important; white-space: nowrap; padding: 0 12px !important; }
     .toolbar .toolbar-custom-select-button {
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 500;
       line-height: 1;
       padding: 0 10px 0 12px;
@@ -7991,7 +7991,7 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       margin-left: 0;
       line-height: 1;
-      font-size: 12px;
+      font-size: 14px;
       font-weight: 500;
       font-variant-numeric: tabular-nums;
     }
@@ -8012,7 +8012,7 @@ INDEX_HTML = r"""<!doctype html>
     .net-filter-grid > .form-group { margin-bottom: 0 !important; min-width: 0; overflow: visible; }
     .net-filter-grid .form-label { font-size: 12px; }
     #network_modal .net-filter-grid .toolbar-custom-select-button {
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 500;
       line-height: 1;
       padding: 0 8px 0 10px;
@@ -8300,11 +8300,11 @@ INDEX_HTML = r"""<!doctype html>
       bottom: calc(100% + 4px);
     }
     .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option {
-      min-height: 36px;
-      height: 36px;
+      min-height: 38px;
+      height: 38px;
       padding: 0 10px;
       gap: 8px;
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 500;
       line-height: 1;
       align-items: center;
@@ -8329,7 +8329,7 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option-count {
       flex: 0 0 auto;
       min-width: 0;
-      font-size: 12px;
+      font-size: 14px;
       font-weight: 500;
       line-height: 1;
       font-variant-numeric: tabular-nums;
@@ -8343,23 +8343,57 @@ INDEX_HTML = r"""<!doctype html>
       flex: 0 0 18px;
     }
     #network_modal.modal {
-      flex-direction: column;
-      align-items: center;
-      justify-content: flex-start;
-      overflow-x: hidden;
-      overflow-y: auto;
-      padding: 20px 16px 40px;
-      overscroll-behavior: contain;
+      overflow: hidden;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 18px 16px 64px;
+      box-sizing: border-box;
     }
     #network_modal .modal-content {
       width: min(720px, 100%);
       max-width: 720px;
-      max-height: none;
-      margin: 0 auto;
-      flex: 0 0 auto;
-      padding: 22px 20px 18px;
-      overflow: visible;
+      max-height: calc(100vh - 82px);
+      max-height: calc(100dvh - 82px);
+      margin: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
       scrollbar-gutter: auto;
+      padding: 22px 12px 14px 20px;
+    }
+    #network_modal .modal-content > :not(form) {
+      flex-shrink: 0;
+    }
+    #network_modal form {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+    }
+    .net-modal-scroll {
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow-x: hidden;
+      overflow-y: scroll;
+      scrollbar-gutter: auto;
+      padding-right: 10px;
+      scrollbar-width: auto;
+      scrollbar-color: rgba(45, 212, 191, .78) rgba(15, 23, 42, .92);
+    }
+    .net-modal-scroll::-webkit-scrollbar { width: 10px; }
+    .net-modal-scroll::-webkit-scrollbar-track {
+      background: rgba(15, 23, 42, .92);
+      border-radius: 999px;
+    }
+    .net-modal-scroll::-webkit-scrollbar-thumb {
+      background: rgba(45, 212, 191, .78);
+      border-radius: 999px;
+      border: 2px solid rgba(15, 23, 42, .92);
+    }
+    .net-modal-scroll::-webkit-scrollbar-thumb:hover {
+      background: rgba(45, 212, 191, .95);
     }
     #network_modal .unified-select {
       position: relative;
@@ -8384,37 +8418,49 @@ INDEX_HTML = r"""<!doctype html>
       bottom: calc(100% + 4px);
     }
     #network_modal .unified-select .toolbar-custom-option {
-      min-height: 36px;
-      height: 36px;
+      min-height: 38px;
+      height: 38px;
       padding: 0 10px;
       gap: 8px;
-      font-size: 13px;
+      font-size: 14px;
       font-weight: 500;
       line-height: 1;
       align-items: center;
     }
-    #network_modal form,
-    #network_modal .form-group {
-      overflow: visible;
+    #network_modal .unified-select .toolbar-custom-option-count,
+    #network_modal .net-filter-grid .toolbar-custom-selected-count {
+      font-size: 14px;
+    }
+    #network_modal form {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
     }
     .net-modal-footer {
-      margin-top: 18px;
+      margin-top: 14px;
+      flex: 0 0 auto;
     }
     .net-routing-warning {
       font-size: 13px;
       color: var(--text-secondary);
       line-height: 1.7;
-      padding: 14px 16px;
-      min-height: 78px;
+      padding: 12px 14px;
+      min-height: 0;
+      height: auto;
+      flex: 0 0 auto;
       background: rgba(255, 255, 255, 0.02);
       border: 1px solid rgba(255, 255, 255, 0.05);
       border-radius: 8px;
-      margin: 0 0 14px;
+      margin: 0;
     }
     .net-modal-actions {
       display: flex;
       gap: 12px;
       justify-content: flex-end;
+      flex: 0 0 auto;
+      padding: 12px 12px 0 0;
     }
     .add-node-flow,
     .add-node-status {
@@ -10198,6 +10244,7 @@ INDEX_HTML = r"""<!doctype html>
       <div id="network_success" style="color: var(--success); font-size: 13px; margin-bottom: 16px; padding: 8px 12px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.2); border-radius: 6px; display: none;"></div>
 
       <form id="network_form" onsubmit="saveNetwork(event)">
+        <div class="net-modal-scroll">
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理端口</label>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" value="8500" disabled title="代理端口固定为 8500">
@@ -10325,10 +10372,11 @@ INDEX_HTML = r"""<!doctype html>
           <div id="net_routing_warning" class="net-routing-warning">
             ℹ️ <strong>服务可用性优先</strong>：国家和 IP 类型作为偏好，不作为硬锁定。系统按“目标国家 → IP 类型 → 稳定性 → 延迟 → 带宽”选择；目标暂时不可用时自动回退到同区域或全网可用节点，目标恢复后自动切回。
           </div>
-          <div class="net-modal-actions">
-            <button type="button" onclick="closeNetworkModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
-            <button type="submit" id="network_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
-          </div>
+        </div>
+        </div>
+        <div class="net-modal-actions">
+          <button type="button" onclick="closeNetworkModal()" style="height: 40px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">取消</button>
+          <button type="submit" id="network_submit_btn" class="btn-primary" style="height: 40px; padding: 0 20px; font-weight: 600; border-radius: 8px;">保存修改</button>
         </div>
       </form>
     </div>
@@ -11040,16 +11088,9 @@ function toggleUnifiedSelect(selectId, event) {
   renderUnifiedSelect(selectId);
   widget.classList.add("open");
   if (button) button.setAttribute("aria-expanded", "true");
-  // Proxy-settings menus stay inside the button so they share its edges.
-  // Logs and other modals still portal out of their overflow containers.
-  if (widget.closest("#network_modal")) {
-    if (menu.parentElement !== widget) widget.appendChild(menu);
-    placeFilterMenu(menu, button || widget);
-  } else {
-    if (menu.parentElement !== document.body) document.body.appendChild(menu);
-    menu.style.display = "block";
-    placeAnchoredMenu(menu, button || widget);
-  }
+  if (menu.parentElement !== document.body) document.body.appendChild(menu);
+  menu.style.display = "block";
+  placeAnchoredMenu(menu, button || widget, !!widget.closest("#network_modal"));
   queueMenuTrack();
 }
 
@@ -11065,13 +11106,13 @@ function chooseUnifiedSelect(selectId, value) {
   closeUnifiedSelects("");
 }
 
-function placeAnchoredMenu(menu, trigger) {
+function placeAnchoredMenu(menu, trigger, exact) {
   if (!menu || !trigger || !trigger.getBoundingClientRect) return;
   const rect = trigger.getBoundingClientRect();
   if (rect.width < 2 && rect.height < 2) return;
   const viewW = window.innerWidth;
   const viewH = window.innerHeight;
-  const width = Math.max(168, Math.round(rect.width));
+  const width = exact ? Math.max(120, Math.round(rect.width)) : Math.max(168, Math.round(rect.width));
   const left = Math.max(8, Math.min(Math.round(rect.left), viewW - width - 8));
   const set = (prop, value) => menu.style.setProperty(prop, value, "important");
   set("position", "fixed");
@@ -11080,7 +11121,7 @@ function placeAnchoredMenu(menu, trigger) {
   set("right", "auto");
   set("width", width + "px");
   set("min-width", width + "px");
-  set("max-width", Math.max(width, 280) + "px");
+  set("max-width", (exact ? width : Math.max(width, 280)) + "px");
   set("margin", "0");
   set("transform", "none");
   set("overflow-y", "auto");
@@ -11088,20 +11129,16 @@ function placeAnchoredMenu(menu, trigger) {
   set("display", "block");
   const spaceBelow = Math.max(0, viewH - rect.bottom - 8);
   const spaceAbove = Math.max(0, rect.top - 8);
-  set("max-height", "320px");
   const needed = Math.min(320, Math.max(96, menu.scrollHeight || 240));
-  // Stick to the button. Open upward only when the menu cannot fit below
-  // and there is more room above. Anchor the near edge so it never floats
-  // away into the connection card.
   const openUp = spaceBelow < Math.min(needed, 200) && spaceAbove > spaceBelow;
   if (openUp) {
     set("max-height", Math.max(96, Math.min(320, spaceAbove)) + "px");
     set("top", "auto");
-    set("bottom", Math.round(viewH - rect.top + 6) + "px");
+    set("bottom", Math.round(viewH - rect.top + 4) + "px");
   } else {
     set("max-height", Math.max(96, Math.min(320, spaceBelow || 320)) + "px");
     set("bottom", "auto");
-    set("top", Math.round(rect.bottom + 6) + "px");
+    set("top", Math.round(rect.bottom + 4) + "px");
   }
 }
 
@@ -11135,7 +11172,7 @@ function repositionOpenMenus() {
     const menu = cfg ? $(cfg.menu) : null;
     const button = cfg ? $(cfg.button) : null;
     if (!menu || !button) return;
-    if (widget.closest("#network_modal")) placeFilterMenu(menu, button);
+    if (widget.closest("#network_modal")) placeAnchoredMenu(menu, button, true);
     else if (menu.parentElement === document.body) placeAnchoredMenu(menu, button);
   });
 }
@@ -11178,7 +11215,7 @@ function bindUnifiedSelectEvents() {
     if (!event.target?.closest?.(".unified-select")) closeUnifiedSelects("");
   });
   window.addEventListener("resize", () => closeUnifiedSelects(""));
-  const modalBody = document.querySelector("#network_modal .modal-content");
+  const modalBody = document.querySelector("#network_modal .net-modal-scroll");
   if (modalBody && modalBody.dataset.menuScrollBound !== "1") {
     modalBody.dataset.menuScrollBound = "1";
     modalBody.addEventListener("scroll", () => {
@@ -11186,7 +11223,7 @@ function bindUnifiedSelectEvents() {
         const selectId = widget.getAttribute("data-unified-select-id");
         const menu = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].menu) : null;
         const button = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].button) : null;
-        if (menu && button) placeFilterMenu(menu, button);
+        if (menu && button) placeAnchoredMenu(menu, button, true);
       });
     }, {passive: true});
   }
@@ -14053,6 +14090,8 @@ function openNetworkModal() {
   const networkModal = $("network_modal");
   networkModal.style.display = "flex";
   networkModal.scrollTop = 0;
+  const networkScroll = networkModal.querySelector(".net-modal-scroll");
+  if (networkScroll) networkScroll.scrollTop = 0;
   $("admin_dropdown").style.display = "none";
 }
 
