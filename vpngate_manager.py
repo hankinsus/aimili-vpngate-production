@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.21"
+APP_VERSION = "V1.0.22"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4619,17 +4619,23 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
     set_state(standby_ready=True, standby_node_id=node_id, standby_latency_ms=parse_int(egress.get("latency_ms")))
     return True
 
-_first_page_snapshot: dict[str, Any] = {"at": 0.0, "country": "", "body": None}
+_first_page_snapshot: dict[tuple[str, str], dict[str, Any]] = {}
 _first_page_snapshot_lock = threading.Lock()
 
 def warm_first_page_loop() -> None:
-    """Keep the server-country first page ready so opening the site does not wait on SQLite."""
+    """Keep the first pages ready so opening the site does not wait on SQLite."""
     time.sleep(0.2)
     while True:
         try:
             if not manual_connection_active:
-                country = str(_read_bootstrap_state().get("local_server_country") or "").strip()
-                if country:
+                countries = [str(_read_bootstrap_state().get("local_server_country") or "").strip(), ""]
+                active = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+                seen: set[str] = set()
+                for country in countries:
+                    country_key = normalized_country_name(country) if country else ""
+                    if country_key in seen:
+                        continue
+                    seen.add(country_key)
                     nodes, total, building = _get_ui_nodes_page(0, 100, country)
                     body = {
                         "ok": True,
@@ -4643,12 +4649,10 @@ def warm_first_page_loop() -> None:
                         "generated_at": time.time(),
                     }
                     with _first_page_snapshot_lock:
-                        _first_page_snapshot["at"] = time.time()
-                        _first_page_snapshot["country"] = country
-                        _first_page_snapshot["body"] = body
+                        _first_page_snapshot[(country_key, active)] = {"at": time.time(), "body": body}
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(15)
 
 def warm_standby_loop() -> None:
     """Keep one already-open OpenVPN tunnel so the next switch is a route flip."""
@@ -13985,6 +13989,19 @@ function exportLogContent() {
 </body></html>"""
 
 INDEX_HTML_ETAG = '"' + hashlib.sha256(INDEX_HTML.encode("utf-8")).hexdigest()[:16] + '"'
+# The shell has no live connection status. Keep one gzipped copy per boot
+# country so a refresh can return 304 instead of the 324KB page.
+_INDEX_PAGE_CACHE: dict[str, tuple[str, bytes, bytes]] = {}
+
+def cached_index_page(boot_country: str) -> tuple[str, bytes, bytes]:
+    cached = _INDEX_PAGE_CACHE.get(boot_country)
+    if cached:
+        return cached
+    page = INDEX_HTML.replace("__BOOT_SERVER_COUNTRY_JSON__", json.dumps(boot_country, ensure_ascii=False)).encode("utf-8")
+    etag = '"' + hashlib.sha256(page).hexdigest()[:16] + '"'
+    packed = (etag, page, gzip.compress(page, compresslevel=6))
+    _INDEX_PAGE_CACHE[boot_country] = packed
+    return packed
 
 def local_proxy_port_reachable(timeout: float = 0.4) -> bool:
     host = LOCAL_PROXY_HOST
@@ -14557,7 +14574,7 @@ class Handler(BaseHTTPRequestHandler):
         if ACCESS_LOG_ENABLED:
             print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
-    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK, cache_control: str = "no-store", etag: str = "") -> None:
+    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK, cache_control: str = "no-store", etag: str = "", content_encoding: str = "") -> None:
         if etag and self.headers.get("If-None-Match") == etag:
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Cache-Control", cache_control)
@@ -14567,6 +14584,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache_control)
         if etag:
@@ -14771,11 +14791,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "flag not found"}, HTTPStatus.NOT_FOUND)
             return
         if effective_path in ("/", "/index.html"):
-            # Dashboard HTML contains the embedded production version and UI code.
-            # Never allow an old HTML shell to survive a production update.
+            # The HTML shell does not carry connection status. Revalidate with
+            # ETag so a refresh is a 304, and a new build still replaces it.
             boot_country = str(_read_bootstrap_state().get("local_server_country") or "")
-            page = INDEX_HTML.replace("__BOOT_SERVER_COUNTRY_JSON__", json.dumps(boot_country, ensure_ascii=False))
-            self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8", cache_control="no-store, max-age=0, must-revalidate")
+            etag, raw, gz = cached_index_page(boot_country)
+            cache_control = "private, no-cache"
+            if "gzip" in str(self.headers.get("Accept-Encoding") or "").lower() and len(gz) < len(raw):
+                self.send_bytes(gz, "text/html; charset=utf-8", cache_control=cache_control, etag=etag, content_encoding="gzip")
+            else:
+                self.send_bytes(raw, "text/html; charset=utf-8", cache_control=cache_control, etag=etag)
         elif effective_path in ("/footer-logo-clean.webp", "/footer-logo-clean.png"):
             try:
                 if effective_path.endswith(".webp"):
@@ -14827,12 +14851,14 @@ class Handler(BaseHTTPRequestHandler):
             protocol = str((query.get("protocol") or [""])[0]).strip().lower()
             ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
             speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
-            if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps and country:
+            if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps:
+                active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+                country_key = normalized_country_name(country) if country else ""
                 with _first_page_snapshot_lock:
-                    snap_at = float(_first_page_snapshot.get("at") or 0)
-                    snap_country = str(_first_page_snapshot.get("country") or "")
-                    snap_body = _first_page_snapshot.get("body")
-                if snap_body and time.time() - snap_at < 20 and normalized_country_name(country) == normalized_country_name(snap_country):
+                    snap = _first_page_snapshot.get((country_key, active_now))
+                snap_body = (snap or {}).get("body")
+                snap_at = float((snap or {}).get("at") or 0)
+                if snap_body and time.time() - snap_at < 60:
                     body = dict(snap_body)
                     body["nodes"] = list(body.get("nodes") or [])[:limit]
                     body["limit"] = limit
@@ -14869,7 +14895,7 @@ class Handler(BaseHTTPRequestHandler):
                     page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
                         offset, limit, country, status, protocol, ip_type, speed_min_bps
                     )
-                self.send_json({
+                body = {
                     "ok": True,
                     "nodes": page_nodes,
                     "offset": offset,
@@ -14879,7 +14905,13 @@ class Handler(BaseHTTPRequestHandler):
                     "cache_building": cache_building,
                     "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps},
                     "generated_at": time.time(),
-                })
+                }
+                if offset == 0 and not status and not protocol and not ip_type and not speed_min_bps:
+                    country_key = normalized_country_name(country) if country else ""
+                    active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+                    with _first_page_snapshot_lock:
+                        _first_page_snapshot[(country_key, active_now)] = {"at": time.time(), "body": body}
+                self.send_json(body)
             finally:
                 ui_query_exit()
         elif effective_path == "/api/ui/filter_counts":
@@ -16509,15 +16541,6 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
                 active_ip = parts[0].strip()
                 active_port = int(parts[1])
                 active_protocol = "openvpn"
-            if not active_ip:
-                try:
-                    raw_active = next((n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)), None)
-                    if raw_active:
-                        active_ip = str(raw_active.get("ip") or raw_active.get("remote_host") or "").strip()
-                        active_protocol = "openvpn"
-                        active_port = parse_int(raw_active.get("remote_port"))
-                except Exception:
-                    pass
         scoped_endpoints, endpoint_total = node_pool.list_endpoints_scoped(
             country=country,
             status=status,

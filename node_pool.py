@@ -521,7 +521,7 @@ class NodePool:
                     'latency': float(item.get('latency_ewma') or item.get('latest_ping') or 0) > 0,
                 }
                 result.append(item)
-            self._scoped_page_cache[cache_key] = (time.monotonic() + 6.0, (result, total))
+            self._scoped_page_cache[cache_key] = (time.monotonic() + 60.0, (result, total))
             self._scoped_page_stale[cache_key] = (result, total)
             return [dict(x) for x in result], total
         finally:
@@ -595,7 +595,10 @@ class NodePool:
             "protocol": protocol,
             "ip_type": ip_type,
         }
-        self._country_catalog_cache[key] = (now + 5.0, result)
+        # Country inventory is not connection status. Keep it for a minute.
+        # The connected filter is one live row and stays short.
+        catalog_ttl = 5.0 if status == "connected" else 60.0
+        self._country_catalog_cache[key] = (now + catalog_ttl, result)
         return dict(result)
 
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
