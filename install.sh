@@ -54,15 +54,61 @@ if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -f /opt/aimilivpn/vpngate_data/sta
 fi
 
 INSTALL_JIUHEYI="${INSTALL_JIUHEYI:-}"
+JIUHEYI_CORE_CHOICE="${JIUHEYI_CORE:-}"
+JIUHEYI_CAMOUFLAGE="${JIUHEYI_REALITY_DOMAIN:-}"
+jiuheyi_already_installed() {
+    [ -f /etc/v2ray-agent/xray/xray ] || [ -f /etc/v2ray-agent/sing-box/sing-box ]
+}
 if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -t 0 ]; then
-    read -r -p "是否同时安装九合一？[y/N]: " INSTALL_JIUHEYI
-    if [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
-        read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
+    if jiuheyi_already_installed; then
+        echo -e "${YELLOW}检测到九合一已安装，跳过。${PLAIN}"
+        INSTALL_JIUHEYI=n
+        if [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
+            read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
+        fi
+    else
+        read -r -p "是否安装九合一？[y/N]: " INSTALL_JIUHEYI
+        if [ "${INSTALL_JIUHEYI}" = "y" ] || [ "${INSTALL_JIUHEYI}" = "Y" ]; then
+            echo -e "${YELLOW}1.Xray-core，6 个协议（直接回车）${PLAIN}"
+            echo -e "${YELLOW}2.sing-box，11 个协议${PLAIN}"
+            read -r -p "请选择内核: " JIUHEYI_CORE_CHOICE
+            case "${JIUHEYI_CORE_CHOICE}" in
+                2|singbox|sing-box) JIUHEYI_CORE_CHOICE=2 ;;
+                *) JIUHEYI_CORE_CHOICE=1 ;;
+            esac
+            if [ -z "${AIMILIVPN_DOMAIN+x}" ] || [ -z "${AIMILIVPN_DOMAIN}" ]; then
+                read -r -p "请输入域名（九合一全部协议需要域名，直接回车则只装 AimiliVPN）: " AIMILIVPN_DOMAIN
+            fi
+            if [ -z "${AIMILIVPN_DOMAIN}" ]; then
+                echo -e "${YELLOW}没有域名，跳过九合一，AimiliVPN 使用服务器 IP 继续安装。${PLAIN}"
+                INSTALL_JIUHEYI=n
+            else
+                echo -e "${YELLOW}1.www.microsoft.com（直接回车）${PLAIN}"
+                echo -e "${YELLOW}2.www.apple.com${PLAIN}"
+                echo -e "${YELLOW}3.dl.google.com${PLAIN}"
+                echo -e "${YELLOW}4.addons.mozilla.org${PLAIN}"
+                echo -e "${YELLOW}5.自己输入${PLAIN}"
+                read -r -p "请选择伪装域名: " JIUHEYI_CAMOUFLAGE_CHOICE
+                case "${JIUHEYI_CAMOUFLAGE_CHOICE}" in
+                    2) JIUHEYI_CAMOUFLAGE="www.apple.com" ;;
+                    3) JIUHEYI_CAMOUFLAGE="dl.google.com" ;;
+                    4) JIUHEYI_CAMOUFLAGE="addons.mozilla.org" ;;
+                    5)
+                        read -r -p "请输入伪装域名: " JIUHEYI_CAMOUFLAGE
+                        JIUHEYI_CAMOUFLAGE=$(printf '%s' "${JIUHEYI_CAMOUFLAGE}" | tr -d '[:space:]')
+                        [ -n "${JIUHEYI_CAMOUFLAGE}" ] || JIUHEYI_CAMOUFLAGE="www.microsoft.com"
+                        ;;
+                    *) JIUHEYI_CAMOUFLAGE="www.microsoft.com" ;;
+                esac
+            fi
+        elif [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
+            read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
+        fi
     fi
 fi
 AIMILIVPN_DOMAIN=$(printf '%s' "${AIMILIVPN_DOMAIN:-}" | tr -d '[:space:]')
 export AIMILIVPN_DOMAIN
-if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -z "${AIMILIVPN_DOMAIN}" ]; then
+if [ -z "${AIMILIVPN_DOMAIN}" ]; then
     export AIMILIVPN_IP_CERT_FOREVER=1
 fi
 
@@ -1343,10 +1389,19 @@ echo -e "=========================================================="
 echo
 
 if [ "${INSTALL_JIUHEYI:-}" = "y" ] || [ "${INSTALL_JIUHEYI:-}" = "Y" ]; then
-    echo -e "${YELLOW}开始安装九合一...${PLAIN}"
-    if ! curl -fsSL "https://raw.githubusercontent.com/hankinsus/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh \
-        || ! grep -q "九合一 V1.0.1" /tmp/jiuheyi-install.sh; then
-        curl -fsSL "https://raw.githubusercontent.com/ilovestudyus-sketch/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh
+    if [ -f /etc/v2ray-agent/xray/xray ] || [ -f /etc/v2ray-agent/sing-box/sing-box ]; then
+        echo -e "${YELLOW}九合一已安装，跳过。${PLAIN}"
+    elif [ -z "${AIMILIVPN_DOMAIN}" ]; then
+        echo -e "${YELLOW}没有域名，跳过九合一。${PLAIN}"
+    else
+        echo -e "${YELLOW}开始安装九合一...${PLAIN}"
+        if ! curl -fsSL "https://raw.githubusercontent.com/hankinsus/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh \
+            || ! grep -q "九合一 V1.0.1" /tmp/jiuheyi-install.sh; then
+            curl -fsSL "https://raw.githubusercontent.com/ilovestudyus-sketch/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh
+        fi
+        JIUHEYI_FROM_AIMILI=1 JIUHEYI_EGRESS=aimili JIUHEYI_ONECLICK=1 \
+            JIUHEYI_CORE="${JIUHEYI_CORE_CHOICE:-1}" \
+            JIUHEYI_REALITY_DOMAIN="${JIUHEYI_CAMOUFLAGE:-www.microsoft.com}" \
+            domain="${AIMILIVPN_DOMAIN}" bash /tmp/jiuheyi-install.sh
     fi
-    JIUHEYI_FROM_AIMILI=1 JIUHEYI_EGRESS=aimili JIUHEYI_ONECLICK=1 domain="${AIMILIVPN_DOMAIN:-}" bash /tmp/jiuheyi-install.sh
 fi

@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.20"
+APP_VERSION = "V1.0.21"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -3491,6 +3491,77 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
         log_to_json("WARNING", "Routing", f"偏好路由恢复失败: {exc}")
         return False
 
+def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> bool:
+    """True when this exit already satisfies the filters the user just saved.
+
+    Country is only required in 优先地区. 住宅 IP accepts residential and mobile.
+    Empty protocol or speed means no extra constraint. A healthy tunnel that
+    already matches is left alone.
+    """
+    if not endpoint:
+        return False
+    mode = str(ui_cfg.get("routing_mode") or "auto")
+    if mode == "fixed_region":
+        target = normalized_country_name(ui_cfg.get("force_country") or "")
+        if target and normalized_country_name(endpoint.get("country")) != target:
+            return False
+    ip_pref = str(ui_cfg.get("routing_ip_type") or "all").lower()
+    actual = str(endpoint_ip_type(endpoint) or "").lower()
+    if ip_pref == "residential" and actual not in ("residential", "mobile"):
+        return False
+    if ip_pref == "mobile" and actual != "mobile":
+        return False
+    if ip_pref == "hosting" and actual != "hosting":
+        return False
+    protocol = str(ui_cfg.get("routing_protocol") or "").strip().lower()
+    if protocol and str(endpoint.get("protocol") or "").lower() != protocol:
+        return False
+    try:
+        min_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        min_speed = 0
+    if min_speed > 0:
+        speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+        if speed < min_speed:
+            return False
+    if mode == "favorites" and routing_favorite_rank(endpoint, ui_cfg) != 0:
+        return False
+    return True
+
+def switch_to_explicit_routing_if_needed() -> bool:
+    """Switch now when a verified exit matches the saved filter and the current one does not.
+
+    If nothing verified matches, keep the current tunnel. Do not drop a working
+    proxy just because the preferred country still has zero nodes.
+    """
+    ui_cfg = load_ui_config()
+    if not bool(ui_cfg.get("connection_enabled", True)):
+        return False
+    if ui_cfg.get("routing_mode") == "fixed_ip":
+        return False
+    if ui_command_plane.is_busy() or manual_connection_active:
+        return False
+    current = current_active_routing_endpoint()
+    if current and endpoint_matches_explicit_routing(current, ui_cfg):
+        return False
+    matching = [
+        ep for ep in unified_hot_pool_candidates(ui_cfg, limit=30)
+        if endpoint_matches_explicit_routing(ep, ui_cfg)
+    ]
+    if not matching:
+        return False
+    best = matching[0]
+    if current and str(best.get("endpoint_id") or "") == str(current.get("endpoint_id") or ""):
+        return False
+    connect_ranked_endpoint(best)
+    set_state(last_check_message="已按代理设置切换到符合筛选的出口")
+    log_to_json(
+        "INFO",
+        "Routing",
+        f"代理筛选生效，切换到 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}",
+    )
+    return True
+
 def apply_user_routing_preferences() -> None:
     try:
         ui_cfg = load_ui_config()
@@ -3498,17 +3569,19 @@ def apply_user_routing_preferences() -> None:
             return
         if ui_cfg.get("routing_mode") == "fixed_ip":
             return
-        # Country/IP/favorites are all soft preferences. The same ranking and
-        # availability fallback is used for every automatic mode.
-        target_country = str(ui_cfg.get("force_country") or "").strip()
+        if switch_to_explicit_routing_if_needed():
+            return
+        target_country = ""
+        if str(ui_cfg.get("routing_mode") or "") == "fixed_region":
+            target_country = str(ui_cfg.get("force_country") or "").strip()
         if target_country:
-            priority_result = start_country_priority(target_country)
-            if priority_result.get("running"):
-                return
+            set_state(last_check_message=f"{target_country} 还没有符合筛选的已验证节点，保持当前出口并继续补齐")
+            start_country_priority(target_country)
+            return
         if active_tunnel_running():
-            maybe_recover_preferred_route(force=True)
-        else:
-            auto_switch_node()
+            set_state(last_check_message="没有符合筛选的已验证节点，保持当前出口")
+            return
+        auto_switch_node()
     except Exception as exc:
         log_to_json("WARNING", "Routing", f"应用用户路由偏好失败: {exc}")
 
@@ -4002,6 +4075,11 @@ def country_priority_worker(country: str) -> None:
         country_priority_request = ""
         if country_priority_lock.locked():
             country_priority_lock.release()
+        try:
+            if not manual_connection_active:
+                switch_to_explicit_routing_if_needed()
+        except Exception as exc:
+            log_to_json("WARNING", "Routing", f"优先国家检测结束后切换失败: {exc}")
         if pending:
             start_country_priority(pending)
 
