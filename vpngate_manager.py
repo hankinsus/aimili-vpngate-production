@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.37"
+APP_VERSION = "V1.0.38"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2597,7 +2597,7 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 "hostname": host,
                 "ip": resolved_ip,
                 "existing_count": len(existing),
-                "message": f"库里已经有这个节点（{where}），没有重复添加。刷新页面后，用筛选就能看到它。",
+                "message": f"全球资源库已有该节点（{where}），没有重复添加。刷新页面后，用筛选就能看到它。",
             }
 
         official = None
@@ -12671,7 +12671,7 @@ function fillAddNodeExample(value){
 
 function renderManualAddAttempts(data, success) {
   if (data && data.already_exists) {
-    return '<div class="add-node-status"><div class="add-node-status-title">库里已有</div><div>' + esc(data.message || "库里已经有这个节点，没有重复添加。刷新页面后，用筛选就能看到它。") + '</div></div>';
+    return '<div class="add-node-status"><div class="add-node-status-title">全球资源库已有</div><div>' + esc(data.message || "全球资源库已有该节点，没有重复添加。刷新页面后，用筛选就能看到它。") + '</div></div>';
   }
   const rawAttempts = Array.isArray(data && data.attempts) ? data.attempts : [];
   const names = {openvpn:"OpenVPN",softether:"SSL-VPN","l2tp-ipsec":"L2TP/IPsec",sstp:"MS-SSTP"};
@@ -15197,7 +15197,7 @@ def _run_manual_add_job(value: str) -> None:
         result = add_manual_vpngate_node(value)
         manual_add_result = dict(result or {})
         if result.get("already_exists"):
-            message = str(result.get("message") or "库里已经有这个节点，没有重复添加。")
+            message = str(result.get("message") or "全球资源库已有该节点，没有重复添加。")
             set_state(
                 manual_add_running=False,
                 manual_add_message=message,
