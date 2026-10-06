@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.47"
+APP_VERSION = "V1.0.48"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -7962,7 +7962,7 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select[data-filter-id="speed_filter"] { flex: 1 1 0; }
     #btn_favorites { flex: 0 0 auto; margin-left: 4px !important; white-space: nowrap; padding: 0 12px !important; }
     .toolbar .toolbar-custom-select-button {
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 500;
       line-height: 1;
       padding: 0 10px 0 12px;
@@ -7980,6 +7980,8 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       gap: 6px;
       line-height: 1;
+      font-size: 15px;
+      font-weight: 500;
     }
     .toolbar .toolbar-custom-option-name {
       min-width: 0;
@@ -7991,7 +7993,7 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       margin-left: 0;
       line-height: 1;
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 500;
       font-variant-numeric: tabular-nums;
     }
@@ -8300,11 +8302,11 @@ INDEX_HTML = r"""<!doctype html>
       bottom: calc(100% + 4px);
     }
     .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option {
-      min-height: 38px;
-      height: 38px;
+      min-height: 40px;
+      height: 40px;
       padding: 0 10px;
       gap: 8px;
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 500;
       line-height: 1;
       align-items: center;
@@ -8324,12 +8326,13 @@ INDEX_HTML = r"""<!doctype html>
       text-overflow: ellipsis;
       white-space: nowrap;
       line-height: 1;
+      font-size: 15px;
       font-weight: 500;
     }
     .toolbar > .toolbar-custom-select > .toolbar-custom-select-menu .toolbar-custom-option-count {
       flex: 0 0 auto;
       min-width: 0;
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 500;
       line-height: 1;
       font-variant-numeric: tabular-nums;
