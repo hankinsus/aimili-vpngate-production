@@ -184,6 +184,20 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_obs_server_time ON observations(server_key, seen_at DESC);
 """
 
+def _empty_upsert_stats() -> dict[str, Any]:
+    return {
+        "inserted_servers": 0,
+        "updated_servers": 0,
+        "unchanged_servers": 0,
+        "inserted_endpoints": 0,
+        "updated_endpoints": 0,
+        "recovered_endpoints": 0,
+        "unchanged_endpoints": 0,
+        "ip_changed_endpoints": 0,
+        "new_endpoint_ids": [],
+    }
+
+
 class NodePool:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -527,11 +541,14 @@ class NodePool:
             if node.get("manual_added_at"):
                 servers[-1]["manual_added_at"] = float(node.get("manual_added_at") or 0)
         if servers:
-            self.upsert_discovery_snapshot(servers, source=source)
+            return self.upsert_discovery_snapshot(servers, source=source)
+        return _empty_upsert_stats()
 
-    def upsert_discovery_snapshot(self, servers: list[dict[str, Any]], source: str = "official_html") -> None:
+    def upsert_discovery_snapshot(self, servers: list[dict[str, Any]], source: str = "official_html") -> dict[str, int]:
         now = time.time()
         seen_keys: set[str] = set()
+        stats = _empty_upsert_stats()
+        new_ids: list[str] = []
         with self.lock, closing(self._connect()) as db:
             for server in servers:
                 hostname = str(server.get("hostname") or server.get("host_name") or "").strip().lower()
@@ -555,9 +572,18 @@ class NodePool:
                 if server.get("manual_added_at"):
                     metadata["manual_added_at"] = float(server.get("manual_added_at"))
                 existing_server = db.execute(
-                    "SELECT metadata_json FROM servers WHERE server_key=?",
+                    "SELECT current_ip, country, metadata_json FROM servers WHERE server_key=?",
                     (key,),
                 ).fetchone()
+                old_ip = str(existing_server["current_ip"] or "").strip() if existing_server else ""
+                old_country = str(existing_server["country"] or "") if existing_server else ""
+                ip_changed = bool(old_ip and ip and old_ip != ip)
+                if not existing_server:
+                    stats["inserted_servers"] += 1
+                elif ip_changed or (country and country != old_country):
+                    stats["updated_servers"] += 1
+                else:
+                    stats["unchanged_servers"] += 1
                 if existing_server:
                     try:
                         previous_meta = json.loads(existing_server["metadata_json"] or "{}")
@@ -610,6 +636,7 @@ class NodePool:
                                 "UPDATE endpoints SET last_seen=? WHERE endpoint_id=?",
                                 (now, duplicate["endpoint_id"]),
                             )
+                            stats["unchanged_endpoints"] += 1
                             continue
                     eid = self.endpoint_id(key, protocol, transport, port)
                     endpoint_meta = {
@@ -622,9 +649,10 @@ class NodePool:
                     if server.get("manual_added_at"):
                         endpoint_meta["manual_added_at"] = float(server.get("manual_added_at"))
                     existing_endpoint = db.execute(
-                        "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
+                        "SELECT status, metadata_json FROM endpoints WHERE endpoint_id=?",
                         (eid,),
                     ).fetchone()
+                    previous_status = str(existing_endpoint["status"] or "").upper() if existing_endpoint else ""
                     if existing_endpoint:
                         try:
                             previous_endpoint_meta = json.loads(existing_endpoint["metadata_json"] or "{}")
@@ -645,6 +673,27 @@ class NodePool:
                         """,
                         (eid, key, protocol, transport, port, "NEW", now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
                     )
+                    if not existing_endpoint:
+                        stats["inserted_endpoints"] += 1
+                        new_ids.append(eid)
+                    elif previous_status in ("RETIRED", "STALE"):
+                        stats["recovered_endpoints"] += 1
+                        new_ids.append(eid)
+                    elif ip_changed and previous_status not in ("NEW",):
+                        stats["ip_changed_endpoints"] += 1
+                        new_ids.append(eid)
+                    else:
+                        stats["unchanged_endpoints"] += 1
+
+                if ip_changed:
+                    db.execute(
+                        """
+                        UPDATE endpoints
+                        SET status='NEW', next_test=0
+                        WHERE server_key=? AND UPPER(status) NOT IN ('RETIRED')
+                        """,
+                        (key,),
+                    )
 
                 db.execute(
                     "INSERT INTO observations(server_key, source, seen_at, ip, ping, speed, sessions, score) VALUES(?,?,?,?,?,?,?,?)",
@@ -660,8 +709,11 @@ class NodePool:
             # that remain unseen for long periods are naturally deprioritized by
             # next_test / last_seen scheduling.
             db.commit()
+        stats["new_endpoint_ids"] = new_ids
+        self.last_upsert_stats = stats
         if str(source or "").startswith("manual"):
             self.invalidate_ui_lists()
+        return stats
 
     def upsert_shared_snapshot(self, resources: list[dict[str, Any]], peer_id: str = "", source_name: str = "shared") -> int:
         """Import peer inventory without copying that peer's latency.

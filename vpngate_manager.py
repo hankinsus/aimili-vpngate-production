@@ -285,6 +285,7 @@ library_check_unavailable = 0
 library_check_rate_seconds = 0.0
 library_check_rate_samples = 0
 library_check_message = ""
+library_check_fetch_reason = "manual_global_scan"
 library_check_wait_reason = ""
 global_country_coverage_last_attempt: dict[str, float] = {}
 global_coverage_pick_cache_country = ""
@@ -2709,7 +2710,7 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         return {"ok": True, "running": True, "pool": node_pool.stats()}
     try:
         servers, sources = vpngate_discovery.fetch_multi_source_tables(max_mirrors=None)
-        node_pool.upsert_discovery_snapshot(servers, source="official_html_multi")
+        upsert = node_pool.upsert_discovery_snapshot(servers, source="official_html_multi") or {}
         last_protocol_discovery_at = time.time()
         stats = node_pool.stats()
         set_state(
@@ -2718,7 +2719,7 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
             protocol_catalog_sources=len(sources),
         )
         log_to_json("INFO", "Main", f"多协议目录刷新完成，本轮合并 {len(servers)} 台服务器，来源 {len(sources)} 个，Master Pool={stats}")
-        return {"ok": True, "servers": len(servers), "sources": sources, "pool": stats}
+        return {"ok": True, "servers": len(servers), "sources": sources, "pool": stats, "upsert": upsert}
     except Exception as exc:
         log_to_json("WARNING", "Main", f"多协议目录刷新失败: {exc}")
         return {"ok": False, "error": str(exc), "pool": node_pool.stats()}
@@ -7931,7 +7932,7 @@ def maybe_start_scheduled_library_check() -> None:
         or ui_command_plane.is_busy()
     ):
         return
-    library_check_control("start")
+    library_check_control("start", {"reason": "scheduled_global_scan"})
     remember_global_scan()
     mode = "每 6 小时" if not global_scan_settings()["auto"] else global_scan_settings()["mode"]
     log_to_json("INFO", "Probe", f"空闲，按计划开始全球库检测（{mode}）")
@@ -8020,6 +8021,24 @@ def _library_check_worker(generation: int) -> None:
     global library_check_message, library_check_wait_reason
     global library_check_stop, library_check_paused
     try:
+        reason = str(library_check_fetch_reason or "manual_global_scan")
+        with library_check_lock:
+            if library_check_generation == generation:
+                library_check_message = "正在更新全球资源库"
+                library_check_wait_reason = ""
+        try:
+            fetched = resource_collect_once(force=True, reason=reason, wait=True)
+            if isinstance(fetched, dict) and fetched.get("ok") is False and not node_pool.stats().get("endpoints"):
+                raise RuntimeError(str(fetched.get("error") or "资源库无法读取"))
+            note = str((fetched or {}).get("message") or "资源更新完成")
+            with library_check_lock:
+                if library_check_generation == generation:
+                    library_check_message = note
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"全球库检测前资源更新未完成，继续检测现有库: {exc}")
+            with library_check_lock:
+                if library_check_generation == generation:
+                    library_check_message = f"资源更新未完成，继续检测现有库：{exc}"
         rows = node_pool.list_endpoint_ids()
         ready_rows: list[dict[str, Any]] = []
         skipped = 0
@@ -8123,7 +8142,7 @@ def library_check_control(action: str, payload: dict[str, Any] | None = None) ->
     global library_check_phase, library_check_total, library_check_tested
     global library_check_available, library_check_unavailable
     global library_check_rate_seconds, library_check_rate_samples
-    global library_check_message, library_check_wait_reason
+    global library_check_message, library_check_wait_reason, library_check_fetch_reason
     action = str(action or "start").strip().lower()
     if action == "save_schedule":
         save_global_scan_settings(payload or {})
@@ -8167,8 +8186,13 @@ def library_check_control(action: str, payload: dict[str, Any] | None = None) ->
             library_check_unavailable = 0
             library_check_rate_seconds = 0.0
             library_check_rate_samples = 0
-            library_check_message = "正在读取节点清单"
+            library_check_message = "正在更新全球资源库"
             library_check_wait_reason = ""
+            library_check_fetch_reason = (
+                "scheduled_global_scan"
+                if str((payload or {}).get("reason") or "") == "scheduled_global_scan"
+                else "manual_global_scan"
+            )
             start_thread = True
     if start_thread:
         remember_global_scan()
@@ -8583,10 +8607,13 @@ def resource_collect_loop() -> None:
         try:
             if (not ISOLATED_INSTANCE and not initial_bootstrap_active
                     and not ui_command_plane.is_busy() and not global_pool_refresh_running):
-                resource_collect_once(force=False)
+                result = resource_collect_once(force=False, reason="background")
+                if isinstance(result, dict) and result.get("busy"):
+                    time.sleep(30)
+                    continue
         except Exception as exc:
             log_to_json("WARNING", "Main", f"独立资源采集循环异常: {exc}")
-        time.sleep(RESOURCE_COLLECTION_INTERVAL_SECONDS)
+        time.sleep(_resource_next_interval(_load_resource_history()))
 
 
 def collector_loop() -> None:
@@ -12295,12 +12322,12 @@ INDEX_HTML = r"""<!doctype html>
         <span style="color:var(--text-secondary);">剩余</span>
         <strong id="library_check_remaining" style="font-variant-numeric:tabular-nums;">0</strong>
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500;">
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:32px; font-size:15px; font-weight:500;">
         <span style="color:var(--text-secondary);">检测剩余时间</span>
         <strong id="library_check_eta" style="font-variant-numeric:tabular-nums;">计算中</strong>
       </div>
-      <div id="library_check_message" style="min-height: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
-      <div style="margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.06);">
+      <div id="library_check_message" style="margin:0; padding:0; min-height:0; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
+      <div style="margin-top:0; padding-top:4px; border-top:1px solid rgba(255,255,255,0.06);">
         <label style="display:flex; align-items:center; gap:8px; margin:0 0 12px; font-size:14px; font-weight:600; color:var(--text-primary);">
           <input type="checkbox" id="library_scan_auto"> 开启自动更新
         </label>
@@ -20911,6 +20938,8 @@ class Tee:
 
 # ========================= AimiliVPN V2 Runtime =========================
 RESOURCE_COLLECTION_INTERVAL_SECONDS = 600
+RESOURCE_COLLECTION_INTERVAL_MAX = 3600
+RESOURCE_FETCH_HISTORY = DATA_DIR / "resource_fetch_history.json"
 AVAILABILITY_TICK_SECONDS = 5
 AVAILABILITY_OPENVPN_IDLE_BATCH = 10
 AVAILABILITY_OPENVPN_ACTIVE_BATCH = 5
@@ -20932,6 +20961,7 @@ bootstrap_connection_lock = threading.Lock()
 resource_engine_running = False
 resource_engine_message = ""
 resource_engine_last_at = 0.0
+_resource_last_result: dict[str, Any] = {}
 availability_engine_running = False
 availability_engine_message = ""
 availability_tested_total = 0
@@ -22277,41 +22307,220 @@ def availability_sweep_once(priority_country=""):
         availability_engine_lock.release()
 
 
-def resource_collect_once(force=False):
-    global resource_engine_running,resource_engine_message,resource_engine_last_at
-    if not force:
-        last_fetch = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
-        if last_fetch and time.time() - last_fetch < RESOURCE_COLLECTION_INTERVAL_SECONDS:
-            return {"ok": True, "skipped": True, "reason": "资源采集周期尚未到达"}
-    if ui_command_plane.is_busy() and not force:
-        return {"ok": True, "skipped": True, "reason": "用户正在执行前端指令"}
-    if manual_connection_active and not force:
-        return {"ok":True,"skipped":True,"reason":"用户正在手动切换节点"}
-    if not resource_engine_lock.acquire(blocking=False): return {"ok":True,"running":True}
-    resource_engine_running=True
-    resource_engine_message="正在采集资源，不影响当前 VPN 连接"
-    set_state(resource_engine_running=True,resource_engine_message=resource_engine_message)
+def _empty_fetch_stats() -> dict[str, Any]:
+    return {
+        "inserted_servers": 0,
+        "updated_servers": 0,
+        "unchanged_servers": 0,
+        "inserted_endpoints": 0,
+        "updated_endpoints": 0,
+        "recovered_endpoints": 0,
+        "unchanged_endpoints": 0,
+        "ip_changed_endpoints": 0,
+        "new_endpoint_ids": [],
+    }
+
+
+def _merge_fetch_stats(total: dict[str, Any], part: dict[str, Any] | None) -> None:
+    if not isinstance(part, dict):
+        return
+    for key in (
+        "inserted_servers", "updated_servers", "unchanged_servers",
+        "inserted_endpoints", "updated_endpoints", "recovered_endpoints",
+        "unchanged_endpoints", "ip_changed_endpoints",
+    ):
+        total[key] = int(total.get(key) or 0) + int(part.get(key) or 0)
+    seen = set(total.get("new_endpoint_ids") or [])
+    for eid in part.get("new_endpoint_ids") or []:
+        text = str(eid or "")
+        if text and text not in seen:
+            seen.add(text)
+            total["new_endpoint_ids"].append(text)
+
+
+def _load_resource_history() -> list[dict[str, Any]]:
+    raw = read_json(RESOURCE_FETCH_HISTORY, [])
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)][-20:]
+
+
+def _resource_next_interval(history: list[dict[str, Any]] | None = None) -> int:
+    rows = list(history if history is not None else _load_resource_history())
+    recent = [int(item.get("inserted_endpoints") or 0) for item in rows[-5:]]
+    if recent and recent[-1] >= 50:
+        return RESOURCE_COLLECTION_INTERVAL_SECONDS
+    if len(recent) < 5:
+        return RESOURCE_COLLECTION_INTERVAL_SECONDS
+    total = sum(recent)
+    if total <= 0:
+        return RESOURCE_COLLECTION_INTERVAL_MAX
+    if total <= 5:
+        return 1800
+    if total <= 25:
+        return 1200
+    return RESOURCE_COLLECTION_INTERVAL_SECONDS
+
+
+def _remember_resource_run(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    history = _load_resource_history()
+    history.append(entry)
+    history = history[-20:]
     try:
-        before=int(node_pool.stats().get("endpoints") or 0)
-        try: candidates=fetch_candidates()
+        write_json(RESOURCE_FETCH_HISTORY, history)
+    except Exception:
+        pass
+    return history
+
+
+def _probe_new_resource_ids(ids: list[str]) -> None:
+    """Probe only the endpoints this fetch inserted or whose IP changed."""
+    for eid in ids[:40]:
+        if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+            return
+        if active_tunnel_running() and proxy_server.proxy_forwarding_busy():
+            return
+        try:
+            probe_pool_endpoint(eid)
         except Exception as exc:
-            candidates=[]; log_to_json("WARNING","Main",f"V2 OpenVPN 资源采集失败: {exc}")
-        catalog=refresh_multi_protocol_catalog(force=True)
-        after=int(node_pool.stats().get("endpoints") or 0)
-        resource_engine_last_at=time.time(); added=max(0,after-before)
-        resource_engine_message=f"资源采集完成 · OpenVPN {len(candidates)} · 多协议服务器 {int(catalog.get('servers') or 0)} · 新增/恢复约 {added} 个端点，立即进入检测"
-        # UI pages read Master Pool directly; do not rebuild the heavyweight
-        # global browser snapshot after every resource sync.
-        set_state(resource_engine_running=False,resource_engine_message=resource_engine_message,resource_engine_last_at=resource_engine_last_at,
-                  last_fetch_at=resource_engine_last_at,last_fetch_status="ok",last_fetch_message=resource_engine_message)
-        return {"ok":True,"endpoints":after,"added":added}
+            log_to_json("WARNING", "Probe", f"新资源检测失败 {eid}: {exc}")
+
+
+def resource_collect_once(force=False, reason: str = "background", wait: bool = False):
+    global resource_engine_running, resource_engine_message, resource_engine_last_at, _resource_last_result
+    reason = str(reason or "background")
+    if not force:
+        history = _load_resource_history()
+        interval = _resource_next_interval(history)
+        last_fetch = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
+        if last_fetch and time.time() - last_fetch < interval:
+            return {"ok": True, "skipped": True, "reason": "资源采集周期尚未到达", "next_interval": interval}
+        if (
+            proxy_server.proxy_forwarding_busy()
+            or is_connecting
+            or manual_connection_active
+            or failover_lock.locked()
+        ):
+            return {"ok": True, "skipped": True, "busy": True, "reason": "当前正在转发或切换，资源更新延后"}
+        if ui_command_plane.is_busy():
+            return {"ok": True, "skipped": True, "busy": True, "reason": "用户正在执行前端指令"}
+    if not resource_engine_lock.acquire(blocking=False):
+        if not wait:
+            return {"ok": True, "running": True, "reused": False}
+        deadline = time.time() + 180
+        while resource_engine_running and time.time() < deadline:
+            time.sleep(0.25)
+        reused = dict(_resource_last_result or {})
+        reused["reused"] = True
+        return reused or {"ok": True, "reused": True}
+    started = time.time()
+    resource_engine_running = True
+    resource_engine_message = "正在更新全球资源库"
+    set_state(resource_engine_running=True, resource_engine_message=resource_engine_message)
+    stats = _empty_fetch_stats()
+    sources_ok = 0
+    sources_failed = 0
+    fetched_servers = 0
+    fetched_endpoints = 0
+    try:
+        openvpn_stats = _empty_fetch_stats()
+        try:
+            candidates = fetch_candidates()
+            fetched_endpoints += len(candidates or [])
+            sources_ok += 1
+            openvpn_stats = dict(getattr(node_pool, "last_upsert_stats", {}) or {})
+        except Exception as exc:
+            candidates = []
+            sources_failed += 1
+            log_to_json("WARNING", "Main", f"V2 OpenVPN 资源采集失败: {exc}")
+        _merge_fetch_stats(stats, openvpn_stats)
+        catalog: dict[str, Any] = {}
+        try:
+            catalog = refresh_multi_protocol_catalog(force=True)
+            if catalog.get("ok"):
+                sources_ok += len(catalog.get("sources") or []) or 1
+                fetched_servers += int(catalog.get("servers") or 0)
+                _merge_fetch_stats(stats, catalog.get("upsert") or getattr(node_pool, "last_upsert_stats", {}) or {})
+            else:
+                sources_failed += 1
+        except Exception as exc:
+            sources_failed += 1
+            log_to_json("WARNING", "Main", f"多协议资源采集失败: {exc}")
+        duration_ms = int((time.time() - started) * 1000)
+        inserted = int(stats.get("inserted_endpoints") or 0)
+        recovered = int(stats.get("recovered_endpoints") or 0)
+        changed = int(stats.get("ip_changed_endpoints") or 0)
+        notify = list(stats.get("new_endpoint_ids") or [])
+        message = (
+            f"资源更新完成 · 耗时 {duration_ms / 1000:.1f} 秒 · "
+            f"新增端点 {inserted} · 更新端点 {int(stats.get('updated_endpoints') or 0)} · "
+            f"恢复 {recovered} · IP变更 {changed} · 无变化 {int(stats.get('unchanged_endpoints') or 0)} · "
+            f"已通知检测 {len(notify)}"
+        )
+        if sources_failed:
+            message += f" · {sources_ok} 个来源成功 / {sources_failed} 个失败"
+        resource_engine_last_at = time.time()
+        resource_engine_message = message
+        history = _remember_resource_run({
+            "timestamp": resource_engine_last_at,
+            "duration_ms": duration_ms,
+            "inserted_endpoints": inserted,
+            "updated_endpoints": int(stats.get("updated_endpoints") or 0),
+            "recovered_endpoints": recovered,
+            "unchanged_endpoints": int(stats.get("unchanged_endpoints") or 0),
+            "ip_changed_endpoints": changed,
+            "sources_ok": sources_ok,
+            "sources_failed": sources_failed,
+            "reason": reason,
+            "notified": len(notify),
+        })
+        next_interval = _resource_next_interval(history)
+        set_state(
+            resource_engine_running=False,
+            resource_engine_message=message,
+            resource_engine_last_at=resource_engine_last_at,
+            last_fetch_at=resource_engine_last_at,
+            last_fetch_status="ok" if sources_ok else "error",
+            last_fetch_message=message,
+            resource_fetch_duration_ms=duration_ms,
+            resource_next_interval=next_interval,
+        )
+        log_to_json(
+            "INFO", "Main",
+            f"资源更新完成 耗时 {duration_ms}ms 原因 {reason} "
+            f"拉取服务器 {fetched_servers} 端点 {fetched_endpoints} "
+            f"新增服务器 {int(stats.get('inserted_servers') or 0)} 端点 {inserted} "
+            f"更新服务器 {int(stats.get('updated_servers') or 0)} 端点 {int(stats.get('updated_endpoints') or 0)} "
+            f"恢复 {recovered} IP变更 {changed} 无变化 {int(stats.get('unchanged_endpoints') or 0)} "
+            f"已通知检测 {len(notify)} 下次 {next_interval}s",
+        )
+        if notify and reason == "background":
+            threading.Thread(
+                target=_probe_new_resource_ids, args=(notify,), daemon=True, name="new-resource-probe",
+            ).start()
+        result = {
+            "ok": bool(sources_ok) or bool(node_pool.stats().get("endpoints")),
+            "message": message,
+            "added": inserted,
+            "inserted_endpoints": inserted,
+            "notified": len(notify),
+            "duration_ms": duration_ms,
+            "next_interval": next_interval,
+            "sources_ok": sources_ok,
+            "sources_failed": sources_failed,
+            "endpoints": int(node_pool.stats().get("endpoints") or 0),
+        }
+        _resource_last_result = result
+        return result
     except Exception as exc:
-        resource_engine_message=f"资源采集异常：{exc}"
-        set_state(resource_engine_running=False,resource_engine_message=resource_engine_message)
-        log_to_json("ERROR","Main",resource_engine_message)
-        return {"ok":False,"error":str(exc)}
+        resource_engine_message = f"资源采集异常：{exc}"
+        set_state(resource_engine_running=False, resource_engine_message=resource_engine_message)
+        log_to_json("ERROR", "Main", resource_engine_message)
+        result = {"ok": False, "error": str(exc), "message": resource_engine_message}
+        _resource_last_result = result
+        return result
     finally:
-        resource_engine_running=False
+        resource_engine_running = False
         resource_engine_lock.release()
 
 
