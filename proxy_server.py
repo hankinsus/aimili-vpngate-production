@@ -279,8 +279,14 @@ def get_forward_interface() -> str:
 
 _live_clients: set[socket.socket] = set()
 _client_generation: dict[socket.socket, int] = {}
+_udp_controls: set[socket.socket] = set()
 _egress_generation = 0
 _live_clients_lock = threading.Lock()
+
+
+def _current_egress_generation() -> int:
+    with _live_clients_lock:
+        return _egress_generation
 
 
 def _track_client(client: socket.socket) -> None:
@@ -291,6 +297,15 @@ def _track_client(client: socket.socket) -> None:
 
 def _untrack_client(client: socket.socket) -> None:
     with _live_clients_lock:
+        _live_clients.discard(client)
+        _client_generation.pop(client, None)
+        _udp_controls.discard(client)
+
+
+def _keep_udp_control(client: socket.socket) -> None:
+    """Leave the SOCKS UDP control connection up when the exit changes."""
+    with _live_clients_lock:
+        _udp_controls.add(client)
         _live_clients.discard(client)
         _client_generation.pop(client, None)
 
@@ -326,17 +341,21 @@ def _publish_egress_generation() -> int:
 
 
 def _retire_old_generation(retired: int, pause: float = 0.5) -> None:
-    """Let the old generation keep transferring, then close only those sockets.
+    """Close old TCP sockets after a short grace. Keep UDP ASSOCIATE controls.
 
-    No SHUT_RD during the grace window. A half-closed socket still looks alive
-    to the browser and swallows the next request.
+    Those controls drop their upstream UDP sockets themselves as soon as they
+    see the new generation, then bind the next packet to the new interface.
     """
     def _run() -> None:
         time.sleep(pause if pause > 0 else 0.5)
         with _live_clients_lock:
-            stale = [sock for sock, gen in _client_generation.items() if gen <= retired]
+            stale = [
+                sock for sock, gen in _client_generation.items()
+                if gen <= retired and sock not in _udp_controls
+            ]
+            udp_kept = len(_udp_controls)
         closed = _close_tracked_clients(stale)
-        print(f"[网关] 旧连接代际 {retired} 已关闭 {closed} 条", flush=True)
+        print(f"[网关] 旧连接代际 {retired} 已关闭 TCP {closed} 条，保留 UDP 关联 {udp_kept} 个", flush=True)
 
     threading.Thread(target=_run, name="egress-retire", daemon=True).start()
 
@@ -390,6 +409,8 @@ def _watch_egress_mode() -> None:
         retired = _publish_egress_generation()
         with DNS_CACHE_LOCK:
             DNS_CACHE.clear()
+        with _UDP_DEST_LOCK:
+            _UDP_DEST_CACHE.clear()
         if mode_changed:
             _write_egress_applied(mode)
         if iface_changed:
@@ -571,13 +592,15 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
         raise
 
 
-_UDP_DEST_CACHE: dict[tuple[str, int], tuple[float, list[tuple[int, tuple[Any, ...]]]]] = {}
+_UDP_DEST_CACHE: dict[tuple[str, str, str, int], tuple[float, list[tuple[int, tuple[Any, ...]]]]] = {}
 _UDP_DEST_LOCK = threading.Lock()
 
 
 def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
     host = str(host or "").strip()
-    key = (host, int(port))
+    iface = get_forward_interface() or ""
+    generation = _current_egress_generation()
+    key = (str(generation), iface, host, int(port))
     now = time.monotonic()
     with _UDP_DEST_LOCK:
         cached = _UDP_DEST_CACHE.get(key)
@@ -634,6 +657,17 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
     client_ip = str(control_address[0] or "")
     client_udp_addr: tuple[str, int] | None = None
     last_activity = time.monotonic()
+    association_generation = _current_egress_generation()
+    _keep_udp_control(client)
+
+    def _drop_upstreams() -> None:
+        for old in upstreams.values():
+            try:
+                old.close()
+            except OSError:
+                pass
+        upstreams.clear()
+
     try:
         _set_udp_socket_options(relay, bind_device=False)
         relay.bind(("0.0.0.0", 0))
@@ -647,7 +681,13 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         while time.monotonic() - last_activity < PROXY_UDP_ASSOCIATION_IDLE_SECONDS:
             sources: list[socket.socket] = [client, relay]
             sources.extend(upstreams.values())
-            readable, _, errored = select.select(sources, [], sources, 5)
+            readable, _, errored = select.select(sources, [], sources, 0.2)
+            current_generation = _current_egress_generation()
+            if current_generation != association_generation:
+                _drop_upstreams()
+                association_generation = current_generation
+                readable = [source for source in readable if source is client or source is relay]
+                print(f"[SOCKS5 UDP] 出口代际 {association_generation}，已重建上游套接字", flush=True)
             if errored:
                 return
 
@@ -680,6 +720,9 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                     if not decoded:
                         continue
                     host, port, payload = decoded
+                    if _current_egress_generation() != association_generation:
+                        _drop_upstreams()
+                        association_generation = _current_egress_generation()
                     destinations = _resolve_udp_destinations(host, port)
                     destinations.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
                     destinations = [item for item in destinations if item[0] == socket.AF_INET]
@@ -711,6 +754,11 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                             sent = True
                             break
                         except OSError:
+                            try:
+                                sock.close()
+                            except OSError:
+                                pass
+                            upstreams.pop(af, None)
                             continue
                     if sent:
                         last_activity = time.monotonic()
@@ -730,6 +778,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
     except Exception as exc:
         print(f"[SOCKS5 UDP] UDP ASSOCIATE 失败: {exc}", flush=True)
     finally:
+        _untrack_client(client)
         try:
             relay.close()
         except Exception:
@@ -739,6 +788,57 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                 sock.close()
             except Exception:
                 pass
+
+
+def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
+    """Open a new SOCKS5 UDP association and ask 1.1.1.1:53 for example.com."""
+    port = int(os.environ.get("LOCAL_PROXY_PORT", "8500"))
+    user, password = get_proxy_credentials()
+    control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    query = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        control.settimeout(timeout)
+        control.connect(("127.0.0.1", port))
+        if user is not None and password is not None:
+            control.sendall(b"\x05\x01\x02")
+            if control.recv(2) != b"\x05\x02":
+                return {"ok": False, "error": "SOCKS5 UDP 认证方法被拒绝"}
+            user_b = user.encode("utf-8")
+            pass_b = password.encode("utf-8")
+            control.sendall(bytes([1, len(user_b)]) + user_b + bytes([len(pass_b)]) + pass_b)
+            if control.recv(2) != b"\x01\x00":
+                return {"ok": False, "error": "SOCKS5 UDP 认证失败"}
+        else:
+            control.sendall(b"\x05\x01\x00")
+            if control.recv(2) != b"\x05\x00":
+                return {"ok": False, "error": "SOCKS5 UDP 握手失败"}
+        control.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        reply = control.recv(10)
+        if len(reply) < 10 or reply[1] != 0:
+            return {"ok": False, "error": "SOCKS5 UDP ASSOCIATE 失败"}
+        relay_port = int.from_bytes(reply[8:10], "big")
+        tx_id = secrets.token_bytes(2)
+        dns = _build_dns_query("example.com", 1, tx_id)
+        if not dns:
+            return {"ok": False, "error": "DNS 查询构造失败"}
+        header = b"\x00\x00\x00\x01" + socket.inet_aton("1.1.1.1") + (53).to_bytes(2, "big")
+        query.settimeout(timeout)
+        query.sendto(header + dns, ("127.0.0.1", relay_port))
+        packet, _peer = query.recvfrom(2048)
+        if len(packet) < 10 or packet[:3] != b"\x00\x00\x00":
+            return {"ok": False, "error": "SOCKS5 UDP 回包无效"}
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            query.close()
+        except OSError:
+            pass
+        try:
+            control.close()
+        except OSError:
+            pass
 
 def _host_is_ip(host: str) -> str | None:
     host = str(host or "").strip()
