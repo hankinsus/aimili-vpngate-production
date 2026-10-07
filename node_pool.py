@@ -1407,6 +1407,18 @@ class NodePool:
             out.append(item)
         return out
 
+    def queue_speed_recheck(self, endpoint_ids: list[str]) -> int:
+        ids = [str(item) for item in endpoint_ids if str(item or "").strip()][:8]
+        if not ids:
+            return 0
+        with self.lock, closing(self._connect()) as db:
+            db.executemany(
+                "UPDATE endpoints SET next_test=0 WHERE endpoint_id=? AND UPPER(status) IN ('HOT','AVAILABLE')",
+                [(item,) for item in ids],
+            )
+            db.commit()
+        return len(ids)
+
     def reset_probe_schedule(self, include_retired: bool = False) -> int:
         where = "" if include_retired else " WHERE UPPER(status) <> 'RETIRED'"
         with self.lock, closing(self._connect()) as db:

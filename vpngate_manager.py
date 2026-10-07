@@ -6184,6 +6184,7 @@ def _load_cold_state() -> dict[str, Any]:
         "order": [str(item) for item in (raw.get("order") or []) if str(item)],
         "failed": [str(item) for item in (raw.get("failed") or []) if str(item)],
         "precold": [str(item) for item in (raw.get("precold") or []) if str(item)],
+        "precold_detail": raw.get("precold_detail") if isinstance(raw.get("precold_detail"), dict) else {},
         "published": str(raw.get("published") or ""),
         "last_connect": float(raw.get("last_connect") or 0),
     }
@@ -6218,55 +6219,209 @@ def _cold_skips_port(endpoint: dict[str, Any]) -> bool:
     return False
 
 
-def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
-    active_eid = str(active_pool_endpoint_id or "")
+def _endpoint_speed_bps(endpoint: dict[str, Any]) -> int:
     try:
-        rows = unified_hot_pool_candidates(ui_cfg, exclude_endpoint_id=active_eid, limit=100)
+        return int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _current_route_protocol(ui_cfg: dict[str, Any]) -> str:
+    allowed = ("openvpn", "softether", "sstp", "l2tp-ipsec")
+    proto = str(ui_cfg.get("routing_protocol") or "").strip().lower()
+    if proto in allowed:
+        return proto
+    try:
+        proto = str(get_state().get("active_tunnel_protocol") or "").strip().lower()
+    except Exception:
+        proto = ""
+    if proto in allowed:
+        return proto
+    if active_pool_endpoint_id:
+        try:
+            endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
+        except Exception:
+            endpoint = None
+        proto = str((endpoint or {}).get("protocol") or "").strip().lower()
+        if proto in allowed:
+            return proto
+    return ""
+
+
+_speed_recheck_at: dict[str, float] = {}
+
+
+def _queue_unmeasured_speed(endpoint_ids: list[str]) -> None:
+    now = time.time()
+    fresh = [
+        eid for eid in endpoint_ids
+        if eid and now - float(_speed_recheck_at.get(eid) or 0) > 3600
+    ][:8]
+    if not fresh:
+        return
+    try:
+        node_pool.queue_speed_recheck(fresh)
+    except Exception:
+        return
+    for eid in fresh:
+        _speed_recheck_at[eid] = now
+
+
+def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    """Verified backups, relaxed by tier. 50 Mbps is the floor that never drops."""
+    active_eid = str(active_pool_endpoint_id or "")
+    active_ip = _active_exit_ip()
+    home = routing_target_country(ui_cfg)
+    proto = _current_route_protocol(ui_cfg)
+    stats = {
+        "same_protocol": 0,
+        "other_protocol": 0,
+        "other_country": 0,
+        "excluded_speed": 0,
+        "excluded_unmeasured": 0,
+        "excluded_occupied": 0,
+        "excluded_duplicate": 0,
+        "excluded_unstable": 0,
+    }
+    try:
+        rows = node_pool.list_routing_endpoints(limit=800)
     except Exception as exc:
         log_to_json("WARNING", "Standby", f"冷备候选读取失败: {exc}")
         return None
-    active_ip = _active_exit_ip()
-    found: dict[str, dict[str, Any]] = {}
+    qualified: list[dict[str, Any]] = []
+    unmeasured: list[str] = []
+    seen_identity: set[str] = set()
+    country_latency: dict[str, int] = {}
     for endpoint in rows:
         eid = str(endpoint.get("endpoint_id") or "")
+        protocol = str(endpoint.get("protocol") or "").lower()
+        if not eid or protocol not in ("openvpn", "softether", "sstp", "l2tp-ipsec"):
+            continue
+        if str(endpoint.get("status") or "").upper() not in ("HOT", "AVAILABLE"):
+            continue
         ip = _endpoint_ip(endpoint)
-        if not eid or not ip or (active_ip and ip == active_ip):
+        if not ip:
             continue
         if endpoint_is_unstable(endpoint) or int(endpoint.get("fail_streak") or 0) >= 3:
+            stats["excluded_unstable"] += 1
             continue
-        if not endpoint_matches_explicit_routing(endpoint, ui_cfg):
+        if eid == active_eid or (active_ip and ip == active_ip):
+            stats["excluded_occupied"] += 1
             continue
-        found[eid] = endpoint
+        speed = _endpoint_speed_bps(endpoint)
+        if speed <= 0:
+            stats["excluded_unmeasured"] += 1
+            unmeasured.append(eid)
+            continue
+        if speed < ROUTING_MIN_LINE_SPEED_BPS:
+            stats["excluded_speed"] += 1
+            continue
+        identity = f"{protocol}|{ip}|{int(endpoint.get('port') or 0)}"
+        if identity in seen_identity:
+            stats["excluded_duplicate"] += 1
+            continue
+        seen_identity.add(identity)
+        endpoint["routing_favorite_rank"] = routing_favorite_rank(endpoint, ui_cfg)
+        qualified.append(endpoint)
+        country = normalized_country_name(endpoint.get("country"))
+        ip_type = str(endpoint_ip_type(endpoint) or "").lower()
+        if country and ip_type in ("mobile", "residential"):
+            latency = endpoint_display_latency_ms(endpoint) or 999999
+            country_latency[country] = min(country_latency.get(country, 999999), latency)
+
+    def _tier(endpoint: dict[str, Any]) -> int:
+        country = normalized_country_name(endpoint.get("country"))
+        protocol = str(endpoint.get("protocol") or "").lower()
+        ip_type = str(endpoint_ip_type(endpoint) or "").lower()
+        same_country = bool(home) and country == home
+        same_protocol = (not proto) or protocol == proto
+        if same_country and same_protocol and ip_type == "mobile":
+            return 0
+        if same_country and same_protocol and ip_type == "residential":
+            return 1
+        if same_country and not same_protocol and ip_type == "mobile":
+            return 2
+        if same_country and not same_protocol and ip_type == "residential":
+            return 3
+        if not same_country and ip_type == "mobile":
+            return 4
+        if not same_country and ip_type == "residential":
+            return 5
+        if same_country and same_protocol and ip_type == "hosting":
+            return 6
+        if same_country and not same_protocol and ip_type == "hosting":
+            return 7
+        if not same_country and ip_type == "hosting":
+            return 8
+        return 9
+
+    def _sort_key(endpoint: dict[str, Any]) -> tuple:
+        tier = _tier(endpoint)
+        country = normalized_country_name(endpoint.get("country"))
+        latency = endpoint_display_latency_ms(endpoint) or 999999
+        country_rank = country_latency.get(country, 999999) if tier in (4, 5, 8) else 0
+        return (
+            tier,
+            int(endpoint.get("routing_favorite_rank") or 1),
+            country_rank,
+            latency,
+            -_endpoint_speed_bps(endpoint),
+        )
+
+    qualified.sort(key=_sort_key)
+    found: dict[str, dict[str, Any]] = {}
+    for endpoint in qualified:
+        endpoint["_precold_tier"] = _tier(endpoint)
+        found[str(endpoint.get("endpoint_id") or "")] = endpoint
+    _queue_unmeasured_speed(unmeasured)
+    _cold_candidates.stats = stats
     return found
 
 
+def _precold_bucket(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> str:
+    home = routing_target_country(ui_cfg)
+    proto = _current_route_protocol(ui_cfg)
+    country = normalized_country_name(endpoint.get("country"))
+    protocol = str(endpoint.get("protocol") or "").lower()
+    same_country = bool(home) and country == home
+    same_protocol = (not proto) or protocol == proto
+    if same_country and same_protocol:
+        return "same_protocol"
+    if same_country:
+        return "other_protocol"
+    return "other_country"
+
+
 def _select_precold_ids(candidates: dict[str, dict[str, Any]], cold_eid: str) -> list[str]:
-    """Next backups behind the one cold standby. At most five, favorites first."""
-    cold = _cold_state()
-    failed = {str(item) for item in (cold.get("failed") or [])}
-    order = [eid for eid in (cold.get("order") or []) if eid in candidates and eid != cold_eid]
+    """Fill up to five behind the cold standby. Earlier tiers stay put."""
+    failed = {str(item) for item in (_cold_state().get("failed") or [])}
+    picked: list[str] = []
     for eid in candidates:
-        if eid != cold_eid and eid not in order:
-            order.append(eid)
-    favorites: list[str] = []
-    rest: list[str] = []
-    for eid in order:
-        if eid in failed:
+        if not eid or eid == cold_eid or eid in failed:
             continue
-        rank = int((candidates.get(eid) or {}).get("routing_favorite_rank") or 1)
-        if rank == 0:
-            favorites.append(eid)
-        else:
-            rest.append(eid)
-    return (favorites + rest)[:PRECOLD_TARGET]
+        picked.append(eid)
+        if len(picked) >= PRECOLD_TARGET:
+            break
+    return picked
 
 
 def _remember_precold(candidates: dict[str, dict[str, Any]], cold_eid: str) -> None:
     precold = _select_precold_ids(candidates, cold_eid)
+    ui_cfg = load_ui_config()
+    detail = dict(getattr(_cold_candidates, "stats", {}) or {})
+    detail["same_protocol"] = 0
+    detail["other_protocol"] = 0
+    detail["other_country"] = 0
+    for eid in precold:
+        bucket = _precold_bucket(candidates.get(eid) or {}, ui_cfg)
+        detail[bucket] = int(detail.get(bucket) or 0) + 1
+    detail["shown"] = len(precold)
+    detail["target"] = PRECOLD_TARGET
     cold = _cold_state()
-    if list(cold.get("precold") or []) == precold:
+    if list(cold.get("precold") or []) == precold and dict(cold.get("precold_detail") or {}) == detail:
         return
     cold["precold"] = precold
+    cold["precold_detail"] = detail
     _save_cold_state()
 
 
@@ -6284,31 +6439,32 @@ def _overlay_pool_roles(state: dict[str, Any]) -> None:
     except Exception:
         raw = []
     shown = [eid for eid in raw if eid not in {active_eid, cold_eid}]
+    detail = _cold_state().get("precold_detail") if isinstance(_cold_state().get("precold_detail"), dict) else {}
+    shown_count = min(PRECOLD_TARGET, len(shown))
     state["pool_primary"] = primary
     state["pool_cold"] = 1 if cold_on else 0
-    state["pool_precold"] = min(PRECOLD_TARGET, len(shown))
+    state["pool_precold"] = shown_count
     state["pool_precold_target"] = PRECOLD_TARGET
+    state["pool_precold_detail"] = (
+        f"预冷备 {shown_count}/{PRECOLD_TARGET}"
+        f" · 当前国家同协议 {int(detail.get('same_protocol') or 0)}"
+        f" · 当前国家其它协议 {int(detail.get('other_protocol') or 0)}"
+        f" · 其它低延迟国家 {int(detail.get('other_country') or 0)}"
+        f" · 速度低于50Mbps排除 {int(detail.get('excluded_speed') or 0)}"
+        f" · 未测速待补 {int(detail.get('excluded_unmeasured') or 0)}"
+        f" · 主备占用或重复排除 {int(detail.get('excluded_occupied') or 0) + int(detail.get('excluded_duplicate') or 0)}"
+    )
 
 
 def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     cold = _cold_state()
-    order = [eid for eid in cold["order"] if eid in candidates]
-    for eid in candidates:
-        if eid not in order:
-            order.append(eid)
     failed = [eid for eid in cold["failed"] if eid in candidates]
     if candidates and failed and all(eid in failed for eid in candidates):
         failed = []
         log_to_json("INFO", "Standby", "冷备已轮换一整轮，仍可用的节点可以重新作为备")
-    cold["order"] = order
+    cold["order"] = list(candidates.keys())
     cold["failed"] = failed
-    favorites = [
-        eid for eid in order
-        if eid not in failed and int((candidates[eid] or {}).get("routing_favorite_rank") or 1) == 0
-    ]
-    for eid in favorites:
-        return candidates[eid]
-    for eid in order:
+    for eid in candidates:
         if eid not in failed:
             return candidates[eid]
     return None
@@ -6391,6 +6547,7 @@ def cold_standby_pass() -> None:
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
         _publish_cold_standby(None)
+        _cold_candidates.stats = {}
         _remember_precold({}, "")
         return
     if is_connecting or manual_connection_active or ui_command_plane.is_busy():
@@ -14019,7 +14176,8 @@ function hotPoolSummaryHtml() {
   const primary = Number(state.pool_primary || 0);
   const cold = Number(state.pool_cold || 0);
   const precold = Number(state.pool_precold || 0);
-  return '<span title="当前正在转发">' + primary + '主</span>+<span title="已选定，可接管">' + cold + '冷备</span>+<span title="已排好，尚未升为冷备">' + precold + '预冷备</span>';
+  const precoldTitle = String(state.pool_precold_detail || "已排好，尚未升为冷备");
+  return '<span title="当前正在转发">' + primary + '主</span>+<span title="已选定，可接管">' + cold + '冷备</span>+<span title="' + esc(precoldTitle) + '">' + precold + '预冷备</span>';
 }
 
 function isDomainHost(value) {
@@ -15209,7 +15367,7 @@ function backendStateRenderSignature(s) {
     x.last_check_message, x.priority_country, x.priority_running,
     x.availability_engine_running,
     x.resource_engine_running, x.global_pool_refresh_running,
-    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.standby_ready, x.standby_prepared, x.standby_node_id,
+    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.pool_precold_detail, x.standby_ready, x.standby_prepared, x.standby_node_id,
     x.egress_mode, x.egress_switching,
     x.manual_switch_active,
     x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,
