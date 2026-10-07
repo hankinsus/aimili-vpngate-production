@@ -9996,6 +9996,8 @@ INDEX_HTML = r"""<!doctype html>
     .unified-select-log .toolbar-custom-select-menu { width: 156px; }
     .unified-select .toolbar-custom-option { min-height: 38px; font-size: 13px; }
     .unified-select-log .toolbar-custom-option { min-height: 34px; font-size: 12px; }
+    #library_check_modal .library-scan-select { flex: 1 1 0; width: auto; min-width: 0; height: 40px; }
+    #library_check_modal .library-scan-select .toolbar-custom-select-menu { width: auto; }
     .toolbar-custom-select.open {
       z-index: 10070;
     }
@@ -12241,12 +12243,12 @@ INDEX_HTML = r"""<!doctype html>
         <strong id="library_check_eta" style="font-variant-numeric:tabular-nums;">计算中</strong>
       </div>
       <div id="library_check_message" style="margin-top: 8px; min-height: 20px; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
-      <div style="margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.06); display:flex; flex-direction:column; gap:10px;">
-        <label style="display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; color:var(--text-primary);">
+      <div style="margin-top:20px; padding-top:18px; border-top:1px solid rgba(255,255,255,0.06);">
+        <label style="display:flex; align-items:center; gap:8px; margin:2px 0 16px; font-size:14px; font-weight:600; color:var(--text-primary);">
           <input type="checkbox" id="library_scan_auto"> 开启自动更新
         </label>
-        <div style="display:flex; gap:8px;">
-          <select id="library_scan_mode" class="input-field" style="flex:1; height:36px;">
+        <div style="display:flex; gap:10px;">
+          <select id="library_scan_mode" aria-hidden="true" tabindex="-1" style="display:none;">
             <option value="loop">循环</option>
             <option value="daily">每天</option>
             <option value="mon">周一</option>
@@ -12257,9 +12259,30 @@ INDEX_HTML = r"""<!doctype html>
             <option value="sat">周六</option>
             <option value="sun">周日</option>
           </select>
-          <select id="library_scan_hour" class="input-field" style="flex:1; height:36px;"></select>
+          <div id="library_scan_mode_widget" class="toolbar-custom-select unified-select library-scan-select" data-unified-select-id="library_scan_mode" aria-label="更新模式">
+            <button id="library_scan_mode_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+              <span id="library_scan_mode_label" class="toolbar-custom-select-label">循环</span>
+              <span class="toolbar-custom-select-arrow">⌄</span>
+            </button>
+            <div id="library_scan_mode_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+          </div>
+          <select id="library_scan_hour" aria-hidden="true" tabindex="-1" style="display:none;">
+            <option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option>
+            <option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option>
+            <option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option>
+            <option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option>
+            <option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option>
+            <option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option>
+          </select>
+          <div id="library_scan_hour_widget" class="toolbar-custom-select unified-select library-scan-select" data-unified-select-id="library_scan_hour" aria-label="开始时间">
+            <button id="library_scan_hour_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+              <span id="library_scan_hour_label" class="toolbar-custom-select-label">00:00</span>
+              <span class="toolbar-custom-select-arrow">⌄</span>
+            </button>
+            <div id="library_scan_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+          </div>
         </div>
-        <div style="color:var(--text-secondary); font-size:12px; line-height:1.45;">不勾选时，每 6 小时在空闲时检测一次。勾选后才按上面的时间开始，系统忙就等到空闲。</div>
+        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">不勾选时，每 6 小时在空闲时检测一次。勾选后才按上面的时间开始，系统忙就等到空闲。</div>
       </div>
       <div style="display:flex; gap:12px; margin-top:18px;">
         <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">手动检测</button>
@@ -13178,7 +13201,9 @@ const UNIFIED_SELECT_CONFIG = {
   net_routing_min_speed: {widget:"net_routing_min_speed_widget", button:"net_routing_min_speed_button", label:"net_routing_min_speed_label", menu:"net_routing_min_speed_menu"},
   rs_sync_interval_unit: {widget:"rs_sync_interval_unit_widget", button:"rs_sync_interval_unit_button", label:"rs_sync_interval_unit_label", menu:"rs_sync_interval_unit_menu"},
   rs_edit_sync_unit: {widget:"rs_edit_sync_unit_widget", button:"rs_edit_sync_unit_button", label:"rs_edit_sync_unit_label", menu:"rs_edit_sync_unit_menu"},
-  log_filter_select: {widget:"log_filter_select_widget", button:"log_filter_select_button", label:"log_filter_select_label", menu:"log_filter_select_menu"}
+  log_filter_select: {widget:"log_filter_select_widget", button:"log_filter_select_button", label:"log_filter_select_label", menu:"log_filter_select_menu"},
+  library_scan_mode: {widget:"library_scan_mode_widget", button:"library_scan_mode_button", label:"library_scan_mode_label", menu:"library_scan_mode_menu"},
+  library_scan_hour: {widget:"library_scan_hour_widget", button:"library_scan_hour_button", label:"library_scan_hour_label", menu:"library_scan_hour_menu"}
 };
 
 function unifiedOptionMarkup(selectId, value, textValue, active) {
@@ -13267,7 +13292,7 @@ function toggleUnifiedSelect(selectId, event) {
   if (button) button.setAttribute("aria-expanded", "true");
   if (menu.parentElement !== document.body) document.body.appendChild(menu);
   menu.style.display = "block";
-  placeAnchoredMenu(menu, button || widget, !!widget.closest("#network_modal"));
+  placeAnchoredMenu(menu, button || widget, !!widget.closest("#network_modal, #library_check_modal"));
   queueMenuTrack();
 }
 
@@ -13349,7 +13374,7 @@ function repositionOpenMenus() {
     const menu = cfg ? $(cfg.menu) : null;
     const button = cfg ? $(cfg.button) : null;
     if (!menu || !button) return;
-    if (widget.closest("#network_modal")) placeAnchoredMenu(menu, button, true);
+    if (widget.closest("#network_modal") || widget.closest("#library_check_modal")) placeAnchoredMenu(menu, button, true);
     else if (menu.parentElement === document.body) placeAnchoredMenu(menu, button);
   });
 }
@@ -16059,20 +16084,19 @@ if (libraryStop) libraryStop.onclick = () => libraryCheckAction("stop");
 
 function paintLibraryScanForm(snapshot) {
   const hour = $("library_scan_hour");
-  if (hour && !hour.options.length) {
-    for (let i = 0; i < 24; i += 1) {
-      const opt = document.createElement("option");
-      opt.value = String(i);
-      opt.textContent = String(i).padStart(2, "0") + ":00";
-      hour.appendChild(opt);
-    }
-  }
-  const focused = document.activeElement;
-  const auto = $("library_scan_auto");
   const mode = $("library_scan_mode");
-  if (auto && focused !== auto) auto.checked = !!(snapshot && snapshot.global_scan_auto);
-  if (mode && focused !== mode && snapshot && snapshot.global_scan_mode) mode.value = snapshot.global_scan_mode;
-  if (hour && focused !== hour && snapshot && snapshot.global_scan_hour != null) hour.value = String(snapshot.global_scan_hour);
+  const auto = $("library_scan_auto");
+  const modeOpen = $("library_scan_mode_widget")?.classList.contains("open");
+  const hourOpen = $("library_scan_hour_widget")?.classList.contains("open");
+  if (auto && document.activeElement !== auto) auto.checked = !!(snapshot && snapshot.global_scan_auto);
+  if (mode && !modeOpen && snapshot && snapshot.global_scan_mode && mode.value !== snapshot.global_scan_mode) {
+    mode.value = snapshot.global_scan_mode;
+  }
+  if (hour && !hourOpen && snapshot && snapshot.global_scan_hour != null && hour.value !== String(snapshot.global_scan_hour)) {
+    hour.value = String(snapshot.global_scan_hour);
+  }
+  if (!modeOpen) renderUnifiedSelect("library_scan_mode");
+  if (!hourOpen) renderUnifiedSelect("library_scan_hour");
 }
 
 function saveLibraryScanForm() {
