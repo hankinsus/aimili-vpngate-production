@@ -6821,13 +6821,20 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         return {"ok": False, "skipped": True, "error": "生产连接正在切换，跳过后台探测"}
     if active_tunnel_running() and endpoint_id == str(active_pool_endpoint_id or ""):
         endpoint = node_pool.get_endpoint(endpoint_id) or {}
+        if proxy_server.get_egress_mode() == "proxy" and bool(get_state().get("proxy_ok")):
+            return {
+                "ok": True,
+                "skipped": True,
+                "active": True,
+                "latency_ms": int(float(endpoint.get("latency_ewma") or 0)),
+                "speed_bps": int((endpoint.get("metadata") or {}).get("last_probe_speed_bps") or 0),
+                "message": "代理模式由 8500 实际出口代表，不重复拨号",
+            }
         return {
-            "ok": True,
+            "ok": False,
             "skipped": True,
             "active": True,
-            "latency_ms": int(float(endpoint.get("latency_ewma") or 0)),
-            "speed_bps": int((endpoint.get("metadata") or {}).get("last_probe_speed_bps") or 0),
-            "message": "当前活动节点由实时连接健康检查代表，不执行并行探测",
+            "error": "隧道已连接，但当前是直连，不能把拨号成功当成代理可用",
         }
     if not protocol_probe_lock.acquire(blocking=False):
         return {"ok": False, "skipped": True, "error": "已有协议探测任务运行中"}
@@ -6899,8 +6906,24 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
             return {"ok": False, "protocol": protocol, "error": message}
 
+        if protocol == "l2tp-ipsec":
+            inner = tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
+            if not inner.get("ok"):
+                message = "L2TP 已拨通，但 PPP 出不了网"
+                node_pool.mark_endpoint_degraded(endpoint_id, message)
+                log_to_json("INFO", "Probe", f"L2TP inner PPP: FAIL {endpoint_id}")
+                return {"ok": False, "protocol": protocol, "error": message}
+            ensure_l2tp_namespace_forward(result)
+            forwarded = check_root_via_interface(str(result.interface or ""), str(result.gateway or ""))
+            if not forwarded.get("ok"):
+                message = "L2TP PPP 通，但主机进不了隧道"
+                node_pool.mark_endpoint_degraded(endpoint_id, message)
+                log_to_json("INFO", "Probe", f"L2TP inner PPP: OK; root→{result.interface}: FAIL {endpoint_id}")
+                return {"ok": False, "protocol": protocol, "error": message}
+            log_to_json("INFO", "Probe", f"L2TP inner PPP: OK; root→{result.interface}: OK {endpoint_id}")
+
         latency_ms = max(1, int((time.perf_counter() - started) * 1000))
-        probe_message = f"{protocol} 实连成功 {latency_ms} ms"
+        probe_message = f"{protocol} 生产出口可用 {latency_ms} ms"
         node_pool.record_endpoint_probe(
             endpoint_id, True, latency_ms, probe_message, speed_bps=None
         )
@@ -14012,14 +14035,14 @@ function render(){
       const hotStandby = !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
       const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
       const statusCell = isCurrentlyActive
-        ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
+        ? `<span class="badge ${n.probe_status === "unavailable" ? "unavailable" : "available"}" title="${esc(n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>${n.probe_status === "unavailable" ? "已连接 · 代理不通" : "已连接"}</span>`
         : isWaiting
           ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
           : hotStandby
           ? `<span class="badge available"><span class="badge-pulse"></span>${standbyLabel}</span>`
           : canRetest
             ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "点击立即检测此节点")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
-            : `<span class="badge ${badgeClass}">${badgeText}</span>`;
+            : `<span class="badge ${badgeClass}" title="${esc(n.probe_message || "")}">${badgeText}</span>`;
 
       // Background detection is allowed to continue while the user manually
       // switches nodes. Only an actual manual connection operation remains
@@ -19516,6 +19539,9 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     path_ok, path_detail = preflight_proxy_egress()
                     if not path_ok:
+                        if active_pool_endpoint_id:
+                            node_pool.mark_endpoint_degraded(str(active_pool_endpoint_id), path_detail)
+                        set_state(last_check_message="代理预检失败：" + path_detail, proxy_error=path_detail)
                         self.send_json({"ok": False, "error": "代理预检失败：" + path_detail}, HTTPStatus.CONFLICT)
                         return
                 proxy_server.set_egress_mode(mode)

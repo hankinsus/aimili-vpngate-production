@@ -1372,6 +1372,35 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
+    def mark_endpoint_degraded(self, endpoint_id: str, message: str) -> bool:
+        """Production path failed. Do not keep showing this node as available."""
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return False
+        now = time.time()
+        note = str(message or "生产代理出口不可用")[:1000]
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute("SELECT metadata_json FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
+            if not row:
+                return False
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["last_error"] = note
+            meta["last_probe_message"] = note
+            db.execute(
+                """UPDATE endpoints SET status='DEGRADED', last_failure=?, failure_count=failure_count+1,
+                   fail_streak=fail_streak+1, success_streak=0, next_test=?, metadata_json=?
+                   WHERE endpoint_id=?""",
+                (now, now + 600, json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+            db.commit()
+        self._invalidate_read_caches()
+        return True
+
     def note_tcp_rtt(self, endpoint_id: str, latency_ms: int) -> None:
         """Store a TCP port round trip. It is a valid latency, not a tunnel dial."""
         endpoint_id = str(endpoint_id or "").strip()
