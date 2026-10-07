@@ -5311,8 +5311,14 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             latency_out=latency_box,
         )
         yielded = "让路" in str(message or "")
-        if ok and latency_box:
-            latency = int(latency_box[0])
+        if ok and not yielded:
+            health = check_interface_egress(f"tun{idx}")
+            if not health.get("ok"):
+                ok = False
+                latency = 0
+                message = "OpenVPN 已握手，但隧道出不了网"
+            else:
+                latency = int(health.get("latency_ms") or 0)
     finally:
         if openvpn_process is not None:
             stop_process(openvpn_process)
@@ -5407,8 +5413,14 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 latency_out=latency_box,
             )
             yielded = "让路" in str(message or "")
-            if ok and latency_box:
-                latency = int(latency_box[0])
+            if ok and not yielded:
+                health = check_interface_egress(dev_name)
+                if not health.get("ok"):
+                    ok = False
+                    latency = 0
+                    message = "OpenVPN 已握手，但隧道出不了网"
+                else:
+                    latency = int(health.get("latency_ms") or 0)
         finally:
             if openvpn_process is not None:
                 stop_process(openvpn_process)
@@ -6732,7 +6744,7 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
         return {"ok": False, "error": f"临时策略路由建立失败: {route_error}"}
 
     cmd = [
-        "curl", "-4", "-sS", "-o", "/dev/null",
+        "curl", "-4", "-k", "-sS", "-o", "/dev/null",
         "-w", "%{http_code} %{time_total}",
         "--interface", f"if!{interface}",
         "--connect-timeout", "3",
@@ -6740,7 +6752,7 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
     ]
     try:
         proven = None
-        for url in ("https://example.com/", "https://www.google.com/generate_204"):
+        for url in ("http://1.1.1.1/", "https://1.1.1.1/cdn-cgi/trace", "https://example.com/"):
             res = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=6)
             parts = (res.stdout or "").strip().split()
             if res.returncode == 0 and len(parts) == 2 and parts[0] in {"200", "204", "301", "302"}:
@@ -6911,6 +6923,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
             return {"ok": False, "protocol": protocol, "error": message}
 
+        egress_latency = 0
         if protocol == "l2tp-ipsec":
             ensure_l2tp_namespace_forward(result)
             inner = tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
@@ -6919,6 +6932,7 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
                 node_pool.mark_endpoint_degraded(endpoint_id, message)
                 log_to_json("INFO", "Probe", f"L2TP inner PPP: FAIL {endpoint_id}")
                 return {"ok": False, "protocol": protocol, "error": message}
+            egress_latency = int(inner.get("latency_ms") or 0)
             forwarded = check_root_via_interface(str(result.interface or ""), str(result.gateway or ""))
             if not forwarded.get("ok"):
                 note = "节点可用，本机转发未通过"
@@ -6927,9 +6941,22 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             else:
                 node_pool.note_local_forward(endpoint_id, True, "")
                 log_to_json("INFO", "Probe", f"L2TP inner PPP: OK; root→{result.interface}: OK {endpoint_id}")
+        elif protocol in ("softether", "sstp"):
+            health = check_interface_egress(str(result.interface or ""), str(getattr(result, "gateway", "") or ""))
+            if not health.get("ok"):
+                message = "协议已连接，但隧道出不了网"
+                node_pool.mark_endpoint_degraded(endpoint_id, message)
+                log_to_json("INFO", "Probe", f"{protocol} tunnel egress FAIL {endpoint_id}")
+                return {"ok": False, "protocol": protocol, "error": message}
+            egress_latency = int(health.get("latency_ms") or 0)
 
-        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
-        probe_message = f"{protocol} 生产出口可用 {latency_ms} ms"
+        latency_ms = egress_latency if 0 < egress_latency <= 1500 else 0
+        forward_failed = protocol == "l2tp-ipsec" and not forwarded.get("ok")
+        probe_message = (
+            f"{protocol} 隧道可上网，本机转发未通过"
+            if forward_failed
+            else f"{protocol} 隧道可上网 {latency_ms} ms"
+        )
         node_pool.record_endpoint_probe(
             endpoint_id, True, latency_ms, probe_message, speed_bps=None
         )

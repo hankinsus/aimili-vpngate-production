@@ -1250,6 +1250,29 @@ exit 42
         except Exception as exc:
             errors.append(f"cloudflare_exception={exc}")
 
+        http_args = [
+            "-4", "-sS",
+            "--interface", f"if!{result.inner_interface}",
+            "-o", "/dev/null",
+            "-w", "%{time_total} %{http_code}",
+            "http://1.1.1.1/",
+            "--connect-timeout", "3",
+            "--max-time", "5",
+        ]
+        try:
+            res = run_in_ns(http_args, command_timeout=6)
+            parts = (res.stdout or "").strip().split()
+            if res.returncode == 0 and len(parts) == 2 and parts[1] in {"200", "301", "302"}:
+                return {
+                    "ok": True,
+                    "ip": "",
+                    "latency_ms": int(float(parts[0]) * 1000),
+                    "check": "fixed-ip-http",
+                }
+            errors.append(f"fixed_ip_http={parts or (res.stderr or '').strip()[-200:]}")
+        except Exception as exc:
+            errors.append(f"fixed_ip_http_exception={exc}")
+
         # Second choice: resolve on root namespace, then force that address in netns.
         try:
             infos = socket.getaddrinfo("api.ipify.org", 443, socket.AF_INET, socket.SOCK_STREAM)

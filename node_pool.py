@@ -1275,6 +1275,8 @@ class NodePool:
             item = dict(row)
             try: item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
             except Exception: item["metadata"] = {}
+            if item["metadata"].get("local_forward_ok") is False:
+                continue
             try: item["server_metadata"] = json.loads(item.pop("server_metadata_json") or "{}")
             except Exception: item["server_metadata"] = {}
             item["country"] = canonical_country_name(item.get("country") or "")
