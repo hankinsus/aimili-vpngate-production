@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import json
 import errno
 import fcntl
 import base64
@@ -281,7 +282,27 @@ _live_clients: set[socket.socket] = set()
 _client_generation: dict[socket.socket, int] = {}
 _udp_controls: set[socket.socket] = set()
 _egress_generation = 0
+_switch_report = {
+    "generation": 0,
+    "mode": "",
+    "old_iface": "",
+    "new_iface": "",
+    "tcp_scheduled": 0,
+    "tcp_old_closed": 0,
+    "udp_live": 0,
+    "udp_associations_rotated": 0,
+}
 _live_clients_lock = threading.Lock()
+
+
+def egress_switch_report() -> dict[str, Any]:
+    with _live_clients_lock:
+        return dict(_switch_report)
+
+
+def _note_udp_rotation() -> None:
+    with _live_clients_lock:
+        _switch_report["udp_associations_rotated"] = int(_switch_report.get("udp_associations_rotated") or 0) + 1
 
 
 def _current_egress_generation() -> int:
@@ -337,6 +358,15 @@ def _publish_egress_generation() -> int:
     with _live_clients_lock:
         retired = _egress_generation
         _egress_generation += 1
+        tcp_scheduled = sum(
+            1 for sock, gen in _client_generation.items()
+            if gen <= retired and sock not in _udp_controls
+        )
+        _switch_report["generation"] = _egress_generation
+        _switch_report["tcp_scheduled"] = tcp_scheduled
+        _switch_report["tcp_old_closed"] = 0
+        _switch_report["udp_live"] = len(_udp_controls)
+        _switch_report["udp_associations_rotated"] = 0
         return retired
 
 
@@ -355,6 +385,9 @@ def _retire_old_generation(retired: int, pause: float = 0.5) -> None:
             ]
             udp_kept = len(_udp_controls)
         closed = _close_tracked_clients(stale)
+        with _live_clients_lock:
+            _switch_report["tcp_old_closed"] = closed
+            udp_kept = int(_switch_report.get("udp_live") or 0)
         print(f"[网关] 旧连接代际 {retired} 已关闭 TCP {closed} 条，保留 UDP 关联 {udp_kept} 个", flush=True)
 
     threading.Thread(target=_run, name="egress-retire", daemon=True).start()
@@ -402,11 +435,16 @@ def _watch_egress_mode() -> None:
         iface = _read_active_iface_file()
         if mode == current and iface == current_iface:
             continue
+        previous_iface = current_iface
         mode_changed = mode != current
         iface_changed = iface != current_iface
         current = mode
         current_iface = iface
         retired = _publish_egress_generation()
+        with _live_clients_lock:
+            _switch_report["mode"] = mode
+            _switch_report["old_iface"] = previous_iface
+            _switch_report["new_iface"] = iface
         with DNS_CACHE_LOCK:
             DNS_CACHE.clear()
         with _UDP_DEST_LOCK:
@@ -658,6 +696,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
     client_udp_addr: tuple[str, int] | None = None
     last_activity = time.monotonic()
     association_generation = _current_egress_generation()
+    association_iface = get_forward_interface() or ""
     _keep_udp_control(client)
 
     def _drop_upstreams() -> None:
@@ -667,6 +706,25 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
             except OSError:
                 pass
         upstreams.clear()
+
+    def _rotate_if_needed() -> bool:
+        nonlocal association_generation, association_iface
+        current_generation = _current_egress_generation()
+        current_iface = get_forward_interface() or ""
+        if current_generation == association_generation and current_iface == association_iface:
+            return False
+        had_upstream = bool(upstreams)
+        old_iface = association_iface
+        _drop_upstreams()
+        association_generation = current_generation
+        association_iface = current_iface
+        if had_upstream:
+            _note_udp_rotation()
+            print(
+                f"[SOCKS5 UDP] udp_generation={association_generation} {old_iface or '-'} -> {association_iface or '-'} upstream sockets recreated",
+                flush=True,
+            )
+        return True
 
     try:
         _set_udp_socket_options(relay, bind_device=False)
@@ -682,12 +740,9 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
             sources: list[socket.socket] = [client, relay]
             sources.extend(upstreams.values())
             readable, _, errored = select.select(sources, [], sources, 0.2)
-            current_generation = _current_egress_generation()
-            if current_generation != association_generation:
-                _drop_upstreams()
-                association_generation = current_generation
+            rotated = _rotate_if_needed()
+            if rotated:
                 readable = [source for source in readable if source is client or source is relay]
-                print(f"[SOCKS5 UDP] 出口代际 {association_generation}，已重建上游套接字", flush=True)
             if errored:
                 return
 
@@ -720,9 +775,8 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                     if not decoded:
                         continue
                     host, port, payload = decoded
-                    if _current_egress_generation() != association_generation:
-                        _drop_upstreams()
-                        association_generation = _current_egress_generation()
+                    if _rotate_if_needed():
+                        pass
                     destinations = _resolve_udp_destinations(host, port)
                     destinations.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
                     destinations = [item for item in destinations if item[0] == socket.AF_INET]
@@ -788,6 +842,94 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                 sock.close()
             except Exception:
                 pass
+
+
+def _write_json_if_changed(path: Path, payload: dict[str, Any]) -> bool:
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except OSError as exc:
+        print(f"[内核] 写 {path} 失败: {exc}", flush=True)
+        return False
+
+
+def ensure_kernel_socks_outbounds() -> None:
+    """Keep Xray on the same SOCKS5 path as sing-box.
+
+    Xray's SOCKS outbound schema has no udp field. TCP, UDP and XUDP all use
+    that outbound. This does not restart sing-box or Xray.
+    """
+    user, password = get_proxy_credentials()
+    user = str(user or "")
+    password = str(password or "")
+    sing_path = Path("/etc/v2ray-agent/sing-box/conf/config/socks5_outbound.json")
+    if (not user or not password) and sing_path.is_file():
+        try:
+            outbound = json.loads(sing_path.read_text(encoding="utf-8"))["outbounds"][0]
+            user = user or str(outbound.get("username") or "")
+            password = password or str(outbound.get("password") or "")
+        except (OSError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+            pass
+    if not user or not password:
+        print("[内核] 未写 Xray 出站：缺少 8500 账号", flush=True)
+        return
+    conf_dir = Path("/etc/v2ray-agent/xray/conf")
+    if not Path("/etc/v2ray-agent/xray").is_dir():
+        return
+    outbound_doc = {
+        "outbounds": [{
+            "protocol": "socks",
+            "tag": "socks5_outbound",
+            "settings": {
+                "servers": [{
+                    "address": "127.0.0.1",
+                    "port": int(os.environ.get("LOCAL_PROXY_PORT", "8500")),
+                    "users": [{"user": user, "pass": password}],
+                }]
+            },
+        }]
+    }
+    wrote = _write_json_if_changed(conf_dir / "00_socks5_outbound.json", outbound_doc)
+    route_path = conf_dir / "09_routing.json"
+    route_text = ""
+    try:
+        route_text = route_path.read_text(encoding="utf-8") if route_path.is_file() else ""
+    except OSError:
+        route_text = ""
+    if "socks5_outbound" not in route_text:
+        wrote = _write_json_if_changed(route_path, {
+            "routing": {
+                "domainStrategy": "AsIs",
+                "rules": [{
+                    "type": "field",
+                    "network": "tcp,udp",
+                    "outboundTag": "socks5_outbound",
+                }],
+            }
+        }) or wrote
+    binary = Path("/etc/v2ray-agent/xray/xray")
+    if not binary.is_file():
+        print("[内核] Xray 程序不在。已准备 SOCKS 出站，TCP/UDP 进 127.0.0.1:8500，没有 udp 字段。当前仍用 sing-box。", flush=True)
+        return
+    try:
+        test = subprocess.run(
+            [str(binary), "run", "-test", "-confdir", str(conf_dir)],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[内核] Xray 配置测试没有跑起来：{exc}", flush=True)
+        return
+    if test.returncode == 0:
+        print("[内核] Xray 配置测试通过。未重启，避免抢 sing-box 端口。", flush=True)
+    else:
+        detail = ((test.stderr or test.stdout or "").strip().splitlines() or ["未知错误"])[-1]
+        print(f"[内核] Xray 配置测试失败，未启动：{detail}", flush=True)
 
 
 def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
@@ -1714,6 +1856,10 @@ def start_proxy_server(host: str, port: int) -> None:
 
     plane = "splice" if hasattr(os, "splice") else "userspace"
     print(f"[网关] 8500 数据面 {plane}。TCP 握手之后走内核管道，业务字节不进用户态。", flush=True)
+    try:
+        ensure_kernel_socks_outbounds()
+    except Exception as exc:
+        print(f"[内核] 出站配置检查失败：{exc}", flush=True)
     threading.Thread(target=_watch_egress_mode, daemon=True, name="egress-watch").start()
     threading.Thread(target=_forward_heartbeat, daemon=True, name="forward-heartbeat").start()
     while True:

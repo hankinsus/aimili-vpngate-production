@@ -17888,6 +17888,19 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                 last_check_message=label if udp.get("ok") else label + " · UDP异常",
             )
             log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip} · udp={'ok' if udp.get('ok') else udp.get('error')}")
+            report = proxy_server.egress_switch_report()
+            summary = (
+                f"generation={report.get('generation')} mode={mode} "
+                f"tcp_old_closed={report.get('tcp_old_closed')} "
+                f"tcp_scheduled={report.get('tcp_scheduled')} "
+                f"udp_associations_rotated={report.get('udp_associations_rotated')} "
+                f"udp_live={report.get('udp_live')} "
+                f"old_iface={report.get('old_iface') or '-'} "
+                f"new_iface={report.get('new_iface') or '-'} "
+                f"tcp_health=ok udp_health={'ok' if udp.get('ok') else 'fail'}"
+            )
+            print(f"[网关] {summary}", flush=True)
+            log_to_json("INFO", "Proxy", summary)
         else:
             if not owned():
                 return
