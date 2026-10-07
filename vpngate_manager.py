@@ -1821,6 +1821,8 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         port = int(endpoint.get("port") or 0)
     except (TypeError, ValueError):
         port = 0
+    advertised = _advertised_speed_bps(endpoint)
+    measured = _measured_speed_bps(endpoint)
     return {
         "id": f"pool:{endpoint.get('endpoint_id', '')}",
         "pool_endpoint_id": str(endpoint.get("endpoint_id") or ""),
@@ -1830,8 +1832,11 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "ip": ip,
         "score": int(endpoint.get("latest_server_score") or 0),
         "ping": int(endpoint.get("latest_ping") or 0),
-        "speed": int(endpoint.get("latest_speed") or (metadata or {}).get("last_probe_speed_bps") or server_metadata.get("last_ip_speed_bps") or 0),
-        "speed_bps": int(endpoint.get("latest_speed") or (metadata or {}).get("last_probe_speed_bps") or server_metadata.get("last_ip_speed_bps") or 0),
+        "speed": measured,
+        "speed_bps": measured,
+        "measured_speed_bps": measured,
+        "advertised_speed_bps": advertised,
+        "speed_source": "measured" if measured > 0 else "not_measured",
         "sessions": int(endpoint.get("latest_sessions") or 0),
         "owner": str(server_metadata.get("owner") or server_metadata.get("isp") or server_metadata.get("as_name") or ""),
         "asn": str(server_metadata.get("asn") or ""),
@@ -3976,8 +3981,8 @@ def routing_favorite_rank(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> i
     return 0 if favorites.intersection(variants) else 1
 
 def routing_speed_gate(endpoint: dict[str, Any]) -> int:
-    """Global speed ladder: >=500 Mbps, >=50 Mbps, then <50 Mbps fallback."""
-    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    """Global speed ladder from this server's tunnel measurement, not the catalog claim."""
+    speed = _measured_speed_bps(endpoint)
     if speed >= ROUTING_HIGH_SPEED_BPS:
         return 0
     if speed >= ROUTING_MIN_LINE_SPEED_BPS:
@@ -4013,7 +4018,7 @@ def routing_session_rank(endpoint: dict[str, Any]) -> int:
         sessions = int(meta.get("sessions") or 0)
     except (TypeError, ValueError):
         return 4
-    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or meta.get("speed") or 0)
+    speed = _measured_speed_bps(endpoint)
     return NodePool.session_grade_rank(sessions, speed, True)
 
 
@@ -4021,7 +4026,7 @@ def routing_service_key(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> tup
     latency = float(endpoint.get("latency_ewma") or endpoint.get("latency_ms") or 999999)
     if latency <= 0:
         latency = 999999
-    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    speed = _measured_speed_bps(endpoint)
     jitter = float(endpoint.get("jitter_ewma") or 999999)
     success_streak = int(endpoint.get("success_streak") or 0)
     return (
@@ -4155,7 +4160,7 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
         preferred_fast = [
             ep for ep in candidates
             if endpoint_ip_type(ep) in ("residential", "mobile")
-            and int(ep.get("latest_speed") or ep.get("speed") or 0) >= ROUTING_MIN_LINE_SPEED_BPS
+            and _measured_speed_bps(ep) >= ROUTING_MIN_LINE_SPEED_BPS
         ]
         if preferred_fast:
             candidates = preferred_fast
@@ -4420,7 +4425,7 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     except (TypeError, ValueError):
         min_speed = 0
     if min_speed > 0:
-        speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+        speed = _measured_speed_bps(endpoint)
         if speed < min_speed:
             return False
     if not latency_filter_matches(endpoint_display_latency_ms(endpoint), str(ui_cfg.get("routing_latency") or "")):
@@ -5679,7 +5684,7 @@ def _active_exit_ip() -> str:
 
 
 def _standby_speed_gap(endpoint: dict[str, Any], target: int) -> int:
-    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    speed = _measured_speed_bps(endpoint)
     if speed <= 0 or target <= 0:
         return 10**12
     return abs(speed - target)
@@ -6220,11 +6225,33 @@ def _cold_skips_port(endpoint: dict[str, Any]) -> bool:
     return False
 
 
-def _endpoint_speed_bps(endpoint: dict[str, Any]) -> int:
+def _measured_speed_bps(endpoint: dict[str, Any]) -> int:
+    """Speed this server measured through the tunnel. Never the catalog advertisement."""
+    metadata = endpoint.get("metadata") if isinstance(endpoint.get("metadata"), dict) else {}
+    server_metadata = endpoint.get("server_metadata") if isinstance(endpoint.get("server_metadata"), dict) else {}
+    for value in (
+        endpoint.get("measured_speed_bps"),
+        metadata.get("last_probe_speed_bps"),
+        server_metadata.get("last_ip_speed_bps"),
+    ):
+        try:
+            speed = int(value or 0)
+        except (TypeError, ValueError):
+            speed = 0
+        if speed > 0:
+            return speed
+    return 0
+
+
+def _advertised_speed_bps(endpoint: dict[str, Any]) -> int:
     try:
-        return int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+        return max(0, int(endpoint.get("latest_speed") or endpoint.get("advertised_speed_bps") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _endpoint_speed_bps(endpoint: dict[str, Any]) -> int:
+    return _measured_speed_bps(endpoint)
 
 
 def _current_route_protocol(ui_cfg: dict[str, Any]) -> str:
@@ -14677,8 +14704,14 @@ function render(){
         : (n.probe_status === "available" ? Number(n.latency_ms || 0) : 0);
       const latencyClass = getLatencyClass(rowLatencyValue);
       const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}" title="网络延迟，不是拨号耗时">${rowLatencyValue} ms</span>` : "-";
-      const rowSpeedValue = Number(n.speed_bps || n.speed || 0);
-      const rowSpeedText = rowSpeedValue ? `<span class="node-speed-val">${esc(speed(rowSpeedValue))}</span>` : "-";
+      const measuredSpeed = Number(n.measured_speed_bps || 0);
+      const advertisedSpeed = Number(n.advertised_speed_bps || 0);
+      const speedTitle = measuredSpeed
+        ? ("服务器实测" + (advertisedSpeed ? " · 标称 " + speed(advertisedSpeed) : ""))
+        : (advertisedSpeed ? ("标称 " + speed(advertisedSpeed) + "，服务器尚未实测") : "服务器尚未实测");
+      const rowSpeedText = measuredSpeed
+        ? `<span class="node-speed-val" title="${esc(speedTitle)}">${esc(speed(measuredSpeed))}</span>`
+        : `<span class="node-speed-val" title="${esc(speedTitle)}">未测</span>`;
       const displayLocation = formatNodeLocation(n);
       const displayLocationFlag = countryFlag(n.country || displayLocation, translateCountry(n.country) || displayLocation, "lazy");
       const protocolName = translateProtocol(n.protocol || "openvpn");
