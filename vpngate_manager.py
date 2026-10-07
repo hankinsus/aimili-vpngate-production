@@ -952,6 +952,11 @@ def set_manual_route_pin(*, protocol: str, endpoint_id: str = "", node_id: str =
         "set_at": time.time(),
     }
     manual_connection_quiet_until = time.time() + 15.0
+    try:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        write_json(DATA_DIR / "manual_route_pin.json", manual_route_pin)
+    except OSError:
+        pass
     if pinned_country and pinned_country != previous_country:
         try:
             release_standby()
@@ -963,6 +968,28 @@ def set_manual_route_pin(*, protocol: str, endpoint_id: str = "", node_id: str =
 def clear_manual_route_pin() -> None:
     global manual_route_pin
     manual_route_pin = {}
+    try:
+        (DATA_DIR / "manual_route_pin.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+def load_manual_route_pin() -> None:
+    global manual_route_pin
+    try:
+        raw = read_json(DATA_DIR / "manual_route_pin.json", {})
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    if not str(raw.get("endpoint_id") or raw.get("node_id") or "").strip():
+        return
+    manual_route_pin = {
+        "protocol": str(raw.get("protocol") or ""),
+        "endpoint_id": str(raw.get("endpoint_id") or ""),
+        "node_id": str(raw.get("node_id") or ""),
+        "country": normalized_country_name(raw.get("country") or ""),
+        "set_at": float(raw.get("set_at") or 0),
+    }
 
 
 def _routing_ip_pref_for_exit(ip_type: str) -> str:
@@ -974,12 +1001,16 @@ def _routing_ip_pref_for_exit(ip_type: str) -> str:
     return ""
 
 
-def align_proxy_settings_to_manual(country: str, ip_type: str) -> None:
-    """Manual switch wins. Persist that node's country and IP type only."""
+def align_proxy_settings_to_manual(country: str, ip_type: str, protocol: str = "") -> None:
+    """Manual switch wins. Persist country, IP type, and the protocol that was clicked."""
     global ui_config_cache, ui_config_cache_at
     country_name = normalized_country_name(country)
     ip_pref = _routing_ip_pref_for_exit(ip_type)
-    if not country_name and not ip_pref:
+    try:
+        protocol_name = normalize_routing_protocol(protocol) if str(protocol or "").strip() else ""
+    except ValueError:
+        protocol_name = ""
+    if not country_name and not ip_pref and not protocol_name:
         return
     cfg = load_ui_config()
     auth_file = DATA_DIR / "ui_auth.json"
@@ -996,6 +1027,15 @@ def align_proxy_settings_to_manual(country: str, ip_type: str) -> None:
             changed = True
         if ip_pref and str(current.get("routing_ip_type") or cfg.get("routing_ip_type") or "all") != ip_pref:
             current["routing_ip_type"] = ip_pref
+            changed = True
+        if protocol_name and str(current.get("routing_protocol") or cfg.get("routing_protocol") or "") != protocol_name:
+            current["routing_protocol"] = protocol_name
+            changed = True
+        if int(current.get("routing_min_speed_bps") or cfg.get("routing_min_speed_bps") or 0) != 0:
+            current["routing_min_speed_bps"] = 0
+            changed = True
+        if str(current.get("routing_latency") or cfg.get("routing_latency") or "") != "":
+            current["routing_latency"] = ""
             changed = True
         if not changed:
             return
@@ -1020,11 +1060,17 @@ def align_proxy_settings_to_manual(country: str, ip_type: str) -> None:
         force_country=str(current.get("force_country") or ""),
         routing_ip_type=str(current.get("routing_ip_type") or "all"),
         routing_mode=str(current.get("routing_mode") or "auto"),
+        routing_protocol=str(current.get("routing_protocol") or ""),
+        routing_min_speed_bps=int(current.get("routing_min_speed_bps") or 0),
+        routing_latency=str(current.get("routing_latency") or ""),
     )
     log_to_json(
         "INFO",
         "Routing",
-        f"手动切换已同步代理设置：国家 {current.get('force_country') or '-'}，IP类型 {current.get('routing_ip_type') or '-'}",
+        "手动切换已覆盖代理设置："
+        f"国家 {current.get('force_country') or '-'}，"
+        f"协议 {current.get('routing_protocol') or '所有'}，"
+        f"IP类型 {current.get('routing_ip_type') or '-'}",
     )
 
 def read_nodes() -> list[dict[str, Any]]:
@@ -3488,6 +3534,18 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 reuse_existing=False,
             )
         else:
+            def _l2tp_progress(stage: str) -> None:
+                labels = {
+                    "ipsec": "IPsec 握手中…",
+                    "l2tp": "IPsec 已完成，正在建立 L2TP…",
+                    "ppp": "L2TP 已发起，正在等待 PPP 地址…",
+                }
+                text = labels.get(stage) or "正在建立 L2TP/IPsec…"
+                if manual:
+                    set_state(manual_switch_message=text, last_check_message=text)
+
+            if manual:
+                set_state(manual_switch_message="IPsec 握手中…", last_check_message="正在进行 IPsec 握手，随后进入 L2TP 和 PPP。")
             result = l2tp_adapter.connect(
                 host=host,
                 username="vpn",
@@ -3495,11 +3553,17 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 psk="vpn",
                 namespace=f"aimili-l2tp-{token}",
                 timeout=35,
+                on_progress=_l2tp_progress,
             )
 
         if not result.ok or not result.interface:
-            node_pool.record_endpoint_probe(endpoint_id, False, 0, result.message)
-            raise RuntimeError(result.message or f"{protocol} 连接失败")
+            detail = str(result.message or f"{protocol} 连接失败")
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, detail[:500])
+            log_to_json("WARNING", "VPN", f"{protocol} 连接失败 {endpoint_id}: {detail[:800]}")
+            if protocol == "l2tp-ipsec":
+                raise RuntimeError("L2TP/IPsec 未完成：IPsec、L2TP 或 PPP 在 35 秒内没有拿到地址")
+            short = " ".join(detail.split())
+            raise RuntimeError(short[:180] or f"{protocol} 连接失败")
 
         if manual:
             set_state(manual_switch_message="目标隧道已建立，正在验证真实出口与网络质量…", last_check_message="目标节点已建立隧道，正在进行真实出口验证…")
@@ -3558,6 +3622,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             align_proxy_settings_to_manual(
                 str(endpoint.get("country") or ""),
                 str(endpoint_ip_type(endpoint) or ""),
+                protocol=protocol,
             )
         endpoint_meta = endpoint.get("server_metadata") or {}
         endpoint_summary = {
@@ -4651,6 +4716,8 @@ def apply_routing_filters(
 def normalized_country_name(country: Any) -> str:
     value = str(country or "").strip()
     return vpn_utils.COUNTRY_TRANSLATIONS.get(value, value)
+
+load_manual_route_pin()
 
 def country_matches(node_country: Any, target_country: Any) -> bool:
     return bool(target_country) and normalized_country_name(node_country) == normalized_country_name(target_country)
@@ -6323,7 +6390,7 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
         manual_switch_message="切换完成",
     )
     set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
-    align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""))
+    align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""), protocol="openvpn")
     return f"Connected {node_id} (smooth switch)"
 
 def connect_node(node_id: str, enable_connection: bool = False, manual: bool = False) -> str:
@@ -6512,7 +6579,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         if manual:
             set_state(manual_switch_message="目标节点验证完成，正在确认客户端状态…", last_check_message="真实出口验证通过，正在完成平滑切换…")
             set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
-            align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""))
+            align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""), protocol="openvpn")
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         remember_live_connection(openvpn_node_id=node_id)
@@ -6962,12 +7029,42 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
     schedule_nodes_probe_flush({node_id: node})
     return node_id
 
+def _endpoint_physical_key(endpoint: dict[str, Any] | None, endpoint_id: str) -> tuple[str, str, int]:
+    if not isinstance(endpoint, dict):
+        return ("", endpoint_id, 0)
+    metadata = endpoint.get("metadata") or {}
+    protocol = str(endpoint.get("protocol") or "").strip().lower()
+    host = str(
+        endpoint.get("current_ip")
+        or metadata.get("ip")
+        or endpoint.get("hostname")
+        or metadata.get("hostname")
+        or ""
+    ).strip().lower()
+    return (protocol, host, parse_int(endpoint.get("port")))
+
+
 def connect_pool_endpoint_with_fallback(endpoint_ids: list[str], manual: bool = False) -> str:
     ids = list(dict.fromkeys(str(x or "").strip() for x in endpoint_ids if str(x or "").strip()))
     if not ids:
         raise ValueError("没有可连接的协议端点")
+    if manual:
+        # The clicked row already merged duplicate catalog sources of the same
+        # protocol/IP/port. Trying each id again spends another 35s on one L2TP.
+        clicked = ids[0]
+        try:
+            clicked_endpoint = node_pool.get_endpoint(clicked)
+        except Exception:
+            clicked_endpoint = None
+        clicked_key = _endpoint_physical_key(clicked_endpoint, clicked)
+        ids = [clicked]
+        log_to_json("INFO", "VPN", f"人工切换只尝试 {clicked_key[0] or '-'} {clicked_key[1] or clicked}:{clicked_key[2] or '-'}")
     errors: list[str] = []
+    started = time.monotonic()
     for endpoint_id in ids:
+        if manual and time.monotonic() - started > 50:
+            errors.append("已超过人工切换时间预算")
+            break
         try:
             endpoint = node_pool.get_endpoint(endpoint_id)
             if endpoint is not None and str(endpoint.get("protocol") or "").lower() == "openvpn":
@@ -6975,10 +7072,8 @@ def connect_pool_endpoint_with_fallback(endpoint_ids: list[str], manual: bool = 
             return connect_pool_endpoint(endpoint_id, manual=manual)
         except Exception as exc:
             errors.append(f"{endpoint_id[:10]}: {exc}")
-            # Do not continue after a successful promotion; connect_pool_endpoint
-            # only returns after the candidate has fully taken over the gateway.
             continue
-    raise RuntimeError("已尝试该 IP/协议的全部候选端点，均未连接成功：" + " | ".join(errors[-4:]))
+    raise RuntimeError("人工切换失败，已停止重试：" + " | ".join(errors[-3:]) if manual else "已尝试该 IP/协议的全部候选端点，均未连接成功：" + " | ".join(errors[-4:]))
 
 def connect_ranked_endpoint(endpoint: dict[str, Any], manual: bool = False) -> str:
     protocol = str(endpoint.get("protocol") or "").lower()
@@ -14644,19 +14739,16 @@ async function connectNode(id){
   startConnectionPolling();
 
   try {
-    const fallbackEndpointIds = selectedNode && Array.isArray(selectedNode.pool_endpoint_ids)
-      ? selectedNode.pool_endpoint_ids
-      : (poolEndpointId ? [poolEndpointId] : []);
     const result = await fetchJsonWithTimeout(
       poolEndpointId ? "./api/connect_pool_endpoint" : "./api/connect",
       {
         method:"POST",
         headers:{"Content-Type":"application/json"},
         body: poolEndpointId
-          ? JSON.stringify({endpoint_id: poolEndpointId, endpoint_ids: fallbackEndpointIds})
+          ? JSON.stringify({endpoint_id: poolEndpointId, endpoint_ids: [poolEndpointId]})
           : JSON.stringify({id})
       },
-      600000
+      90000
     );
     if (result.running) {
       if (result.state) adoptBackendState(result.state);

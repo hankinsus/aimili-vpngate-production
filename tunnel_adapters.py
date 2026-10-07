@@ -734,6 +734,7 @@ class L2TPIPsecAdapter:
         psk: str = "vpn",
         namespace: str = "aimili-l2tp",
         timeout: int = 35,
+        on_progress: Any = None,
     ) -> TunnelResult:
         if not self.available():
             return TunnelResult(False, self.protocol, message="L2TP/IPsec dependencies are not installed")
@@ -896,14 +897,17 @@ trap cleanup EXIT INT TERM
 
 ipsec start --nofork --conf "{ipsec_conf}" >"{ipsec_log}" 2>&1 &
 STARTER_PID=$!
+echo ipsec > "{work_dir}/stage"
 sleep 2
 timeout 15s ipsec up vpngate >>"{ipsec_log}" 2>&1
+echo l2tp > "{work_dir}/stage"
 xl2tpd -D -c "{xl2tp_conf}" -s "{l2tp_secrets}" -p "{pid_file}" -C "{control_file}" >"{xl2tp_log}" 2>&1 &
 XL2TP_PID=$!
 for _ in $(seq 1 20); do
   [ -e "{control_file}" ] && break
   sleep 0.25
 done
+echo ppp > "{work_dir}/stage"
 echo "c vpngate" > "{control_file}"
 for _ in $(seq 1 60); do
   IFACE=$(ip -o link show | awk -F': ' '$2 ~ /^ppp[0-9]+$/ {{print $2; exit}}')
@@ -966,7 +970,20 @@ exit 42
             deadline = time.time() + timeout
             ready = work_dir / "ready"
             iface_file = work_dir / "ppp-iface"
+            stage_file = work_dir / "stage"
+            last_stage = ""
             while time.time() < deadline:
+                if on_progress is not None and stage_file.exists():
+                    try:
+                        stage = stage_file.read_text(encoding="utf-8").strip()
+                    except OSError:
+                        stage = ""
+                    if stage and stage != last_stage:
+                        last_stage = stage
+                        try:
+                            on_progress(stage)
+                        except Exception:
+                            pass
                 if proc.poll() is not None:
                     output = ""
                     try:
