@@ -18182,8 +18182,8 @@ def owned_tunnel_local_liveness() -> tuple[bool, str]:
 _tunnel_health_epoch = 0
 
 
-def _probe_iface_tcp(iface: str, timeout: float = 1.0) -> tuple[bool, str]:
-    """One TCP handshake on this NIC. Not a Cloudflare request."""
+def _probe_iface_tcp(iface: str, timeout: float = 1.0, host: str = "8.8.8.8") -> tuple[bool, str]:
+    """One TCP handshake on this NIC. Google resolvers only, never 1.1.1.1."""
     iface = str(iface or "").strip()
     if not iface or not Path("/sys/class/net", iface).exists():
         return False, "接口不存在"
@@ -18191,7 +18191,7 @@ def _probe_iface_tcp(iface: str, timeout: float = 1.0) -> tuple[bool, str]:
     try:
         sock.settimeout(timeout)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
-        sock.connect(("8.8.8.8", 443))
+        sock.connect((host, 443))
         return True, ""
     except OSError as exc:
         return False, str(exc)
@@ -18199,8 +18199,27 @@ def _probe_iface_tcp(iface: str, timeout: float = 1.0) -> tuple[bool, str]:
         sock.close()
 
 
-def active_tunnel_stale_reason() -> str:
-    """Empty when the published NIC can still carry traffic. One failure is enough."""
+def _soft_round_failures(iface: str) -> int:
+    """How many of 8.8.8.8:443 and 8.8.4.4:443 failed. One miss is jitter."""
+    failed = {"n": 0}
+    guard = threading.Lock()
+
+    def _one(host: str) -> None:
+        ok, _detail = _probe_iface_tcp(iface, 1.0, host)
+        if not ok:
+            with guard:
+                failed["n"] += 1
+
+    workers = [threading.Thread(target=_one, args=(host,), daemon=True) for host in ("8.8.8.8", "8.8.4.4")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(1.3)
+    return failed["n"] + sum(1 for worker in workers if worker.is_alive())
+
+
+def active_tunnel_hard_reason() -> str:
+    """Structural death only. A single slow TCP handshake is not enough."""
     if proxy_server.get_egress_mode() != "proxy":
         return ""
     if not active_pool_endpoint_id and not active_openvpn_node_id:
@@ -18217,19 +18236,22 @@ def active_tunnel_stale_reason() -> str:
         oper = ""
     if oper == "down":
         return f"活动网卡 {iface} 已 down"
+    alive, why = owned_tunnel_local_liveness()
+    if not alive:
+        return why or "隧道进程已退出"
     try:
         route = subprocess.run(
             ["ip", "route", "get", "8.8.8.8", "oif", iface],
             capture_output=True, text=True, timeout=1,
         )
-    except Exception as exc:
-        return f"策略路由检查失败: {exc}"
+    except Exception:
+        return ""
     if route.returncode != 0 or iface not in (route.stdout or ""):
         return f"策略路由未指向 {iface}"
-    ok, detail = _probe_iface_tcp(iface, 1.0)
-    if not ok:
-        return f"活动网卡 {iface} 数据面失败: {detail}"
     return ""
+
+
+_soft_fail_streak = 0
 
 
 def _invalidate_tunnel_health(reason: str) -> None:
@@ -18325,6 +18347,7 @@ def _promote_live_standby() -> bool:
 
 
 def fast_tunnel_liveness_loop() -> None:
+    global _soft_fail_streak
     time.sleep(1)
     while True:
         try:
@@ -18332,25 +18355,53 @@ def fast_tunnel_liveness_loop() -> None:
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             if not active_pool_endpoint_id and not active_openvpn_node_id:
+                _soft_fail_streak = 0
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             if proxy_server.get_egress_mode() != "proxy":
+                _soft_fail_streak = 0
                 iface = str(proxy_server.get_active_interface() or "").strip()
                 if iface and not Path("/sys/class/net", iface).exists():
                     set_state(active_tunnel_ok=False, tunnel_role="STALE")
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
-            reason = active_tunnel_stale_reason()
-            if not reason:
+            hard = active_tunnel_hard_reason()
+            if hard:
+                _soft_fail_streak = 0
+                _invalidate_tunnel_health(hard)
+                log_to_json("WARNING", "Proxy", f"活动隧道硬故障: {hard}")
+                if not _promote_live_standby():
+                    _detach_dead_forwarding()
+                    handle_confirmed_tunnel_failure(hard)
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
+            if proxy_server.proxy_forwarding_busy(1.0):
+                if _soft_fail_streak:
+                    log_to_json("INFO", "Proxy", "最近 1 秒仍有业务流量，忽略一次探测超时")
+                _soft_fail_streak = 0
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            iface = str(proxy_server.get_active_interface() or "").strip()
+            if _soft_round_failures(iface) < 2:
+                if _soft_fail_streak:
+                    set_state(tunnel_role="ACTIVE", last_check_message="数据面复测已恢复")
+                    log_to_json("INFO", "Proxy", "数据面复测已恢复，不切换")
+                _soft_fail_streak = 0
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            _soft_fail_streak += 1
+            if _soft_fail_streak < 2:
+                set_state(tunnel_role="SUSPECT", last_check_message="数据面一次超时，正在复测")
+                log_to_json("INFO", "Proxy", f"活动网卡 {iface} 探测超时，标为 SUSPECT，不切换")
+                time.sleep(0.25)
+                continue
+            reason = f"活动网卡 {iface} 数据面连续两轮失败"
+            _soft_fail_streak = 0
             _invalidate_tunnel_health(reason)
-            log_to_json("WARNING", "Proxy", f"活动隧道立即判定失效: {reason}")
-            if _promote_live_standby():
-                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                continue
-            _detach_dead_forwarding()
-            handle_confirmed_tunnel_failure(reason)
+            log_to_json("WARNING", "Proxy", reason)
+            if not _promote_live_standby():
+                _detach_dead_forwarding()
+                handle_confirmed_tunnel_failure(reason)
         except Exception as exc:
             log_to_json("ERROR", "Proxy", f"快速存活守护异常: {exc}")
         time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
