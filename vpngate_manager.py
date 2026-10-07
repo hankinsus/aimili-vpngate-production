@@ -17143,7 +17143,8 @@ def check_proxy_health() -> dict[str, Any]:
             proxy_hosts = [LOCAL_PROXY_HOST]
 
         for p_host in proxy_hosts:
-            proxy_url = f"socks5://{p_host}:{LOCAL_PROXY_PORT}"
+            # socks5h asks 8500 to resolve the name. socks5 resolves here and would hide a broken tunnel DNS.
+            proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             cmd = [
                 "curl", "-4", "-sS",
