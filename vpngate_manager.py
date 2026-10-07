@@ -12242,9 +12242,9 @@ INDEX_HTML = r"""<!doctype html>
         <span style="color:var(--text-secondary);">检测剩余时间</span>
         <strong id="library_check_eta" style="font-variant-numeric:tabular-nums;">计算中</strong>
       </div>
-      <div id="library_check_message" style="margin-top: 8px; min-height: 20px; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
-      <div style="margin-top:20px; padding-top:18px; border-top:1px solid rgba(255,255,255,0.06);">
-        <label style="display:flex; align-items:center; gap:8px; margin:2px 0 16px; font-size:14px; font-weight:600; color:var(--text-primary);">
+      <div id="library_check_message" style="min-height: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
+      <div style="margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.06);">
+        <label style="display:flex; align-items:center; gap:8px; margin:0 0 12px; font-size:14px; font-weight:600; color:var(--text-primary);">
           <input type="checkbox" id="library_scan_auto"> 开启自动更新
         </label>
         <div style="display:flex; gap:10px;">
