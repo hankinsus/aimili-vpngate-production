@@ -8857,7 +8857,6 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.45;
     }
     .active-location-with-flag,
-    .node-location-cell,
     .node-location-cell-inner {
       display: inline-flex;
       align-items: center;
@@ -8865,6 +8864,12 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       max-width: 100%;
       vertical-align: middle;
+      flex-wrap: nowrap;
+      white-space: nowrap;
+    }
+    .node-location-cell {
+      overflow: hidden;
+      white-space: nowrap;
     }
     .active-location-with-flag > span:last-child,
     .node-location-cell > .node-cell-ellipsis,
@@ -10357,8 +10362,13 @@ INDEX_HTML = r"""<!doctype html>
       text-align: left;
     }
 
+    .node-protocol-cell {
+      overflow: hidden;
+    }
+
     .node-address-cell {
-      white-space: normal;
+      overflow: hidden;
+      white-space: nowrap;
     }
 
     .node-address-cell .mono {
@@ -10366,23 +10376,31 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 400;
       color: #8eb8c4;
       letter-spacing: 0;
-      white-space: normal;
-      word-break: break-all;
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      word-break: normal;
     }
     .node-address-stack {
       display: flex;
       flex-direction: column;
       justify-content: center;
       min-width: 0;
+      max-width: 100%;
       gap: 1px;
       line-height: 1.25;
+      overflow: hidden;
     }
     .node-domain {
       font-size: 12px;
       font-weight: 500;
       color: #d5dee8;
-      white-space: normal;
-      word-break: break-all;
+      display: block;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      word-break: normal;
     }
     .node-address-cell.is-blocked .node-domain,
     .node-address-cell.is-blocked .mono {
@@ -11810,14 +11828,14 @@ INDEX_HTML = r"""<!doctype html>
       <table class="node-table">
         <thead>
           <tr>
-            <th class="col-status" style="width: 8%;">状态</th>
-            <th class="col-protocol" style="width: 8%;">协议</th>
-            <th class="col-address" style="width: 22%;">域名 : 端口 / IP</th>
+            <th class="col-status" style="width: 7%;">状态</th>
+            <th class="col-protocol" style="width: 10%;">协议</th>
+            <th class="col-address" style="width: 16%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 7%;">延迟</th>
-            <th class="col-speed" style="width: 11%;">速度</th>
-            <th class="col-location" style="width: 18%;">物理位置</th>
-            <th class="col-owner" style="width: 15%;">运营主体 / ISP</th>
-            <th class="col-iptype" style="width: 6%;">IP 类型</th>
+            <th class="col-speed" style="width: 10%;">速度</th>
+            <th class="col-location" style="width: 16%;">物理位置</th>
+            <th class="col-owner" style="width: 14%;">运营主体 / ISP</th>
+            <th class="col-iptype" style="width: 7%;">IP 类型</th>
             <th class="col-actions" style="width: 13%;">操作</th>
           </tr>
         </thead>
