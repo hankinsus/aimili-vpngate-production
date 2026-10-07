@@ -2192,77 +2192,78 @@ def apply_cached_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
         if cached:
             node["latency_ms"] = cached
 
-def schedule_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
-    global _tcp_fill_running
-    if _tcp_fill_running:
-        return
-    snapshot = [dict(node) for node in nodes if isinstance(node, dict)]
-    if not snapshot:
-        return
-    def _run() -> None:
-        global _tcp_fill_running
-        _tcp_fill_running = True
+_rtt_queue: queue.Queue[tuple[str, int, str]] = queue.Queue(maxsize=48)
+_rtt_queued: set[str] = set()
+_rtt_workers_started = False
+
+
+def _rtt_worker() -> None:
+    while True:
+        host, port, endpoint_id = _rtt_queue.get()
+        key = f"{host}:{port}"
         try:
-            for _ in range(20):
-                if not ui_query_active() and not manual_connection_active:
-                    break
-                time.sleep(0.15)
-            if manual_connection_active or ui_query_active():
-                return
-            apply_server_tcp_rtt(snapshot)
-        finally:
-            _tcp_fill_running = False
-    threading.Thread(target=_run, daemon=True, name="page-tcp-rtt").start()
-
-def apply_server_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
-    """Fill the visible page with TCP port round trips from this server.
-
-    A full tunnel dial includes handshake time and reads high. The port round
-    trip is also a valid latency. UDP and L2TP are left on the tunnel figure.
-    """
-    pending: list[dict[str, Any]] = []
-    for node in nodes:
-        if not isinstance(node, dict) or not _node_accepts_tcp_rtt(node):
-            continue
-        host = str(node.get("ip") or node.get("remote_host") or "").strip()
-        port = parse_int(node.get("remote_port"))
-        if not host or port <= 0:
-            continue
-        cached = cached_tcp_rtt(host, port)
-        if cached:
-            node["latency_ms"] = usable_latency_ms(parse_int(node.get("latency_ms")), tcp_rtt_ms=cached)
-            continue
-        pending.append(node)
-    if not pending:
-        return
-    futures: dict[concurrent.futures.Future[int], dict[str, Any]] = {}
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=12)
-    try:
-        for node in pending[:24]:
-            host = str(node.get("ip") or node.get("remote_host") or "").strip()
-            port = parse_int(node.get("remote_port"))
-            futures[pool.submit(tcp_connect_ms, host, port, 0.6)] = node
-        done, not_done = concurrent.futures.wait(set(futures), timeout=0.7)
-        for future in done:
-            node = futures[future]
-            try:
-                latency_ms = parse_int(future.result())
-            except Exception:
-                latency_ms = 0
-            if not latency_ms:
+            if ui_query_active() or manual_connection_active:
                 continue
-            node["latency_ms"] = usable_latency_ms(parse_int(node.get("latency_ms")), tcp_rtt_ms=latency_ms)
-            remember_tcp_rtt(str(node.get("ip") or node.get("remote_host") or ""), parse_int(node.get("remote_port")), latency_ms)
-            endpoint_id = str(node.get("pool_endpoint_id") or "")
+            try:
+                if proxy_server.proxy_forwarding_busy(1.0):
+                    continue
+            except Exception:
+                pass
+            latency_ms = tcp_connect_ms(host, port, 0.6)
+            if latency_ms <= 0:
+                continue
+            remember_tcp_rtt(host, port, latency_ms)
             if endpoint_id:
                 try:
                     node_pool.note_tcp_rtt(endpoint_id, latency_ms)
                 except Exception:
                     pass
-        for future in not_done:
-            future.cancel()
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        finally:
+            with _TCP_RTT_LOCK:
+                _rtt_queued.discard(key)
+            _rtt_queue.task_done()
+
+
+def _ensure_rtt_workers() -> None:
+    global _rtt_workers_started
+    if _rtt_workers_started:
+        return
+    _rtt_workers_started = True
+    for index in range(3):
+        threading.Thread(target=_rtt_worker, daemon=True, name=f"tcp-rtt-{index}").start()
+
+
+def enqueue_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
+    _ensure_rtt_workers()
+    for node in nodes:
+        if not isinstance(node, dict) or not _node_accepts_tcp_rtt(node):
+            continue
+        host = str(node.get("ip") or node.get("remote_host") or "").strip()
+        port = parse_int(node.get("remote_port"))
+        if not host or port <= 0 or cached_tcp_rtt(host, port):
+            continue
+        key = f"{host}:{port}"
+        with _TCP_RTT_LOCK:
+            if key in _rtt_queued:
+                continue
+            _rtt_queued.add(key)
+        try:
+            _rtt_queue.put_nowait((host, port, str(node.get("pool_endpoint_id") or "")))
+        except queue.Full:
+            with _TCP_RTT_LOCK:
+                _rtt_queued.discard(key)
+
+
+def schedule_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
+    apply_server_tcp_rtt(nodes)
+
+
+def apply_server_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
+    """Cached port RTT only. Live probes stay on a 3-worker queue.
+    """
+    apply_cached_tcp_rtt(nodes)
+    enqueue_tcp_rtt(nodes)
+
 
 def _prefer_openvpn_ip(config_text: str, node: dict[str, Any]) -> str:
     """Keep the volunteer hostname. VPN Gate IPs are often dynamic; the domain is the stable address."""
@@ -6273,6 +6274,17 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
     active_ip = _active_exit_ip()
     home = routing_target_country(ui_cfg)
     proto = _current_route_protocol(ui_cfg)
+    cache_key = f"{home}|{proto}"
+    cached = getattr(_cold_candidates, "cache", None)
+    now_rank = time.time()
+    if isinstance(cached, dict) and cached.get("key") == cache_key and (now_rank - float(cached.get("at") or 0) < 3600 or ui_query_active()):
+        _cold_candidates.stats = dict(cached.get("stats") or {})
+        return dict(cached.get("found") or {})
+    if ui_query_active():
+        if isinstance(cached, dict):
+            _cold_candidates.stats = dict(cached.get("stats") or {})
+            return dict(cached.get("found") or {})
+        return {}
     stats = {
         "same_protocol": 0,
         "other_protocol": 0,
@@ -6375,6 +6387,7 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         found[str(endpoint.get("endpoint_id") or "")] = endpoint
     _queue_unmeasured_speed(unmeasured)
     _cold_candidates.stats = stats
+    _cold_candidates.cache = {"at": time.time(), "key": cache_key, "found": found, "stats": dict(stats)}
     return found
 
 
@@ -6561,7 +6574,7 @@ def cold_standby_pass() -> None:
         _cold_candidates.stats = {}
         _remember_precold({}, "")
         return
-    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
         return
     candidates = _cold_candidates(ui_cfg)
     if candidates is None:
@@ -6631,7 +6644,7 @@ FAVORITE_PROBE_SECONDS = 3600
 
 def favorite_connectivity_pass() -> None:
     """Check one saved favorite per hour. Does not touch the live tunnel while it is busy."""
-    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
         return
     ui_cfg = load_ui_config()
     raw_ids = [str(item).strip() for item in (ui_cfg.get("favorite_node_ids") or []) if str(item or "").strip()]
@@ -14038,7 +14051,7 @@ function forgetStaleCountryCounts() {
   renderCustomFilter("country_filter", true);
 }
 
-async function refreshCountryCatalog(force = false) {
+async function refreshCountryCatalog(force = false, signal = null) {
   const key = currentFilterKey();
   if (!force && countryCatalogData && countryCatalogKey === key) {
     updateCountryFilter();
@@ -14055,7 +14068,7 @@ async function refreshCountryCatalog(force = false) {
 
   countryCatalogInflightKey = key;
   const requestKey = key;
-  countryCatalogPromise = fetchJsonWithTimeout("./api/ui/country_catalog" + (params.toString() ? "?" + params.toString() : ""), {}, 8000)
+  countryCatalogPromise = fetchJsonWithTimeout("./api/ui/country_catalog" + (params.toString() ? "?" + params.toString() : ""), signal ? {signal} : {}, 8000)
     .then(data => {
       if (currentFilterKey() !== requestKey) return countryCatalogData;
       countryCatalogData = data || {countries:{}, total_ip_count:0, server_country:""};
@@ -15023,9 +15036,22 @@ let refreshPollBusy = false;
 let countryPriorityPollBusy = false;
 let manualConnectionUiBusy = false;
 
+let listQueryController = null;
+function beginListQuery() {
+  if (listQueryController) {
+    try { listQueryController.abort(); } catch (_) {}
+  }
+  listQueryController = new AbortController();
+  return listQueryController;
+}
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const external = options && options.signal;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 10000));
+  if (external) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener("abort", () => controller.abort(), {once: true});
+  }
   try {
     const requestOptions = Object.assign({
       credentials: "same-origin",
@@ -15043,7 +15069,14 @@ async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
     if (!response.ok) throw new Error(data && data.error ? data.error : ("HTTP " + response.status));
     return data;
   } catch (err) {
-    if (err && err.name === "AbortError") throw new Error("请求超时，请稍后重试");
+    if (err && err.name === "AbortError") {
+      if (external && external.aborted) {
+        const quiet = new Error("aborted");
+        quiet.name = "AbortError";
+        throw quiet;
+      }
+      throw new Error("请求超时，请稍后重试");
+    }
     throw err;
   } finally {
     clearTimeout(timer);
@@ -15064,7 +15097,7 @@ async function fetchUiStateOnly(timeoutMs = 5000) {
   return fetchJsonWithTimeout("./api/ui/state", {}, timeoutMs);
 }
 
-async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
+async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signal = null) {
   const seq = ++nodeQuerySeq;
   const scope = readListScope();
   const params = new URLSearchParams();
@@ -15076,7 +15109,7 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000) {
   if (scope.ipType) params.set("ip_type", scope.ipType);
   if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
   if (scope.latency) params.set("latency", scope.latency);
-  const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), {}, timeoutMs);
+  const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), signal ? {signal} : {}, timeoutMs);
   if (data && typeof data === "object") data._nodeQuerySeq = seq;
   return data;
 }
@@ -15165,7 +15198,7 @@ function updateNodeLoadProgress(done, total, finished = false) {
     : scopeName + "首页已就绪 · 后台继续加载 " + Math.max(0, total - done) + " 条";
 }
 
-async function loadScopedNodes(country, generation) {
+async function loadScopedNodes(country, generation, signal = null) {
   const myGeneration = generation;
   nodeListLoading = true;
   currentPage = 1;
@@ -15175,7 +15208,7 @@ async function loadScopedNodes(country, generation) {
 
   // First-screen rule: one authoritative Master Pool page only.
   // Keep the previous rows on screen until this page actually arrives.
-  const first = await fetchScopedNodePage(0, pageSize, 12000);
+  const first = await fetchScopedNodePage(0, pageSize, 12000, signal);
   if (myGeneration !== scopeLoadGeneration) return;
   if (!nodePageIsCurrent(first)) {
     nodeListLoading = false;
@@ -15239,7 +15272,7 @@ async function loadServerPage(page) {
   }
 }
 
-async function loadScope(country, {preserveState = true} = {}) {
+async function loadScope(country, {preserveState = true, signal = null} = {}) {
   const generation = ++scopeLoadGeneration;
   const scope = String(country || "").trim();
   activeCountryScope = scope;
@@ -15273,9 +15306,9 @@ async function loadScope(country, {preserveState = true} = {}) {
         return;
       }
     }
-    await loadScopedNodes(scope, generation);
+    await loadScopedNodes(scope, generation, signal);
   } catch (e) {
-    if (generation !== scopeLoadGeneration) return;
+    if (generation !== scopeLoadGeneration || (e && e.name === "AbortError")) return;
     nodeListLoading = false;
     nodeListError = (e && e.message) ? String(e.message) : "筛选失败";
     console.warn("按范围加载节点失败", e);
@@ -16133,7 +16166,7 @@ let filterCountsRequestSeq = 0;
 let filterCountsLoading = true;
 let nodeListLoading = false;
 let nodeListError = "";
-async function refreshFilterCounts() {
+async function refreshFilterCounts(signal = null) {
   const seq = ++filterCountsRequestSeq;
   filterCountsLoading = true;
   updateStatusFilterOptions();
@@ -16146,7 +16179,7 @@ async function refreshFilterCounts() {
   if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
   if (scope.latency) params.set("latency", scope.latency);
   try {
-    const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), {}, 8000);
+    const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), signal ? {signal} : {}, 8000);
     if (seq !== filterCountsRequestSeq) return;
     if (data?.status_counts) state.status_counts = data.status_counts;
     state.connected_count = Number(data?.connected_count || 0);
@@ -16162,6 +16195,23 @@ async function refreshFilterCounts() {
   }
 }
 
+let filterReloadTimer = null;
+function scheduleScopedReload(country, prioritize = false) {
+  nodeListLoading = true;
+  nodeListError = "";
+  setRowsPending(true);
+  render();
+  if (filterReloadTimer) clearTimeout(filterReloadTimer);
+  filterReloadTimer = setTimeout(() => {
+    filterReloadTimer = null;
+    const controller = beginListQuery();
+    const signal = controller.signal;
+    const loadPromise = loadScope(country, {preserveState: true, signal});
+    refreshCountryCatalog(false, signal).catch(err => { if (err && err.name === "AbortError") return; });
+    refreshFilterCounts(signal).catch(err => { if (err && err.name === "AbortError") return; });
+    loadPromise.then(() => { if (prioritize && country) prioritizeCountry(country); }).catch(err => { if (err && err.name === "AbortError") return; });
+  }, 120);
+}
 async function applyNodeFilterChange(event) {
   const fromStatus = event?.target?.id === "status_filter";
   if (!fromStatus) {
@@ -16175,15 +16225,7 @@ async function applyNodeFilterChange(event) {
   currentPage = 1;
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
-  nodes = [];
-  totalNodeCount = 0;
-  nodeListError = "";
-  nodeListLoading = true;
-  render();
-  const loadPromise = loadScope(country, {preserveState:true});
-  refreshCountryCatalog(false).catch(() => {});
-  setTimeout(() => refreshFilterCounts().catch(() => {}), 80);
-  await loadPromise;
+  scheduleScopedReload(country, false);
 }
 
 $("country_filter").onchange=async()=>{
@@ -16197,17 +16239,7 @@ $("country_filter").onchange=async()=>{
   activeCountryScope = country;
   forgetStaleCountryCounts();
   currentPage = 1;
-  nodes = [];
-  totalNodeCount = 0;
-  nodeListError = "";
-  nodeListLoading = true;
-  render();
-  // Start the node page immediately. The country catalog must not block the list.
-  const loadPromise = loadScope(country, {preserveState:true});
-  refreshCountryCatalog(false).catch(() => {});
-  setTimeout(() => refreshFilterCounts().catch(() => {}), 180);
-  await loadPromise;
-  if (country) prioritizeCountry(country);
+  scheduleScopedReload(country, true);
 };
 $("protocol_filter").onchange=applyNodeFilterChange;
 $("ip_type_filter").onchange=applyNodeFilterChange;
@@ -21838,6 +21870,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     offset = max(0, int(offset or 0))
     limit = max(1, min(200, int(limit or 100)))
     speed_min_bps = max(0, int(speed_min_bps or 0))
+    started = time.perf_counter()
 
     # Do not start/build the heavyweight global UI snapshot here. The Master
     # Pool is the normal source for this endpoint, so a country/filter request
@@ -21917,6 +21950,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
             for endpoint in scoped_endpoints
         ]
         scoped_nodes = _sanitize_ui_nodes([node for node in scoped_nodes if node])
+        sqlite_ms = int((time.perf_counter() - started) * 1000)
         apply_server_tcp_rtt(scoped_nodes)
         # Keep the browser-facing ranking deterministic inside the returned
         # page. The SQL query already applies the same primary status/latency
@@ -21927,6 +21961,9 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
         # footer must show — never a larger raw COUNT.
         if offset == 0 and len(scoped_endpoints) < limit:
             endpoint_total = len(ordered)
+        total_ms = int((time.perf_counter() - started) * 1000)
+        if total_ms > 200:
+            log_to_json("INFO", "UI", f"ui_nodes_ms={total_ms} sqlite_ms={sqlite_ms} serialize_ms={max(0, total_ms - sqlite_ms)} country={country or '-'} protocol={protocol or '-'}")
         return ordered, endpoint_total, building
     except Exception as exc:
         log_to_json("WARNING", "Main", f"按范围读取 Master Pool UI 页面失败，回退 UI 快照: {exc}")
@@ -21946,6 +21983,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
 
 def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0, latency=""):
     """Return status counts for the currently selected filter scope."""
+    started = time.perf_counter()
     country = normalized_country_name(country) if country else ""
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
@@ -21972,6 +22010,9 @@ def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0, 
                 connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type, speed_min_bps, latency) else 0
     except Exception:
         connected_count = 0
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if elapsed_ms > 200:
+        log_to_json("INFO", "UI", f"filter_counts_ms={elapsed_ms} country={country or '-'} protocol={protocol or '-'}")
     return {
         "country": country,
         "protocol": protocol,
@@ -21983,6 +22024,7 @@ def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0, 
 
 def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0, latency=""):
     """Return global country/IP totals without transferring global node rows."""
+    started = time.perf_counter()
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
@@ -22028,6 +22070,9 @@ def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0,
         or read_json(STATE_FILE, {}).get("initial_bootstrap_country")
         or ""
     ).strip()
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if elapsed_ms > 200:
+        log_to_json("INFO", "UI", f"country_catalog_ms={elapsed_ms} protocol={protocol or '-'} ip_type={ip_type or '-'}")
     return {
         "total_ip_count": int(catalog.get("total_ip_count") or 0),
         "country_ip_count": int(catalog.get("country_ip_count") or sum(int(v.get("ip_count") or 0) for v in countries.values())),
