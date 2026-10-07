@@ -1390,7 +1390,8 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         try:
             upstream = create_connection((host, port), timeout=20)
         except Exception as e:
-            print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+            if str(host or "").lower() != "api6.ipify.org":
+                print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
             try:
                 client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             except OSError:

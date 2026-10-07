@@ -202,10 +202,10 @@ github_update_last_result: dict[str, Any] = {}
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 
 def background_paused() -> bool:
-    """Stop catalog ingest, availability sweeps, and keepalive churn.
+    """Stop catalog ingest and availability sweeps only.
 
-    The 2-vCPU / 1GB VM cannot probe and forward at the same time. A file
-    pause lets the 8500 path be measured without a code rollback.
+    Production health is separate: direct egress, the live tunnel, and the
+    8500 client path keep running while the library is paused.
     """
     if DISABLE_BACKGROUND_LOOPS:
         return True
@@ -12789,6 +12789,26 @@ function getLatencyClass(ms) {
   return 'latency-poor';
 }
 
+function triState(value) {
+  if (value === true || value === 1 || value === 'true') return true;
+  if (value === false || value === 0 || value === 'false') return false;
+  return null;
+}
+
+function egressHealthBadge(state) {
+  if (state.connection_status === 'connecting') return ['正在连接', 'not_checked'];
+  if (state.egress_mode === 'direct') {
+    const ok = triState(state.direct_egress_ok);
+    if (ok === true) return ['直连可用', 'available'];
+    if (ok === false) return ['直连不可用', 'unavailable'];
+    return ['直连检测中', 'not_checked'];
+  }
+  const proxyOk = triState(state.client_proxy_ok);
+  if (proxyOk === true || state.client_status === 'usable') return ['客户端可用', 'available'];
+  if (proxyOk === false || state.client_status === 'degraded') return ['客户端不可用', 'unavailable'];
+  return ['已连接 · 等待验证', 'not_checked'];
+}
+
 function displayNodePort(node) {
   const actual = Number(node?.remote_port || 0);
   if (actual > 0) return String(actual);
@@ -13814,16 +13834,9 @@ function render(){
     const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
     const activeDisplayLocation = formatNodeLocation({country: ep.country || "", location: ep.location || ""});
     const endpointAddress = addressPair(ep.hostname, ep.current_ip, ep.port);
-    const clientBadge = state.connection_status === "connecting"
-      ? "正在连接"
-      : (state.egress_mode === "direct"
-        ? (state.proxy_ok ? "直连可用" : "直连不可用")
-        : (state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证")));
-    const clientBadgeClass = state.connection_status === "connecting"
-      ? "not_checked"
-      : (state.egress_mode === "direct"
-        ? (state.proxy_ok ? "available" : "unavailable")
-        : (state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked")));
+    const clientBadgePair = egressHealthBadge(state);
+    const clientBadge = clientBadgePair[0];
+    const clientBadgeClass = clientBadgePair[1];
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
@@ -13859,16 +13872,9 @@ function render(){
     const latencyText = activeLatencyValue ? `<span class="latency-val ${latencyClass}">${activeLatencyValue} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
     const displayLocationFlag = countryFlag(activeNode.country || displayLocation, displayLocation, "eager");
-    const clientBadge = state.connection_status === "connecting"
-      ? "正在连接"
-      : (state.egress_mode === "direct"
-        ? (state.proxy_ok ? "直连可用" : "直连不可用")
-        : (state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证")));
-    const clientBadgeClass = state.connection_status === "connecting"
-      ? "not_checked"
-      : (state.egress_mode === "direct"
-        ? (state.proxy_ok ? "available" : "unavailable")
-        : (state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked")));
+    const clientBadgePair = egressHealthBadge(state);
+    const clientBadge = clientBadgePair[0];
+    const clientBadgeClass = clientBadgePair[1];
     const activeAddress = addressPair(activeNode.host_name || activeNode.remote_host, activeNode.ip, activeNode.remote_port);
     activeCardContainer.innerHTML = `
       <div class="active-card">
@@ -13989,26 +13995,42 @@ function render(){
     pBadge.style.background = "";
     pBadge.style.color = "";
     pBadge.style.borderColor = "";
-    if (state.proxy_ok !== undefined) {
-      if (state.proxy_ok) {
+    if (state.egress_mode === "direct") {
+      const directOk = triState(state.direct_egress_ok);
+      if (directOk === true) {
         pBadge.className = "badge available";
-        pBadge.textContent = "可用";
+        pBadge.textContent = "直连可用";
+        pIpVal.textContent = state.proxy_ip || state.server_public_ip || "-";
+        const latencyClass = getLatencyClass(state.proxy_latency_ms);
+        pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms || 0} ms</span>`;
+      } else if (directOk === false) {
+        pBadge.className = "badge unavailable";
+        pBadge.textContent = "直连不可用";
+        pIpVal.textContent = "-";
+        pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;">${esc(state.proxy_error || "服务器直连失败")}</span>`;
+      } else {
+        pBadge.className = "badge not_checked";
+        pBadge.textContent = "直连检测中";
+        pIpVal.textContent = "-";
+        pLatVal.textContent = "";
+      }
+    } else {
+      const proxyOk = triState(state.client_proxy_ok) !== null ? triState(state.client_proxy_ok) : triState(state.proxy_ok);
+      if (proxyOk === true) {
+        pBadge.className = "badge available";
+        pBadge.textContent = "客户端可用";
         pIpVal.textContent = state.proxy_ip || "-";
         const latencyClass = getLatencyClass(state.proxy_latency_ms);
         pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
-      } else {
+      } else if (proxyOk === false) {
         pBadge.className = "badge unavailable";
-        pBadge.textContent = "不可用";
+        pBadge.textContent = "客户端不可用";
         pIpVal.textContent = "-";
         pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px; max-width: 450px; display: inline-block; white-space: normal; line-height: 1.4; text-align: left;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
-      }
-    } else {
-      pBadge.className = "badge not_checked";
-      pBadge.textContent = "未检测";
-      pIpVal.textContent = "-";
-      if (state.last_check_message) {
-        pLatVal.innerHTML = `<span style="color: var(--text-secondary); font-size: 12px;">${esc(state.last_check_message)}</span>`;
       } else {
+        pBadge.className = "badge not_checked";
+        pBadge.textContent = "等待验证";
+        pIpVal.textContent = "-";
         pLatVal.innerHTML = "";
       }
     }
@@ -17702,7 +17724,10 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
             set_state(
                 egress_mode=mode,
                 egress_switching=False,
-                proxy_ok=True,
+                direct_egress_ok=(mode == "direct"),
+                client_proxy_ok=(mode == "proxy"),
+                proxy_ok=(mode == "proxy"),
+                active_tunnel_ok=active_tunnel_running(),
                 proxy_ip=exit_ip,
                 proxy_latency_ms=parse_int(health.get("latency_ms")),
                 proxy_error="",
@@ -17901,45 +17926,58 @@ def fast_tunnel_liveness_loop() -> None:
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting
     proxy_health_failures = 0
-    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
     while True:
-        if background_paused():
-            time.sleep(5)
-            continue
         last_checker_heartbeat = time.time()
         try:
             if is_connecting:
-                time.sleep(5)
+                time.sleep(2)
                 continue
 
-            # Never infer ownership from an existing host tun/ppp interface.
-            # If this manager has no intended active endpoint, it is idle.
-            # If an endpoint ID still exists but the process/interface vanished,
-            # that is a real tunnel failure and must enter failover handling.
+            mode = proxy_server.get_egress_mode()
+            tunnel_up = active_tunnel_running()
             check_target = str(active_pool_endpoint_id or active_openvpn_node_id or "")
-            if not active_tunnel_running():
+            if mode == "direct":
+                res = check_proxy_health()
+                set_state(
+                    direct_egress_ok=bool(res.get("ok")),
+                    active_tunnel_ok=tunnel_up,
+                    proxy_ip=str(res.get("ip") or "") if res.get("ok") else "-",
+                    proxy_latency_ms=parse_int(res.get("latency_ms")),
+                    proxy_error="" if res.get("ok") else str(res.get("error") or "服务器直连失败"),
+                )
+                if res.get("ok"):
+                    proxy_health_failures = 0
+                    log_to_json("INFO", "Proxy", f"直连可用，延迟 {res.get('latency_ms')} ms")
+                else:
+                    proxy_health_failures += 1
+                    log_to_json("WARNING", "Proxy", f"直连出口失败，不更换 VPN 节点: {res.get('error')}")
+                time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                continue
+
+            if not tunnel_up:
                 if not check_target:
                     set_state(
+                        client_proxy_ok=False,
                         proxy_ok=False,
+                        active_tunnel_ok=False,
                         proxy_ip="-",
                         proxy_latency_ms=0,
                         proxy_error="当前实例没有活动 VPN 隧道",
                     )
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
-                res = {
-                    "ok": False,
-                    "error": "活动 VPN 隧道进程或网卡已消失",
-                }
+                res = {"ok": False, "error": "活动 VPN 隧道进程或网卡已消失"}
             else:
                 res = check_proxy_health()
             if res["ok"]:
                 proxy_health_failures = 0
                 set_state(
+                    client_proxy_ok=True,
                     proxy_ok=True,
+                    active_tunnel_ok=True,
                     proxy_ip=res["ip"],
                     proxy_latency_ms=res["latency_ms"],
-                    proxy_error=""
+                    proxy_error="",
                 )
                 maybe_recover_preferred_route()
                 if proxy_server.get_egress_mode() != "direct":
@@ -17964,10 +18002,12 @@ def background_proxy_checker() -> None:
                 confirm = check_proxy_health()
                 if confirm.get("ok"):
                     set_state(
+                        client_proxy_ok=True,
                         proxy_ok=True,
+                        active_tunnel_ok=True,
                         proxy_ip=confirm["ip"],
                         proxy_latency_ms=confirm["latency_ms"],
-                        proxy_error=""
+                        proxy_error="",
                     )
                     maybe_recover_preferred_route()
                     log_to_json("WARNING", "Proxy", f"首次健康检查失败但复检恢复，保持当前节点: {first_error}")
@@ -17976,7 +18016,8 @@ def background_proxy_checker() -> None:
                 error_msg = confirm.get("error") or first_error
                 if proxy_server.get_egress_mode() == "direct":
                     set_state(
-                        proxy_ok=False,
+                        direct_egress_ok=False,
+                        active_tunnel_ok=tunnel_up,
                         proxy_ip="-",
                         proxy_latency_ms=0,
                         proxy_error="服务器直连失败：" + str(error_msg),
@@ -17988,7 +18029,9 @@ def background_proxy_checker() -> None:
                     print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理连续检测失败！原因: {error_msg}", flush=True)
                     log_to_json("WARNING", "Proxy", f"代理连续检测失败: {error_msg}")
                 set_state(
+                    client_proxy_ok=False,
                     proxy_ok=False,
+                    active_tunnel_ok=tunnel_up,
                     proxy_ip="-",
                     proxy_latency_ms=0,
                     proxy_error=error_msg
@@ -21104,13 +21147,21 @@ def _get_fast_nodes_state():
         active = active_tunnel_running()
     except Exception:
         active = False
+    state["active_tunnel_ok"] = bool(active)
+    state["egress_mode"] = proxy_server.get_egress_mode()
     if active:
         state["connection_status"] = "connected"
         state["connection_message"] = "当前 VPN 隧道正常运行"
-        if state.get("proxy_ok") is True:
-            state["client_status"] = "usable"
-        elif state.get("proxy_ok") is False:
-            state["client_status"] = "degraded"
+        if state.get("egress_mode") == "proxy":
+            flag = state.get("client_proxy_ok")
+            if flag is None:
+                flag = state.get("proxy_ok")
+            if flag is True:
+                state["client_status"] = "usable"
+            elif flag is False:
+                state["client_status"] = "degraded"
+            else:
+                state["client_status"] = "validating"
         else:
             state["client_status"] = "validating"
     elif manual_connection_active or failover_lock.locked() or is_connecting:
@@ -21122,7 +21173,6 @@ def _get_fast_nodes_state():
         state["connection_message"] = "当前没有活动 VPN 隧道"
         state["client_status"] = "not_connected"
     state["client_usable"] = state["client_status"] == "usable"
-    state["egress_mode"] = proxy_server.get_egress_mode()
 
     state["resource_engine_running"] = bool(resource_engine_running)
     state["resource_engine_message"] = resource_engine_message
