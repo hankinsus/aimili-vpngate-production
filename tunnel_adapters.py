@@ -917,7 +917,6 @@ for _ in $(seq 1 60); do
     # can recurse into ppp0 and collapse the tunnel.
     ip route replace "{resolved_host}/32" via "{host_ip}" dev "{ns_veth}" onlink
     ip route replace default dev "$IFACE"
-    ip link set "$IFACE" mtu 1200
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
       iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
@@ -925,10 +924,12 @@ for _ in $(seq 1 60); do
       iptables -A FORWARD -i "{ns_veth}" -o "$IFACE" -j ACCEPT
     iptables -C FORWARD -i "$IFACE" -o "{ns_veth}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
       iptables -A FORWARD -i "$IFACE" -o "{ns_veth}" -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -t mangle -C OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
-    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
-      iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
+    iptables -t mangle -D OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || true
+    iptables -t mangle -D FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || true
+    iptables -t mangle -C OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+      iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     echo "$IFACE" > "{work_dir / 'ppp-iface'}"
     touch "{work_dir / 'ready'}"
     wait "$XL2TP_PID"

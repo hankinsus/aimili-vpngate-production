@@ -2596,11 +2596,12 @@ def _clear_all_node_active_flags() -> None:
         if changed:
             write_json(NODES_FILE, nodes)
 
-def stop_active_openvpn() -> None:
+def stop_active_openvpn(keep_policy: bool = False) -> None:
     global active_openvpn_process, active_openvpn_node_id
     remember_connection_ended(openvpn_node_id=str(active_openvpn_node_id or ""))
     with lock:
-        cleanup_policy_routing()
+        if not keep_policy:
+            cleanup_policy_routing()
         config_to_delete = None
         if active_openvpn_node_id:
             nodes = read_nodes()
@@ -2652,12 +2653,9 @@ def _tunnel_carrier_alive() -> bool:
     process = tunnel.process
     return process is not None and process.poll() is None
 
-def stop_active_external_tunnel() -> None:
-    global active_external_tunnel, active_pool_endpoint_id
-    remember_connection_ended(endpoint_id=str(active_pool_endpoint_id or ""))
-    tunnel = active_external_tunnel
+def _disconnect_external_tunnel(tunnel: tunnel_adapters.TunnelResult | None) -> None:
+    """Stop one tunnel process. Does not clear the published 8500 interface."""
     if tunnel is None:
-        active_pool_endpoint_id = ""
         return
     try:
         if tunnel.protocol == "softether":
@@ -2678,6 +2676,16 @@ def stop_active_external_tunnel() -> None:
             l2tp_adapter.disconnect(tunnel.namespace or "aimili-l2tp-prod")
     except Exception as exc:
         log_to_json("WARNING", "VPN", f"停止 {tunnel.protocol} 隧道失败: {exc}")
+
+
+def stop_active_external_tunnel() -> None:
+    global active_external_tunnel, active_pool_endpoint_id
+    remember_connection_ended(endpoint_id=str(active_pool_endpoint_id or ""))
+    tunnel = active_external_tunnel
+    if tunnel is None:
+        active_pool_endpoint_id = ""
+        return
+    _disconnect_external_tunnel(tunnel)
     cleanup_policy_routing()
     proxy_server.clear_active_interface()
     active_external_tunnel = None
@@ -3591,11 +3599,9 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 local_forward_note = "节点可用，本机转发未通过：" + str(forwarded.get("error") or "root→host_veth 失败")
                 node_pool.note_local_forward(endpoint_id, False, local_forward_note)
 
-        # Candidate is independently verified. Only now release the old tunnel.
-        # Never tear down the live SSTP/L2TP interface if the candidate did not
-        # get its own device. Reusing ppp0 and then stopping the old process
-        # drops the only tunnel.
         old_tunnel = active_external_tunnel
+        old_openvpn = active_openvpn_running()
+        previous_iface = proxy_server.get_active_interface()
         if (
             old_tunnel is not None
             and old_tunnel.interface
@@ -3607,30 +3613,41 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             set_state(manual_switch_message="隧道已验证，正在确认 8500 出口…", last_check_message="新隧道已通过出口检测，正在确认客户端转发。")
         if not manual and (manual_connection_active or time.time() < manual_connection_quiet_until):
             raise RuntimeError("人工切换优先，取消这次自动接管")
-        if active_external_tunnel is not None:
-            stop_active_external_tunnel()
-        if active_openvpn_running():
-            stop_active_openvpn()
+
+        # Publish the new NIC before the old tunnel is removed, then let 8500
+        # drop sockets that are still bound to the previous device.
+        proxy_server.set_active_interface(result.interface)
+        setup_policy_routing(result.interface, gateway=result.gateway)
+        if not _wait_iface_applied(str(result.interface or ""), timeout=1.0):
+            log_to_json("WARNING", "VPN", f"8500 未在 1 秒内确认新网卡 {result.interface}")
+
+        in_direct = proxy_server.get_egress_mode() == "direct"
+        health = (
+            {"ok": True, "ip": str(direct_health.get("ip") or ""), "latency_ms": direct_health.get("latency_ms") or 0}
+            if in_direct
+            else check_proxy_health(fast=True)
+        )
+        if not health.get("ok"):
+            if previous_iface:
+                proxy_server.set_active_interface(previous_iface)
+            if old_tunnel is not None and old_tunnel.interface:
+                setup_policy_routing(old_tunnel.interface, gateway=str(getattr(old_tunnel, "gateway", "") or ""))
+            elif previous_iface:
+                setup_policy_routing(previous_iface)
+            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "8500 代理出口检测失败"))
+            raise RuntimeError(str(health.get("error") or "8500 代理出口检测失败"))
+
+        if old_tunnel is not None:
+            _disconnect_external_tunnel(old_tunnel)
+        if old_openvpn:
+            stop_active_openvpn(keep_policy=True)
 
         active_external_tunnel = result
         active_pool_endpoint_id = endpoint_id
         active_openvpn_node_id = ""
-        proxy_server.set_active_interface(result.interface)
-        setup_policy_routing(result.interface, gateway=result.gateway)
         promoted = True
-
         connection_generation += 1
         active_connection_generation = connection_generation
-
-        health = (
-            {"ok": True, "ip": str(direct_health.get("ip") or ""), "latency_ms": direct_health.get("latency_ms") or 0}
-            if proxy_server.get_egress_mode() == "direct"
-            else check_proxy_health(fast=True)
-        )
-        if not health.get("ok"):
-            node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "8500 代理出口检测失败"))
-            stop_active_external_tunnel()
-            raise RuntimeError(str(health.get("error") or "8500 代理出口检测失败"))
 
         latency = parse_int(health.get("latency_ms")) or parse_int(direct_health.get("latency_ms"))
         node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
@@ -3666,8 +3683,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             manual_switch_message=("切换完成，正在确认客户端状态…" if manual else ""),
             active_tunnel_interface=result.interface,
             tunnel_forward_ok=not bool(local_forward_note),
-            proxy_ok=True,
-            proxy_ip=health.get("ip", ""),
+            proxy_ok=not in_direct,
+            proxy_ip="" if in_direct else health.get("ip", ""),
             proxy_latency_ms=latency,
             proxy_error=local_forward_note,
             is_connecting=False,
@@ -7653,14 +7670,23 @@ def _library_probe_openvpn(endpoint: dict[str, Any]) -> dict[str, Any]:
         temp_path.write_text(config_text, encoding="utf-8")
         idx = get_free_test_index()
         latency_box: list[int] = []
-        ok, message, _process = run_openvpn_until_ready(
-            str(temp_path), False, True, timeout=12, dev=f"tun{idx}",
+        ok, message, process = run_openvpn_until_ready(
+            str(temp_path), True, True, timeout=12, dev=f"tun{idx}",
             latency_out=latency_box, quiet=True,
         )
-        if "让路" in str(message or ""):
-            return {"deferred": True, "message": message}
-        latency = int(latency_box[0]) if ok and latency_box else 0
-        return {"ok": bool(ok), "latency_ms": latency, "message": message}
+        try:
+            if "让路" in str(message or ""):
+                return {"deferred": True, "message": message}
+            if not ok:
+                return {"ok": False, "latency_ms": 0, "message": message}
+            health = check_interface_egress(f"tun{idx}")
+            if not health.get("ok"):
+                return {"ok": False, "latency_ms": 0, "message": "OpenVPN 已握手，但隧道出不了网"}
+            latency = int(health.get("latency_ms") or 0)
+            return {"ok": True, "latency_ms": latency, "message": message}
+        finally:
+            if process is not None:
+                stop_process(process)
     except Exception as exc:
         return {"ok": False, "latency_ms": 0, "message": str(exc)}
     finally:
@@ -7684,14 +7710,7 @@ def _library_probe_one(endpoint_id: str) -> str:
     if not endpoint:
         return "unavailable"
     if _library_is_live_production(endpoint):
-        latency = int(float(endpoint.get("latency_ewma") or 0))
-        try:
-            node_pool.record_endpoint_probe(
-                endpoint_id, True, latency, "当前在线节点，检测未重复拨号", speed_bps=None,
-            )
-        except Exception:
-            pass
-        return "available"
+        return "live"
     protocol = str(endpoint.get("protocol") or "").lower()
     host = str(endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
     port = int(endpoint.get("port") or 0)
@@ -7755,6 +7774,13 @@ def _library_check_worker(generation: int) -> None:
             outcome = _library_probe_one(endpoint_id)
             if outcome == "stop":
                 break
+            if outcome == "live":
+                with library_check_lock:
+                    if library_check_generation != generation:
+                        return
+                    library_check_tested += 1
+                index += 1
+                continue
             if outcome.startswith("deferred"):
                 _library_set_wait(outcome.split(":", 1)[1] if ":" in outcome else "检测让路")
                 time.sleep(0.6)
@@ -17402,10 +17428,6 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
         return
     try:
         subprocess.run(
-            ["ip", "netns", "exec", namespace, "ip", "link", "set", inner, "mtu", "1200"],
-            capture_output=True, text=True, timeout=3,
-        )
-        subprocess.run(
             ["ip", "netns", "exec", namespace, "sysctl", "-w", "net.ipv4.ip_forward=1"],
             capture_output=True, text=True, timeout=3,
         )
@@ -17414,8 +17436,8 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
     rules = [
         ["filter", "FORWARD", "-i", ns_dev, "-o", inner, "-j", "ACCEPT"],
         ["filter", "FORWARD", "-i", inner, "-o", ns_dev, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
-        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
     ]
     for table, *rule in rules:
         try:
@@ -17627,6 +17649,20 @@ def _wait_egress_applied(mode: str, timeout: float = 1.5) -> bool:
     while time.time() < deadline:
         try:
             if path.read_text(encoding="utf-8").strip().lower() == mode:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def _wait_iface_applied(iface: str, timeout: float = 1.0) -> bool:
+    deadline = time.time() + timeout
+    path = DATA_DIR / "active_iface.applied"
+    wanted = str(iface or "").strip()
+    while time.time() < deadline:
+        try:
+            if path.read_text(encoding="utf-8").strip() == wanted:
                 return True
         except OSError:
             pass
@@ -17906,14 +17942,15 @@ def background_proxy_checker() -> None:
                     proxy_error=""
                 )
                 maybe_recover_preferred_route()
-                try:
-                    live_id = str(active_pool_endpoint_id or "")
-                    if not live_id and active_openvpn_node_id:
-                        live_id = _resolve_openvpn_endpoint_id(str(active_openvpn_node_id))
-                    if live_id:
-                        node_pool.refresh_live_availability(live_id)
-                except Exception:
-                    pass
+                if proxy_server.get_egress_mode() != "direct":
+                    try:
+                        live_id = str(active_pool_endpoint_id or "")
+                        if not live_id and active_openvpn_node_id:
+                            live_id = _resolve_openvpn_endpoint_id(str(active_openvpn_node_id))
+                        if live_id:
+                            node_pool.refresh_live_availability(live_id)
+                    except Exception:
+                        pass
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 first_error = res.get("error", "未知错误")
@@ -17937,6 +17974,16 @@ def background_proxy_checker() -> None:
                     continue
 
                 error_msg = confirm.get("error") or first_error
+                if proxy_server.get_egress_mode() == "direct":
+                    set_state(
+                        proxy_ok=False,
+                        proxy_ip="-",
+                        proxy_latency_ms=0,
+                        proxy_error="服务器直连失败：" + str(error_msg),
+                    )
+                    log_to_json("WARNING", "Proxy", f"直连出口失败，不更换 VPN 节点: {error_msg}")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 if active_openvpn_node_id:
                     print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理连续检测失败！原因: {error_msg}", flush=True)
                     log_to_json("WARNING", "Proxy", f"代理连续检测失败: {error_msg}")
@@ -19588,7 +19635,15 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
                         return
                 proxy_server.set_egress_mode(mode)
-                _wait_egress_applied(mode, timeout=1.2)
+                if not _wait_egress_applied(mode, timeout=1.2):
+                    proxy_server.set_egress_mode(previous)
+                    set_state(
+                        egress_mode=previous,
+                        egress_switching=False,
+                        last_check_message="8500 未确认出口切换，已恢复",
+                    )
+                    self.send_json({"ok": False, "error": "8500 未在时限内应用出口切换"}, HTTPStatus.CONFLICT)
+                    return
                 if mode == "direct":
                     suspend_policy_routing()
                 set_state(

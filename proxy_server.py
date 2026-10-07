@@ -41,30 +41,32 @@ PROXY_SOCKET_BUFFER_BYTES = 262144
 PROXY_UDP_ASSOCIATION_IDLE_SECONDS = 6 * 3600
 PROXY_UDP_MAX_PACKET_BYTES = 65535
 _last_forward_mono = 0.0
-_last_forward_write = 0.0
+_forward_dirty = False
 
 def note_proxy_forwarded(nbytes: int = 0) -> None:
-    """Remember the last client payload so probes can yield while 8500 is in use.
-
-    The relay runs in its own process. The timestamp file is what the manager
-    reads; the in-process clock only covers a relay that shares this process.
-    """
-    global _last_forward_mono, _last_forward_write
+    """Count forwarded bytes in memory. A side thread writes the timestamp."""
+    global _last_forward_mono, _forward_dirty
     if nbytes <= 0:
         return
-    now = time.monotonic()
-    _last_forward_mono = now
-    if now - _last_forward_write < 1.0:
-        return
-    _last_forward_write = now
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path = DATA_DIR / "proxy_forward_at"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(str(time.time()), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        pass
+    _last_forward_mono = time.monotonic()
+    _forward_dirty = True
+
+
+def _forward_heartbeat() -> None:
+    global _forward_dirty
+    while True:
+        time.sleep(1.0)
+        if not _forward_dirty:
+            continue
+        _forward_dirty = False
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path = DATA_DIR / "proxy_forward_at"
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(str(time.time()), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
 
 def proxy_forwarding_busy(grace: float = 3.0) -> bool:
     """True while client bytes have moved across 8500 inside the grace window."""
@@ -129,10 +131,11 @@ def _iptables_mss(action: str, iface: str) -> None:
     )
 
 def tune_forwarding_interface(iface: str) -> None:
-    """PPP from SSTP comes up at MTU 1500 and txqueuelen 3.
+    """Raise the transmit queue and clamp TCP MSS to the path MTU.
 
-    That blackholes full-size TCP and drops bursts. Clamp the device and
-    TCP MSS once, when this interface becomes the 8500 egress.
+    Do not overwrite a negotiated MTU that is already at or below 1400.
+    Only an oversized device, such as an SSTP PPP that came up at 1500, is
+    lowered. OpenVPN, SoftEther and L2TP keep the MTU they negotiated.
     """
     global _last_tuned_iface
     iface = str(iface or "").strip()
@@ -145,9 +148,22 @@ def tune_forwarding_interface(iface: str) -> None:
             pass
     try:
         subprocess.run(
-            ["ip", "link", "set", "dev", iface, "mtu", "1400", "txqueuelen", "1000"],
+            ["ip", "link", "set", "dev", iface, "txqueuelen", "1000"],
             capture_output=True, text=True, timeout=3,
         )
+        shown = subprocess.run(
+            ["ip", "-o", "link", "show", "dev", iface],
+            capture_output=True, text=True, timeout=2,
+        )
+        mtu = 0
+        parts = (shown.stdout or "").split()
+        if "mtu" in parts:
+            mtu = parse_int(parts[parts.index("mtu") + 1])
+        if mtu > 1400:
+            subprocess.run(
+                ["ip", "link", "set", "dev", iface, "mtu", "1400"],
+                capture_output=True, text=True, timeout=3,
+            )
     except Exception:
         pass
     try:
@@ -292,15 +308,26 @@ def _drop_live_clients() -> int:
     return closed
 
 
-def _write_egress_applied(mode: str) -> None:
-    path = DATA_DIR / "egress_mode.applied"
+def _write_applied(name: str, value: str) -> None:
+    path = DATA_DIR / name
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(mode, encoding="utf-8")
+        tmp.write_text(value, encoding="utf-8")
         tmp.replace(path)
     except OSError:
         pass
+
+
+def _write_egress_applied(mode: str) -> None:
+    _write_applied("egress_mode.applied", mode)
+
+
+def _read_active_iface_file() -> str:
+    try:
+        return _normalize_iface(ACTIVE_IFACE_FILE.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
 
 
 def _read_egress_mode_file() -> str:
@@ -312,21 +339,30 @@ def _read_egress_mode_file() -> str:
 
 
 def _watch_egress_mode() -> None:
-    """Cut old sockets when the exit changes so the next request uses the new NIC."""
+    """Cut old sockets when the exit or the active VPN NIC changes."""
     current = _read_egress_mode_file()
+    current_iface = _read_active_iface_file()
     _write_egress_applied(current)
+    _write_applied("active_iface.applied", current_iface)
     while True:
         time.sleep(0.1)
         mode = _read_egress_mode_file()
-        if mode == current:
+        iface = _read_active_iface_file()
+        if mode == current and iface == current_iface:
             continue
+        mode_changed = mode != current
+        iface_changed = iface != current_iface
         current = mode
+        current_iface = iface
         with DNS_CACHE_LOCK:
             DNS_CACHE.clear()
         closed = _drop_live_clients()
-        _write_egress_applied(mode)
-        label = "服务器直连" if mode == "direct" else "代理隧道"
-        print(f"[网关] 出口已切到{label}，断开旧连接 {closed} 条", flush=True)
+        if mode_changed:
+            _write_egress_applied(mode)
+        if iface_changed:
+            _write_applied("active_iface.applied", iface)
+        label = "服务器直连" if mode == "direct" else (iface or "代理隧道")
+        print(f"[网关] 出口已切到 {label}，断开旧连接 {closed} 条", flush=True)
 
 
 def parse_int(value: Any) -> int:
@@ -501,12 +537,24 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
         raise
 
 
+_UDP_DEST_CACHE: dict[tuple[str, int], tuple[float, list[tuple[int, tuple[Any, ...]]]]] = {}
+_UDP_DEST_LOCK = threading.Lock()
+
+
 def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
-    ip = resolve_dns_over_active_tunnel(host, iface=get_forward_interface())
+    host = str(host or "").strip()
+    key = (host, int(port))
+    now = time.monotonic()
+    with _UDP_DEST_LOCK:
+        cached = _UDP_DEST_CACHE.get(key)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+    literal = _host_is_ip(host)
+    ip = literal or resolve_dns_over_active_tunnel(host, iface=get_forward_interface())
     if not ip:
         return []
     try:
-        return [
+        found = [
             (af, sa)
             for af, socktype, proto, canonname, sa in socket.getaddrinfo(
                 ip, port, 0, socket.SOCK_DGRAM
@@ -515,6 +563,34 @@ def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any
         ]
     except OSError:
         return []
+    with _UDP_DEST_LOCK:
+        if len(_UDP_DEST_CACHE) > 512:
+            _UDP_DEST_CACHE.clear()
+        _UDP_DEST_CACHE[key] = (now, found)
+    return found
+
+
+def _socks5_reply_ipv4(client: socket.socket) -> str:
+    """Address the remote client can send UDP to. Never its own 127.0.0.1."""
+    try:
+        peer_ip = str(client.getpeername()[0] or "")
+    except OSError:
+        peer_ip = ""
+    if peer_ip in ("127.0.0.1", "::1"):
+        return "127.0.0.1"
+    try:
+        local_ip = str(client.getsockname()[0] or "")
+    except OSError:
+        local_ip = ""
+    if local_ip.startswith("::ffff:"):
+        local_ip = local_ip[7:]
+    try:
+        socket.inet_aton(local_ip)
+        if local_ip not in ("0.0.0.0", "127.0.0.1"):
+            return local_ip
+    except OSError:
+        pass
+    return "0.0.0.0"
 
 
 def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]) -> None:
@@ -526,11 +602,11 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
     last_activity = time.monotonic()
     try:
         _set_udp_socket_options(relay, bind_device=False)
-        relay.bind(("127.0.0.1", 0))
+        relay.bind(("0.0.0.0", 0))
         bind_port = int(relay.getsockname()[1])
-        client.sendall(
-            b"\x05\x00\x00\x01\x7f\x00\x00\x01" + bind_port.to_bytes(2, "big")
-        )
+        reply_ip = _socks5_reply_ipv4(client)
+        reply_octets = socket.inet_aton(reply_ip if reply_ip != "0.0.0.0" else "0.0.0.0")
+        client.sendall(b"\x05\x00\x00\x01" + reply_octets + bind_port.to_bytes(2, "big"))
         relay.setblocking(False)
         client.setblocking(False)
 
@@ -1060,10 +1136,47 @@ class _SpliceLeg:
 
 def _pipe_cap(read_fd: int) -> int:
     try:
+        fcntl.fcntl(read_fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 1024 * 1024)
+    except (OSError, AttributeError):
+        pass
+    try:
         size = int(fcntl.fcntl(read_fd, fcntl.F_GETPIPE_SZ))
     except (OSError, AttributeError):
         size = 65536
     return size if size > 0 else 65536
+
+
+def _poll_ready(rlist: list[socket.socket], wlist: list[socket.socket], timeout: float) -> tuple[list[socket.socket], list[socket.socket], list[socket.socket]]:
+    poller = select.poll()
+    watched: dict[int, socket.socket] = {}
+    for sock in rlist:
+        poller.register(sock, select.POLLIN)
+        watched[sock.fileno()] = sock
+    for sock in wlist:
+        fd = sock.fileno()
+        if fd in watched:
+            poller.modify(sock, select.POLLIN | select.POLLOUT)
+        else:
+            poller.register(sock, select.POLLOUT)
+            watched[fd] = sock
+    try:
+        events = poller.poll(max(0, int(timeout * 1000)))
+    except OSError:
+        return [], [], list(watched.values())
+    readable: list[socket.socket] = []
+    writable: list[socket.socket] = []
+    errored: list[socket.socket] = []
+    for fd, mask in events:
+        sock = watched.get(fd)
+        if sock is None:
+            continue
+        if mask & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+            errored.append(sock)
+        if mask & select.POLLIN:
+            readable.append(sock)
+        if mask & select.POLLOUT:
+            writable.append(sock)
+    return readable, writable, errored
 
 
 def _splice_once(src_fd: int, dst_fd: int, count: int, flags: int, moved: bool) -> int | None:
@@ -1139,7 +1252,7 @@ def _relay_splice(left: socket.socket, right: socket.socket) -> None:
             if not rlist and not wlist:
                 return
             try:
-                _readable, _writable, errored = select.select(rlist, wlist, list(peers), 60)
+                _readable, _writable, errored = _poll_ready(rlist, wlist, 60)
             except (OSError, ValueError):
                 return
             if errored:
@@ -1186,7 +1299,7 @@ def _relay_copy(left: socket.socket, right: socket.socket) -> None:
         if not rlist and not wlist:
             return
         try:
-            readable, writable, errored = select.select(rlist, wlist, list(peers), 60)
+            readable, writable, errored = _poll_ready(rlist, wlist, 60)
         except (OSError, ValueError):
             return
         if errored:
@@ -1259,7 +1372,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             client.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         if command == 3:  # UDP ASSOCIATE (RFC 1928)
-            socks5_udp_associate(client, ("127.0.0.1", client.getpeername()[1]))
+            socks5_udp_associate(client, client.getpeername())
             return
         if command != 1:
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -1467,6 +1580,7 @@ def start_proxy_server(host: str, port: int) -> None:
     plane = "splice" if hasattr(os, "splice") else "userspace"
     print(f"[网关] 8500 数据面 {plane}。TCP 握手之后走内核管道，业务字节不进用户态。", flush=True)
     threading.Thread(target=_watch_egress_mode, daemon=True, name="egress-watch").start()
+    threading.Thread(target=_forward_heartbeat, daemon=True, name="forward-heartbeat").start()
     while True:
         try:
             client, address = server.accept()
