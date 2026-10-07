@@ -932,6 +932,10 @@ for _ in $(seq 1 60); do
       iptables -t mangle -A OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
     iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
       iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
+    iptables -t mangle -C FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
+      iptables -t mangle -A FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
+    iptables -t mangle -C INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
+      iptables -t mangle -A INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
     echo "$IFACE" > "{work_dir / 'ppp-iface'}"
     touch "{work_dir / 'ready'}"
     wait "$XL2TP_PID"
