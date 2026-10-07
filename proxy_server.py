@@ -291,9 +291,7 @@ def _untrack_client(client: socket.socket) -> None:
         _live_clients.discard(client)
 
 
-def _drop_live_clients() -> int:
-    with _live_clients_lock:
-        clients = list(_live_clients)
+def _close_tracked_clients(clients: list[socket.socket]) -> int:
     closed = 0
     for client in clients:
         try:
@@ -306,6 +304,30 @@ def _drop_live_clients() -> int:
         except OSError:
             pass
     return closed
+
+
+def _drop_live_clients() -> int:
+    with _live_clients_lock:
+        clients = list(_live_clients)
+    return _close_tracked_clients(clients)
+
+
+def _drain_live_clients(pause: float = 0.8) -> int:
+    """Stop old sockets taking new work, then close only that snapshot.
+
+    The caller publishes the new exit first. Connections opened after this
+    snapshot bind to that exit and are not closed here.
+    """
+    with _live_clients_lock:
+        clients = list(_live_clients)
+    for client in clients:
+        try:
+            client.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+    if clients:
+        time.sleep(pause if pause > 0 else 0.8)
+    return _close_tracked_clients(clients)
 
 
 def _write_applied(name: str, value: str) -> None:
@@ -356,13 +378,13 @@ def _watch_egress_mode() -> None:
         current_iface = iface
         with DNS_CACHE_LOCK:
             DNS_CACHE.clear()
-        closed = _drop_live_clients()
+        closed = _drain_live_clients(0.8)
         if mode_changed:
             _write_egress_applied(mode)
         if iface_changed:
             _write_applied("active_iface.applied", iface)
         label = "服务器直连" if mode == "direct" else (iface or "代理隧道")
-        print(f"[网关] 出口已切到 {label}，断开旧连接 {closed} 条", flush=True)
+        print(f"[网关] 出口已切到 {label}，排空后断开旧连接 {closed} 条", flush=True)
 
 
 def parse_int(value: Any) -> int:

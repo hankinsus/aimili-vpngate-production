@@ -17626,7 +17626,7 @@ def preflight_proxy_egress() -> tuple[bool, str]:
     return True, iface
 
 
-def check_proxy_health(fast: bool = False) -> dict[str, Any]:
+def check_proxy_health(fast: bool = False, urls: tuple[str, ...] | None = None) -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
@@ -17741,7 +17741,8 @@ def check_proxy_health(fast: bool = False) -> dict[str, Any]:
         # that could already open web pages.
         result = None
         page_budget = 2 if fast else 4
-        for url in ("https://example.com/", "https://www.google.com/generate_204"):
+        targets = urls or ("https://example.com/", "https://www.google.com/generate_204")
+        for url in targets:
             result = _curl_via_proxy(url, page_budget, False)
             if result:
                 break
@@ -17798,6 +17799,14 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
         else:
             ensure_active_policy_route()
         health = check_proxy_health(fast=True)
+        if health.get("ok") and proxy_server.get_egress_mode() == mode:
+            for url in ("https://ilovestudyip.com/", "https://www.google.com/generate_204"):
+                if proxy_server.get_egress_mode() != mode:
+                    return
+                hit = check_proxy_health(fast=True, urls=(url,))
+                if not hit.get("ok"):
+                    health = {"ok": False, "error": "8500 切换后验收失败：" + url}
+                    break
         if proxy_server.get_egress_mode() != mode:
             return
         if health.get("ok"):
@@ -19769,7 +19778,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
                         return
                 proxy_server.set_egress_mode(mode)
-                if not _wait_egress_applied(mode, timeout=1.2):
+                if not _wait_egress_applied(mode, timeout=2.5):
                     proxy_server.set_egress_mode(previous)
                     set_state(
                         egress_mode=previous,
