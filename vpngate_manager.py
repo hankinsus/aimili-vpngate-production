@@ -2519,6 +2519,18 @@ def _delete_route_rules(table: int) -> None:
             return
 
 
+def suspend_policy_routing() -> None:
+    """Direct mode. Drop every lookup of table 100, including rules with no oif.
+
+    The route stays in the table. Proxy mode puts the live oif rule back
+    before the 8500 process starts using the tunnel again.
+    """
+    try:
+        _delete_route_rules(int(ACTIVE_ROUTE_TABLE))
+    except Exception:
+        pass
+
+
 def cleanup_policy_routing() -> None:
     try:
         _delete_route_rules(int(ACTIVE_ROUTE_TABLE))
@@ -17105,12 +17117,14 @@ def check_proxy_health() -> dict[str, Any]:
     # 2. 直连模式检查服务器网卡；代理模式检查当前 VPN 网卡。
     if proxy_server.get_egress_mode() == "direct":
         active_iface = proxy_server.physical_egress_interface()
+        if not active_iface:
+            active_iface = ""
         missing_iface_error = f"服务器出口网卡 ({active_iface}) 不存在"
     else:
         active_iface = proxy_server.get_active_interface()
         missing_iface_error = f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 当前 VPN 网卡 ({active_iface}) 不存在，请确保隧道已成功建立"
-    iface_path = Path("/sys/class/net") / active_iface if active_iface else Path("/sys/class/net/__missing__")
-    if sys.platform.startswith("linux") and (not active_iface or not iface_path.exists()):
+    iface_path = Path("/sys/class/net") / active_iface if active_iface else None
+    if sys.platform.startswith("linux") and active_iface and not iface_path.exists():
         return {
             "ok": False,
             "error": missing_iface_error
@@ -17129,7 +17143,7 @@ def check_proxy_health() -> dict[str, Any]:
             proxy_hosts = [LOCAL_PROXY_HOST]
 
         for p_host in proxy_hosts:
-            proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
+            proxy_url = f"socks5://{p_host}:{LOCAL_PROXY_PORT}"
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             cmd = [
                 "curl", "-4", "-sS",
@@ -17215,11 +17229,15 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
         _wait_egress_applied(mode)
         if proxy_server.get_egress_mode() != mode:
             return
-        if mode == "proxy":
+        if mode == "direct":
+            suspend_policy_routing()
+        else:
             ensure_active_policy_route()
         health = check_proxy_health()
         if not health.get("ok") and proxy_server.get_egress_mode() == mode:
-            if mode == "proxy":
+            if mode == "direct":
+                suspend_policy_routing()
+            else:
                 ensure_active_policy_route()
             health = check_proxy_health()
         if proxy_server.get_egress_mode() != mode:
@@ -17249,15 +17267,28 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
         else:
             detail = str(health.get("error") or "出口确认失败")
             fallback = previous if previous in ("direct", "proxy") and previous != mode else ""
-            if fallback:
-                proxy_server.set_egress_mode(fallback)
+            if fallback == "proxy":
+                ensure_active_policy_route()
+                proxy_server.set_egress_mode("proxy")
+                _wait_egress_applied("proxy", timeout=1.2)
                 set_state(
-                    egress_mode=fallback,
+                    egress_mode="proxy",
                     egress_switching=False,
                     proxy_error=detail,
-                    last_check_message=f"切换失败，已恢复{'直连' if fallback == 'direct' else '代理'}：{detail}",
+                    last_check_message=f"切换失败，已恢复代理：{detail}",
                 )
-                log_to_json("WARNING", "Proxy", f"出口切换到 {mode} 失败，已恢复 {fallback}：{detail}")
+                log_to_json("WARNING", "Proxy", f"出口切换到 {mode} 失败，已恢复 proxy：{detail}")
+            elif fallback == "direct":
+                proxy_server.set_egress_mode("direct")
+                _wait_egress_applied("direct", timeout=1.2)
+                suspend_policy_routing()
+                set_state(
+                    egress_mode="direct",
+                    egress_switching=False,
+                    proxy_error=detail,
+                    last_check_message=f"切换失败，已恢复直连：{detail}",
+                )
+                log_to_json("WARNING", "Proxy", f"出口切换到 {mode} 失败，已恢复 direct：{detail}")
             else:
                 set_state(
                     egress_mode=mode,
@@ -19116,32 +19147,35 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "当前没有代理隧道，请先连接节点再切回代理模式"}, HTTPStatus.CONFLICT)
                     return
                 previous = proxy_server.get_egress_mode()
+                if previous == mode:
+                    self.send_json({
+                        "ok": True,
+                        "mode": mode,
+                        "switching": False,
+                        "previous": previous,
+                        "state": _get_fast_nodes_state(),
+                    })
+                    return
                 if mode == "proxy":
                     ready, detail = ensure_active_policy_route()
                     if not ready:
                         self.send_json({"ok": False, "error": "代理出口路由未就绪：" + detail}, HTTPStatus.CONFLICT)
                         return
-                label = "已切换 · 服务器直连" if mode == "direct" else "已切换 · 代理隧道"
-                if previous != mode:
-                    proxy_server.set_egress_mode(mode)
-                    _wait_egress_applied(mode, timeout=1.2)
-                quick = read_json(STATE_FILE, {})
-                if not isinstance(quick, dict):
-                    quick = {}
-                exit_ip = ""
+                proxy_server.set_egress_mode(mode)
+                _wait_egress_applied(mode, timeout=1.2)
                 if mode == "direct":
-                    exit_ip = str(quick.get("server_public_ip") or "")
-                else:
-                    endpoint = quick.get("active_pool_endpoint") if isinstance(quick.get("active_pool_endpoint"), dict) else {}
-                    exit_ip = str(endpoint.get("current_ip") or "")
-                quick["egress_mode"] = mode
-                quick["egress_switching"] = False
-                quick["proxy_ok"] = True
-                quick["proxy_error"] = ""
-                if exit_ip:
-                    quick["proxy_ip"] = exit_ip
-                quick["last_check_message"] = label
-                write_json(STATE_FILE, quick)
+                    suspend_policy_routing()
+                set_state(
+                    egress_mode=mode,
+                    egress_switching=True,
+                    proxy_error="",
+                    last_check_message="切换中",
+                )
+                threading.Thread(
+                    target=_refresh_egress_health,
+                    args=(mode, previous),
+                    daemon=True,
+                ).start()
                 global fast_state_cache, fast_state_cache_at
                 with fast_state_cache_lock:
                     fast_state_cache = None
@@ -19149,7 +19183,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({
                     "ok": True,
                     "mode": mode,
-                    "switching": False,
+                    "switching": True,
                     "previous": previous,
                     "state": _get_fast_nodes_state(),
                 })

@@ -28,7 +28,7 @@ proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 # Keep DNS results for a short time so each HTTPS connection does not pay for
 # another DNS round trip over the active VPN interface.
 DNS_CACHE_TTL_SECONDS = 60.0
-DNS_NEGATIVE_TTL_SECONDS = 15.0
+DNS_NEGATIVE_TTL_SECONDS = 2.0
 DNS_POSITIVE_MIN_SECONDS = 30.0
 DNS_POSITIVE_MAX_SECONDS = 300.0
 DNS_STAGE_TIMEOUT_SECONDS = 1.0
@@ -249,7 +249,7 @@ def physical_egress_interface() -> str:
     except Exception:
         iface = ""
     if not iface:
-        iface = _physical_iface_cache or "ens4"
+        return _physical_iface_cache
     _physical_iface_cache = iface
     _physical_iface_at = now
     return iface
