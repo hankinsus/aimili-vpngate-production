@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import errno
+import fcntl
 import base64
 import ipaddress
 import os
@@ -29,7 +31,6 @@ DNS_CACHE_TTL_SECONDS = 60.0
 DNS_NEGATIVE_TTL_SECONDS = 15.0
 DNS_POSITIVE_MIN_SECONDS = 30.0
 DNS_POSITIVE_MAX_SECONDS = 300.0
-# One stage. Tunnel UDP is raced inside this budget; system DNS is a second stage only if that fails.
 DNS_STAGE_TIMEOUT_SECONDS = 1.0
 DNS_TUNNEL_RESOLVERS = ("1.1.1.1", "8.8.8.8")
 DNS_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
@@ -91,13 +92,7 @@ def _normalize_iface(iface: str) -> str:
     return iface
 
 def get_active_interface() -> str:
-    """Return the 8500 egress NIC, or "" for direct (host default route).
-
-    Missing, empty, or an explicit direct sentinel must not fall back to tun0.
-    SSL-VPN has no tun0; binding DNS and TCP there blackholes every name.
-    The file mtime is the cross-process switch signal, so a mode change is
-    visible on the next lookup instead of sticking for the cache window.
-    """
+    """Tunnel NIC, or "" when direct / unset. Never invent tun0."""
     global _iface_cache_value, _iface_cache_at, _iface_cache_token
     env_iface = str(os.environ.get("ACTIVE_TUNNEL_IFACE") or "").strip()
     if env_iface:
@@ -181,11 +176,7 @@ def set_active_interface(iface: str) -> None:
     tune_forwarding_interface(iface)
 
 def clear_active_interface() -> None:
-    """Switch 8500 to direct. Write an empty file so the proxy process sees it.
-
-    Unlink used to look like a read error and the proxy kept the previous NIC,
-    or worse, invented tun0.
-    """
+    """Direct mode. An empty file is visible to the proxy process; unlink looked like tun0."""
     global _iface_cache_value, _iface_cache_at, _iface_cache_token
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -200,6 +191,143 @@ def clear_active_interface() -> None:
     _iface_cache_value = ""
     _iface_cache_token = None
     _iface_cache_at = 0.0
+
+_egress_mode_cache = ""
+_egress_mode_at = 0.0
+_physical_iface_cache = ""
+_physical_iface_at = 0.0
+
+def get_egress_mode() -> str:
+    global _egress_mode_cache, _egress_mode_at
+    now = time.monotonic()
+    if _egress_mode_cache and now - _egress_mode_at < 0.05:
+        return _egress_mode_cache
+    mode = "proxy"
+    try:
+        raw = (DATA_DIR / "egress_mode.txt").read_text(encoding="utf-8").strip().lower()
+        if raw == "direct":
+            mode = "direct"
+    except OSError:
+        pass
+    _egress_mode_cache = mode
+    _egress_mode_at = now
+    return mode
+
+def set_egress_mode(mode: str) -> str:
+    global _egress_mode_cache, _egress_mode_at
+    mode = "direct" if str(mode or "").strip().lower() == "direct" else "proxy"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / "egress_mode.txt"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(mode, encoding="utf-8")
+    tmp.replace(path)
+    _egress_mode_cache = mode
+    _egress_mode_at = time.monotonic()
+    return mode
+
+def physical_egress_interface() -> str:
+    """Server NIC that owns the default route. Never a tunnel device."""
+    global _physical_iface_cache, _physical_iface_at
+    now = time.monotonic()
+    if _physical_iface_cache and now - _physical_iface_at < 5:
+        return _physical_iface_cache
+    iface = ""
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "route", "show", "default"],
+            capture_output=True, text=True, timeout=2,
+        )
+        for line in (res.stdout or "").splitlines():
+            parts = line.split()
+            if "dev" not in parts:
+                continue
+            dev = parts[parts.index("dev") + 1]
+            if dev.startswith(("tun", "tap", "vpn", "ppp", "wg", "lo")):
+                continue
+            iface = dev
+            break
+    except Exception:
+        iface = ""
+    if not iface:
+        iface = _physical_iface_cache or "ens4"
+    _physical_iface_cache = iface
+    _physical_iface_at = now
+    return iface
+
+def get_forward_interface() -> str:
+    """Interface the local proxy binds to. Direct mode uses the server NIC."""
+    if get_egress_mode() == "direct":
+        return physical_egress_interface()
+    return get_active_interface()
+
+
+_live_clients: set[socket.socket] = set()
+_live_clients_lock = threading.Lock()
+
+
+def _track_client(client: socket.socket) -> None:
+    with _live_clients_lock:
+        _live_clients.add(client)
+
+
+def _untrack_client(client: socket.socket) -> None:
+    with _live_clients_lock:
+        _live_clients.discard(client)
+
+
+def _drop_live_clients() -> int:
+    with _live_clients_lock:
+        clients = list(_live_clients)
+    closed = 0
+    for client in clients:
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            client.close()
+            closed += 1
+        except OSError:
+            pass
+    return closed
+
+
+def _write_egress_applied(mode: str) -> None:
+    path = DATA_DIR / "egress_mode.applied"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(mode, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _read_egress_mode_file() -> str:
+    try:
+        raw = (DATA_DIR / "egress_mode.txt").read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return "proxy"
+    return "direct" if raw == "direct" else "proxy"
+
+
+def _watch_egress_mode() -> None:
+    """Cut old sockets when the exit changes so the next request uses the new NIC."""
+    current = _read_egress_mode_file()
+    _write_egress_applied(current)
+    while True:
+        time.sleep(0.1)
+        mode = _read_egress_mode_file()
+        if mode == current:
+            continue
+        current = mode
+        with DNS_CACHE_LOCK:
+            DNS_CACHE.clear()
+        closed = _drop_live_clients()
+        _write_egress_applied(mode)
+        label = "服务器直连" if mode == "direct" else "代理隧道"
+        print(f"[网关] 出口已切到{label}，断开旧连接 {closed} 条", flush=True)
+
 
 def parse_int(value: Any) -> int:
     try:
@@ -366,7 +494,7 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
     if not bind_device:
         return
     try:
-        iface = get_active_interface()
+        iface = get_forward_interface()
         if iface:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
     except OSError:
@@ -374,8 +502,7 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
 
 
 def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
-    """Use the same egress-scoped resolver as TCP so UDP does not leak off-tunnel."""
-    ip = resolve_dns_over_active_tunnel(host)
+    ip = resolve_dns_over_active_tunnel(host, iface=get_forward_interface())
     if not ip:
         return []
     try:
@@ -626,7 +753,7 @@ def _dns_udp_query(host: str, qtype: int, dns_server: str, timeout: float, iface
 
 
 def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
-    ip, _ttl = _dns_udp_query(host, qtype, dns_server, timeout, get_active_interface())
+    ip, _ttl = _dns_udp_query(host, qtype, dns_server, timeout, get_forward_interface())
     return ip
 
 
@@ -652,7 +779,6 @@ def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: f
 
 
 def _system_dns_ipv4(host: str, timeout: float) -> str | None:
-    """Local stub resolver. Used for direct mode, and as a last resort on the tunnel path."""
     box: dict[str, str] = {}
 
     def run() -> None:
@@ -685,13 +811,11 @@ def _remember_dns(key: tuple[str, str], ip: str | None, raw_ttl: float, now: flo
 
 
 def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeout: float = DNS_STAGE_TIMEOUT_SECONDS, iface: str | None = None) -> str | None:
-    """Resolve on the same egress 8500 will connect through.
+    """Resolve on the same NIC 8500 will bind.
 
-    Proxy (iface set): race 1.1.1.1 and 8.8.8.8 bound to that NIC. First answer
-    wins, usually one tunnel RTT, not a 3s serial timeout. Direct (iface empty):
-    ask the host stub and do not bind a device. Concurrent lookups of the same
-    name share one flight. Cache keys include the iface, so 直连/代理切换 drops
-    the other path's answers immediately.
+    Direct binds the server NIC. Proxy binds the tunnel NIC. First of 1.1.1.1
+    and 8.8.8.8 wins inside one second. Same name shares one flight. The cache
+    key includes the NIC, so a mode switch cannot reuse the other path.
     """
     literal = _host_is_ip(host)
     if literal:
@@ -700,7 +824,7 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
     if not key_host:
         return None
     if iface is None:
-        iface = get_active_interface()
+        iface = get_forward_interface()
     scope = iface or "@direct"
     cache_key = (scope, key_host)
     stage_timeout = timeout if timeout and timeout > 0 else DNS_STAGE_TIMEOUT_SECONDS
@@ -770,28 +894,88 @@ def _tune_socket(sock: socket.socket) -> socket.socket:
             sock.setsockopt(socket.IPPROTO_TCP, opt, value)
         except OSError:
             pass
-    for level, opt in (
-        (socket.SOL_SOCKET, socket.SO_RCVBUF),
-        (socket.SOL_SOCKET, socket.SO_SNDBUF),
-    ):
-        try:
-            sock.setsockopt(level, opt, PROXY_SOCKET_BUFFER_BYTES)
-        except OSError:
-            pass
     return sock
+
+
+def _iface_has_ipv6(iface: str) -> bool:
+    iface = str(iface or "").strip()
+    if not iface:
+        return False
+    try:
+        lines = Path("/proc/net/if_inet6").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        parts = line.split()
+        if parts and parts[-1] == iface:
+            return True
+    return False
+
+
+def _repair_policy_route(iface: str) -> None:
+    """Reattach table 100 to the live NIC without deleting the current rule first."""
+    iface = str(iface or "").strip()
+    if not iface or not re.fullmatch(r"[A-Za-z0-9._:-]{1,15}", iface):
+        return
+    table = str(os.environ.get("ACTIVE_ROUTE_TABLE") or "100")
+    try:
+        probe = subprocess.run(
+            ["ip", "route", "get", "1.1.1.1", "oif", iface],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return
+    if probe.returncode == 0 and ("dev " + iface) in (probe.stdout or ""):
+        return
+    gateway = ""
+    try:
+        gateway = (DATA_DIR / "active_gateway.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        gateway = ""
+    cmd = ["ip", "route", "replace", "default"]
+    if gateway:
+        cmd.extend(["via", gateway, "dev", iface, "onlink"])
+    else:
+        cmd.extend(["dev", iface])
+    cmd.extend(["table", table])
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        shown = subprocess.run(["ip", "-4", "rule", "show"], capture_output=True, text=True, timeout=2)
+        already = False
+        for line in (shown.stdout or "").splitlines():
+            if ("oif " + iface) in line and ("lookup " + table) in line:
+                already = True
+                break
+        if not already:
+            subprocess.run(["ip", "rule", "add", "oif", iface, "table", table], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return
 
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
-    iface = get_active_interface()
+    iface = get_forward_interface()
+    if get_egress_mode() != "direct" and not iface:
+        raise OSError("[DNS] 代理模式没有活动网卡")
     if not _host_is_ip(host):
         resolved_ip = resolve_dns_over_active_tunnel(host, iface=iface)
         if not resolved_ip:
-            raise OSError("[DNS] 当前出站模式没有解析结果")
+            raise OSError("[DNS] 当前出站没有解析结果")
         host = resolved_ip
 
+    try:
+        results = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError:
+        results = []
+    allow_v6 = _iface_has_ipv6(iface)
+    ordered = [item for item in results if item[0] != socket.AF_INET6 or allow_v6]
+    ordered.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    if not ordered:
+        raise OSError("getaddrinfo returns empty list")
+
     err = None
-    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+    repaired = False
+    for res in ordered:
         af, socktype, proto, canonname, sa = res
         sock = None
         try:
@@ -801,29 +985,182 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
             if iface:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
             sock.connect(sa)
-            # The timeout protects only connection establishment. Long-lived
-            # HTTPS/WebSocket sessions should not be dropped after 30 seconds
-            # of idle time.
             sock.settimeout(None)
             return sock
         except OSError as e:
             err = e
-            if "operation not permitted" in str(e).lower() or e.errno == 1:
-                err = OSError(f"[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定当前 VPN 网卡失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
-            elif "no such device" in str(e).lower() or e.errno == 19:
-                err = OSError(f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定当前 VPN 网卡失败，找不到当前活动 VPN 网卡！这通常是因为 VPN 隧道未成功建立或已异常退出。")
             if sock is not None:
                 sock.close()
+                sock = None
+            unreachable = e.errno in (101, 113)
+            if unreachable and not repaired and get_egress_mode() != "direct":
+                repaired = True
+                _repair_policy_route(iface)
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                    sock.settimeout(timeout)
+                    _tune_socket(sock)
+                    if iface:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+                    sock.connect(sa)
+                    sock.settimeout(None)
+                    return sock
+                except OSError as retry_error:
+                    err = retry_error
+                    if sock is not None:
+                        sock.close()
+            elif "operation not permitted" in str(e).lower() or e.errno == 1:
+                err = OSError("[错误代码 3006] [ERR_PROXY_BIND_TUN_PERM_DENIED] 绑定当前 VPN 网卡失败，权限不足！必须以 root 权限运行，或者进程缺少 CAP_NET_RAW 权限。")
+            elif "no such device" in str(e).lower() or e.errno == 19:
+                err = OSError("[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定当前 VPN 网卡失败，找不到当前活动 VPN 网卡！这通常是因为 VPN 隧道未成功建立或已异常退出。")
     if err is not None:
         raise err
-    else:
-        raise OSError("getaddrinfo returns empty list")
+    raise OSError("getaddrinfo returns empty list")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
-    """Copy both ways without letting one full buffer stall the other.
+    """Forward TCP after the SOCKS/HTTP handshake.
 
-    An idle connection stays open. Only EOF or a socket error ends it, so a
-    paused page or a quiet websocket is not cut after two minutes.
+    OpenVPN, SSTP, L2TP/IPsec and SSL-VPN all publish one tunnel interface.
+    8500 binds that interface and splices both directions. The bytes never
+    enter this process. UDP associate still carries a SOCKS header, so that
+    path stays in userspace. The copy fallback is only for a kernel that
+    rejects splice before any byte has moved.
+    """
+    try:
+        _relay_splice(left, right)
+    except _SpliceUnsupported:
+        global _splice_fallback_logged
+        if not _splice_fallback_logged:
+            _splice_fallback_logged = True
+            print("[网关] 本机 splice 不可用，退回用户态转发", flush=True)
+        _relay_copy(left, right)
+
+
+class _SpliceUnsupported(Exception):
+    pass
+
+
+_splice_fallback_logged = False
+_SPLICE_REJECT = {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, getattr(errno, "ENOTSUP", 95)}
+
+
+class _SpliceLeg:
+    __slots__ = ("src", "dst", "pipe_r", "pipe_w", "cap", "pending", "src_eof", "dst_shut")
+
+    def __init__(self, src: socket.socket, dst: socket.socket, pipe_r: int, pipe_w: int, cap: int) -> None:
+        self.src = src
+        self.dst = dst
+        self.pipe_r = pipe_r
+        self.pipe_w = pipe_w
+        self.cap = cap
+        self.pending = 0
+        self.src_eof = False
+        self.dst_shut = False
+
+
+def _pipe_cap(read_fd: int) -> int:
+    try:
+        size = int(fcntl.fcntl(read_fd, fcntl.F_GETPIPE_SZ))
+    except (OSError, AttributeError):
+        size = 65536
+    return size if size > 0 else 65536
+
+
+def _splice_once(src_fd: int, dst_fd: int, count: int, flags: int, moved: bool) -> int | None:
+    try:
+        return os.splice(src_fd, dst_fd, count, flags=flags)
+    except BlockingIOError:
+        return None
+    except InterruptedError:
+        return None
+    except OSError as exc:
+        if not moved and exc.errno in _SPLICE_REJECT:
+            raise _SpliceUnsupported from exc
+        raise
+
+
+def _relay_splice(left: socket.socket, right: socket.socket) -> None:
+    if not hasattr(os, "splice"):
+        raise _SpliceUnsupported
+    peers = (left, right)
+    for sock in peers:
+        try:
+            sock.settimeout(None)
+            sock.setblocking(False)
+        except OSError:
+            return
+    pipes: list[int] = []
+    try:
+        in_flags = os.SPLICE_F_MOVE | os.SPLICE_F_NONBLOCK | os.SPLICE_F_MORE
+        out_flags = os.SPLICE_F_MOVE | os.SPLICE_F_NONBLOCK
+        legs: list[_SpliceLeg] = []
+        for src, dst in ((left, right), (right, left)):
+            pipe_r, pipe_w = os.pipe()
+            pipes.extend((pipe_r, pipe_w))
+            os.set_blocking(pipe_r, False)
+            os.set_blocking(pipe_w, False)
+            legs.append(_SpliceLeg(src, dst, pipe_r, pipe_w, _pipe_cap(pipe_r)))
+        moved = False
+        while True:
+            progressed = False
+            for leg in legs:
+                if leg.pending and not leg.dst_shut:
+                    sent = _splice_once(leg.pipe_r, leg.dst.fileno(), leg.pending, out_flags, moved)
+                    if sent is None:
+                        pass
+                    elif sent <= 0:
+                        leg.dst_shut = True
+                    else:
+                        leg.pending -= sent
+                        moved = True
+                        progressed = True
+                        note_proxy_forwarded(sent)
+                room = leg.cap - leg.pending
+                if room > 0 and not leg.src_eof:
+                    got = _splice_once(leg.src.fileno(), leg.pipe_w, room, in_flags, moved)
+                    if got == 0:
+                        leg.src_eof = True
+                    elif got:
+                        leg.pending += got
+                        moved = True
+                        progressed = True
+                if leg.src_eof and leg.pending == 0 and not leg.dst_shut:
+                    try:
+                        leg.dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    leg.dst_shut = True
+            if all(leg.dst_shut for leg in legs):
+                return
+            if progressed:
+                continue
+            rlist = [leg.src for leg in legs if not leg.src_eof and leg.pending < leg.cap]
+            wlist = [leg.dst for leg in legs if leg.pending and not leg.dst_shut]
+            if not rlist and not wlist:
+                return
+            try:
+                _readable, _writable, errored = select.select(rlist, wlist, list(peers), 60)
+            except (OSError, ValueError):
+                return
+            if errored:
+                return
+    except _SpliceUnsupported:
+        raise
+    except OSError:
+        return
+    finally:
+        for fd in pipes:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _relay_copy(left: socket.socket, right: socket.socket) -> None:
+    """Copy both ways. An offset avoids rewriting the buffer on every send.
+
+    `del buf[:sent]` memmoves the whole window on each packet. Under load that
+    burns the only cores and the forward rate collapses as soon as it rises.
     """
     peers = (left, right)
     for sock in peers:
@@ -831,18 +1168,20 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             sock.setblocking(False)
         except OSError:
             return
-    outgoing: dict[socket.socket, bytearray] = {left: bytearray(), right: bytearray()}
+    bufs: dict[socket.socket, bytearray] = {left: bytearray(), right: bytearray()}
+    offs = {left: 0, right: 0}
     closed = {left: False, right: False}
     while True:
-        if all(closed[sock] and not outgoing[sock] for sock in peers):
+        if all(closed[sock] and offs[sock] >= len(bufs[sock]) for sock in peers):
             return
         rlist = []
         wlist = []
         for sock in peers:
             other = right if sock is left else left
-            if not closed[sock] and len(outgoing[other]) < 262144:
+            pending_other = len(bufs[other]) - offs[other]
+            if not closed[sock] and pending_other < 1024 * 1024:
                 rlist.append(sock)
-            if outgoing[sock]:
+            if offs[sock] < len(bufs[sock]):
                 wlist.append(sock)
         if not rlist and not wlist:
             return
@@ -853,23 +1192,34 @@ def relay(left: socket.socket, right: socket.socket) -> None:
         if errored:
             return
         for sock in writable:
-            buf = outgoing[sock]
-            if not buf:
+            start = offs[sock]
+            if start >= len(bufs[sock]):
                 continue
+            view = memoryview(bufs[sock])
             try:
-                sent = sock.send(buf)
+                sent = sock.send(view[start:])
             except BlockingIOError:
+                view.release()
                 continue
             except OSError:
+                view.release()
                 return
+            view.release()
             if sent <= 0:
                 return
-            del buf[:sent]
+            offs[sock] = start + sent
             note_proxy_forwarded(sent)
+            if offs[sock] >= 256 * 1024 or offs[sock] >= len(bufs[sock]):
+                if offs[sock] >= len(bufs[sock]):
+                    bufs[sock].clear()
+                    offs[sock] = 0
+                elif offs[sock] >= 256 * 1024:
+                    del bufs[sock][:offs[sock]]
+                    offs[sock] = 0
         for sock in readable:
             other = right if sock is left else left
             try:
-                data = sock.recv(65536)
+                data = sock.recv(262144)
             except BlockingIOError:
                 continue
             except OSError:
@@ -877,7 +1227,10 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             if not data:
                 closed[sock] = True
                 continue
-            outgoing[other].extend(data)
+            if offs[other] and offs[other] >= len(bufs[other]):
+                bufs[other].clear()
+                offs[other] = 0
+            bufs[other].extend(data)
 
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
@@ -1028,6 +1381,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             upstream.close()
 
 def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+    _track_client(client)
     try:
         _tune_socket(client)
         client.settimeout(30)
@@ -1048,6 +1402,8 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
             client.close()
         except OSError:
             pass
+    finally:
+        _untrack_client(client)
 
 def start_proxy_server(host: str, port: int) -> None:
     is_ipv6 = ":" in host or host == ""
@@ -1108,6 +1464,9 @@ def start_proxy_server(host: str, port: int) -> None:
             print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag_msg}", flush=True)
             return
 
+    plane = "splice" if hasattr(os, "splice") else "userspace"
+    print(f"[网关] 8500 数据面 {plane}。TCP 握手之后走内核管道，业务字节不进用户态。", flush=True)
+    threading.Thread(target=_watch_egress_mode, daemon=True, name="egress-watch").start()
     while True:
         try:
             client, address = server.accept()

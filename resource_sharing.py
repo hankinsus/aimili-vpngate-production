@@ -15,6 +15,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+def _shared_speed_bps(endpoint: dict[str, Any]) -> int:
+    """Peer speed is useful. Peer latency is not: each site measures its own."""
+    try:
+        speed = int(endpoint.get("latest_speed") or 0)
+    except (TypeError, ValueError):
+        speed = 0
+    if speed > 0:
+        return speed
+    metadata = endpoint.get("metadata") or {}
+    try:
+        return max(0, int(metadata.get("last_probe_speed_bps") or metadata.get("shared_speed_bps") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class ResourceShareManager:
     """Peer resource sharing over the existing HTTPS management port."""
 
@@ -751,6 +766,7 @@ class ResourceShareManager:
             "peers": peers,
             "relationships": self.relationships(),
         }
+
     @staticmethod
     def _sanitized_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
         metadata = endpoint.get("metadata") or {}
@@ -775,7 +791,8 @@ class ResourceShareManager:
             "transport": str(endpoint.get("transport") or "").lower(),
             "port": int(endpoint.get("port") or 0),
             "status": str(endpoint.get("status") or "NEW"),
-            "latency_ms": int(float(endpoint.get("latency_ewma") or endpoint.get("latest_ping") or 0)),
+            "latency_ms": 0,
+            "speed_bps": _shared_speed_bps(endpoint),
             "success_count": int(endpoint.get("success_count") or 0),
             "failure_count": int(endpoint.get("failure_count") or 0),
             "success_streak": int(endpoint.get("success_streak") or 0),

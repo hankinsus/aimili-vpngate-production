@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.53"
+APP_VERSION = "V1.0.72"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -200,6 +200,21 @@ github_update_running = False
 github_update_last_result: dict[str, Any] = {}
 
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+
+def background_paused() -> bool:
+    """Stop catalog ingest, availability sweeps, and keepalive churn.
+
+    The 2-vCPU / 1GB VM cannot probe and forward at the same time. A file
+    pause lets the 8500 path be measured without a code rollback.
+    """
+    if DISABLE_BACKGROUND_LOOPS:
+        return True
+    try:
+        return (DATA_DIR / "background_paused").is_file()
+    except OSError:
+        return False
+
+
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
@@ -256,6 +271,19 @@ global_pool_refresh_status = "idle"
 global_pool_refresh_message = ""
 global_pool_refresh_servers = 0
 global_pool_refresh_sources = 0
+library_check_lock = threading.Lock()
+library_check_generation = 0
+library_check_stop = False
+library_check_paused = False
+library_check_phase = "idle"
+library_check_total = 0
+library_check_tested = 0
+library_check_available = 0
+library_check_unavailable = 0
+library_check_rate_seconds = 0.0
+library_check_rate_samples = 0
+library_check_message = ""
+library_check_wait_reason = ""
 global_country_coverage_last_attempt: dict[str, float] = {}
 global_coverage_pick_cache_country = ""
 global_coverage_pick_cache_at = 0.0
@@ -546,30 +574,52 @@ def upstream_proxy_auth_file() -> str | None:
         print(f"[上游代理认证] 写入认证文件失败: {exc}", flush=True)
         return None
 
+_json_file_locks_guard = threading.Lock()
+_json_file_locks: dict[str, threading.Lock] = {}
+
+
+def _json_file_lock(path: Path) -> threading.Lock:
+    key = str(path)
+    with _json_file_locks_guard:
+        found = _json_file_locks.get(key)
+        if found is None:
+            found = threading.Lock()
+            _json_file_locks[key] = found
+        return found
+
+
 def write_json(path: Path, data: Any) -> None:
-    # Never hold the process-wide lock across a multi-megabyte json.dumps.
-    # nodes.json is about 2.4MB; dumping it under that lock froze the homepage.
+    # nodes.json is ~11MB. Parsing and dumping it takes seconds and holds the
+    # GIL. Keep that work off the process-wide lock, and do not make a state
+    # read wait behind a node-library rewrite.
     if path == NODES_FILE and isinstance(data, list) and not data and path.exists():
-        with lock:
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                existing = None
+        try:
+            with _json_file_lock(path):
+                existing_text = path.read_text(encoding="utf-8")
+        except OSError:
+            existing_text = ""
+        try:
+            existing = json.loads(existing_text) if existing_text else None
+        except Exception:
+            existing = None
         if isinstance(existing, list) and existing:
             log_to_json("WARNING", "Main", "拒绝用临时空节点快照覆盖已有节点库")
             return
     payload = json.dumps(data, ensure_ascii=False, indent=2)
-    with lock:
+    with _json_file_lock(path):
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(path)
+    if path == NODES_FILE:
+        _invalidate_nodes_index()
+
 
 def read_json(path: Path, default: Any) -> Any:
-    with lock:
-        try:
+    try:
+        with _json_file_lock(path):
             text = path.read_text(encoding="utf-8")
-        except OSError:
-            return default
+    except OSError:
+        return default
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -630,7 +680,8 @@ def load_ui_config() -> dict[str, Any]:
             "fixed_node_id": "",
             "favorite_node_ids": [],
             "fav_fail_fallback": True,
-            "web_domain": ""
+            "web_domain": "",
+            "routing_blocklist": "",
         }
         updated = False
         if auth_file.exists():
@@ -638,7 +689,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain", "routing_blocklist"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -686,6 +737,13 @@ def load_ui_config() -> dict[str, Any]:
             ui_config_cache["favorite_node_ids"] = list(config.get("favorite_node_ids") or [])
             ui_config_cache_at = time.monotonic()
         return dict(config)
+
+
+def invalidate_ui_config_cache() -> None:
+    global ui_config_cache, ui_config_cache_at
+    with ui_config_cache_lock:
+        ui_config_cache = None
+        ui_config_cache_at = 0.0
 
 # 初始化时优先从 ui_auth.json 加载保存的代理出站端口和网页端口配置以覆盖环境变量
 try:
@@ -897,7 +955,7 @@ def set_manual_route_pin(*, protocol: str, endpoint_id: str = "", node_id: str =
     if pinned_country and pinned_country != previous_country:
         try:
             release_standby()
-            set_state(standby_ready=False, standby_node_id="")
+            _clear_hot_standby_identity()
         except Exception:
             pass
         log_to_json("INFO", "Standby", f"手动切换到{pinned_country}，热备改到该国家")
@@ -906,11 +964,202 @@ def clear_manual_route_pin() -> None:
     global manual_route_pin
     manual_route_pin = {}
 
+
+def _routing_ip_pref_for_exit(ip_type: str) -> str:
+    value = str(ip_type or "").strip().lower()
+    if value in ("residential", "mobile", "home") or "住宅" in value or "移动" in value:
+        return "residential"
+    if value in ("hosting", "datacenter") or "机房" in value:
+        return "hosting"
+    return ""
+
+
+def align_proxy_settings_to_manual(country: str, ip_type: str) -> None:
+    """Manual switch wins. Persist that node's country and IP type only."""
+    global ui_config_cache, ui_config_cache_at
+    country_name = normalized_country_name(country)
+    ip_pref = _routing_ip_pref_for_exit(ip_type)
+    if not country_name and not ip_pref:
+        return
+    cfg = load_ui_config()
+    auth_file = DATA_DIR / "ui_auth.json"
+    with lock:
+        try:
+            current = json.loads(auth_file.read_text(encoding="utf-8")) if auth_file.exists() else {}
+        except Exception:
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        changed = False
+        if country_name and str(current.get("force_country") or cfg.get("force_country") or "") != country_name:
+            current["force_country"] = country_name
+            changed = True
+        if ip_pref and str(current.get("routing_ip_type") or cfg.get("routing_ip_type") or "all") != ip_pref:
+            current["routing_ip_type"] = ip_pref
+            changed = True
+        if not changed:
+            return
+        for key, default in (
+            ("routing_mode", cfg.get("routing_mode") or "auto"),
+            ("routing_protocol", cfg.get("routing_protocol") or ""),
+            ("routing_min_speed_bps", cfg.get("routing_min_speed_bps") or 0),
+            ("routing_latency", cfg.get("routing_latency") or ""),
+            ("connection_enabled", cfg.get("connection_enabled", True)),
+        ):
+            current.setdefault(key, default)
+        try:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            write_json(auth_file, current)
+        except Exception as exc:
+            log_to_json("WARNING", "Routing", f"手动切换同步代理设置失败: {exc}")
+            return
+    with ui_config_cache_lock:
+        ui_config_cache = None
+        ui_config_cache_at = 0.0
+    set_state(
+        force_country=str(current.get("force_country") or ""),
+        routing_ip_type=str(current.get("routing_ip_type") or "all"),
+        routing_mode=str(current.get("routing_mode") or "auto"),
+    )
+    log_to_json(
+        "INFO",
+        "Routing",
+        f"手动切换已同步代理设置：国家 {current.get('force_country') or '-'}，IP类型 {current.get('routing_ip_type') or '-'}",
+    )
+
 def read_nodes() -> list[dict[str, Any]]:
     raw = read_json(NODES_FILE, [])
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, dict)]
+
+
+# The node table reads SQLite. nodes.json is an 11MB OpenVPN config cache.
+# A country sweep used to read, sort, and rewrite that file on every endpoint,
+# holding the GIL for several seconds so /api/ui/nodes never finished.
+_nodes_index_lock = threading.Lock()
+_nodes_index: dict[str, dict[str, Any]] | None = None
+_nodes_flush_lock = threading.Lock()
+_nodes_flush_pending: dict[str, dict[str, Any]] = {}
+_nodes_flush_timer: threading.Timer | None = None
+_NODES_FLUSH_SECONDS = 20.0
+
+
+def _invalidate_nodes_index() -> None:
+    global _nodes_index
+    with _nodes_index_lock:
+        _nodes_index = None
+
+
+def _nodes_index_get() -> dict[str, dict[str, Any]]:
+    global _nodes_index
+    with _nodes_index_lock:
+        if _nodes_index is not None:
+            return _nodes_index
+    loaded: dict[str, dict[str, Any]] = {}
+    for node in read_nodes():
+        nid = str(node.get("id") or "")
+        if nid:
+            loaded[nid] = node
+    with _nodes_index_lock:
+        if _nodes_index is None:
+            _nodes_index = loaded
+        return _nodes_index
+
+
+def _remember_openvpn_node(node: dict[str, Any]) -> None:
+    nid = str(node.get("id") or "")
+    if not nid:
+        return
+    with _nodes_index_lock:
+        global _nodes_index
+        if _nodes_index is None:
+            _nodes_index = {}
+        _nodes_index[nid] = node
+
+
+def _patch_nodes_index(node_id: str, fields: dict[str, Any]) -> None:
+    nid = str(node_id or "")
+    if not nid or not isinstance(fields, dict):
+        return
+    with _nodes_index_lock:
+        if _nodes_index is None:
+            return
+        current = _nodes_index.get(nid)
+        if current is None:
+            _nodes_index[nid] = dict(fields)
+            _nodes_index[nid].setdefault("id", nid)
+        else:
+            current.update(fields)
+
+
+def schedule_nodes_probe_flush(updates: dict[str, dict[str, Any]]) -> None:
+    """Coalesce nodes.json writes. Probe results are already in SQLite."""
+    if not updates:
+        return
+    global _nodes_flush_timer
+    staged: list[tuple[str, dict[str, Any]]] = []
+    with _nodes_flush_lock:
+        for nid, fields in updates.items():
+            key = str(nid or "")
+            if not key or not isinstance(fields, dict):
+                continue
+            slot = _nodes_flush_pending.setdefault(key, {})
+            slot.update(fields)
+            staged.append((key, dict(fields)))
+        if _nodes_flush_timer is None:
+            timer = threading.Timer(_NODES_FLUSH_SECONDS, _flush_nodes_probe_updates)
+            timer.daemon = True
+            _nodes_flush_timer = timer
+            timer.start()
+    for key, fields in staged:
+        _patch_nodes_index(key, fields)
+
+
+def _flush_nodes_probe_updates() -> None:
+    global _nodes_flush_timer
+    with _nodes_flush_lock:
+        pending = _nodes_flush_pending
+        _nodes_flush_pending = {}
+        _nodes_flush_timer = None
+    if not pending:
+        return
+    try:
+        nodes = read_nodes()
+        positions = {str(node.get("id") or ""): idx for idx, node in enumerate(nodes)}
+        changed = False
+        for nid, fields in pending.items():
+            if not isinstance(fields, dict):
+                continue
+            if nid in positions:
+                nodes[positions[nid]].update(fields)
+                changed = True
+                continue
+            created = dict(fields)
+            created.setdefault("id", nid)
+            nodes.append(created)
+            positions[nid] = len(nodes) - 1
+            changed = True
+        if changed:
+            if len(nodes) > 1000:
+                active_ids = {str(active_openvpn_node_id or "")}
+                kept = [
+                    node for node in nodes
+                    if str(node.get("id") or "") in active_ids or node.get("probe_status") in ("available", "testing")
+                ]
+                rest = [node for node in nodes if node not in kept]
+                kept.extend(rest[-max(0, 1000 - len(kept)):])
+                nodes = kept[:1000]
+            write_json(NODES_FILE, sort_all_nodes(nodes))
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"节点库延迟写盘失败: {exc}")
+    with _nodes_flush_lock:
+        if _nodes_flush_pending and _nodes_flush_timer is None:
+            timer = threading.Timer(_NODES_FLUSH_SECONDS, _flush_nodes_probe_updates)
+            timer.daemon = True
+            _nodes_flush_timer = timer
+            timer.start()
+
 
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, active_pool_endpoint_id, is_connecting, manual_connection_active, manual_connection_epoch
@@ -924,6 +1173,8 @@ def get_state() -> dict[str, Any]:
     state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    if not is_connecting and not manual_connection_active:
+        state["manual_switch_active"] = False
     try:
         bootstrap = _read_bootstrap_state()
         state["server_country"] = str(
@@ -932,17 +1183,6 @@ def get_state() -> dict[str, Any]:
             or ""
         ).strip()
         state["server_country_code"] = str(bootstrap.get("local_server_country_code") or "").strip().upper()
-        if not state["server_country"]:
-            detected = _detect_local_server_country()
-            if detected.get("country"):
-                state["server_country"] = str(detected.get("country") or "").strip()
-                state["server_country_code"] = str(detected.get("country_code") or "").strip().upper()
-                _write_bootstrap_state(
-                    local_server_country=state["server_country"],
-                    local_server_country_code=state["server_country_code"],
-                    local_server_public_ip=str(detected.get("public_ip") or ""),
-                    detection_source=str(detected.get("source") or ""),
-                )
     except Exception:
         state.setdefault("server_country", "")
         state.setdefault("server_country_code", "")
@@ -973,7 +1213,9 @@ def get_state() -> dict[str, Any]:
                 }
         except Exception:
             pass
+    _attach_local_server_identity(state)
     state["active_tunnel_interface"] = proxy_server.get_active_interface() if active_tunnel_running() else ""
+    state["egress_mode"] = proxy_server.get_egress_mode()
     if active_external_tunnel is not None:
         state["active_tunnel_protocol"] = active_external_tunnel.protocol
     elif active_openvpn_running():
@@ -993,6 +1235,7 @@ def get_state() -> dict[str, Any]:
     state["global_pool_refresh_message"] = global_pool_refresh_message
     state["global_pool_refresh_servers"] = global_pool_refresh_servers
     state["global_pool_refresh_sources"] = global_pool_refresh_sources
+    state.update(_library_check_public_state())
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
@@ -1041,10 +1284,25 @@ def get_state() -> dict[str, Any]:
     state["routing_protocol"] = str(ui_cfg.get("routing_protocol") or "")
     state["routing_min_speed_bps"] = int(ui_cfg.get("routing_min_speed_bps") or 0)
     state["routing_latency"] = str(ui_cfg.get("routing_latency") or "")
+    state["routing_blocklist"] = str(ui_cfg.get("routing_blocklist") or "")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = bool(ui_cfg.get("fav_fail_fallback", True))
+    state["background_paused"] = background_paused()
+    try:
+        scheme = scheme_match_snapshot(ui_cfg)
+    except Exception:
+        scheme = {"country": "", "available": 0, "inventory": 0, "label": "", "capped": False}
+    state["scheme_country"] = str(scheme.get("country") or "")
+    state["scheme_available"] = int(scheme.get("available") or 0)
+    state["scheme_inventory"] = int(scheme.get("inventory") or 0)
+    state["scheme_label"] = str(scheme.get("label") or "")
+    state["scheme_capped"] = bool(scheme.get("capped"))
+    state["standby_prepared"] = bool(state.get("standby_prepared"))
+    if state["background_paused"]:
+        state["priority_running"] = False
+        state["priority_full_sweep_running"] = False
     state["manual_route_pin"] = dict(manual_route_pin)
     state["manual_connection_quiet_until"] = manual_connection_quiet_until
     state["ui_command_plane"] = ui_command_plane.ui_state()
@@ -1863,6 +2121,17 @@ def remember_tcp_rtt(host: str, port: int, latency_ms: int) -> None:
     with _TCP_RTT_LOCK:
         _TCP_RTT_CACHE[key] = (time.time(), latency_ms)
 
+def _node_accepts_tcp_rtt(node: dict[str, Any]) -> bool:
+    """UDP and L2TP have no TCP handshake. Port RTT is only for TCP listeners."""
+    protocol = str(node.get("protocol") or "").lower()
+    transport = str(node.get("proto") or node.get("transport") or "").lower()
+    if protocol == "l2tp-ipsec" or transport == "udp":
+        return False
+    if protocol == "openvpn" and transport != "tcp":
+        return False
+    return protocol in ("softether", "sstp", "openvpn")
+
+
 def apply_cached_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
     for node in nodes:
         if not isinstance(node, dict):
@@ -1896,19 +2165,24 @@ def schedule_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
     threading.Thread(target=_run, daemon=True, name="page-tcp-rtt").start()
 
 def apply_server_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
-    """Fill the visible page with TCP round trips measured on this server."""
+    """Fill the visible page with TCP port round trips from this server.
+
+    A full tunnel dial includes handshake time and reads high. The port round
+    trip is also a valid latency. UDP and L2TP are left on the tunnel figure.
+    """
     pending: list[dict[str, Any]] = []
     for node in nodes:
-        if not isinstance(node, dict):
+        if not isinstance(node, dict) or not _node_accepts_tcp_rtt(node):
             continue
         host = str(node.get("ip") or node.get("remote_host") or "").strip()
         port = parse_int(node.get("remote_port"))
+        if not host or port <= 0:
+            continue
         cached = cached_tcp_rtt(host, port)
         if cached:
-            node["latency_ms"] = cached
+            node["latency_ms"] = usable_latency_ms(parse_int(node.get("latency_ms")), tcp_rtt_ms=cached)
             continue
-        if host and port > 0 and not parse_int(node.get("latency_ms")):
-            pending.append(node)
+        pending.append(node)
     if not pending:
         return
     futures: dict[concurrent.futures.Future[int], dict[str, Any]] = {}
@@ -1917,17 +2191,24 @@ def apply_server_tcp_rtt(nodes: list[dict[str, Any]]) -> None:
         for node in pending[:24]:
             host = str(node.get("ip") or node.get("remote_host") or "").strip()
             port = parse_int(node.get("remote_port"))
-            futures[pool.submit(tcp_connect_ms, host, port, 0.8)] = node
-        done, not_done = concurrent.futures.wait(set(futures), timeout=0.9)
+            futures[pool.submit(tcp_connect_ms, host, port, 0.6)] = node
+        done, not_done = concurrent.futures.wait(set(futures), timeout=0.7)
         for future in done:
             node = futures[future]
             try:
                 latency_ms = parse_int(future.result())
             except Exception:
                 latency_ms = 0
-            if latency_ms:
-                node["latency_ms"] = latency_ms
-                remember_tcp_rtt(str(node.get("ip") or node.get("remote_host") or ""), parse_int(node.get("remote_port")), latency_ms)
+            if not latency_ms:
+                continue
+            node["latency_ms"] = usable_latency_ms(parse_int(node.get("latency_ms")), tcp_rtt_ms=latency_ms)
+            remember_tcp_rtt(str(node.get("ip") or node.get("remote_host") or ""), parse_int(node.get("remote_port")), latency_ms)
+            endpoint_id = str(node.get("pool_endpoint_id") or "")
+            if endpoint_id:
+                try:
+                    node_pool.note_tcp_rtt(endpoint_id, latency_ms)
+                except Exception:
+                    pass
         for future in not_done:
             future.cancel()
     finally:
@@ -1957,7 +2238,7 @@ def _prefer_openvpn_ip(config_text: str, node: dict[str, Any]) -> str:
             out.append(line)
     return "\n".join(out) + ("\n" if text_value.endswith("\n") else "") if changed else text_value
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", latency_out: list[int] | None = None, quiet: bool = False) -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
@@ -2005,6 +2286,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     tail: list[str] = []
     ok = False
     message = "OpenVPN did not complete initialization."
+    peer_ms = 0
     while time.time() - started < limit:
         if dev not in ("tun0", "tun-sb") and not str(dev).startswith("tun-sw") and (manual_connection_active or ui_query_active()):
             startup_done[0] = True
@@ -2026,9 +2308,14 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         lower = line.lower()
         if keep_alive and dev == "tun0":
             update_handshake_status(lower)
+        if peer_ms <= 0 and "peer connection initiated" in lower:
+            peer_ms = max(1, int((time.time() - started) * 1000))
         if "initialization sequence completed" in lower:
             ok = True
-            message = f"OpenVPN connected in {int((time.time() - started) * 1000)} ms."
+            elapsed_ms = peer_ms or max(1, int((time.time() - started) * 1000))
+            if latency_out is not None:
+                latency_out[:] = [elapsed_ms]
+            message = f"OpenVPN connected in {elapsed_ms} ms."
             break
         if "auth_failed" in lower or "authentication failed" in lower:
             message = "AUTH_FAILED"
@@ -2039,17 +2326,17 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     else:
         message = f"OpenVPN timeout after {limit}s."
 
-    # Bulk write accumulated startup logs
-    for line_str in openvpn_logs:
-        level = "INFO"
-        line_lower = line_str.lower()
-        if "cannot be used in this context" in line_lower:
+    if not quiet:
+        for line_str in openvpn_logs:
             level = "INFO"
-        elif "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
-            level = "ERROR"
-        elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
-            level = "WARNING"
-        log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
+            line_lower = line_str.lower()
+            if "cannot be used in this context" in line_lower:
+                level = "INFO"
+            elif "error" in line_lower or "failed" in line_lower or "cannot" in line_lower or "fatal" in line_lower or "permission denied" in line_lower:
+                level = "ERROR"
+            elif "warning" in line_lower or "warn" in line_lower or "deprecated" in line_lower:
+                level = "WARNING"
+            log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
     if not ok:
         err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
@@ -2061,8 +2348,165 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
+def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
+    """Install the live oif rule before removing any other one.
+
+    The old order deleted table 100 first. A failed add then left 8500 bound
+    to a tunnel NIC with no route, and every new connection was
+    "Network is unreachable" after an egress switch.
+    """
+    interface = str(interface or "").strip()
+    gateway = str(gateway or "").strip()
+    if not interface:
+        return
+    table = str(ACTIVE_ROUTE_TABLE)
+    success = False
+    for attempt in range(1, 4):
+        try:
+            route_cmd = ["ip", "route", "replace", "default"]
+            if gateway:
+                route_cmd.extend(["via", gateway])
+            route_cmd.extend(["dev", interface])
+            if gateway:
+                route_cmd.append("onlink")
+            route_cmd.extend(["table", table])
+            subprocess.run(route_cmd, check=True, timeout=2)
+            if not _oif_rule_prefs(interface, int(table)):
+                rule = subprocess.run(
+                    ["ip", "rule", "add", "oif", interface, "table", table],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if rule.returncode != 0 and "File exists" not in (rule.stderr or ""):
+                    raise RuntimeError((rule.stderr or rule.stdout or "策略规则添加失败").strip())
+            _drop_foreign_oif_rules(interface, ACTIVE_ROUTE_TABLE)
+            for proc_path in ["all", "default", interface]:
+                try:
+                    subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{proc_path}.rp_filter=2"], capture_output=True, timeout=2)
+                except Exception:
+                    pass
+            try:
+                (DATA_DIR / "active_gateway.txt").write_text(gateway, encoding="utf-8")
+            except OSError:
+                pass
+            _quiesce_duplicate_tunnel_ifaces(interface)
+            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
+            success = True
+            break
+        except Exception as e:
+            print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
+            time.sleep(0.4)
+
+    if not success:
+        print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
+        log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由")
+
+
+def _oif_rule_prefs(interface: str, table: int) -> list[str]:
+    try:
+        shown = subprocess.run(["ip", "-4", "rule", "show"], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return []
+    prefs = []
+    for line in (shown.stdout or "").splitlines():
+        if not re.search(rf"\blookup {int(table)}\b", line):
+            continue
+        match = re.search(r"\boif (\S+)", line)
+        if not match or match.group(1) != interface:
+            continue
+        pref = line.split(":", 1)[0].strip()
+        if pref.isdigit():
+            prefs.append(pref)
+    return prefs
+
+
+def _drop_foreign_oif_rules(interface: str, table: int) -> None:
+    try:
+        shown = subprocess.run(["ip", "-4", "rule", "show"], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return
+    foreign = []
+    own = []
+    for line in (shown.stdout or "").splitlines():
+        if not re.search(rf"\blookup {int(table)}\b", line):
+            continue
+        match = re.search(r"\boif (\S+)", line)
+        if not match:
+            continue
+        other = match.group(1)
+        pref = line.split(":", 1)[0].strip()
+        if other != interface:
+            foreign.append(other)
+        elif pref.isdigit():
+            own.append(pref)
+    for other in foreign:
+        try:
+            subprocess.run(["ip", "rule", "del", "oif", other, "table", str(table)], capture_output=True, timeout=2)
+        except Exception:
+            pass
+    for pref in own[1:]:
+        try:
+            subprocess.run(["ip", "rule", "del", "pref", pref], capture_output=True, timeout=2)
+        except Exception:
+            pass
+
+
+def _iface_ipv4(interface: str) -> str:
+    try:
+        shown = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", interface], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return ""
+    match = re.search(r"\binet (\d+\.\d+\.\d+\.\d+)", shown.stdout or "")
+    return match.group(1) if match else ""
+
+
+def _quiesce_duplicate_tunnel_ifaces(active: str) -> None:
+    """A leftover NIC with the same tunnel address makes the next bind unroutable."""
+    active = str(active or "").strip()
+    own_ip = _iface_ipv4(active)
+    if not active or not own_ip:
+        return
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return
+    for name in names:
+        if name == active or name == STANDBY_DEV:
+            continue
+        if not name.startswith(("vpn", "tun", "tap", "ppp")):
+            continue
+        if _iface_ipv4(name) != own_ip:
+            continue
+        try:
+            subprocess.run(["ip", "link", "set", "dev", name, "down"], capture_output=True, timeout=2)
+            log_to_json("INFO", "Routing", f"已关闭与 {active} 相同地址的残留网卡 {name}")
+        except Exception:
+            pass
+
+
+def ensure_active_policy_route() -> tuple[bool, str]:
+    iface = str(proxy_server.get_active_interface() or "").strip()
+    if not iface or not Path("/sys/class/net").joinpath(iface).exists():
+        return False, f"活动网卡不存在 {iface or '-'}"
+    gateway = ""
+    if active_external_tunnel is not None:
+        gateway = str(getattr(active_external_tunnel, "gateway", "") or "")
+    if not gateway:
+        try:
+            gateway = (DATA_DIR / "active_gateway.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            gateway = ""
+    setup_policy_routing(iface, gateway=gateway)
+    try:
+        probe = subprocess.run(["ip", "route", "get", "1.1.1.1", "oif", iface], capture_output=True, text=True, timeout=2)
+    except Exception as exc:
+        return False, str(exc)
+    text = ((probe.stdout or "") + " " + (probe.stderr or "")).strip()
+    if probe.returncode == 0 and iface in text:
+        return True, iface
+    return False, text[:180] or "策略路由未指向活动网卡"
+
 def _delete_route_rules(table: int) -> None:
-    """ip rule del removes a single match. Mode switches used to leave stale oif rules."""
+    """ip rule del removes one match. Keep going until table 100 is empty."""
     for _ in range(32):
         try:
             result = subprocess.run(
@@ -2075,50 +2519,9 @@ def _delete_route_rules(table: int) -> None:
             return
 
 
-def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
-    _delete_route_rules(ACTIVE_ROUTE_TABLE)
-    try:
-        subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
-    except Exception:
-        pass
-
-    success = False
-    for attempt in range(1, 4):
-        try:
-            route_cmd = ["ip", "route", "replace", "default"]
-            if gateway:
-                route_cmd.extend(["via", gateway])
-            route_cmd.extend(["dev", interface])
-            if gateway:
-                route_cmd.append("onlink")
-            route_cmd.extend(["table", str(ACTIVE_ROUTE_TABLE)])
-            subprocess.run(route_cmd, check=True, timeout=2)
-            rule = subprocess.run(
-                ["ip", "rule", "add", "oif", interface, "table", str(ACTIVE_ROUTE_TABLE)],
-                capture_output=True, text=True, timeout=2,
-            )
-            if rule.returncode != 0 and "File exists" not in (rule.stderr or ""):
-                raise RuntimeError((rule.stderr or rule.stdout or "策略规则添加失败").strip())
-            # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
-            for proc_path in ["all", "default", interface]:
-                try:
-                    subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{proc_path}.rp_filter=2"], capture_output=True, timeout=2)
-                except Exception:
-                    pass
-            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
-            success = True
-            break
-        except Exception as e:
-            print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
-            time.sleep(1)
-
-    if not success:
-        print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
-        log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由")
-
 def cleanup_policy_routing() -> None:
     try:
-        _delete_route_rules(ACTIVE_ROUTE_TABLE)
+        _delete_route_rules(int(ACTIVE_ROUTE_TABLE))
         subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
         print(f"[policy_routing] Cleared policy routing table {ACTIVE_ROUTE_TABLE}", flush=True)
     except Exception:
@@ -2865,6 +3268,9 @@ def protocol_catalog_loop() -> None:
     # Initial catalog refresh shortly after startup, then refresh periodically.
     time.sleep(10)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             if ui_command_plane.is_busy() or global_pool_refresh_running:
                 time.sleep(5)
@@ -2883,6 +3289,9 @@ def resource_share_loop() -> None:
     # its next real sync is due according to its configured hour/day/week interval.
     time.sleep(45)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             if ui_command_plane.is_busy() or global_pool_refresh_running:
                 time.sleep(5)
@@ -3106,6 +3515,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             raise RuntimeError(f"{protocol} 没有建立独立隧道，仍占用当前网卡 {result.interface}")
         if manual:
             set_state(manual_switch_message="隧道已验证，正在确认 8500 出口…", last_check_message="新隧道已通过出口检测，正在确认客户端转发。")
+        if not manual and (manual_connection_active or time.time() < manual_connection_quiet_until):
+            raise RuntimeError("人工切换优先，取消这次自动接管")
         if active_external_tunnel is not None:
             stop_active_external_tunnel()
         if active_openvpn_running():
@@ -3132,6 +3543,10 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         remember_live_connection(endpoint_id=endpoint_id)
         if manual:
             set_manual_route_pin(protocol=protocol, endpoint_id=endpoint_id, country=str(endpoint.get("country") or ""))
+            align_proxy_settings_to_manual(
+                str(endpoint.get("country") or ""),
+                str(endpoint_ip_type(endpoint) or ""),
+            )
         endpoint_meta = endpoint.get("server_metadata") or {}
         endpoint_summary = {
             "endpoint_id": endpoint_id,
@@ -3281,6 +3696,81 @@ def normalize_routing_latency(value: Any) -> str:
     if text not in ROUTING_LATENCY_CHOICES:
         raise ValueError("无效的延迟筛选")
     return text
+
+def normalize_routing_blocklist(value: Any) -> str:
+    """One domain or IP per line. * blocks every candidate. vpn_87* blocks that prefix."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        raw_lines = [str(item) for item in value]
+    else:
+        raw_lines = str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    kept: list[str] = []
+    seen: set[str] = set()
+    for line in raw_lines:
+        text = " ".join(str(line).strip().split())
+        if not text or text.startswith("#"):
+            continue
+        compact = text.replace(" ", "")
+        if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", compact):
+            text = compact
+        if len(text) > 253:
+            raise ValueError("屏蔽规则过长")
+        key = text.lower()
+        if key in seen:
+            continue
+        if len(kept) >= 200:
+            raise ValueError("屏蔽列表最多 200 条")
+        seen.add(key)
+        kept.append(text)
+    return "\n".join(kept)
+
+def routing_block_rules(ui_cfg: dict[str, Any]) -> list[str]:
+    try:
+        text = normalize_routing_blocklist(ui_cfg.get("routing_blocklist") or "")
+    except ValueError:
+        text = str(ui_cfg.get("routing_blocklist") or "")
+    return [line.strip().lower() for line in text.splitlines() if line.strip()]
+
+def _block_rule_matches(rule: str, value: str) -> bool:
+    if not rule or not value:
+        return False
+    if rule == "*":
+        return True
+    if "*" not in rule:
+        return rule == value
+    try:
+        regex = re.escape(rule).replace(r"\*", ".*")
+        return re.fullmatch(regex, value) is not None
+    except re.error:
+        return False
+
+def endpoint_block_values(endpoint: dict[str, Any]) -> list[str]:
+    meta = endpoint.get("metadata") if isinstance(endpoint.get("metadata"), dict) else {}
+    values: list[str] = []
+    for raw in (
+        endpoint.get("hostname"),
+        endpoint.get("host_name"),
+        meta.get("hostname") if isinstance(meta, dict) else "",
+        endpoint.get("current_ip"),
+        meta.get("ip") if isinstance(meta, dict) else "",
+        _endpoint_ip(endpoint),
+    ):
+        text = str(raw or "").strip().lower()
+        if text and text not in values:
+            values.append(text)
+    return values
+
+def endpoint_is_blocked(endpoint: dict[str, Any] | None, ui_cfg: dict[str, Any]) -> bool:
+    rules = routing_block_rules(ui_cfg)
+    if not rules or not endpoint:
+        return False
+    if "*" in rules:
+        return True
+    for value in endpoint_block_values(endpoint):
+        if any(_block_rule_matches(rule, value) for rule in rules):
+            return True
+    return False
 
 def latency_filter_matches(latency_ms: int, latency_filter: str) -> bool:
     text = str(latency_filter or "").strip().lower()
@@ -3521,6 +4011,8 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
     for endpoint in endpoints.values():
         eid = str(endpoint.get("endpoint_id") or "")
         if not eid or eid == exclude_endpoint_id:
+            continue
+        if endpoint_is_blocked(endpoint, ui_cfg):
             continue
         if endpoint.get("status") not in ("HOT", "AVAILABLE"):
             continue
@@ -3787,6 +4279,8 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     """
     if not endpoint:
         return False
+    if endpoint_is_blocked(endpoint, ui_cfg):
+        return False
     mode = str(ui_cfg.get("routing_mode") or "auto")
     if mode == "fixed_region":
         target = normalized_country_name(ui_cfg.get("force_country") or "")
@@ -3817,8 +4311,145 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
         return False
     return True
 
+
+_scheme_snap_lock = threading.Lock()
+_scheme_snap: dict[str, Any] = {"at": 0.0, "key": "", "value": None}
+_scheme_snap_running = False
+
+
+def _scheme_filter_label(ui_cfg: dict[str, Any]) -> str:
+    parts: list[str] = []
+    protocol = str(ui_cfg.get("routing_protocol") or "").strip().lower()
+    parts.append({"openvpn": "OpenVPN", "softether": "SSL-VPN", "sstp": "SSTP", "l2tp-ipsec": "L2TP/IPsec"}.get(protocol, "所有协议"))
+    ip_type = str(ui_cfg.get("routing_ip_type") or "all").lower()
+    parts.append({"residential": "住宅", "hosting": "机房", "mobile": "移动", "all": "不限类型"}.get(ip_type, ip_type))
+    latency = str(ui_cfg.get("routing_latency") or "").strip().lower()
+    if latency == "gt1000":
+        parts.append("＞1000 ms")
+    elif latency:
+        parts.append(f"≤{latency} ms")
+    else:
+        parts.append("不限延迟")
+    try:
+        speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        speed = 0
+    if speed >= 1_000_000_000:
+        parts.append(f"≥{speed / 1_000_000_000:.0f} Gbps")
+    elif speed > 0:
+        parts.append(f"≥{speed / 1_000_000:.0f} Mbps")
+    else:
+        parts.append("不限速度")
+    if str(ui_cfg.get("routing_mode") or "") == "favorites":
+        parts.append("仅收藏")
+    rules = routing_block_rules(ui_cfg)
+    if rules:
+        parts.append(f"屏蔽 {len(rules)} 条")
+    return " · ".join(parts)
+
+
+def _scheme_cache_key(ui_cfg: dict[str, Any]) -> str:
+    favorites = ",".join(str(item) for item in (ui_cfg.get("favorite_node_ids") or []))
+    return "|".join([
+        str(ui_cfg.get("routing_mode") or ""),
+        normalized_country_name(ui_cfg.get("force_country") or ""),
+        str(ui_cfg.get("routing_ip_type") or ""),
+        str(ui_cfg.get("routing_protocol") or ""),
+        str(ui_cfg.get("routing_min_speed_bps") or 0),
+        str(ui_cfg.get("routing_latency") or ""),
+        str(ui_cfg.get("routing_blocklist") or ""),
+        favorites,
+    ])
+
+
+def _compute_scheme_snapshot(ui_cfg: dict[str, Any]) -> dict[str, Any]:
+    mode = str(ui_cfg.get("routing_mode") or "")
+    country = "" if mode == "fixed_ip" else normalized_country_name(ui_cfg.get("force_country") or "")
+    protocol = str(ui_cfg.get("routing_protocol") or "").strip().lower()
+    loose = dict(ui_cfg)
+    loose["routing_latency"] = ""
+    loose["routing_min_speed_bps"] = 0
+    try:
+        rows = node_pool.list_routing_endpoints(limit=800, country=country, protocol=protocol)
+        if country and not rows:
+            rows = node_pool.list_routing_endpoints(limit=800, protocol=protocol)
+    except Exception:
+        rows = []
+    inventory: set[str] = set()
+    available: set[str] = set()
+    for endpoint in rows:
+        if not endpoint_matches_explicit_routing(endpoint, loose):
+            continue
+        if country and normalized_country_name(endpoint.get("country")) != country:
+            continue
+        ip = _endpoint_ip(endpoint) or str(endpoint.get("endpoint_id") or "")
+        if not ip:
+            continue
+        inventory.add(ip)
+        if endpoint_matches_explicit_routing(endpoint, ui_cfg):
+            available.add(ip)
+    return {
+        "country": country,
+        "available": len(available),
+        "inventory": len(inventory),
+        "label": _scheme_filter_label(ui_cfg),
+        "capped": len(rows) >= 800,
+    }
+
+
+def invalidate_scheme_snapshot() -> None:
+    global _scheme_snap_running
+    with _scheme_snap_lock:
+        _scheme_snap["at"] = 0.0
+        _scheme_snap["key"] = ""
+        _scheme_snap["value"] = None
+        _scheme_snap_running = False
+
+
+def scheme_match_snapshot(ui_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Cached scheme counts. The UI poll must not scan the pool itself."""
+    global _scheme_snap_running
+    key = _scheme_cache_key(ui_cfg)
+    placeholder = {
+        "country": "" if str(ui_cfg.get("routing_mode") or "") == "fixed_ip" else normalized_country_name(ui_cfg.get("force_country") or ""),
+        "available": 0,
+        "inventory": 0,
+        "label": _scheme_filter_label(ui_cfg),
+        "capped": False,
+    }
+    with _scheme_snap_lock:
+        cached = _scheme_snap.get("value") if _scheme_snap.get("key") == key else None
+        fresh = isinstance(cached, dict) and time.time() - float(_scheme_snap.get("at") or 0) < 20
+        if fresh:
+            return dict(cached)
+        if _scheme_snap_running or is_connecting or manual_connection_active:
+            return dict(cached) if isinstance(cached, dict) else placeholder
+        _scheme_snap_running = True
+
+    def _refresh() -> None:
+        global _scheme_snap_running
+        try:
+            value = _compute_scheme_snapshot(ui_cfg)
+            with _scheme_snap_lock:
+                _scheme_snap["at"] = time.time()
+                _scheme_snap["key"] = key
+                _scheme_snap["value"] = value
+        except Exception:
+            pass
+        finally:
+            with _scheme_snap_lock:
+                _scheme_snap_running = False
+
+    threading.Thread(target=_refresh, daemon=True, name="scheme-snap").start()
+    return dict(cached) if isinstance(cached, dict) else placeholder
+
+
 def enter_explicit_scheme(immediate: bool = False) -> bool:
     """Move onto the saved scheme once a stable node satisfies it."""
+    # A manual switch pins the exit. Availability sweeps must not replace it,
+    # and a paused box is reserved for forwarding measurements.
+    if background_paused() or manual_route_pin:
+        return False
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)) or not _explicit_scheme_configured(ui_cfg):
         return False
@@ -3850,6 +4481,8 @@ def enter_explicit_scheme(immediate: bool = False) -> bool:
 
 def degrade_to_default_scheme() -> bool:
     """If the chosen country has no stable node, change country and keep the rest."""
+    if background_paused() or manual_route_pin:
+        return False
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)) or ui_cfg.get("routing_mode") == "fixed_ip":
         return False
@@ -3913,6 +4546,86 @@ def apply_user_routing_preferences() -> None:
         auto_switch_node()
     except Exception as exc:
         log_to_json("WARNING", "Routing", f"应用用户路由偏好失败: {exc}")
+
+
+def _refresh_cold_standby_now() -> None:
+    try:
+        cold_standby_pass()
+    except Exception as exc:
+        log_to_json("WARNING", "Standby", f"新代理设置冷备刷新失败: {exc}")
+
+
+def apply_saved_scheme_now() -> None:
+    """Put the saved proxy settings on the live exit and the cold standby now.
+
+    Library detection stays paused. Nothing here starts a country sweep or
+    changes the saved country. No matching node means the current tunnel stays.
+    """
+    try:
+        invalidate_scheme_snapshot()
+        ui_cfg = load_ui_config()
+        if not bool(ui_cfg.get("connection_enabled", True)):
+            return
+        if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+            return
+        current = current_active_routing_endpoint()
+        if current and endpoint_matches_explicit_routing(current, ui_cfg) and not endpoint_is_unstable(current):
+            set_state(routing_degraded=False, last_check_message="当前出口符合代理设置")
+            _refresh_cold_standby_now()
+            return
+        matching = [
+            ep for ep in _stable_candidates(unified_hot_pool_candidates(ui_cfg, limit=30))
+            if endpoint_matches_explicit_routing(ep, ui_cfg) and not endpoint_is_unstable(ep)
+        ]
+        if not matching:
+            set_state(routing_degraded=True, last_check_message="新代理设置暂无稳定节点，保持当前出口")
+            log_to_json("INFO", "Routing", "新代理设置暂无稳定节点，保持当前出口")
+            _refresh_cold_standby_now()
+            return
+        best = matching[0]
+        if current and str(best.get("endpoint_id") or "") == str(current.get("endpoint_id") or ""):
+            set_state(routing_degraded=False, last_check_message="当前出口符合代理设置")
+            _refresh_cold_standby_now()
+            return
+        # manual=True keeps the old tunnel until the new one is verified.
+        connect_ranked_endpoint(best, manual=True)
+        clear_manual_route_pin()
+        set_state(
+            routing_degraded=False,
+            last_check_message="已按新代理设置切换出口",
+            manual_switch_active=False,
+            manual_switch_message="已按新代理设置切换出口",
+            is_connecting=False,
+            manual_connection_active=False,
+            pending_connection_id="",
+            pending_connection_pool_endpoint_id="",
+            pending_connection_protocol="",
+            pending_connection_country="",
+            pending_connection_address="",
+        )
+        log_to_json(
+            "INFO",
+            "Routing",
+            f"已按新代理设置切换 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}",
+        )
+        _refresh_cold_standby_now()
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"应用新代理设置失败，保持当前出口: {exc}")
+        try:
+            clear_manual_route_pin()
+            set_state(
+                routing_degraded=True,
+                last_check_message="切换新代理设置失败，保持当前出口",
+                manual_switch_active=False,
+                is_connecting=False,
+                manual_connection_active=False,
+                pending_connection_id="",
+                pending_connection_pool_endpoint_id="",
+            )
+            _refresh_cold_standby_now()
+        except Exception:
+            pass
+
 
 def apply_routing_filters(
     nodes: list[dict[str, Any]],
@@ -4226,6 +4939,15 @@ def country_full_sweep(country: str) -> dict[str, Any]:
 
         cursor = 0
         while cursor < len(refs):
+            if background_paused():
+                country_full_sweep_running = False
+                probe_engine_running = False
+                set_state(
+                    priority_running=False,
+                    priority_full_sweep_running=False,
+                    priority_message="后台检测已暂停，转发优先",
+                )
+                return {"ok": True, "paused": True, "country": target, "tested": cursor, "total": len(refs)}
             # A live tunnel, an open page, or a catalog refresh owns the small
             # VM. Wait here instead of opening another tunnel on top of them.
             while (
@@ -4329,6 +5051,9 @@ def country_full_sweep(country: str) -> dict[str, Any]:
 
 def country_priority_worker(country: str) -> None:
     global country_priority_request
+    if background_paused():
+        country_priority_request = ""
+        return
     try:
         # First pass is always a complete resource-pool sweep for the target
         # country. Only after every endpoint has been checked once do we let
@@ -4413,7 +5138,7 @@ def country_priority_worker(country: str) -> None:
         if country_priority_lock.locked():
             country_priority_lock.release()
         try:
-            if not manual_connection_active:
+            if not manual_connection_active and not background_paused() and not manual_route_pin:
                 switch_to_explicit_routing_if_needed()
         except Exception as exc:
             log_to_json("WARNING", "Routing", f"优先国家检测结束后切换失败: {exc}")
@@ -4472,42 +5197,27 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
-    # Final latency is measured from the real OpenVPN tunnel establishment,
-    # not from VPNGate's advertised Ping value. ICMP/TCP reachability is only
-    # a fast hint and is deliberately not used as the final probe metric.
+    # Latency is the real handshake, not a port probe and not a download.
     latency = 0
-    speed_bps = 0
-    speed_result: dict[str, Any] = {}
     openvpn_process: subprocess.Popen[str] | None = None
-    speed_table: int | None = None
-    speed_endpoint_id = node_pool.endpoint_id(
-        node_pool.server_key(node), "openvpn",
-        str(node.get("proto") or node.get("transport") or "tcp").strip().lower(), p
-    )
+    ok = False
+    message = "OpenVPN did not complete initialization."
+    yielded = False
 
     idx = None
     try:
         idx = get_free_test_index()
+        latency_box: list[int] = []
         ok, message, openvpn_process = run_openvpn_until_ready(
-            str(temp_path), keep_alive=True, route_nopull=True, timeout=12, dev=f"tun{idx}"
+            str(temp_path), keep_alive=True, route_nopull=True, timeout=12, dev=f"tun{idx}",
+            latency_out=latency_box,
         )
-        if ok:
-            latency = usable_latency_ms(tcp_connect_ms(h, p), fallback_ping)
-            if proxy_server.proxy_forwarding_busy():
-                speed_result = {"ok": False, "speed_bps": 0, "error": "客户端正在转发，跳过测速"}
-            else:
-                speed_table = _acquire_probe_route_table()
-                speed_result = (
-                    measure_or_reuse_ip_speed(f"tun{idx}", speed_endpoint_id, table=speed_table)
-                    if speed_table is not None
-                    else {"ok": False, "speed_bps": 0, "error": "无可用测速策略路由表"}
-                )
-            speed_bps = int(speed_result.get("speed_bps") or 0)
+        yielded = "让路" in str(message or "")
+        if ok and latency_box:
+            latency = int(latency_box[0])
     finally:
         if openvpn_process is not None:
             stop_process(openvpn_process)
-        if speed_table is not None:
-            _release_probe_route_table(speed_table)
         if idx is not None:
             release_test_index(idx)
         try:
@@ -4516,48 +5226,26 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         except Exception:
             pass
 
-    temp_node = {
-        "id": node_id,
-        "ip": h,
-        "remote_host": h,
-        "remote_port": p,
-        "speed": speed_bps,
-        "speed_bps": speed_bps,
-        "owner": "",
-        "asn": "",
-        "as_name": "",
-        "location": "",
-        "ip_type": "",
-        "quality": "",
-    }
-    if speed_bps > 0:
-        message = f"{message} · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
-    elif ok and not speed_result.get("ok"):
-        message = f"{message} · 速度测试失败"
-    if ok:
-        vpn_utils.enrich_ip_info([temp_node])
+    if yielded:
+        with lock:
+            nodes = read_nodes()
+            node = next((item for item in nodes if item.get("id") == node_id), None)
+            if node:
+                node["probe_message"] = message
+                return node
+            return {"id": node_id, "probe_message": message, "probe_status": "not_checked"}
 
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
             node["latency_ms"] = latency if ok else 0
-            node["speed"] = speed_bps if ok else 0
-            node["speed_bps"] = speed_bps if ok else 0
             node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
-            if ok:
-                node["owner"] = temp_node["owner"]
-                node["asn"] = temp_node["asn"]
-                node["as_name"] = temp_node["as_name"]
-                node["location"] = temp_node["location"]
-                node["ip_type"] = temp_node["ip_type"]
-                node["quality"] = temp_node["quality"]
-
             try:
                 node_pool.record_probe(
-                    node, ok=ok, latency_ms=latency, message=message, speed_bps=speed_bps
+                    node, ok=ok, latency_ms=latency, message=message, speed_bps=None
                 )
             except Exception as pool_exc:
                 log_to_json("WARNING", "Main", f"NodePool 单节点探测结果写入失败: {pool_exc}")
@@ -4569,16 +5257,11 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             return {}
 
 def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
-    with lock:
-        nodes = read_nodes()
-        to_test = [n for n in nodes if n.get("id") in node_ids]
-        now = time.time()
-        for n in nodes:
-            if n.get("id") in node_ids and not n.get("active") and n.get("probe_status") != "unavailable":
-                n["probe_status"] = "testing"
-                n["probe_message"] = "正在检测节点连通性..."
-                n["probed_at"] = now
-        write_json(NODES_FILE, sort_all_nodes(nodes))
+    # Serve the probe from the in-memory OpenVPN cache. Rewriting nodes.json
+    # here used to freeze every filter request for the whole dump.
+    wanted = {str(node_id) for node_id in (node_ids or []) if str(node_id or "")}
+    index = _nodes_index_get()
+    to_test = [dict(index[nid]) for nid in wanted if nid in index]
 
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
@@ -4610,47 +5293,27 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 "speed_bps": 0,
             }
 
-        # For OpenVPN, use real tunnel establishment time plus an isolated
-        # download throughput test as the final availability metrics.
+        # Real handshake only. No port probe and no download.
         latency = 0
-        speed_bps = 0
-        speed_result: dict[str, Any] = {}
         tun_idx = None
-        speed_table: int | None = None
-        speed_endpoint_id = node_pool.endpoint_id(
-            node_pool.server_key(n_info), "openvpn",
-            str(n_info.get("proto") or n_info.get("transport") or "tcp").strip().lower(), p
-        )
         openvpn_process: subprocess.Popen[str] | None = None
+        ok = False
+        message = "OpenVPN did not complete initialization."
+        yielded = False
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
+            latency_box: list[int] = []
             ok, message, openvpn_process = run_openvpn_until_ready(
-                str(temp_path), keep_alive=True, route_nopull=True, timeout=12, dev=dev_name
+                str(temp_path), keep_alive=True, route_nopull=True, timeout=12, dev=dev_name,
+                latency_out=latency_box,
             )
-            if ok:
-                latency = usable_latency_ms(tcp_connect_ms(h, p), fallback_ping)
-                if proxy_server.proxy_forwarding_busy(8) or active_tunnel_running():
-                    speed_result = {"ok": False, "skipped": True, "speed_bps": 0, "error": "在线隧道占用中，跳过测速"}
-                else:
-                    speed_table = _acquire_probe_route_table()
-                    speed_result = (
-                        measure_or_reuse_ip_speed(dev_name, speed_endpoint_id, table=speed_table)
-                        if speed_table is not None
-                        else {"ok": False, "speed_bps": 0, "error": "无可用测速策略路由表"}
-                    )
-                speed_bps = int(speed_result.get("speed_bps") or 0)
-                if speed_bps > 0:
-                    message = f"{message} · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
-                elif speed_result.get("skipped"):
-                    message = f"{message} · 在线隧道占用中，未测速"
-                else:
-                    message = f"{message} · 速度测试失败"
+            yielded = "让路" in str(message or "")
+            if ok and latency_box:
+                latency = int(latency_box[0])
         finally:
             if openvpn_process is not None:
                 stop_process(openvpn_process)
-            if speed_table is not None:
-                _release_probe_route_table(speed_table)
             if tun_idx is not None:
                 release_test_index(tun_idx)
             try:
@@ -4659,18 +5322,28 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             except Exception:
                 pass
 
+        if yielded:
+            return {
+                "id": node_id,
+                "skipped": True,
+                "latency_ms": 0,
+                "probe_status": "not_checked",
+                "probe_message": message,
+                "speed_bps": 0,
+            }
+
         temp_node = {
             "id": node_id,
             "ip": n_info.get("ip") or h,
             "remote_host": h,
             "remote_port": p,
             "latency_ms": latency,
-            "speed": speed_bps,
-            "speed_bps": speed_bps,
+            "speed": parse_int(n_info.get("speed") or n_info.get("speed_bps")),
+            "speed_bps": parse_int(n_info.get("speed_bps") or n_info.get("speed")),
             "probe_status": "available" if ok else "unavailable",
             "probe_message": message,
             "probed_at": time.time(),
-            "record_speed_bps": None if speed_result.get("skipped") else speed_bps,
+            "record_speed_bps": None,
             "owner": "",
             "asn": "",
             "as_name": "",
@@ -4683,10 +5356,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     updated_nodes_map = {}
     # Protect the production proxy path from CPU/TUN contention while still
     # refreshing the full candidate pool in the background.
-    probe_worker_limit = 1 if active_tunnel_running() else 3
+    probe_worker_limit = 1
     max_workers = min(probe_worker_limit, max(1, len(to_test)))
-    completed_since_flush = 0
-    last_flush_at = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -4697,6 +5368,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             nid = futures[future]
             try:
                 res = future.result()
+                if res.get("skipped"):
+                    continue
                 updated_nodes_map[nid] = res
                 try:
                     original_node = next((item for item in to_test if item.get("id") == nid), None)
@@ -4727,38 +5400,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                 except Exception as pool_exc:
                     log_to_json("WARNING", "Main", f"NodePool 异常探测结果写入失败: {pool_exc}")
 
-            # Avoid re-reading and rewriting the entire nodes.json after every
-            # single probe completion. Flush small batches so the UI remains
-            # responsive without turning disk I/O into an O(n^2) bottleneck.
-            completed_since_flush += 1
-            now = time.time()
-            if completed_since_flush >= 5 or now - last_flush_at >= 1.0:
-                with lock:
-                    current_nodes = read_nodes()
-                    for current in current_nodes:
-                        current_id = current.get("id")
-                        if current_id in updated_nodes_map:
-                            current.update(updated_nodes_map[current_id])
-                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
-                completed_since_flush = 0
-                last_flush_at = now
-
-    # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
-    successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
-    if successful_nodes:
-        try:
-            vpn_utils.enrich_ip_info(successful_nodes)
-        except Exception as ee:
-            print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
-
-    with lock:
-        current_nodes = read_nodes()
-        for n in current_nodes:
-            nid = n.get("id")
-            if nid in updated_nodes_map:
-                n.update(updated_nodes_map[nid])
-        sorted_nodes = sort_all_nodes(current_nodes)
-        write_json(NODES_FILE, sorted_nodes)
+    if updated_nodes_map:
+        schedule_nodes_probe_flush(updated_nodes_map)
 
     return list(updated_nodes_map.values())
 
@@ -5104,6 +5747,9 @@ def warm_first_page_loop() -> None:
     """Keep the first pages ready so opening the site does not wait on SQLite."""
     time.sleep(0.2)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             if not manual_connection_active:
                 countries = [str(_read_bootstrap_state().get("local_server_country") or "").strip(), ""]
@@ -5132,10 +5778,47 @@ def warm_first_page_loop() -> None:
             pass
         time.sleep(15)
 
+def _clear_hot_standby_identity() -> None:
+    """Drop a live hot standby without erasing a prepared cold pin."""
+    try:
+        raw = read_json(STATE_FILE, {})
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    prepared = bool(raw.get("standby_prepared"))
+    ip = str(raw.get("standby_ip") or "").strip()
+    port = parse_int(raw.get("standby_port"))
+    protocol = str(raw.get("standby_protocol") or "").strip().lower()
+    sid = str(raw.get("standby_node_id") or "")
+    if prepared and ip:
+        found = ""
+        if port > 0 and protocol:
+            try:
+                found = node_pool.find_endpoint_id(ip, port, protocol)
+            except Exception:
+                found = ""
+        if found:
+            wanted = "pool:" + found
+            if sid == wanted and not raw.get("standby_ready"):
+                return
+            set_state(standby_ready=False, standby_node_id=wanted)
+            return
+        if sid.startswith("pool:"):
+            set_state(standby_ready=False)
+            return
+        set_state(standby_ready=False, standby_node_id="")
+        return
+    set_state(standby_ready=False, standby_node_id="")
+
+
 def warm_standby_loop() -> None:
     """Keep one already-open OpenVPN tunnel so the next switch is a route flip."""
     time.sleep(8)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             if manual_connection_active or ui_command_plane.is_busy() or is_connecting or not active_tunnel_running():
                 time.sleep(2)
@@ -5158,7 +5841,7 @@ def warm_standby_loop() -> None:
                 chosen_ip = _endpoint_ip(chosen)
                 if chosen and chosen_ip and (chosen_ip != standby_ip or (chosen_protocol and chosen_protocol != "openvpn")):
                     release_standby()
-                    set_state(standby_ready=False, standby_node_id="")
+                    _clear_hot_standby_identity()
                     _publish_scheme_standby(chosen)
                     time.sleep(8)
                     continue
@@ -5166,7 +5849,7 @@ def warm_standby_loop() -> None:
                 standby_country = normalized_country_name(standby_slot.get("country") or "")
                 if sid and sid == str(active_openvpn_node_id or ""):
                     release_standby()
-                    set_state(standby_ready=False, standby_node_id="")
+                    _clear_hot_standby_identity()
                     continue
                 if pin_country and standby_country and standby_country != pin_country:
                     replacement = _select_standby_openvpn_node()
@@ -5178,7 +5861,7 @@ def warm_standby_loop() -> None:
                         time.sleep(30)
                         continue
                     release_standby()
-                    set_state(standby_ready=False, standby_node_id="")
+                    _clear_hot_standby_identity()
                     log_to_json("INFO", "Standby", f"热备改到{pin_country}")
                     _bring_up_standby(replacement)
                     time.sleep(8)
@@ -5201,7 +5884,7 @@ def warm_standby_loop() -> None:
                         failed_until[pending_id] = time.time() + 600
                         _select_standby_openvpn_node.failed_until = failed_until
                         release_standby()
-                        set_state(standby_ready=False, standby_node_id="")
+                        _clear_hot_standby_identity()
                         log_to_json("INFO", "Standby", f"热备出口未通过 {pending_id}: {egress.get('error') or ''}")
                 time.sleep(8)
                 continue
@@ -5222,13 +5905,234 @@ def warm_standby_loop() -> None:
                 if time.time() - float(getattr(warm_standby_loop, "empty_log_at", 0) or 0) > 300:
                     warm_standby_loop.empty_log_at = time.time()
                     log_to_json("INFO", "Standby", "还没有可预连的 OpenVPN 热备")
-                set_state(standby_ready=False, standby_node_id="")
+                _clear_hot_standby_identity()
                 time.sleep(30)
                 continue
             _bring_up_standby(node)
         except Exception as exc:
             log_to_json("WARNING", "Standby", f"热备隧道维护失败: {exc}")
         time.sleep(8)
+
+COLD_PORT_SECONDS = 60
+COLD_CONNECT_SECONDS = 600
+_cold_guard = threading.Lock()
+_cold_mem: dict[str, Any] | None = None
+_cold_announced = False
+
+
+def _load_cold_state() -> dict[str, Any]:
+    raw = read_json(DATA_DIR / "cold_standby.json", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "order": [str(item) for item in (raw.get("order") or []) if str(item)],
+        "failed": [str(item) for item in (raw.get("failed") or []) if str(item)],
+        "published": str(raw.get("published") or ""),
+        "last_connect": float(raw.get("last_connect") or 0),
+    }
+
+
+def _cold_state() -> dict[str, Any]:
+    global _cold_mem
+    with _cold_guard:
+        if _cold_mem is None:
+            _cold_mem = _load_cold_state()
+        return _cold_mem
+
+
+def _save_cold_state() -> None:
+    with _cold_guard:
+        snapshot = dict(_cold_mem or _load_cold_state())
+        snapshot["order"] = list(snapshot.get("order") or [])
+        snapshot["failed"] = list(snapshot.get("failed") or [])
+    try:
+        write_json(DATA_DIR / "cold_standby.json", snapshot)
+    except Exception:
+        pass
+
+
+def _cold_skips_port(endpoint: dict[str, Any]) -> bool:
+    protocol = str(endpoint.get("protocol") or "").lower()
+    transport = str(endpoint.get("transport") or "").lower()
+    if protocol == "l2tp-ipsec" or transport == "udp":
+        return True
+    if protocol == "openvpn" and transport != "tcp":
+        return True
+    return False
+
+
+def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
+    active_eid = str(active_pool_endpoint_id or "")
+    try:
+        rows = unified_hot_pool_candidates(ui_cfg, exclude_endpoint_id=active_eid, limit=100)
+    except Exception as exc:
+        log_to_json("WARNING", "Standby", f"冷备候选读取失败: {exc}")
+        return None
+    active_ip = _active_exit_ip()
+    found: dict[str, dict[str, Any]] = {}
+    for endpoint in rows:
+        eid = str(endpoint.get("endpoint_id") or "")
+        ip = _endpoint_ip(endpoint)
+        if not eid or not ip or (active_ip and ip == active_ip):
+            continue
+        if endpoint_is_unstable(endpoint) or int(endpoint.get("fail_streak") or 0) >= 3:
+            continue
+        if not endpoint_matches_explicit_routing(endpoint, ui_cfg):
+            continue
+        found[eid] = endpoint
+    return found
+
+
+def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    cold = _cold_state()
+    order = [eid for eid in cold["order"] if eid in candidates]
+    for eid in candidates:
+        if eid not in order:
+            order.append(eid)
+    failed = [eid for eid in cold["failed"] if eid in candidates]
+    if candidates and failed and all(eid in failed for eid in candidates):
+        failed = []
+        log_to_json("INFO", "Standby", "冷备已轮换一整轮，仍可用的节点可以重新作为备")
+    cold["order"] = order
+    cold["failed"] = failed
+    for eid in order:
+        if eid not in failed:
+            return candidates[eid]
+    return None
+
+
+def _rotate_cold(eid: str, candidates: dict[str, dict[str, Any]]) -> None:
+    cold = _cold_state()
+    order = [item for item in cold["order"] if item != eid and item in candidates]
+    for item in candidates:
+        if item not in order and item != eid:
+            order.append(item)
+    order.append(eid)
+    if eid not in cold["failed"]:
+        cold["failed"].append(eid)
+    cold["order"] = order
+    cold["failed"] = [item for item in cold["failed"] if item in candidates or item == eid]
+    if candidates and all(item in cold["failed"] for item in candidates):
+        cold["failed"] = []
+        log_to_json("INFO", "Standby", "冷备已轮换一整轮，仍可用的节点可以重新作为备")
+    cold["published"] = ""
+    _save_cold_state()
+
+
+def _publish_cold_standby(endpoint: dict[str, Any] | None) -> None:
+    global _cold_announced
+    cold = _cold_state()
+    if not endpoint:
+        if cold.get("published") or _cold_announced:
+            set_state(standby_prepared=False, standby_node_id="", standby_ip="", standby_port=0, standby_protocol="")
+            cold["published"] = ""
+            _cold_announced = True
+            _save_cold_state()
+        return
+    eid = str(endpoint.get("endpoint_id") or "")
+    wanted_id = ("pool:" + eid) if eid else ""
+    try:
+        raw_state = read_json(STATE_FILE, {})
+    except Exception:
+        raw_state = {}
+    if not isinstance(raw_state, dict):
+        raw_state = {}
+    same = (
+        cold.get("published") == eid
+        and _cold_announced
+        and bool(raw_state.get("standby_prepared"))
+        and str(raw_state.get("standby_node_id") or "") == wanted_id
+        and str(raw_state.get("standby_ip") or "") == _endpoint_ip(endpoint)
+    )
+    if same:
+        return
+    set_state(
+        standby_prepared=True,
+        standby_node_id="pool:" + eid,
+        standby_ip=_endpoint_ip(endpoint),
+        standby_port=int(endpoint.get("port") or 0),
+        standby_protocol=str(endpoint.get("protocol") or ""),
+    )
+    cold["published"] = eid
+    _cold_announced = True
+    _save_cold_state()
+    log_to_json("INFO", "Standby", f"冷备已准备 {endpoint.get('protocol')} {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}")
+
+
+def _cold_port_open(endpoint: dict[str, Any]) -> bool | None:
+    if _cold_skips_port(endpoint):
+        return None
+    host = _endpoint_ip(endpoint) or str(endpoint.get("hostname") or "").strip()
+    try:
+        port = int(endpoint.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not host or port <= 0:
+        return None
+    return _tcp_port_open(host, port, timeout=1.5)
+
+
+def cold_standby_pass() -> None:
+    ui_cfg = load_ui_config()
+    if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+        _publish_cold_standby(None)
+        return
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+        return
+    candidates = _cold_candidates(ui_cfg)
+    if candidates is None:
+        return
+    chosen: dict[str, Any] | None = None
+    for _ in range(3):
+        chosen = _pick_cold(candidates)
+        if not chosen:
+            break
+        probed = _cold_port_open(chosen)
+        if probed is False:
+            eid = str(chosen.get("endpoint_id") or "")
+            log_to_json("INFO", "Standby", f"冷备端口不可用，排到队尾 {_endpoint_ip(chosen)}:{chosen.get('port')}")
+            _rotate_cold(eid, candidates)
+            chosen = None
+            continue
+        break
+    if chosen is None and any(
+        eid not in set(_cold_state().get("failed") or []) for eid in candidates
+    ):
+        chosen = _pick_cold(candidates)
+    _publish_cold_standby(chosen)
+    if not chosen:
+        return
+    cold = _cold_state()
+    now = time.time()
+    if now - float(cold.get("last_connect") or 0) < COLD_CONNECT_SECONDS:
+        return
+    cold["last_connect"] = now
+    _save_cold_state()
+    if active_tunnel_running() or proxy_server.proxy_forwarding_busy():
+        return
+    eid = str(chosen.get("endpoint_id") or "")
+    result = probe_pool_endpoint(eid)
+    if result.get("skipped") or result.get("active"):
+        return
+    if not result.get("ok"):
+        log_to_json("INFO", "Standby", f"冷备实连不可用，排到队尾 {eid}: {result.get('error') or ''}")
+        _rotate_cold(eid, candidates)
+        nxt = _pick_cold(candidates)
+        if nxt and str(nxt.get("endpoint_id") or "") != eid:
+            _publish_cold_standby(nxt)
+        else:
+            _publish_cold_standby(None)
+
+
+def cold_standby_loop() -> None:
+    """One prepared standby. Port check each minute. Real connect only when the exit is idle."""
+    time.sleep(4)
+    while True:
+        try:
+            cold_standby_pass()
+        except Exception as exc:
+            log_to_json("WARNING", "Standby", f"冷备维护失败: {exc}")
+        time.sleep(COLD_PORT_SECONDS)
 
 def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) -> str:
     """Make-before-break manual OpenVPN switch with rollback before the new route is committed."""
@@ -5407,6 +6311,7 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
         manual_switch_message="切换完成",
     )
     set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
+    align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""))
     return f"Connected {node_id} (smooth switch)"
 
 def connect_node(node_id: str, enable_connection: bool = False, manual: bool = False) -> str:
@@ -5595,6 +6500,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         if manual:
             set_state(manual_switch_message="目标节点验证完成，正在确认客户端状态…", last_check_message="真实出口验证通过，正在完成平滑切换…")
             set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
+            align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""))
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         remember_live_connection(openvpn_node_id=node_id)
@@ -5616,7 +6522,10 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
 PROBE_ROUTE_TABLE = 200
 
 def cleanup_probe_policy_routing(table: int = PROBE_ROUTE_TABLE) -> None:
-    _delete_route_rules(table)
+    try:
+        subprocess.run(["ip", "rule", "del", "table", str(table)], capture_output=True, timeout=2)
+    except Exception:
+        pass
     try:
         subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
     except Exception:
@@ -5664,19 +6573,22 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
         return {"ok": False, "error": f"临时策略路由建立失败: {route_error}"}
 
     cmd = [
-        "curl", "-4", "-sS",
+        "curl", "-4", "-sS", "-o", "/dev/null",
+        "-w", "%{http_code} %{time_total}",
         "--interface", f"if!{interface}",
-        "-w", "\n%{time_total} %{http_code}",
-        "https://api.ipify.org",
-        "--connect-timeout", "4",
-        "--max-time", "8",
+        "--connect-timeout", "3",
+        "--max-time", "4",
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
-        if res.returncode != 0:
-            diagnostics: list[str] = [f"curl_exit={res.returncode}", f"gateway={gateway or '-'}"]
-            if res.stderr:
-                diagnostics.append(f"curl_error={res.stderr.strip()[-500:]}")
+        proven = None
+        for url in ("https://example.com/", "https://www.google.com/generate_204"):
+            res = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=6)
+            parts = (res.stdout or "").strip().split()
+            if res.returncode == 0 and len(parts) == 2 and parts[0] in {"200", "204", "301", "302"}:
+                proven = {"ok": True, "ip": "", "latency_ms": int(float(parts[1]) * 1000)}
+                break
+        if not proven:
+            diagnostics: list[str] = [f"gateway={gateway or '-'}", "connectivity=example.com/google unreachable"]
             for label, diag_cmd in [
                 ("addr", ["ip", "-4", "addr", "show", "dev", interface]),
                 ("probe_table", ["ip", "route", "show", "table", str(table)]),
@@ -5684,65 +6596,36 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
             ]:
                 try:
                     diag = subprocess.run(diag_cmd, capture_output=True, text=True, timeout=3)
-                    diagnostics.append(f"{label}={(diag.stdout or diag.stderr).strip()[-700:]}")
+                    diagnostics.append(f"{label}={(diag.stdout or diag.stderr).strip()[-400:]}")
                 except Exception as exc:
                     diagnostics.append(f"{label}_error={exc}")
             return {"ok": False, "error": " | ".join(diagnostics)}
-        lines = res.stdout.strip().splitlines()
-        if len(lines) < 2:
-            return {"ok": False, "error": "测试出口没有返回有效结果"}
-        ip = lines[0].strip()
-        timing = lines[-1].split()
-        if len(timing) != 2 or timing[1] != "200":
-            return {"ok": False, "error": f"测试出口 HTTP 异常: {lines[-1]}"}
-        latency_ms = int(float(timing[0]) * 1000)
-        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+        ip_cmd = [
+            "curl", "-4", "-sS",
+            "--interface", f"if!{interface}",
+            "-w", "\n%{http_code}",
+            "http://api.ipify.org",
+            "--connect-timeout", "2",
+            "--max-time", "2",
+        ]
+        try:
+            ip_res = subprocess.run(ip_cmd, capture_output=True, text=True, timeout=3)
+            lines = (ip_res.stdout or "").strip().splitlines()
+            if ip_res.returncode == 0 and len(lines) >= 2 and lines[-1].strip() == "200":
+                ip = lines[0].strip()
+                if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+                    proven["ip"] = ip
+        except Exception:
+            pass
+        return proven
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
         cleanup_probe_policy_routing(table)
 
 def measure_interface_speed(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
-    """Measure real download throughput through an isolated test tunnel."""
-    interface = str(interface or "").strip()
-    if not interface:
-        return {"ok": False, "speed_bps": 0, "error": "缺少测试网卡"}
-    route_ok, route_error = setup_probe_policy_routing(interface, gateway, table=table)
-    if not route_ok:
-        return {"ok": False, "speed_bps": 0, "error": f"临时测速路由建立失败: {route_error}"}
-    if not speed_test_lock.acquire(timeout=1.0):
-        cleanup_probe_policy_routing(table)
-        return {"ok": False, "speed_bps": 0, "error": "测速资源忙，稍后重试"}
-    try:
-        url = f"https://speed.cloudflare.com/__down?bytes={SPEED_TEST_BYTES}"
-        cmd = [
-            "curl", "-4", "-sS", "-o", "/dev/null",
-            "--interface", f"if!{interface}",
-            "-w", "%{speed_download} %{http_code}",
-            url,
-            "--connect-timeout", "3",
-            "--max-time", str(SPEED_TEST_TIMEOUT_SECONDS),
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=9)
-        if res.returncode != 0:
-            return {"ok": False, "speed_bps": 0, "error": f"curl_exit={res.returncode}: {(res.stderr or '').strip()[-300:]}"}
-        parts = (res.stdout or "").strip().split()
-        if len(parts) != 2 or parts[1] != "200":
-            return {"ok": False, "speed_bps": 0, "error": f"测速 HTTP 异常: {(res.stdout or '').strip()}"}
-        bytes_per_second = float(parts[0] or 0)
-        speed_bps = max(0, int(bytes_per_second * 8))
-        if speed_bps <= 0:
-            return {"ok": False, "speed_bps": 0, "error": "测速结果为 0"}
-        return {
-            "ok": True,
-            "speed_bps": speed_bps,
-            "speed_mbps": round(speed_bps / 1_000_000, 1),
-        }
-    except Exception as exc:
-        return {"ok": False, "speed_bps": 0, "error": str(exc)}
-    finally:
-        cleanup_probe_policy_routing(table)
-        speed_test_lock.release()
+    """Speed downloads are disabled. GCP bills egress, and detection must not fetch them."""
+    return {"ok": False, "skipped": True, "speed_bps": 0, "error": "测速已关闭，避免访问 Cloudflare 产生云出口流量"}
 
 def measure_or_reuse_ip_speed(interface: str, endpoint_id: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
     """Run one real download speed test per current IP within the reuse window."""
@@ -5807,11 +6690,9 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
     token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:10] or uuid.uuid4().hex[:10]
     result: tunnel_adapters.TunnelResult | None = None
     cleanup = None
-    probe_table: int | None = _acquire_probe_route_table()
+    started = time.perf_counter()
 
     try:
-        if probe_table is None:
-            return {"ok": False, "skipped": True, "error": "探测临时路由表暂时已满"}
         if protocol == "softether" and active_tunnel_running() and active_external_tunnel is not None and str(active_external_tunnel.protocol or "") == "softether":
             return {"ok": False, "skipped": True, "error": "生产隧道正在使用 SoftEther，跳过并行探测以免打断 vpnclient"}
         if protocol == "softether":
@@ -5858,46 +6739,24 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
 
         if result is None or not result.ok or not result.interface:
             message = result.message if result else "隧道未建立"
+            lowered = message.lower()
+            if "not installed" in lowered or "未安装" in message:
+                return {"ok": False, "skipped": True, "protocol": protocol, "error": message}
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
             return {"ok": False, "protocol": protocol, "error": message}
 
-        egress = (
-            tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
-            if protocol == "l2tp-ipsec"
-            else check_interface_egress(result.interface, result.gateway, table=probe_table)
-        )
-        if not egress.get("ok"):
-            message = str(egress.get("error") or "接口出口不可用")
-            node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
-            return {"ok": False, "protocol": protocol, "interface": result.interface, "error": message}
-
-        latency_ms = parse_int(egress.get("latency_ms"))
-        speed_result = {"ok": False}
-        if active_tunnel_running() or proxy_server.proxy_forwarding_busy(20):
-            speed_bps = 0
-            recorded_speed = None
-            probe_message = "background egress probe ok · 在线隧道占用中，跳过测速"
-        else:
-            speed_result = measure_or_reuse_ip_speed(result.interface, endpoint_id, gateway=result.gateway or "", table=probe_table)
-            speed_bps = int(speed_result.get("speed_bps") or 0)
-            recorded_speed = speed_bps
-            probe_message = "background egress probe ok"
-            if speed_result.get("ok"):
-                probe_message += f" · 速度 {round(speed_bps / 8_000_000, 2)} MB/s"
-            else:
-                probe_message += f" · speed test failed: {speed_result.get('error') or 'unknown'}"
+        latency_ms = max(1, int((time.perf_counter() - started) * 1000))
+        probe_message = f"{protocol} 实连成功 {latency_ms} ms"
         node_pool.record_endpoint_probe(
-            endpoint_id, True, latency_ms, probe_message, speed_bps=recorded_speed
+            endpoint_id, True, latency_ms, probe_message, speed_bps=None
         )
         return {
             "ok": True,
             "protocol": protocol,
             "interface": result.interface,
-            "ip": egress.get("ip", ""),
             "latency_ms": latency_ms,
-            "speed_bps": speed_bps,
-            "speed_mbps": round(speed_bps / 1_000_000, 1) if speed_bps > 0 else 0,
-            "speed_test_ok": bool(speed_result.get("ok")),
+            "speed_bps": 0,
+            "message": probe_message,
         }
     except Exception as exc:
         try:
@@ -5911,8 +6770,6 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
                 cleanup()
             except Exception:
                 pass
-        if probe_table is not None:
-            _release_probe_route_table(probe_table)
         protocol_probe_lock.release()
 
 def protocol_probe_loop() -> None:
@@ -5926,6 +6783,9 @@ def protocol_probe_loop() -> None:
     """
     time.sleep(15)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             if proxy_server.proxy_forwarding_busy() or ui_query_active() or ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or country_full_sweep_running:
                 time.sleep(5)
@@ -6026,6 +6886,8 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
         port = int(endpoint.get("port") or 0)
         country = endpoint.get("country") or "XX"
         node_id = safe_name(f"{country}_{ip}_{port}_{transport}")
+    if node_id and node_id in _nodes_index_get():
+        return node_id
     config_file = str(endpoint.get("config_ref") or metadata.get("config_file") or "").strip()
     config_text = ""
     if config_file:
@@ -6084,20 +6946,8 @@ def ensure_openvpn_node_from_pool(endpoint: dict[str, Any]) -> str:
         "pool_endpoint_id": endpoint_id,
         "pool_rehydrated": True,
     }
-    with lock:
-        nodes = read_nodes()
-        for idx, existing in enumerate(nodes):
-            if existing.get("id") == node_id:
-                nodes[idx].update({k: v for k, v in node.items() if v not in (None, "")})
-                write_json(NODES_FILE, sort_all_nodes(nodes))
-                return node_id
-        nodes.append(node)
-        if len(nodes) > 1000:
-            active_ids = {str(active_openvpn_node_id or "")}
-            kept = [n for n in nodes if n.get("id") in active_ids or n.get("probe_status") in ("available", "testing")]
-            kept.extend([n for n in nodes if n not in kept][-max(0, 1000-len(kept)):])
-            nodes = kept[:1000]
-        write_json(NODES_FILE, sort_all_nodes(nodes))
+    _remember_openvpn_node(node)
+    schedule_nodes_probe_flush({node_id: node})
     return node_id
 
 def connect_pool_endpoint_with_fallback(endpoint_ids: list[str], manual: bool = False) -> str:
@@ -6382,6 +7232,405 @@ def global_probe_sweep_once() -> dict[str, Any]:
     return {"ok": True, "openvpn_tested": tested_openvpn, "pool_tested": tested_pool}
 
 
+_library_preview_at = 0.0
+_library_preview_total = 0
+
+
+def library_check_preview_total() -> int:
+    """How many endpoints a library check would dial. Shown before Start."""
+    global _library_preview_at, _library_preview_total
+    now = time.time()
+    if _library_preview_total and now - _library_preview_at < 30:
+        return _library_preview_total
+    total = 0
+    try:
+        for protocol, count in node_pool.count_by_protocol(exclude_retired=True).items():
+            if _library_protocol_ready(protocol):
+                total += int(count)
+    except Exception:
+        total = _library_preview_total
+    _library_preview_at = now
+    _library_preview_total = total
+    return total
+
+
+def _library_check_public_state() -> dict[str, Any]:
+    with library_check_lock:
+        tested = int(library_check_tested)
+        total = int(library_check_total)
+        available = int(library_check_available)
+        unavailable = int(library_check_unavailable)
+        samples = int(library_check_rate_samples)
+        rate = float(library_check_rate_seconds)
+        phase = str(library_check_phase or "idle")
+        message = str(library_check_message or "")
+        wait = str(library_check_wait_reason or "")
+        paused = bool(library_check_paused)
+    remaining = max(0, total - tested)
+    eta = 0
+    if samples > 0 and rate > 0 and remaining > 0 and phase in ("running", "paused", "stopping"):
+        eta = int(remaining * (rate / samples))
+    return {
+        "library_check_running": phase in ("running", "paused", "stopping"),
+        "library_check_phase": phase,
+        "library_check_paused": paused or phase == "paused",
+        "library_check_total": total,
+        "library_check_preview_total": library_check_preview_total(),
+        "library_check_tested": tested,
+        "library_check_available": available,
+        "library_check_unavailable": unavailable,
+        "library_check_remaining": remaining,
+        "library_check_eta_seconds": eta,
+        "library_check_message": message,
+        "library_check_wait_reason": wait,
+    }
+
+
+def _library_set_wait(reason: str) -> None:
+    global library_check_wait_reason
+    with library_check_lock:
+        library_check_wait_reason = str(reason or "")
+
+
+def _library_set_message(message: str) -> None:
+    global library_check_message
+    with library_check_lock:
+        library_check_message = str(message or "")
+
+
+def _library_protocol_ready(protocol: str) -> bool:
+    protocol = str(protocol or "").strip().lower()
+    if protocol == "openvpn":
+        return tunnel_adapters.command_exists("openvpn")
+    if protocol == "softether":
+        return tunnel_adapters.SoftEtherAdapter.available()
+    if protocol == "sstp":
+        return tunnel_adapters.SSTPAdapter.available()
+    if protocol == "l2tp-ipsec":
+        return l2tp_adapter.available()
+    return False
+
+
+def _library_status_rank(status: str) -> int:
+    value = str(status or "").upper()
+    if value == "NEW":
+        return 0
+    if value in ("STALE", "DEGRADED"):
+        return 1
+    if value == "COOLDOWN":
+        return 2
+    return 3
+
+
+def _library_wait_until_slot(generation: int) -> str:
+    while True:
+        with library_check_lock:
+            if library_check_generation != generation or library_check_stop:
+                return "stop"
+            paused = library_check_paused
+        if paused:
+            _library_set_wait("已暂停")
+            time.sleep(0.4)
+            continue
+        if manual_connection_active or is_connecting or maintenance_lock.locked():
+            _library_set_wait("人工切换或维护进行中，检测让路")
+            time.sleep(0.5)
+            continue
+        if ui_query_active():
+            _library_set_wait("前台筛选中，检测让路")
+            time.sleep(0.4)
+            continue
+        if proxy_server.proxy_forwarding_busy():
+            _library_set_wait("转发占用中，等待空闲后再拨号")
+            time.sleep(0.5)
+            continue
+        _library_set_wait("")
+        return "go"
+
+
+def _library_is_live_production(endpoint: dict[str, Any]) -> bool:
+    if not active_tunnel_running():
+        return False
+    endpoint_id = str(endpoint.get("endpoint_id") or "")
+    if endpoint_id and endpoint_id == str(active_pool_endpoint_id or ""):
+        return True
+    node_id = str((endpoint.get("metadata") or {}).get("node_id") or "")
+    if node_id and node_id == str(active_openvpn_node_id or ""):
+        return True
+    ip = str(endpoint.get("current_ip") or "").strip()
+    port = str(int(endpoint.get("port") or 0))
+    transport = str(endpoint.get("transport") or "").strip().lower()
+    active_id = str(active_openvpn_node_id or "")
+    needle = f"{ip}_{port}_{transport}" if transport else f"{ip}_{port}"
+    return bool(ip and port != "0" and active_id and (active_id == needle or active_id.endswith("_" + needle)))
+
+
+def _library_openvpn_config(endpoint: dict[str, Any]) -> str:
+    metadata = endpoint.get("metadata") or {}
+    node_id = str(metadata.get("node_id") or "").strip()
+    host = str(endpoint.get("hostname") or metadata.get("hostname") or endpoint.get("current_ip") or "").strip()
+    port = int(endpoint.get("port") or 0)
+    transport = str(endpoint.get("transport") or "tcp").strip().lower() or "tcp"
+    text = ""
+    if node_id:
+        try:
+            cached = _nodes_index_get().get(node_id) or {}
+        except Exception:
+            cached = {}
+        text = str(cached.get("config_text") or "")
+        if text.strip():
+            return _prefer_openvpn_ip(text, cached)
+    config_file = str(endpoint.get("config_ref") or metadata.get("config_file") or "").strip()
+    if config_file:
+        try:
+            text = Path(config_file).read_text(encoding="utf-8")
+        except Exception:
+            text = ""
+    if not text.strip():
+        text = _manual_openvpn_template() or ""
+        if text.strip():
+            text = re.sub(r"(?m)^remote\s+\S+\s+\d+\s*$", f"remote {host} {port}", text, count=1)
+            text = re.sub(r"(?m)^proto\s+\S+\s*$", f"proto {transport}", text, count=1)
+    if not text.strip():
+        return ""
+    return _prefer_openvpn_ip(text, {
+        "host_name": host,
+        "remote_host": host,
+        "remote_port": port,
+        "proto": transport,
+    })
+
+
+def _library_probe_openvpn(endpoint: dict[str, Any]) -> dict[str, Any]:
+    endpoint_id = str(endpoint.get("endpoint_id") or "")
+    config_text = _library_openvpn_config(endpoint)
+    if not config_text.strip():
+        return {"ok": False, "latency_ms": 0, "message": "缺少 OpenVPN 配置"}
+    if not protocol_probe_lock.acquire(blocking=False):
+        return {"deferred": True, "message": "已有协议探测，检测让路"}
+    temp_path = test_config_path(endpoint_id or "library")
+    idx = None
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        temp_path.write_text(config_text, encoding="utf-8")
+        idx = get_free_test_index()
+        latency_box: list[int] = []
+        ok, message, _process = run_openvpn_until_ready(
+            str(temp_path), False, True, timeout=12, dev=f"tun{idx}",
+            latency_out=latency_box, quiet=True,
+        )
+        if "让路" in str(message or ""):
+            return {"deferred": True, "message": message}
+        latency = int(latency_box[0]) if ok and latency_box else 0
+        return {"ok": bool(ok), "latency_ms": latency, "message": message}
+    except Exception as exc:
+        return {"ok": False, "latency_ms": 0, "message": str(exc)}
+    finally:
+        if idx is not None:
+            release_test_index(idx)
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+        protocol_probe_lock.release()
+
+
+def _library_probe_one(endpoint_id: str) -> str:
+    if library_check_stop:
+        return "stop"
+    try:
+        endpoint = node_pool.get_endpoint(endpoint_id)
+    except Exception as exc:
+        return "deferred:读取端点失败，稍后重试 " + str(exc)
+    if not endpoint:
+        return "unavailable"
+    if _library_is_live_production(endpoint):
+        latency = int(float(endpoint.get("latency_ewma") or 0))
+        try:
+            node_pool.record_endpoint_probe(
+                endpoint_id, True, latency, "当前在线节点，检测未重复拨号", speed_bps=None,
+            )
+        except Exception:
+            pass
+        return "available"
+    protocol = str(endpoint.get("protocol") or "").lower()
+    host = str(endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
+    port = int(endpoint.get("port") or 0)
+    _library_set_message(f"正在拨号 {protocol} {host}:{port}" if port else f"正在拨号 {protocol} {host}")
+    if protocol == "openvpn":
+        result = _library_probe_openvpn(endpoint)
+        if result.get("deferred"):
+            return "deferred:" + str(result.get("message") or "检测让路")
+        ok = bool(result.get("ok"))
+        try:
+            node_pool.record_endpoint_probe(
+                endpoint_id, ok, int(result.get("latency_ms") or 0),
+                str(result.get("message") or ""), speed_bps=None,
+            )
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"全球库检测写入失败: {exc}")
+        return "available" if ok else "unavailable"
+    result = probe_pool_endpoint(endpoint_id)
+    if result.get("skipped") and not result.get("ok"):
+        return "deferred:" + str(result.get("error") or result.get("message") or "检测让路")
+    return "available" if result.get("ok") else "unavailable"
+
+
+def _library_check_worker(generation: int) -> None:
+    global library_check_phase, library_check_total, library_check_tested
+    global library_check_available, library_check_unavailable
+    global library_check_rate_seconds, library_check_rate_samples
+    global library_check_message, library_check_wait_reason
+    global library_check_stop, library_check_paused
+    try:
+        rows = node_pool.list_endpoint_ids()
+        ready_rows: list[dict[str, Any]] = []
+        skipped = 0
+        for row in rows:
+            if str(row.get("status") or "").upper() == "RETIRED":
+                continue
+            if not _library_protocol_ready(str(row.get("protocol") or "")):
+                skipped += 1
+                continue
+            ready_rows.append(row)
+        ready_rows.sort(key=lambda item: (_library_status_rank(str(item.get("status") or "")), str(item.get("endpoint_id") or "")))
+        ids = [str(item.get("endpoint_id") or "") for item in ready_rows if str(item.get("endpoint_id") or "")]
+        with library_check_lock:
+            if library_check_generation != generation:
+                return
+            library_check_total = len(ids)
+            note = "正在逐个真实拨号，只记录往返延迟和可用性"
+            if skipped:
+                note += f"；已跳过 {skipped} 个未安装客户端或未知协议的端点"
+            library_check_message = note
+            stop_now = library_check_stop
+        if stop_now:
+            return
+        log_to_json("INFO", "Probe", f"全球库检测开始：可实连 {len(ids)}，跳过 {skipped}")
+        index = 0
+        while index < len(ids):
+            if _library_wait_until_slot(generation) == "stop":
+                break
+            endpoint_id = ids[index]
+            started = time.perf_counter()
+            outcome = _library_probe_one(endpoint_id)
+            if outcome == "stop":
+                break
+            if outcome.startswith("deferred"):
+                _library_set_wait(outcome.split(":", 1)[1] if ":" in outcome else "检测让路")
+                time.sleep(0.6)
+                continue
+            elapsed = max(0.0, time.perf_counter() - started)
+            with library_check_lock:
+                if library_check_generation != generation:
+                    return
+                library_check_tested += 1
+                if outcome == "available":
+                    library_check_available += 1
+                else:
+                    library_check_unavailable += 1
+                library_check_rate_seconds += elapsed
+                library_check_rate_samples += 1
+                tested_now = library_check_tested
+                library_check_wait_reason = ""
+            if tested_now == 1 or tested_now % 50 == 0:
+                log_to_json("INFO", "Probe", f"全球库检测进度 {tested_now}/{len(ids)}")
+            index += 1
+    except Exception as exc:
+        log_to_json("ERROR", "Probe", f"全球库检测异常: {exc}")
+        with library_check_lock:
+            if library_check_generation == generation:
+                library_check_phase = "error"
+                library_check_message = f"检测异常：{exc}"
+                library_check_wait_reason = ""
+    finally:
+        with library_check_lock:
+            if library_check_generation != generation:
+                finished = False
+            else:
+                finished = True
+                if library_check_phase == "error":
+                    library_check_paused = False
+                    library_check_stop = False
+                else:
+                    stopped = bool(library_check_stop) or library_check_phase == "stopping"
+                    if stopped:
+                        library_check_phase = "stopped"
+                        library_check_message = "检测已停止"
+                    elif library_check_total <= 0:
+                        library_check_phase = "done"
+                        if not library_check_message:
+                            library_check_message = "没有可实连的端点"
+                    else:
+                        library_check_phase = "done"
+                        library_check_message = "检测完成，只记录了真实连接的往返延迟和可用性"
+                    library_check_wait_reason = ""
+                    library_check_paused = False
+                    library_check_stop = False
+        if finished:
+            try:
+                _drop_ui_page_snapshots()
+            except Exception:
+                pass
+
+
+def library_check_control(action: str) -> dict[str, Any]:
+    global library_check_generation, library_check_stop, library_check_paused
+    global library_check_phase, library_check_total, library_check_tested
+    global library_check_available, library_check_unavailable
+    global library_check_rate_seconds, library_check_rate_samples
+    global library_check_message, library_check_wait_reason
+    action = str(action or "start").strip().lower()
+    if action not in ("start", "pause", "resume", "stop"):
+        action = "start"
+    start_thread = False
+    generation = 0
+    with library_check_lock:
+        if action == "pause":
+            if library_check_phase == "running":
+                library_check_paused = True
+                library_check_phase = "paused"
+                library_check_wait_reason = "已暂停"
+        elif action == "resume":
+            if library_check_phase == "paused":
+                library_check_paused = False
+                library_check_phase = "running"
+                library_check_wait_reason = ""
+        elif action == "stop":
+            if library_check_phase in ("running", "paused"):
+                library_check_stop = True
+                library_check_paused = False
+                library_check_phase = "stopping"
+                library_check_wait_reason = "正在停止，当前这一次拨号结束后停止"
+        elif library_check_phase == "paused":
+            library_check_paused = False
+            library_check_phase = "running"
+            library_check_wait_reason = ""
+        elif library_check_phase == "stopping":
+            library_check_message = "正在停止上一次检测，请稍后再开始"
+        elif library_check_phase != "running":
+            library_check_generation += 1
+            generation = library_check_generation
+            library_check_stop = False
+            library_check_paused = False
+            library_check_phase = "running"
+            library_check_total = library_check_preview_total()
+            library_check_tested = 0
+            library_check_available = 0
+            library_check_unavailable = 0
+            library_check_rate_seconds = 0.0
+            library_check_rate_samples = 0
+            library_check_message = "正在读取节点清单"
+            library_check_wait_reason = ""
+            start_thread = True
+    if start_thread:
+        threading.Thread(
+            target=_library_check_worker, args=(generation,), daemon=True, name="library-check",
+        ).start()
+    return _library_check_public_state()
+
+
 def refresh_global_pool_background(force: bool = True) -> dict[str, Any]:
     global global_pool_refresh_running, global_pool_refresh_last_at
     global global_pool_refresh_status, global_pool_refresh_message
@@ -6478,6 +7727,9 @@ def global_country_coverage_loop() -> None:
     # Start after the initial catalog has had a chance to load.
     time.sleep(30)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             global_country_coverage_heartbeat = time.time()
             if not global_pool_refresh_running and not ui_command_plane.is_busy() and not maintenance_lock.locked() and not manual_connection_active:
@@ -6778,6 +8030,9 @@ def resource_collect_loop() -> None:
     # acquisition is intentionally not on the critical path of page opening.
     time.sleep(120)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         try:
             if (not ISOLATED_INSTANCE and not initial_bootstrap_active
                     and not ui_command_plane.is_busy() and not global_pool_refresh_running):
@@ -6790,6 +8045,9 @@ def resource_collect_loop() -> None:
 def collector_loop() -> None:
     global last_collector_heartbeat
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         last_collector_heartbeat = time.time()
         success = False
         try:
@@ -7246,11 +8504,84 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 6px 16px rgba(244, 63, 94, 0.35);
     }
 
+    .egress-switch {
+      display: inline-flex;
+      align-items: center;
+      height: 40px;
+      padding: 3px;
+      gap: 2px;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(15, 23, 42, 0.45);
+      flex: 0 0 auto;
+    }
+
+    .egress-switch button {
+      height: 32px;
+      padding: 0 14px;
+      border: none;
+      border-radius: 8px;
+      background: transparent;
+      color: #cbd5e1;
+      font-size: 15px;
+      font-weight: 500;
+      line-height: 32px;
+      cursor: pointer;
+    }
+
+    .egress-switch button.is-on.direct {
+      background: #0f766e;
+      color: #fff;
+    }
+
+    .egress-switch button.is-on.proxy {
+      background: #4f46e5;
+      color: #fff;
+    }
+
     button:disabled {
       opacity: 0.4;
       cursor: not-allowed;
       transform: none !important;
       box-shadow: none !important;
+    }
+
+    .egress-switch-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      justify-content: center;
+      gap: 4px;
+      flex: 0 0 auto;
+    }
+
+    .egress-status {
+      position: static;
+      height: 16px;
+      min-height: 16px;
+      margin: 0;
+      line-height: 16px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #f5c542;
+      letter-spacing: 0;
+      pointer-events: none;
+      white-space: nowrap;
+      text-align: right;
+      visibility: hidden;
+    }
+
+    .egress-status.is-live {
+      visibility: visible;
+    }
+
+    .egress-status.ok {
+      color: #34d399;
+    }
+
+    .egress-switch button:disabled {
+      opacity: 1;
+      cursor: wait;
     }
 
     main {
@@ -7260,6 +8591,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .active-card {
+      position: relative;
       background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(79, 70, 229, 0.04) 100%);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
@@ -7867,22 +9199,31 @@ INDEX_HTML = r"""<!doctype html>
       outline-offset: 2px;
     }
     .background-task-strip {
-      min-height: 38px;
+      min-height: 36px;
       display: flex;
       align-items: center;
-      gap: 9px;
-      padding: 8px 12px;
+      gap: 10px;
+      margin: 0 0 8px;
+      padding: 6px 52px 6px 14px;
       border: 1px solid rgba(99,102,241,.16);
       border-radius: 10px;
       background: rgba(99,102,241,.045);
       color: var(--text-secondary);
-      font-size: 12px;
-      line-height: 1.45;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.35;
+      letter-spacing: 0;
       box-sizing: border-box;
     }
     .background-task-strip.running {
       border-color: rgba(245,158,11,.22);
       background: rgba(245,158,11,.055);
+    }
+    .background-task-strip > span:last-child {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .background-task-dot {
       width: 7px;
@@ -7901,17 +9242,19 @@ INDEX_HTML = r"""<!doctype html>
     .country-priority {
       display: flex;
       align-items: center;
-      gap: 9px;
-      margin: 0 0 10px;
-      padding: 8px 12px;
-      min-height: 34px;
+      gap: 10px;
+      margin: 0 0 8px;
+      padding: 6px 52px 6px 14px;
+      min-height: 36px;
       box-sizing: border-box;
       border: 1px solid rgba(20,184,166,.14);
-      border-radius: 9px;
+      border-radius: 10px;
       background: rgba(20,184,166,.035);
       color: var(--text-secondary);
-      font-size: 12px;
-      line-height: 1.45;
+      font-size: 13px;
+      font-weight: 500;
+      line-height: 1.35;
+      letter-spacing: 0;
     }
     .country-priority.running {
       border-color: rgba(245,158,11,.20);
@@ -7920,6 +9263,41 @@ INDEX_HTML = r"""<!doctype html>
     .country-priority .badge {
       flex: 0 0 auto;
       white-space: nowrap;
+    }
+    .library-status-main {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 500;
+    }
+    .library-server-meta {
+      flex: 1 1 auto;
+      min-width: 168px;
+      max-width: 58%;
+      margin-left: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      color: #d5dee8;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .library-server-meta > span {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .library-server-meta .mono {
+      flex: 0 0 auto;
+      overflow: visible;
+      text-overflow: clip;
+      color: #e7eef6;
+      font-weight: 500;
     }
     @media (max-width: 768px) {
       .country-priority {
@@ -7987,6 +9365,9 @@ INDEX_HTML = r"""<!doctype html>
       z-index: 100;
       overflow: visible !important;
     }
+    .toolbar > .toolbar-custom-select {
+      height: 36px;
+    }
     .toolbar-custom-select[data-filter-id="status_filter"] { flex: 1.32 1 0; }
     .toolbar-custom-select[data-filter-id="country_filter"] { flex: 1.18 1 0; }
     .toolbar-custom-select[data-filter-id="protocol_filter"],
@@ -7995,6 +9376,7 @@ INDEX_HTML = r"""<!doctype html>
     .toolbar-custom-select[data-filter-id="speed_filter"] { flex: 1 1 0; }
     #btn_favorites { flex: 0 0 auto; margin-left: 4px !important; white-space: nowrap; padding: 0 12px !important; }
     .toolbar .toolbar-custom-select-button {
+      height: 36px;
       font-size: 15px;
       font-weight: 500;
       line-height: 1;
@@ -8732,14 +10114,16 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     th, td {
-      padding: 8px 8px;
+      padding: 6px 8px;
       border-bottom: 1px solid var(--border-color);
-      font-size: 14px;
+      font-size: 13px;
+      font-weight: 500;
       color: #c5ced6;
       box-sizing: border-box;
       vertical-align: middle;
       min-width: 0;
       overflow: hidden;
+      line-height: 1.3;
     }
 
     .node-cell-ellipsis {
@@ -8747,12 +10131,10 @@ INDEX_HTML = r"""<!doctype html>
       width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: normal;
-      overflow-wrap: anywhere;
-      line-height: 1.35;
-      display: -webkit-box;
-      -webkit-box-orient: vertical;
-      -webkit-line-clamp: 2;
+      white-space: nowrap;
+      overflow-wrap: normal;
+      line-height: 1.3;
+      display: block;
     }
 
     .node-address-cell .node-cell-ellipsis {
@@ -8815,13 +10197,39 @@ INDEX_HTML = r"""<!doctype html>
       color: #8eb8c4;
       letter-spacing: 0;
     }
-    .node-speed-val {
-      display: inline-flex;
-      align-items: center;
+    .node-address-stack {
+      display: flex;
+      flex-direction: column;
       justify-content: center;
-      min-width: 84px;
-      font-weight: 400;
-      font-size: 14px;
+      min-width: 0;
+      gap: 1px;
+      line-height: 1.25;
+    }
+    .node-domain {
+      font-size: 12px;
+      font-weight: 500;
+      color: #d5dee8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .node-address-cell.is-blocked .node-domain,
+    .node-address-cell.is-blocked .mono {
+      color: #cbb992;
+    }
+    .node-blocked-tag {
+      margin-top: 2px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #b7a67e;
+      letter-spacing: 0;
+    }
+    .node-speed-val {
+      display: inline-block;
+      min-width: 0;
+      white-space: nowrap;
+      font-weight: 500;
+      font-size: 13px;
       color: #b7c3ce;
       font-variant-numeric: tabular-nums;
     }
@@ -8841,9 +10249,9 @@ INDEX_HTML = r"""<!doctype html>
 
     th {
       background: rgba(17, 24, 39, 0.55);
-      font-size: 13px;
-      font-weight: 500;
-      letter-spacing: 0.04em;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
       text-transform: none;
       color: #7f8b99;
       white-space: nowrap;
@@ -8966,7 +10374,7 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: center;
       justify-content: flex-end;
-      gap: 8px;
+      gap: 6px;
       flex-wrap: nowrap;
       width: 100%;
     }
@@ -10048,9 +11456,9 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
-    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="重新开始一轮全球资源采集与可用性检测，不清空历史数据，不断开当前 VPN。">
+    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="打开全球库检测。只做真实连接，记录往返延迟和可用性，不测速，不访问 Cloudflare 或 CDN。">
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex:0 0 16px;"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
-      重新轮询全球库
+      全球库检测
     </button>
     <button id="btn_add_node" class="btn-primary" type="button" onclick="openAddNodeModal()" style="background: rgba(129,140,248,0.14); border: 1px solid rgba(129,140,248,0.35);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 5v14M5 12h14" /></svg>
@@ -10097,7 +11505,7 @@ INDEX_HTML = r"""<!doctype html>
     <section class="active-node-section" id="active_node_card" style="margin-bottom: 14px;">
       <!-- Rendered dynamically by render() -->
     </section>
-    <div id="background_activity_status" class="background-task-strip" style="display:none;margin-bottom:10px;">
+    <div id="background_activity_status" class="background-task-strip" style="display:none;">
       <span class="background-task-dot"></span>
       <span id="background_activity_text"></span>
     </div>
@@ -10196,7 +11604,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="speed_filter_menu" class="toolbar-custom-select-menu" role="listbox"></div>
       </div>
 
-    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 40px; padding: 0 14px; border-radius: 10px; font-size: 14px; font-weight: 500; gap: 6px;">
+    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 36px; padding: 0 12px; border-radius: 10px; font-size: 13px; font-weight: 400; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
       </svg>
@@ -10212,19 +11620,15 @@ INDEX_HTML = r"""<!doctype html>
             ⭐ 收藏专属管理面板
           </span>
           <span style="font-size: 13px; color: var(--text-secondary);">
-            在这里管理您的收藏节点过滤，以及设置出站连接漂移策略。
+            只看已收藏的节点。出站模式仍以代理设置为准。
           </span>
         </div>
-        <div style="display: flex; gap: 12px; align-items: center;">
-          <button id="btn_toggle_fav_routing" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="toggleFavRouting()">
-            启用仅用收藏出站
-          </button>
-        </div>
+        <div style="display: flex; gap: 12px; align-items: center;"></div>
       </div>
 
       <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px;">
-        <div style="padding: 10px 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; font-size: 12px; color: var(--warning); line-height: 1.5;">
-          <strong>仅用收藏是强锁定模式。</strong>开启后只会连接收藏节点；如果收藏节点全部不可用，系统不会切换到非收藏节点。
+        <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
+          这里只过滤当前列表里的收藏节点，不改变出站。要只从收藏节点出站，请在代理设置里选择「仅用收藏」。
         </div>
       </div>
     </div>
@@ -10236,14 +11640,14 @@ INDEX_HTML = r"""<!doctype html>
         <thead>
           <tr>
             <th class="col-status" style="width: 8%;">状态</th>
-            <th class="col-protocol" style="width: 9%;">协议</th>
-            <th class="col-address" style="width: 18%;">IP 地址 : 端口</th>
-            <th class="col-latency" style="width: 8%;">延迟</th>
-            <th class="col-speed" style="width: 8%;">速度</th>
-            <th class="col-location" style="width: 14%;">物理位置</th>
-            <th class="col-owner" style="width: 11%;">运营主体 / ISP</th>
-            <th class="col-iptype" style="width: 7%;">IP 类型</th>
-            <th class="col-actions" style="width: 17%;">操作</th>
+            <th class="col-protocol" style="width: 8%;">协议</th>
+            <th class="col-address" style="width: 14%;">IP 地址 : 端口</th>
+            <th class="col-latency" style="width: 7%;">延迟</th>
+            <th class="col-speed" style="width: 11%;">速度</th>
+            <th class="col-location" style="width: 18%;">物理位置</th>
+            <th class="col-owner" style="width: 15%;">运营主体 / ISP</th>
+            <th class="col-iptype" style="width: 6%;">IP 类型</th>
+            <th class="col-actions" style="width: 13%;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -10264,6 +11668,48 @@ INDEX_HTML = r"""<!doctype html>
         </span>
         <button id="btn_next_page" class="connect-btn" style="height: 32px; padding: 0 10px;">下一页</button>
         <button id="btn_last_page" class="connect-btn" style="height: 32px; padding: 0 10px;">尾页</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Library check dialog -->
+  <div id="library_check_modal" class="modal">
+    <div class="modal-content" style="max-width: 460px; padding: 28px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <h3 id="library_check_title" style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary);">全球资源库检测</h3>
+        <button type="button" onclick="closeLibraryCheckModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">只拨真实隧道，记录往返延迟和可用性。不测速，不访问 Cloudflare / CDN。空闲时才拨，转发或筛选时等待，等待不算失败。</div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="color:var(--text-secondary);">检节点数</span>
+        <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="color:var(--text-secondary);">已检测</span>
+        <strong id="library_check_tested" style="font-variant-numeric:tabular-nums;">0</strong>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="color:var(--text-secondary);">可用</span>
+        <strong id="library_check_available" style="color:#34d399; font-variant-numeric:tabular-nums;">0</strong>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="color:var(--text-secondary);">不可用</span>
+        <strong id="library_check_unavailable" style="color:#fb7185; font-variant-numeric:tabular-nums;">0</strong>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="color:var(--text-secondary);">剩余</span>
+        <strong id="library_check_remaining" style="font-variant-numeric:tabular-nums;">0</strong>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500;">
+        <span style="color:var(--text-secondary);">检测剩余时间</span>
+        <strong id="library_check_eta" style="font-variant-numeric:tabular-nums;">计算中</strong>
+      </div>
+      <div id="library_check_message" style="margin-top: 8px; min-height: 20px; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
+      <div style="display:flex; gap:12px; margin-top:18px;">
+        <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">开始检测</button>
+        <button type="button" id="library_check_stop" disabled style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px; border:1px solid rgba(225,29,72,0.35); background:rgba(225,29,72,0.22); color:rgba(255,255,255,0.55); cursor:not-allowed;">停止检测</button>
       </div>
     </div>
   </div>
@@ -10463,6 +11909,11 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-desc">普通机房</div>
               </div>
             </div>
+          </div>
+          <div class="form-group" style="margin-top: 4px; margin-bottom: 16px;">
+            <label class="form-label" for="net_routing_blocklist">屏蔽列表</label>
+            <textarea id="net_routing_blocklist" class="input-field" rows="4" spellcheck="false" placeholder="每行一个域名或 IP。* 屏蔽全部。vpn_87* 屏蔽该前缀及后面全部。" style="height: auto; min-height: 96px; padding: 8px 12px; resize: vertical; line-height: 1.45;"></textarea>
+            <div style="margin-top: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.45;">命中的域名或 IP 不会进入出站方案。一行一条。列表里标黄。</div>
           </div>
         </div>
 
@@ -10916,7 +12367,8 @@ INDEX_HTML = r"""<!doctype html>
   </footer>
 </main>
 <script>
-let nodes=[], state={}, testingNodeIds = new Set();
+let nodes=[], state={}, testingNodeIds = new Set(), waitingNodeIds = new Set();
+const manualTestQueue = [];
 const BOOT_SERVER_COUNTRY = __BOOT_SERVER_COUNTRY_JSON__;
 let currentPage = 1;
 const pageSize = 60;
@@ -11014,7 +12466,7 @@ const translateCountry = c => {
 };
 
 const translateStatus = s => {
-  const dict = {"available": "可用", "connected": "已连接", "unavailable": "不可用", "testing": "检测中", "not_checked": "待检测"};
+  const dict = {"available": "可用", "connected": "已连接", "unavailable": "不可用", "testing": "检测中", "waiting": "等待中", "not_checked": "待检测"};
   return dict[s] || s || "待检测";
 };
 
@@ -11036,6 +12488,46 @@ function displayNodePort(node) {
   if (protocol === 'softether' || protocol === 'sstp') return '443';
   if (protocol === 'l2tp-ipsec') return '500/4500';
   return '';
+}
+
+function nodeDomainLabel(node) {
+  const values = [node && node.host_name, node && node.hostname, node && node.remote_host];
+  for (let i = 0; i < values.length; i++) {
+    const host = String(values[i] || "").trim();
+    if (!host || host.indexOf("MANUAL_") === 0) continue;
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.charAt(0) === "[") continue;
+    return host;
+  }
+  return "";
+}
+
+function blockRules() {
+  return String((state && state.routing_blocklist) || "")
+    .split(/\n/)
+    .map(line => line.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function blockRuleMatches(rule, value) {
+  if (!rule || !value) return false;
+  if (rule === "*") return true;
+  if (rule.indexOf("*") < 0) return rule === value;
+  const body = rule.split("*").map(part => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*");
+  try {
+    return new RegExp("^" + body + "$").test(value);
+  } catch (e) {
+    return false;
+  }
+}
+
+function nodeIsBlocked(node) {
+  const rules = blockRules();
+  if (!rules.length || !node) return false;
+  if (rules.indexOf("*") >= 0) return true;
+  const values = [nodeDomainLabel(node), node.ip, node.current_ip, node.host_name, node.hostname, node.remote_host]
+    .map(value => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  return values.some(value => rules.some(rule => blockRuleMatches(rule, value)));
 }
 
 function matchesNodeFilters(n, ignoreCountry = false) {
@@ -11070,7 +12562,8 @@ function matchesNodeFilters(n, ignoreCountry = false) {
     if (probe !== "available" && probe !== "testing" && probe !== "not_checked" && !n.active) return false;
   }
   if (selectedStatus === "standby") {
-    if (!(state?.standby_ready && n.id && n.id === state.standby_node_id)) return false;
+    const shown = !!(state?.standby_ready || state?.standby_prepared);
+    if (!shown || !nodeIsStandby(n, state?.standby_node_id)) return false;
   }
   if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) return false;
   if (selectedStatus === "not_checked" && (n.probe_status !== "not_checked" || n.active)) return false;
@@ -11438,7 +12931,7 @@ function updateStatusFilterOptions() {
   const usable = counts.usable != null && counts.usable !== ""
     ? Number(counts.usable)
     : (Number(counts.available || 0) + Number(counts.testing || 0) + Number(counts.not_checked || 0));
-  const standby = (state?.standby_ready && state?.standby_node_id) ? 1 : 0;
+  const standby = ((state?.standby_ready || state?.standby_prepared) && state?.standby_node_id) ? 1 : 0;
   const countsReady = counts && Object.keys(counts).length > 0 && !filterCountsLoading;
   const shownUsable = countsReady ? usable : "加载中";
   const shownTotal = countsReady ? total : "加载中";
@@ -11621,6 +13114,7 @@ let countryCatalogKey = "";
 let countryCatalogPromise = null;
 let countryCatalogInflightKey = "";
 let activeCountryScope = "";
+let countryFollowsNode = true;
 let scopeLoadGeneration = 0;
 
 function readListScope() {
@@ -11806,11 +13300,12 @@ function getFilteredNodes() {
   return nodes.filter(n => !!n);
 }
 
-function hotPoolSummary() {
-  const primary = 1;
-  const standby = state.standby_ready ? 1 : 0;
-  const cold = Math.max(0, Number(state.hot_pool_size || 0) - primary);
-  return `${primary}主+${standby}备+${cold}冷备`;
+function hotPoolSummaryHtml() {
+  const standbyOn = !!(state.standby_prepared || state.standby_ready);
+  const standby = standbyOn ? 1 : 0;
+  const cold = Math.max(0, Number(state.hot_pool_size || 0) - 1);
+  const standbyTitle = standbyOn ? "备已准备好" : "备未准备";
+  return '<span title="正在转发">1主</span>+<span title="' + standbyTitle + '">' + standby + '备</span>+<span title="已入库，没有第二条隧道">' + cold + '冷备</span>';
 }
 
 function isDomainHost(value) {
@@ -11862,8 +13357,9 @@ function stableSortNodes() {
     if (aActive !== bActive) return aActive ? -1 : 1;
 
     const standbyId = String(state?.standby_node_id || "");
-    const aStandby = !aActive && !!state?.standby_ready && nodeIsStandby(a, standbyId);
-    const bStandby = !bActive && !!state?.standby_ready && nodeIsStandby(b, standbyId);
+    const standbyShown = !!(state?.standby_ready || state?.standby_prepared);
+    const aStandby = !aActive && standbyShown && nodeIsStandby(a, standbyId);
+    const bStandby = !bActive && standbyShown && nodeIsStandby(b, standbyId);
     if (aStandby !== bStandby) return aStandby ? -1 : 1;
 
     const aRank = statusRank[a.probe_status || "not_checked"] ?? 2;
@@ -12033,11 +13529,11 @@ function render(){
               <span>IP 类型: <strong>${esc(translateIpType(ep.ip_type))}</strong></span>
               <span>延时: <strong>${latencyText}</strong></span>
               <span>速度: <strong>${esc(ep.speed_bps ? speed(ep.speed_bps) : "未测")}</strong></span>
-              <span class="active-hot-pool" title="1 主：正在转发。1 备：已经连好，主节点失败时立刻接管。冷备：已测通、还没建隧道。满编目标 60，多数国家凑不满，所以只显示实际冷备。"><span>热备池</span><strong>${esc(hotPoolSummary())}</strong></span>
+              <span class="active-hot-pool"><span>热备池</span><strong>${hotPoolSummaryHtml()}</strong></span>
             </div>
           </div>
         </div>
-        <button class="btn-danger" style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">断开连接</button>
+        ${egressSwitchHtml()}
       </div>
     `;
   } else if (activeNode) {
@@ -12073,14 +13569,11 @@ function render(){
               <span>IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
               <span>延时: <strong>${latencyText}</strong></span>
               <span>速度: <strong>${esc(activeNode.speed ? `${(Number(activeNode.speed)/1000000).toFixed(1)} Mbps` : "未测")}</strong></span>
-              <span class="active-hot-pool" title="1 主：正在转发。1 备：已经连好，主节点失败时立刻接管。冷备：已测通、还没建隧道。满编目标 60，多数国家凑不满，所以只显示实际冷备。"><span>热备池</span><strong>${esc(hotPoolSummary())}</strong></span>
+              <span class="active-hot-pool"><span>热备池</span><strong>${hotPoolSummaryHtml()}</strong></span>
             </div>
           </div>
         </div>
-        <button class="btn-danger" style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          断开连接
-        </button>
+        ${egressSwitchHtml()}
       </div>
     `;
   } else {
@@ -12099,6 +13592,7 @@ function render(){
             </div>
           </div>
         </div>
+        ${egressSwitchHtml()}
       </div>
     `;
   }
@@ -12106,25 +13600,10 @@ function render(){
   const bgActivityEl = $("background_activity_status");
   const bgActivityTextEl = $("background_activity_text");
   if (bgActivityEl && bgActivityTextEl) {
-    const collecting = !!state.resource_engine_running;
-    const probing = !!state.availability_engine_running;
-    const priorityRunning = !!state.priority_running;
-    const bootstrapRunning = !!state.initial_bootstrap_running;
-    const manualSwitchRunning = !!state.manual_switch_active;
-    const tested = Number(state.availability_tested_total || 0);
-    const queue = Number(state.availability_queue || 0);
-    let bgText = "资源守护正常运行 · 新资源进入后立即检测 · 后台检测不影响当前 VPN 连接";
-    if (manualSwitchRunning) bgText = "人工切换中 · " + String(state.manual_switch_message || state.last_check_message || "正在平滑建立并验证新隧道") + " · 当前连接保持在线";
-    else if (bootstrapRunning) bgText = "首次安装初始化中 · 先获取资源，再检测本机国家并自动连接最低延迟节点";
-    else if (state.failover_in_progress) bgText = "主备切换中 · 正在验证备用节点，当前连接状态单独显示";
-    else if (collecting) bgText = "资源收集中 · 正在从主站、镜像和多协议目录补充 Master Pool";
-    else if (probing) bgText = String(state.availability_engine_message || "可用性检测中 · 新资源优先 · 全球资源最长 4 小时滚动复检");
-    else if (priorityRunning && state.priority_full_sweep_running) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 已检测 " + Number(state.priority_full_sweep_tested || 0) + "/" + Number(state.priority_full_sweep_total || 0) + " · 待检测 " + Number(state.priority_full_sweep_remaining || 0) + " · 可用 " + Number(state.priority_available || 0);
-    else if (priorityRunning) bgText = translateCountry(state.priority_country || "") + " 优先检测中 · 可用 " + Number(state.priority_available || 0) + " · 目标 " + Number(state.priority_target || 10);
-    const detail = (priorityRunning && state.priority_full_sweep_running) ? "" : ((tested > 0 || queue > 0) ? " · 已检测 " + tested + " · 待检测 " + queue : "");
+    const schemeRunning = !state.background_paused && (!!state.priority_running || !!state.availability_engine_running || !!state.priority_full_sweep_running);
     bgActivityEl.style.display = "flex";
-    bgActivityEl.className = "background-task-strip " + ((manualSwitchRunning || collecting || probing || priorityRunning || bootstrapRunning || state.failover_in_progress) ? "running" : "");
-    bgActivityTextEl.textContent = bgText + detail;
+    bgActivityEl.className = "background-task-strip" + (schemeRunning ? " running" : "");
+    bgActivityTextEl.textContent = proxySettingsLine();
   }
 
   const globalRefreshEl = $("global_refresh_status");
@@ -12226,7 +13705,7 @@ function render(){
 
   const rowsHost = $("rows");
   const rowsSig = [
-    currentPageNodes.map(n => n ? [n.id, n.probe_status, n.probe_message || "", n.latency_ms, n.speed_bps || n.speed || 0, n.hot_standby ? 1 : 0, n.ip_type || "", n.country || ""].join("~") : "").join("|"),
+    currentPageNodes.map(n => n ? [n.id, n.probe_status, n.probe_message || "", n.latency_ms, n.speed_bps || n.speed || 0, n.hot_standby ? 1 : 0, n.standby_row ? 1 : 0, n.ip_type || "", n.country || ""].join("~") : "").join("|"),
     state.active_pool_endpoint_id || "",
     state.active_openvpn_node_id || "",
     state.manual_switch_active ? 1 : 0,
@@ -12236,6 +13715,14 @@ function render(){
     showFavoritesOnly ? 1 : 0,
     Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids.join(",") : "",
     Array.from(testingNodeIds).join(","),
+    Array.from(waitingNodeIds).join(","),
+    state.routing_blocklist || "",
+    state.standby_prepared ? 1 : 0,
+    state.standby_ready ? 1 : 0,
+    state.standby_node_id || "",
+    state.standby_ip || "",
+    state.standby_port || "",
+    state.standby_protocol || "",
     nodeListLoading ? 1 : 0,
     totalNodeCount,
     currentPage
@@ -12243,15 +13730,16 @@ function render(){
   const skipRows = !!(rowsHost && rowsHost.dataset.sig === rowsSig && rowsHost.children.length);
   if (!skipRows) {
 
-  // Render table rows. A non-zero Master Pool inventory with zero loaded rows
-  // means the resource details are still being fetched; do not present it as
-  // a false "no matching nodes" result.
+  // A finished request with zero rows is an empty filter, not a stuck load.
+  // Keeping a previous total (for example 66) after the rows were cleared made
+  // every timed-out filter spin on 资源加载中 forever.
   if (currentPageNodes.length === 0) {
-    const hasServerInventory = Number(totalNodeCount || 0) > 0;
-    const resourceLoading = !!nodeListLoading || (hasServerInventory && (nodes.length === 0 || nodeCacheBuilding || state.global_pool_refresh_running));
+    const resourceLoading = !!nodeListLoading;
     const emptyText = resourceLoading
       ? `<span class="badge not_checked"><span class="badge-pulse"></span>资源加载中</span><div style="margin-top:8px;">正在读取当前筛选范围的节点资源，请稍候……</div>`
-      : "未找到符合过滤条件的备选节点。";
+      : (nodeListError
+        ? `<div>${esc(nodeListError)}</div>`
+        : (showFavoritesOnly ? "当前筛选结果里没有已收藏节点。这只过滤列表，不改变出站。" : "未找到符合过滤条件的备选节点。"));
     $("rows").innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyText}</td></tr>`;
   } else {
     $("rows").innerHTML=currentPageNodes.map(n=>{
@@ -12259,7 +13747,8 @@ function render(){
       const isCurrentlyActive = nodeIsConnected(n);
       const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
-      const displayProbeStatus = isTesting ? "testing" : (n.probe_status || "not_checked");
+      const isWaiting = !isTesting && waitingNodeIds.has(n.id);
+      const displayProbeStatus = isTesting ? "testing" : (isWaiting ? "waiting" : (n.probe_status || "not_checked"));
 
       const badgeClass = isCurrentlyActive ? 'available' : displayProbeStatus;
       const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(displayProbeStatus);
@@ -12276,13 +13765,19 @@ function render(){
       const displayPort = displayNodePort(n);
       const listIp = String(n.ip || "").trim();
       const nodeAddress = (listIp || "-") + (displayPort ? ":" + displayPort : "");
+      const domainLabel = nodeDomainLabel(n);
+      const blocked = nodeIsBlocked(n);
 
-      const canRetest = !isCurrentlyActive && !isTesting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
-      const hotStandby = !isCurrentlyActive && nodeIsStandby(n, state?.standby_node_id);
+      const canRetest = !isCurrentlyActive && !isTesting && !isWaiting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
+      const standbyShown = !!(state?.standby_ready || state?.standby_prepared);
+      const hotStandby = !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
+      const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
       const statusCell = isCurrentlyActive
         ? `<span class="badge available"><span class="badge-pulse"></span>已连接</span>`
-        : hotStandby
-          ? `<span class="badge available"><span class="badge-pulse"></span>备连接</span>`
+        : isWaiting
+          ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
+          : hotStandby
+          ? `<span class="badge available"><span class="badge-pulse"></span>${standbyLabel}</span>`
           : canRetest
             ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "点击立即检测此节点")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
             : `<span class="badge ${badgeClass}">${badgeText}</span>`;
@@ -12307,7 +13802,7 @@ function render(){
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : isPendingSwitch
           ? `<button class="connect-btn switching-btn" disabled><span class="switch-spinner"></span>切换中</button>`
-          : `<button class="connect-btn" ${(isUnavailable || isTesting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+          : `<button class="connect-btn" ${(isUnavailable || isTesting || isWaiting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
 
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
@@ -12318,7 +13813,7 @@ function render(){
       return `<tr ${rowClass}>
         <td class="node-status-cell" data-label="状态">${statusCell}</td>
         <td class="node-protocol-cell" data-label="协议">${renderProtocolCell(n)}</td>
-        <td class="node-address-cell" data-label="IP" title="${esc(nodeAddress)}"><div class="node-cell-ellipsis mono">${esc(nodeAddress)}</div></td>
+        <td class="node-address-cell${blocked ? " is-blocked" : ""}" data-label="IP" title="${esc(domainLabel ? domainLabel + " " + nodeAddress : nodeAddress)}"><div class="node-address-stack">${domainLabel ? `<div class="node-domain">${esc(domainLabel)}</div>` : ""}<div class="mono">${esc(nodeAddress)}</div>${blocked ? `<div class="node-blocked-tag">已屏蔽</div>` : ""}</div></td>
         <td class="node-latency-cell" data-label="延迟">${latencyText}</td>
         <td class="node-speed-cell" data-label="速度">${rowSpeedText}</td>
         <td class="node-location-cell" data-label="位置" title="${esc(displayLocation)}"><div class="node-location-cell-inner">${displayLocationFlag}<span class="node-cell-ellipsis">${esc(displayLocation)}</span></div></td>
@@ -12337,20 +13832,13 @@ function render(){
   }
 
   // Render pagination controls
-  $("page_start").textContent = totalNodeCount > 0 && shown.length > 0 ? currentPage : 0;
+  $("page_start").textContent = String(currentPage || 1);
   $("page_end").textContent = shown.length;
   $("filtered_count").textContent = nodeListLoading ? "加载中" : totalNodeCount;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
   const poolSummary = $("pool_summary");
-  if (poolSummary) {
-    const poolServers = Number(state.pool_servers || 0);
-    const poolEndpoints = Number(state.pool_endpoints || 0);
-    const poolIps = Number(state.pool_distinct_ips || 0);
-    poolSummary.textContent = poolServers
-      ? `全球资源库：${poolServers} 台服务器 · ${poolEndpoints} 个协议端点 · ${poolIps} 个 IP`
-      : "全球资源库：—";
-  }
+  if (poolSummary) poolSummary.textContent = "";
 
   $("btn_first_page").disabled = currentPage === 1;
   $("btn_prev_page").disabled = currentPage === 1;
@@ -12368,37 +13856,93 @@ $("btn_last_page").onclick = () => {
   loadServerPage(totalPages);
 };
 
+function proxySettingsConfigured() {
+  const mode = String(state.routing_mode || "auto");
+  if (mode === "fixed_region" || mode === "fixed_ip" || mode === "favorites") return true;
+  if (String(state.force_country || state.scheme_country || "").trim()) return true;
+  if (String(state.routing_protocol || "").trim()) return true;
+  if (String(state.routing_ip_type || "all") !== "all") return true;
+  if (String(state.routing_latency || "").trim()) return true;
+  if (Number(state.routing_min_speed_bps || 0) > 0) return true;
+  if (String(state.routing_blocklist || "").trim()) return true;
+  return false;
+}
+
+function proxySettingsLine() {
+  const country = translateCountry(state.scheme_country || state.force_country || "");
+  const configured = proxySettingsConfigured();
+  const label = String(state.scheme_label || "").trim();
+  const available = Number(state.scheme_available || 0);
+  const inventory = Number(state.scheme_inventory || 0);
+  const detecting = !state.background_paused && (!!state.priority_running || !!state.priority_full_sweep_running || !!state.availability_engine_running);
+  let status = "默认规则";
+  if (configured) {
+    const where = country || "";
+    status = where + (state.background_paused ? "检测已暂停" : (detecting ? "检测中" : "检测待命"));
+  }
+  const settingBody = [configured ? (country || "不限国家") : "不限国家", label || "所有协议 · 不限类型 · 不限延迟 · 不限速度"].filter(Boolean).join(" · ");
+  return status + " 代理设置 · " + settingBody + " · 符合 " + available + " · 已验证 " + inventory + " IP";
+}
+
+function libraryStockText() {
+  const servers = Number(state.pool_servers || 0);
+  const endpoints = Number(state.pool_endpoints || 0);
+  const ips = Number(state.pool_distinct_ips || 0);
+  if (!servers && !endpoints && !ips) return "全球资源库统计中";
+  return servers + " 台服务器 · " + endpoints + " 个协议端点 · " + ips + " 个 IP";
+}
+
+function libraryStatusLine() {
+  const stock = libraryStockText();
+  if (state.manual_switch_active) return "人工切换中 · " + String(state.manual_switch_message || "正在验证新隧道") + " · " + stock;
+  if (state.failover_in_progress) return "主备切换中 · " + stock;
+  if (state.initial_bootstrap_running) return "首次安装初始化中 · " + stock;
+  if (state.background_paused) return "全球库检测已暂停 · " + stock;
+  if (state.resource_engine_running) return "资源收集中 · " + stock;
+  if (state.priority_running && state.priority_full_sweep_running) {
+    const pc = translateCountry(state.priority_country || "");
+    return (pc ? pc + "全量轮询中" : "全量轮询中") + " · 已检测 " + Number(state.priority_full_sweep_tested || 0) + "/" + Number(state.priority_full_sweep_total || 0) + " · 待检测 " + Number(state.priority_full_sweep_remaining || 0) + " · " + stock;
+  }
+  if (state.availability_engine_running) return String(state.availability_engine_message || "可用性轮询中") + " · " + stock;
+  const tested = Number(state.availability_tested_total || 0);
+  const queue = Number(state.availability_queue || 0);
+  let head = "全球库轮询待命";
+  if (tested || queue) head += " · 已检测 " + tested + " · 待检测 " + queue;
+  return head + " · " + stock;
+}
+
+function currentServerMetaHtml() {
+  const ip = String(state?.server_public_ip || "").trim();
+  const country = String(state?.server_country || "").trim();
+  const code = String(state?.server_country_code || "").trim();
+  const location = String(state?.server_location || "").trim();
+  const owner = String(state?.server_owner || "").trim();
+  const ipType = String(state?.server_ip_type || "").trim();
+  if (!ip && !country && !location) return "";
+  const place = formatNodeLocation({country, location}) || translateCountry(country);
+  const flag = countryFlag(code || country || place, translateCountry(country) || place, "eager");
+  const bits = [];
+  if (ip) bits.push('<span class="mono">当前服务器：' + esc(ip) + '</span>');
+  if (place) bits.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
+  if (owner) bits.push('<span>' + esc(owner) + '</span>');
+  if (ipType) bits.push('<span>' + esc(translateIpType(ipType)) + '</span>');
+  return bits.join('<span>·</span>');
+}
+
 function paintPriorityStatus() {
   const priorityStatusEl = $("country_priority_status");
   if (!priorityStatusEl) return;
-  const pcRaw = String(state.priority_country || "");
-  const pc = translateCountry(pcRaw);
-  if (!pc) {
-    priorityStatusEl.style.display = "none";
-    return;
-  }
-  const av = Number(state.priority_available || 0);
-  const target = Number(state.priority_target || 10);
-  const min = Number(state.priority_minimum || 5);
-  const inventory = Number(state.priority_inventory || 0);
-  const inventoryTarget = Number(state.priority_inventory_target || 20);
-  const rawPriorityMessage = String(state.priority_message || (av + " 个可用节点"));
-  const priorityMessage = /unauthorized|http\s*401/i.test(rawPriorityMessage)
-    ? "管理员会话已失效，请刷新页面并重新登录"
-    : (pcRaw && rawPriorityMessage.startsWith(pcRaw)
-      ? rawPriorityMessage.replace(pcRaw, pc)
-      : rawPriorityMessage);
+  const running = !state.background_paused && !!(
+    state.priority_running || state.priority_full_sweep_running || state.availability_engine_running ||
+    state.resource_engine_running || state.initial_bootstrap_running || state.manual_switch_active || state.failover_in_progress
+  );
   priorityStatusEl.style.display = "flex";
-  priorityStatusEl.className = state.priority_running ? "country-priority running" : "country-priority";
-  const fullSweepRunning = !!state.priority_full_sweep_running;
-  const fullSweepTotal = Number(state.priority_full_sweep_total || 0);
-  const fullSweepTested = Number(state.priority_full_sweep_tested || 0);
-  const fullSweepRemaining = Number(state.priority_full_sweep_remaining || 0);
-  priorityStatusEl.innerHTML = state.priority_running
-    ? (fullSweepRunning
-      ? `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 资源库全量检测中</span><span>已检测 ${fullSweepTested}/${fullSweepTotal} · 剩余 ${fullSweepRemaining} · 当前可用 ${av} · 库存 ${inventory}</span>`
-      : `<span class="badge not_checked"><span class="badge-pulse"></span>${esc(pc)} 优先检测中</span><span>库存 ${inventory}/${inventoryTarget} IP · 可用 ${av} · 目标 ${min}-${target}</span>`)
-    : `<span class="badge available">${esc(pc)} 优先检测完成</span><span>库存 ${inventory}/${inventoryTarget} IP · ${esc(priorityMessage)}</span>`;
+  priorityStatusEl.className = "country-priority" + (running ? " running" : "");
+  const badge = running
+    ? `<span class="badge not_checked"><span class="badge-pulse"></span>全球库</span>`
+    : `<span class="badge available">全球库</span>`;
+  const serverMeta = currentServerMetaHtml();
+  priorityStatusEl.innerHTML = badge + `<span class="library-status-main">${esc(libraryStatusLine())}</span>` + (serverMeta ? `<span class="library-server-meta">${serverMeta}</span>` : "");
 }
 
 async function prioritizeCountry(country){
@@ -12473,9 +14017,21 @@ async function prioritizeCountry(country){
 
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
+  if (!id || testingNodeIds.has(id) || waitingNodeIds.has(id)) return;
+  if (testingNodeIds.size || manualTestQueue.length) {
+    waitingNodeIds.add(id);
+    manualTestQueue.push(id);
+    render();
+    return;
+  }
+  await runManualTest(id);
+}
+
+async function runManualTest(id){
+  if (!id) return;
+  waitingNodeIds.delete(id);
   testingNodeIds.add(id);
   render();
-
   try {
     const result = await fetchJsonWithTimeout("./api/test_node", {
       method: "POST",
@@ -12511,7 +14067,13 @@ async function testNode(btn, id, event){
     }
   } finally {
     testingNodeIds.delete(id);
-    render();
+    const nextId = manualTestQueue.shift();
+    if (nextId) {
+      waitingNodeIds.delete(nextId);
+      runManualTest(nextId);
+    } else {
+      render();
+    }
   }
 }
 
@@ -12630,7 +14192,15 @@ function nodeIsStandby(n, standbyId) {
   if (n.standby_row) return true;
   const id = String(standbyId || state?.standby_node_id || "");
   const poolId = id.indexOf("pool:") === 0 ? id.slice(5) : id;
-  return !!(id && (n.id === id || n.pool_endpoint_id === id || n.pool_endpoint_id === poolId || n.id === poolId));
+  if (id && (n.id === id || n.pool_endpoint_id === id || n.pool_endpoint_id === poolId || n.id === poolId)) return true;
+  if (!(state?.standby_ready || state?.standby_prepared)) return false;
+  const ip = String(state?.standby_ip || "").trim();
+  if (!ip || String(n.ip || "").trim() !== ip) return false;
+  const protocol = String(state?.standby_protocol || "").trim().toLowerCase();
+  if (protocol && String(n.protocol || "").trim().toLowerCase() !== protocol) return false;
+  const port = Number(state?.standby_port || 0);
+  const nodePort = Number(n.remote_port || n.port || 0);
+  return !port || !nodePort || nodePort === port;
 }
 
 const manualProbeHold = new Map();
@@ -12689,9 +14259,15 @@ async function loadScopedNodes(country, generation) {
   // First-screen rule: one authoritative Master Pool page only.
   // Keep the previous rows on screen until this page actually arrives.
   const first = await fetchScopedNodePage(0, pageSize, 12000);
-  if (myGeneration !== scopeLoadGeneration || !nodePageIsCurrent(first)) return;
+  if (myGeneration !== scopeLoadGeneration) return;
+  if (!nodePageIsCurrent(first)) {
+    nodeListLoading = false;
+    render();
+    return;
+  }
 
   totalNodeCount = Number(first?.total || 0);
+  nodeListError = "";
   nodeListLoading = false;
   nodeCacheBuilding = !!first?.cache_building;
   const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
@@ -12784,80 +14360,74 @@ async function loadScope(country, {preserveState = true} = {}) {
   } catch (e) {
     if (generation !== scopeLoadGeneration) return;
     nodeListLoading = false;
+    nodeListError = (e && e.message) ? String(e.message) : "筛选失败";
     console.warn("按范围加载节点失败", e);
     updateNodeLoadProgress(nodes.length, totalNodeCount, true);
     render();
   }
 }
 
+function connectedListCountry() {
+  const ep = state && state.active_pool_endpoint;
+  const node = state && state.active_openvpn_node;
+  const raw = (ep && ep.country) || (node && node.country) || (state && state.force_country) || "";
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  return translateCountry(text) || text;
+}
+
+function pinCountryFilter(country) {
+  const next = String(country || "").trim();
+  if (!next) return;
+  activeCountryScope = next;
+  const select = $("country_filter");
+  if (!select) return;
+  const wanted = translateCountry(next) || next;
+  const match = Array.from(select.options).find((option) =>
+    option.value === next || option.value === wanted || translateCountry(option.value) === wanted
+  );
+  if (!match) {
+    const opt = document.createElement("option");
+    opt.value = wanted;
+    opt.textContent = wanted;
+    select.appendChild(opt);
+  }
+  select.value = match ? match.value : wanted;
+  renderCustomCountryFilter();
+}
+
+function followConnectedCountry() {
+  if (!countryFollowsNode) return;
+  const next = connectedListCountry();
+  if (!next) return;
+  const current = translateCountry(activeCountryScope) || String(activeCountryScope || "").trim();
+  if (current && current === next) return;
+  pinCountryFilter(next);
+  loadScope(next, {preserveState: true});
+}
+
 async function load(){
   const generation = ++scopeLoadGeneration;
   nodeListLoading = true;
-  const bootCountry = String(BOOT_SERVER_COUNTRY || "").trim();
-  if (bootCountry) {
-    activeCountryScope = bootCountry;
-    const select = $("country_filter");
-    if (select && !String(select.value || "").trim()) select.value = bootCountry;
-  }
-  // State used to block the first node page, and that state call parsed a
-  // multi-megabyte file. Start the page now; apply state when it arrives.
-  const statePromise = fetchUiStateOnly(4000).catch(e => {
+  const stateData = await fetchUiStateOnly(4000).catch(e => {
     console.warn("状态读取失败，继续尝试读取节点范围", e);
     return null;
   });
-  const earlyPagePromise = fetchScopedNodePage(0, pageSize, 8000);
-
-  let painted = false;
-  try {
-    const first = await earlyPagePromise;
-    if (generation !== scopeLoadGeneration || !nodePageIsCurrent(first)) return;
-    totalNodeCount = Number(first?.total || 0);
-    nodeListLoading = false;
-    nodeCacheBuilding = !!first?.cache_building;
-    const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
-    nodes = [];
-    if (firstNodes.length) mergeLoadedNodePage(firstNodes);
-    updateCountryFilter();
-    updateNodeLoadProgress(firstNodes.length, totalNodeCount, true);
-    render();
-    painted = true;
-  } catch (e) {
-    if (generation !== scopeLoadGeneration) return;
-    console.warn("首屏节点范围读取失败", e);
-  }
-
-  const stateData = await statePromise;
   if (generation !== scopeLoadGeneration) return;
   if (stateData?.state) adoptBackendState(stateData.state);
-  if (painted) render();
-
-  const serverCountry = String(
-    state.server_country ||
-    state.initial_bootstrap_country ||
-    bootCountry ||
-    ""
-  ).trim();
-  const sameScope = !serverCountry || serverCountry === bootCountry || translateCountry(serverCountry) === translateCountry(bootCountry);
-  if (!sameScope) {
+  const scopeCountry = countryFollowsNode ? connectedListCountry() : String($("country_filter")?.value || activeCountryScope || "").trim();
+  if (scopeCountry) pinCountryFilter(scopeCountry);
+  try {
+    await loadScopedNodes(scopeCountry, generation);
+  } catch (e) {
     if (generation !== scopeLoadGeneration) return;
-    activeCountryScope = serverCountry;
-    const select = $("country_filter");
-    if (select && serverCountry) select.value = serverCountry;
-    try {
-      await loadScopedNodes(serverCountry, generation);
-    } catch (e) {
-      if (generation !== scopeLoadGeneration) return;
-      nodeListLoading = false;
-      console.warn("首屏节点范围读取失败", e);
-      updateNodeLoadProgress(nodes.length, totalNodeCount, true);
-      render();
-    }
-  } else if (!painted) {
     nodeListLoading = false;
+    nodeListError = (e && e.message) ? String(e.message) : "筛选失败";
+    console.warn("首屏节点范围读取失败", e);
     updateNodeLoadProgress(nodes.length, totalNodeCount, true);
     render();
   }
-
+  if (state.library_check_running) openLibraryCheckModal(false);
   if (state.global_pool_refresh_running) {
     startRefreshPolling();
   } else if (state.is_connecting || state.manual_switch_active) {
@@ -12879,7 +14449,7 @@ function refreshButtonIdle() {
   const btn = $("refresh");
   if (!btn) return;
   btn.disabled = false;
-  btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex:0 0 16px;"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>重新轮询全球库`;
+  btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex:0 0 16px;"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>全球库检测`;
 }
 
 function backendStateRenderSignature(s) {
@@ -12892,7 +14462,13 @@ function backendStateRenderSignature(s) {
     x.last_check_message, x.priority_country, x.priority_running,
     x.availability_engine_running,
     x.resource_engine_running, x.global_pool_refresh_running,
-    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.standby_ready, x.standby_node_id,
+    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.standby_ready, x.standby_prepared, x.standby_node_id,
+    x.egress_mode, x.egress_switching,
+    x.manual_switch_active,
+    x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,
+    x.standby_ip, x.standby_protocol,
+    x.server_public_ip, x.server_country, x.server_location, x.server_owner, x.server_ip_type,
+    x.active_pool_endpoint?.current_ip, x.active_pool_endpoint?.hostname,
     x.active_pool_endpoint?.speed_bps
   ].map(v => String(v ?? "")).join("|");
 }
@@ -12923,6 +14499,7 @@ function startBackendStatePolling() {
         const prevSig = backendStateRenderSignature(state);
         const nextSig = backendStateRenderSignature(next);
         adoptBackendState(next);
+        followConnectedCountry();
         // Do not rebuild the entire node table every 4 seconds. Only redraw
         // when connection/priority/engine state actually changed.
         if (prevSig !== nextSig) render();
@@ -12939,7 +14516,7 @@ function startBackendStatePolling() {
 
 function startRefreshPolling() {
   if (refreshPollInterval) clearInterval(refreshPollInterval);
-  refreshButtonBusy("正在重新轮询全球库...");
+  refreshButtonBusy("全球库检测中...");
   refreshPollInterval = setInterval(async () => {
     if (refreshPollBusy) return;
     refreshPollBusy = true;
@@ -13132,6 +14709,115 @@ async function connectNode(id){
     render();
     startConnectionPolling();
   }
+}
+
+let egressHoldUntil = 0;
+
+function paintEgressChrome() {
+  const switching = !!(state && state.egress_switching);
+  const mode = state && state.egress_mode === "direct" ? "direct" : "proxy";
+  const showDone = !switching && Date.now() < egressHoldUntil;
+  const failed = showDone && /失败|恢复/.test(String(state && state.last_check_message || ""));
+  document.querySelectorAll(".egress-status").forEach((statusEl) => {
+    statusEl.textContent = switching ? "切换中" : (failed ? "已恢复" : (showDone ? "已切换" : ""));
+    statusEl.className = "egress-status" + ((switching || showDone) ? " is-live" : "") + ((showDone && !failed) ? " ok" : "");
+  });
+  document.querySelectorAll(".egress-switch button[data-egress]").forEach((btn) => {
+    const kind = btn.getAttribute("data-egress");
+    btn.className = kind === mode ? ("is-on " + kind) : "";
+    btn.disabled = switching;
+  });
+}
+
+async function setEgressMode(mode) {
+  const previous = state.egress_mode === "direct" ? "direct" : "proxy";
+  if (previous === mode || state.egress_switching) return;
+  state.egress_switching = true;
+  state.egress_mode = mode;
+  state.last_check_message = "切换中";
+  egressHoldUntil = 0;
+  paintEgressChrome();
+  const finish = () => {
+    state.egress_switching = false;
+    egressHoldUntil = Date.now() + 3000;
+    paintEgressChrome();
+    if (egressHoldUntil) {
+      setTimeout(() => {
+        if (Date.now() >= egressHoldUntil) paintEgressChrome();
+      }, 3100);
+    }
+  };
+  try {
+    const result = await fetchJsonWithTimeout("./api/egress_mode", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({mode})
+    }, 8000);
+    if (result && result.state) adoptBackendState(result.state);
+    state.egress_mode = (result && result.mode) || mode;
+    state.egress_switching = !!(result && result.switching);
+    state.last_check_message = (result && result.state && result.state.last_check_message) || "已切换";
+    if (result && result.ok && result.switching === false) {
+      finish();
+      return;
+    }
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const snap = await fetchUiStateOnly(4000);
+      const next = snap && snap.state;
+      if (!next) continue;
+      state.egress_mode = next.egress_mode || state.egress_mode;
+      state.egress_switching = !!next.egress_switching;
+      state.proxy_ok = next.proxy_ok;
+      state.proxy_ip = next.proxy_ip;
+      state.proxy_error = next.proxy_error;
+      state.proxy_latency_ms = next.proxy_latency_ms;
+      state.last_check_message = next.last_check_message || state.last_check_message;
+      paintEgressChrome();
+      if (!next.egress_switching && next.egress_mode === mode) break;
+      if (!next.egress_switching && next.egress_mode && next.egress_mode !== mode) break;
+    }
+  } catch (e) {
+    try {
+      const snap = await fetchUiStateOnly(4000);
+      const next = snap && snap.state;
+      if (next && next.egress_mode) {
+        state.egress_mode = next.egress_mode;
+        state.egress_switching = !!next.egress_switching;
+        state.last_check_message = next.last_check_message || ((e && e.message) ? e.message : "切换出口失败");
+      } else {
+        state.egress_mode = previous;
+        state.last_check_message = (e && e.message) ? e.message : "切换出口失败";
+      }
+    } catch (_) {
+      state.egress_mode = previous;
+      state.last_check_message = (e && e.message) ? e.message : "切换出口失败";
+    }
+  }
+  finish();
+}
+
+function egressStatusHtml() {
+  const switching = !!(state && state.egress_switching);
+  const showDone = !switching && Date.now() < egressHoldUntil;
+  const failed = showDone && /失败|恢复/.test(String(state && state.last_check_message || ""));
+  if (switching) return `<div class="egress-status is-live">切换中</div>`;
+  if (failed) return `<div class="egress-status is-live">已恢复</div>`;
+  if (showDone) return `<div class="egress-status is-live ok">已切换</div>`;
+  return `<div class="egress-status" aria-hidden="true"></div>`;
+}
+
+function egressSwitchHtml() {
+  const switching = !!(state && state.egress_switching);
+  const mode = state && state.egress_mode === "direct" ? "direct" : "proxy";
+  return `<div class="egress-switch-wrap">
+    ${egressStatusHtml()}
+    <div class="egress-switch" role="group" aria-label="出口模式">
+      <button type="button" data-egress="direct" class="${mode === "direct" ? "is-on direct" : ""}" ${switching ? "disabled" : ""} onclick="setEgressMode('direct')">直连模式</button>
+      <button type="button" data-egress="proxy" class="${mode === "proxy" ? "is-on proxy" : ""}" ${switching ? "disabled" : ""} onclick="setEgressMode('proxy')">代理模式</button>
+    </div>
+  </div>`;
 }
 
 async function disconnectNode(){
@@ -13452,6 +15138,7 @@ async function loadLegacy(){
     progressivelyLoadNodes(totalNodeCount, generation);
   }
 
+  if (state.library_check_running) openLibraryCheckModal(false);
   if (state.global_pool_refresh_running) {
     startRefreshPolling();
   } else if (state.is_connecting) {
@@ -13462,6 +15149,7 @@ async function loadLegacy(){
 let filterCountsRequestSeq = 0;
 let filterCountsLoading = true;
 let nodeListLoading = false;
+let nodeListError = "";
 async function refreshFilterCounts() {
   const seq = ++filterCountsRequestSeq;
   filterCountsLoading = true;
@@ -13505,6 +15193,8 @@ async function applyNodeFilterChange(event) {
   const country = String($("country_filter")?.value || "").trim();
   activeCountryScope = country;
   nodes = [];
+  totalNodeCount = 0;
+  nodeListError = "";
   nodeListLoading = true;
   render();
   const loadPromise = loadScope(country, {preserveState:true});
@@ -13514,6 +15204,7 @@ async function applyNodeFilterChange(event) {
 }
 
 $("country_filter").onchange=async()=>{
+  countryFollowsNode = false;
   const statusSelect = $("status_filter");
   if (statusSelect && statusSelect.value !== "all") {
     statusSelect.value = "all";
@@ -13524,6 +15215,8 @@ $("country_filter").onchange=async()=>{
   forgetStaleCountryCounts();
   currentPage = 1;
   nodes = [];
+  totalNodeCount = 0;
+  nodeListError = "";
   nodeListLoading = true;
   render();
   // Start the node page immediately. The country catalog must not block the list.
@@ -13543,25 +15236,137 @@ bindCustomFilterEvents();
 renderAllUnifiedSelects();
 bindUnifiedSelectEvents();
 
-$("refresh").onclick=async()=>{
-  if (manualConnectionUiBusy || state.manual_connection_active) return;
-  refreshButtonBusy("正在重新轮询全球库...");
-  try{
-    const data = await fetchJsonWithTimeout("./api/refresh_global_pool",{method:"POST"}, 10000);
-    if (data.ok === false) throw new Error(data.error || "全球库刷新启动失败");
-    state = Object.assign({}, state, {
-      global_pool_refresh_running: true,
-      global_pool_refresh_status: "running",
-      global_pool_refresh_message: data.message || "正在重新开始全球资源轮询"
+let libraryCheckPollTimer = null;
+let libraryCheckSeenPhase = "";
+
+function formatLibraryEta(phase, snapshot) {
+  const current = String(phase || "");
+  if (current === "done") return "已完成";
+  if (current === "stopped") return "已停止";
+  if (current === "error") return "已中断";
+  const tested = Number(snapshot && snapshot.library_check_tested || 0);
+  const eta = Number(snapshot && snapshot.library_check_eta_seconds || 0);
+  if (!tested || eta <= 0) return "计算中";
+  const hours = Math.floor(eta / 3600);
+  const minutes = Math.floor((eta % 3600) / 60);
+  const seconds = eta % 60;
+  if (hours > 0) return hours + "小时" + minutes + "分";
+  if (minutes > 0) return minutes + "分" + seconds + "秒";
+  return seconds + "秒";
+}
+
+function paintLibraryCheckModal() {
+  const snapshot = state || {};
+  const phase = String(snapshot.library_check_phase || "idle");
+  const title = $("library_check_title");
+  const titles = {
+    running: "全球资源库检测中",
+    paused: "全球资源库检测已暂停",
+    stopping: "正在停止检测",
+    done: "全球资源库检测完成",
+    stopped: "全球资源库检测已停止",
+    error: "全球资源库检测异常"
+  };
+  if (title) title.textContent = titles[phase] || "全球资源库检测";
+  const write = (id, value) => {
+    const el = $(id);
+    if (el) el.textContent = String(value ?? 0);
+  };
+  write("library_check_total", (phase === "running" || phase === "paused" || phase === "stopping" || phase === "done" || phase === "stopped" || phase === "error") && Number(snapshot.library_check_total || 0) > 0
+    ? Number(snapshot.library_check_total || 0)
+    : Number(snapshot.library_check_preview_total || snapshot.pool_endpoints || 0));
+  write("library_check_tested", Number(snapshot.library_check_tested || 0));
+  write("library_check_available", Number(snapshot.library_check_available || 0));
+  write("library_check_unavailable", Number(snapshot.library_check_unavailable || 0));
+  write("library_check_remaining", Number(snapshot.library_check_remaining || 0));
+  const eta = $("library_check_eta");
+  if (eta) eta.textContent = formatLibraryEta(phase, snapshot);
+  const message = $("library_check_message");
+  if (message) message.textContent = String(snapshot.library_check_wait_reason || snapshot.library_check_message || "");
+  const toggle = $("library_check_toggle");
+  if (toggle) {
+    toggle.textContent = phase === "running" ? "暂停" : (phase === "paused" ? "恢复检测" : "开始检测");
+    toggle.disabled = phase === "stopping";
+  }
+  const stop = $("library_check_stop");
+  if (stop) {
+    const armed = phase === "running" || phase === "paused";
+    stop.disabled = !armed;
+    stop.textContent = "停止检测";
+    stop.style.background = armed ? "#e11d48" : "rgba(225,29,72,0.22)";
+    stop.style.color = armed ? "#fff" : "rgba(255,255,255,0.55)";
+    stop.style.border = armed ? "1px solid #e11d48" : "1px solid rgba(225,29,72,0.35)";
+    stop.style.cursor = armed ? "pointer" : "not-allowed";
+  }
+}
+
+function openLibraryCheckModal(startJob) {
+  const modal = $("library_check_modal");
+  if (modal) modal.style.display = "flex";
+  paintLibraryCheckModal();
+  if (libraryCheckPollTimer) clearInterval(libraryCheckPollTimer);
+  libraryCheckPollTimer = setInterval(pollLibraryCheckModal, 1500);
+  pollLibraryCheckModal();
+  if (!startJob) return;
+  const phase = String((state && state.library_check_phase) || "idle");
+  if (phase === "paused") libraryCheckAction("resume");
+  else if (phase !== "running" && phase !== "stopping") libraryCheckAction("start");
+}
+
+function closeLibraryCheckModal() {
+  const modal = $("library_check_modal");
+  if (modal) modal.style.display = "none";
+  if (libraryCheckPollTimer) {
+    clearInterval(libraryCheckPollTimer);
+    libraryCheckPollTimer = null;
+  }
+}
+
+async function libraryCheckAction(action) {
+  try {
+    const data = await fetchJsonWithTimeout("./api/library_check", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({action: action})
+    }, 15000);
+    if (!state) state = {};
+    Object.keys(data || {}).forEach((key) => {
+      if (key.indexOf("library_check_") === 0) state[key] = data[key];
     });
-    render();
-    startRefreshPolling();
+    paintLibraryCheckModal();
+  } catch (e) {
+    const el = $("library_check_message");
+    if (el) el.textContent = "操作失败：" + (e && e.message ? e.message : e);
   }
-  catch(e){
-    refreshButtonIdle();
-    alert("更新节点失败：\n" + (e.message || e));
-  }
+}
+
+async function pollLibraryCheckModal() {
+  const modal = $("library_check_modal");
+  if (!modal || modal.style.display === "none") return;
+  try {
+    const data = await fetchUiStateOnly(4000);
+    if (!data || !data.state) return;
+    const prev = libraryCheckSeenPhase;
+    adoptBackendState(data.state);
+    const phase = String(state.library_check_phase || "");
+    libraryCheckSeenPhase = phase;
+    paintLibraryCheckModal();
+    if ((phase === "done" || phase === "stopped") && (prev === "running" || prev === "paused" || prev === "stopping")) {
+      refreshCurrentNodePageFast();
+    }
+  } catch (_) {}
+}
+
+$("refresh").onclick=()=>{ openLibraryCheckModal(false); };
+const libraryToggle = $("library_check_toggle");
+if (libraryToggle) libraryToggle.onclick = () => {
+  const phase = String((state && state.library_check_phase) || "idle");
+  if (phase === "running") libraryCheckAction("pause");
+  else if (phase === "paused") libraryCheckAction("resume");
+  else if (phase !== "stopping") libraryCheckAction("start");
 };
+const libraryStop = $("library_check_stop");
+if (libraryStop) libraryStop.onclick = () => libraryCheckAction("stop");
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
   const badge = $("proxy_status_badge");
@@ -13756,58 +15561,6 @@ function updateFavPanelUI() {
     } else {
       btn.classList.remove("active");
     }
-  }
-
-  if (showFavoritesOnly && state) {
-    const favRoutingBtn = $("btn_toggle_fav_routing");
-    if (favRoutingBtn) {
-      if (state.routing_mode === "favorites") {
-        favRoutingBtn.textContent = "禁用仅用收藏出站";
-        favRoutingBtn.style.background = "var(--danger-gradient)";
-        favRoutingBtn.style.borderColor = "transparent";
-        favRoutingBtn.style.color = "#ffffff";
-        favRoutingBtn.style.boxShadow = "0 0 12px rgba(244, 63, 94, 0.3)";
-      } else {
-        favRoutingBtn.textContent = "启用仅用收藏出站";
-        favRoutingBtn.style.background = "rgba(255,255,255,0.03)";
-        favRoutingBtn.style.borderColor = "var(--border-color)";
-        favRoutingBtn.style.color = "var(--text-primary)";
-        favRoutingBtn.style.boxShadow = "none";
-      }
-    }
-  }
-}
-
-async function toggleFavRouting() {
-  if (!state) return;
-  const newMode = state.routing_mode === "favorites" ? "auto" : "favorites";
-
-  state.routing_mode = newMode;
-  updateFavPanelUI();
-
-  try {
-    const res = await fetch("./api/update_routing", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        routing_mode: newMode,
-        force_country: state.force_country || "",
-        routing_ip_type: state.routing_ip_type || "all",
-        routing_protocol: state.routing_protocol || "",
-        routing_min_speed_bps: Number(state.routing_min_speed_bps || 0),
-        routing_latency: state.routing_latency || ""
-      })
-    });
-    const data = await res.json();
-    if (res.ok && data.ok) {
-      load();
-    } else {
-      alert("更新出站路由设置失败: " + (data.error || "未知错误"));
-      load();
-    }
-  } catch (err) {
-    alert("连接服务器失败，请稍后重试");
-    load();
   }
 }
 
@@ -14165,6 +15918,11 @@ async function saveCredentials(e) {
 function openNetworkModal() {
   $("network_error").style.display = "none";
   $("network_success").style.display = "none";
+  const submitBtn = $("network_submit_btn");
+  if (submitBtn) {
+    submitBtn.disabled = false;
+    submitBtn.textContent = "保存修改";
+  }
   $("network_form").reset();
 
   if (state) {
@@ -14180,6 +15938,8 @@ function openNetworkModal() {
     if (protocolSelect) protocolSelect.value = state.routing_protocol || "";
     if (speedSelect) speedSelect.value = String(state.routing_min_speed_bps || 0);
     if (latencySelect) latencySelect.value = state.routing_latency || "";
+    const blockList = $("net_routing_blocklist");
+    if (blockList) blockList.value = state.routing_blocklist || "";
     syncUnifiedSelect("net_routing_protocol");
     syncUnifiedSelect("net_routing_min_speed");
     syncUnifiedSelect("net_routing_latency");
@@ -14222,6 +15982,7 @@ async function saveNetwork(e) {
   const routingProtocol = $("net_routing_protocol")?.value || "";
   const routingMinSpeed = Number($("net_routing_min_speed")?.value || 0);
   const routingLatency = String($("net_routing_latency")?.value || "");
+  const routingBlocklist = String($("net_routing_blocklist")?.value || "");
 
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -14243,25 +16004,36 @@ async function saveNetwork(e) {
 
   submitBtn.disabled = true;
   submitBtn.textContent = "正在保存...";
+  let restarting = false;
 
   try {
-    const res = await fetch("./api/update_settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        proxy_port: proxyPort,
-        routing_mode: routingMode,
-        force_country: forceCountry,
-        routing_ip_type: routingIpType,
-        routing_protocol: routingProtocol,
-        routing_min_speed_bps: routingMinSpeed,
-        routing_latency: routingLatency
-      })
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    let res;
+    try {
+      res = await fetch("./api/update_settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          proxy_port: proxyPort,
+          routing_mode: routingMode,
+          force_country: forceCountry,
+          routing_ip_type: routingIpType,
+          routing_protocol: routingProtocol,
+          routing_min_speed_bps: routingMinSpeed,
+          routing_latency: routingLatency,
+          routing_blocklist: routingBlocklist
+        }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     const data = await res.json();
     if (res.ok && data.ok) {
       if (data.restart_needed) {
+        restarting = true;
         successDiv.textContent = "保存成功！代理出站端口已变更，页面将在 4 秒内自动刷新...";
         successDiv.style.display = "block";
 
@@ -14274,27 +16046,42 @@ async function saveNetwork(e) {
       } else {
         successDiv.textContent = data.message || "配置保存成功，已即时生效！";
         successDiv.style.display = "block";
-        setTimeout(async () => {
+        const watchSavedScheme = async () => {
           closeNetworkModal();
-          try {
-            const stateData = await fetchUiStateOnly(4000);
-            if (stateData?.state) adoptBackendState(stateData.state);
-          } catch (_) {}
+          const deadline = Date.now() + (data.switching ? 20000 : 6000);
+          do {
+            try {
+              const stateData = await fetchUiStateOnly(4000);
+              if (stateData?.state) adoptBackendState(stateData.state);
+            } catch (_) {}
+            render();
+            if (data.switching && (state.manual_switch_active || state.is_connecting)) {
+              await new Promise(resolve => setTimeout(resolve, 800));
+              continue;
+            }
+            if (!data.switching && Date.now() + 4000 < deadline) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              continue;
+            }
+            break;
+          } while (Date.now() < deadline);
+          render();
           if (data.switching) refreshCurrentNodePageFast().catch(() => {});
-          else render();
-        }, data.switching ? 2200 : 800);
+        };
+        setTimeout(watchSavedScheme, 300);
       }
     } else {
       errorDivEl.textContent = data.error || "保存失败，请检查输入";
       errorDivEl.style.display = "block";
+    }
+  } catch (err) {
+    errorDivEl.textContent = err && err.name === "AbortError" ? "保存超时，请重试" : "连接服务器失败，请稍后重试";
+    errorDivEl.style.display = "block";
+  } finally {
+    if (!restarting && submitBtn) {
       submitBtn.disabled = false;
       submitBtn.textContent = "保存修改";
     }
-  } catch (err) {
-    errorDivEl.textContent = "连接服务器失败，请稍后重试";
-    errorDivEl.style.display = "block";
-    submitBtn.disabled = false;
-    submitBtn.textContent = "保存修改";
   }
 }
 
@@ -14347,6 +16134,7 @@ setInterval(async () => {
         mergeLoadedNodePage(d.nodes);
         if (d?.total != null) totalNodeCount = Number(d.total || 0);
         if (d?.cache_building != null) nodeCacheBuilding = !!d.cache_building;
+        nodeListError = "";
         stableSortNodes();
         updateCountryFilter();
       }
@@ -15314,18 +17102,22 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 代理模式才要求隧道网卡存在。直连是空接口，走主机默认路由。
-    active_iface = proxy_server.get_active_interface()
-    if active_iface:
-        iface_path = Path("/sys/class/net") / active_iface
-        if sys.platform.startswith("linux") and not iface_path.exists():
-            return {
-                "ok": False,
-                "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 当前 VPN 网卡 ({active_iface}) 不存在，请确保隧道已成功建立"
-            }
+    # 2. 直连模式检查服务器网卡；代理模式检查当前 VPN 网卡。
+    if proxy_server.get_egress_mode() == "direct":
+        active_iface = proxy_server.physical_egress_interface()
+        missing_iface_error = f"服务器出口网卡 ({active_iface}) 不存在"
+    else:
+        active_iface = proxy_server.get_active_interface()
+        missing_iface_error = f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 当前 VPN 网卡 ({active_iface}) 不存在，请确保隧道已成功建立"
+    iface_path = Path("/sys/class/net") / active_iface if active_iface else Path("/sys/class/net/__missing__")
+    if sys.platform.startswith("linux") and (not active_iface or not iface_path.exists()):
+        return {
+            "ok": False,
+            "error": missing_iface_error
+        }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
-    def _curl_check_ip(url: str) -> dict[str, Any] | None:
+    def _curl_via_proxy(url: str, max_time: float, want_body: bool) -> dict[str, Any] | None:
         proxy_hosts = []
         if LOCAL_PROXY_HOST == "::":
             proxy_hosts = ["[::1]", "127.0.0.1"]
@@ -15340,74 +17132,155 @@ def check_proxy_health() -> dict[str, Any]:
             proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             cmd = [
-                "curl", "-s",
-                "-w", "\n%{time_total} %{http_code}",
+                "curl", "-4", "-sS",
+                "-o", "/dev/null",
+                "-w", "%{http_code} %{time_total}",
                 "-x", proxy_url,
+                "--connect-timeout", "3",
+                "--max-time", str(max_time),
                 url,
-                "--max-time", "5"
             ]
+            if want_body:
+                cmd = [
+                    "curl", "-4", "-sS",
+                    "-w", "\n%{http_code} %{time_total}",
+                    "-x", proxy_url,
+                    "--connect-timeout", "2",
+                    "--max-time", str(max_time),
+                    url,
+                ]
             if proxy_user is not None and proxy_pass is not None:
                 cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-                if res.returncode == 0:
-                    lines = res.stdout.strip().splitlines()
-                    if len(lines) >= 2:
-                        ip = lines[0].strip()
-                        time_info = lines[1].strip().split()
-                        if len(time_info) == 2:
-                            total_time_str, http_code = time_info
-                            if http_code == "200" and ip:
-                                latency_ms = int(float(total_time_str) * 1000)
-                                return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=max_time + 2)
+                if res.returncode != 0:
+                    continue
+                if want_body:
+                    lines = (res.stdout or "").strip().splitlines()
+                    if len(lines) < 2:
+                        continue
+                    meta = lines[-1].split()
+                    if len(meta) != 2 or meta[0] != "200":
+                        continue
+                    body = lines[0].strip()
+                    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", body):
+                        continue
+                    return {"ok": True, "ip": body, "latency_ms": int(float(meta[1]) * 1000)}
+                parts = (res.stdout or "").strip().split()
+                if len(parts) == 2 and parts[0] in {"200", "204", "301", "302"}:
+                    return {"ok": True, "ip": "", "latency_ms": int(float(parts[1]) * 1000)}
             except Exception:
                 pass
         return None
 
     try:
-        result = _curl_check_ip("http://api.ipify.org")
-        if result:
-            return result
-        result = _curl_check_ip("http://ip.sb")
-        if result:
-            return result
-
-        # 此时外网测试失败，检测本地代理端口是否依然能连通。若仍能连通，直接抛出出口测试失败，不调用占用诊断
-        port_still_listening = False
-        test_sock = None
-        try:
-            test_sock = socket.socket(af, socket.SOCK_STREAM)
-            test_sock.settimeout(1.0)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            try:
-                test_sock.connect((connect_host, LOCAL_PROXY_PORT))
-                port_still_listening = True
-            except Exception:
-                if connect_host == "::1":
-                    test_sock.close()
-                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_sock.settimeout(1.0)
-                    test_sock.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                    port_still_listening = True
-        except Exception:
-            pass
-        finally:
-            if test_sock is not None:
-                try:
-                    test_sock.close()
-                except Exception:
-                    pass
-
-        if not port_still_listening:
-            diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
-            if diag:
-                return {"ok": False, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
-
-        return {"ok": False, "error": "出口连接测试失败 (ip.sb 和 api.ipify.org 均无法连通，可能是节点已失效或 VPS 防火墙限制了 UDP/TCP 出站端口)"}
+        # Connectivity decides the switch. ipify/ip.sb often time out through
+        # the tunnel and used to hold 「切换中」 for ~20s, then revert a path
+        # that could already open web pages.
+        result = None
+        for url in ("https://example.com/", "https://www.google.com/generate_204"):
+            result = _curl_via_proxy(url, 4, False)
+            if result:
+                break
+        if not result:
+            return {"ok": False, "error": "出口连接测试失败 (example.com 与 google 均无法连通)"}
+        identity = _curl_via_proxy("http://api.ipify.org", 2, True)
+        if identity and identity.get("ip"):
+            result["ip"] = identity["ip"]
+            result["latency_ms"] = identity.get("latency_ms") or result.get("latency_ms")
+        return result
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
+
+def _wait_egress_applied(mode: str, timeout: float = 1.5) -> bool:
+    deadline = time.time() + timeout
+    path = DATA_DIR / "egress_mode.applied"
+    while time.time() < deadline:
+        try:
+            if path.read_text(encoding="utf-8").strip().lower() == mode:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def _refresh_egress_health(mode: str, previous: str = "") -> None:
+    """Confirm the exit after the proxy has dropped sockets on the old NIC.
+
+    A failed check repairs the policy route once. If it is still dead, put the
+    previous mode back so the browser is not left on an unreachable exit.
+    """
+    try:
+        _wait_egress_applied(mode)
+        if proxy_server.get_egress_mode() != mode:
+            return
+        if mode == "proxy":
+            ensure_active_policy_route()
+        health = check_proxy_health()
+        if not health.get("ok") and proxy_server.get_egress_mode() == mode:
+            if mode == "proxy":
+                ensure_active_policy_route()
+            health = check_proxy_health()
+        if proxy_server.get_egress_mode() != mode:
+            return
+        if health.get("ok"):
+            label = "已切换 · 服务器直连" if mode == "direct" else "已切换 · 代理隧道"
+            exit_ip = str(health.get("ip") or "")
+            if not exit_ip:
+                if mode == "direct":
+                    exit_ip = str(read_json(STATE_FILE, {}).get("server_public_ip") or "")
+                else:
+                    try:
+                        endpoint = node_pool.get_endpoint(str(active_pool_endpoint_id or "")) or {}
+                    except Exception:
+                        endpoint = {}
+                    exit_ip = str(endpoint.get("current_ip") or "")
+            set_state(
+                egress_mode=mode,
+                egress_switching=False,
+                proxy_ok=True,
+                proxy_ip=exit_ip,
+                proxy_latency_ms=parse_int(health.get("latency_ms")),
+                proxy_error="",
+                last_check_message=label,
+            )
+            log_to_json("INFO", "Proxy", f"{label} · {exit_ip}")
+        else:
+            detail = str(health.get("error") or "出口确认失败")
+            fallback = previous if previous in ("direct", "proxy") and previous != mode else ""
+            if fallback:
+                proxy_server.set_egress_mode(fallback)
+                set_state(
+                    egress_mode=fallback,
+                    egress_switching=False,
+                    proxy_error=detail,
+                    last_check_message=f"切换失败，已恢复{'直连' if fallback == 'direct' else '代理'}：{detail}",
+                )
+                log_to_json("WARNING", "Proxy", f"出口切换到 {mode} 失败，已恢复 {fallback}：{detail}")
+            else:
+                set_state(
+                    egress_mode=mode,
+                    egress_switching=False,
+                    proxy_error=detail,
+                    last_check_message="已切换，出口确认失败：" + detail,
+                )
+    except Exception as exc:
+        try:
+            if proxy_server.get_egress_mode() == mode:
+                set_state(
+                    egress_mode=mode,
+                    egress_switching=False,
+                    last_check_message="已切换，出口确认失败：" + str(exc),
+                )
+        except Exception:
+            pass
+    try:
+        global fast_state_cache
+        with fast_state_cache_lock:
+            fast_state_cache = None
+    except Exception:
+        pass
 
 def handle_confirmed_tunnel_failure(error_msg: str, expected_target: str = "") -> None:
     global is_connecting
@@ -15514,6 +17387,9 @@ def fast_tunnel_liveness_loop() -> None:
     last_target = ""
     time.sleep(3)
     while True:
+        if background_paused():
+            time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+            continue
         try:
             if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or failover_lock.locked():
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
@@ -15551,6 +17427,9 @@ def background_proxy_checker() -> None:
     proxy_health_failures = 0
     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
     while True:
+        if background_paused():
+            time.sleep(5)
+            continue
         last_checker_heartbeat = time.time()
         try:
             if is_connecting:
@@ -15640,6 +17519,9 @@ def active_node_pinger() -> None:
     # background proxy health loop, avoiding duplicate ICMP/TCP probes.
     global last_pinger_heartbeat
     while True:
+        if background_paused():
+            time.sleep(10)
+            continue
         last_pinger_heartbeat = time.time()
         try:
             if active_tunnel_running():
@@ -15714,6 +17596,8 @@ manual_add_started_at = 0.0
 def backfill_manual_speeds() -> None:
     """Measure speed for manual nodes that were saved before speed tests ran."""
     time.sleep(20)
+    if background_paused():
+        return
     try:
         endpoint_ids = node_pool.manual_endpoints_missing_speed(limit=6)
     except Exception:
@@ -15890,7 +17774,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
             return
         self.send_bytes(body, "application/json; charset=utf-8", status)
 
@@ -16160,10 +18047,7 @@ class Handler(BaseHTTPRequestHandler):
                                 connected_nodes = [node]
                     elif active_openvpn_node_id:
                         try:
-                            raw_active = next(
-                                (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
-                                None,
-                            )
+                            raw_active = _nodes_index_get().get(str(active_openvpn_node_id))
                         except Exception:
                             raw_active = None
                         if raw_active:
@@ -16173,21 +18057,13 @@ class Handler(BaseHTTPRequestHandler):
                                 connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
                     page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
                 elif status == "standby":
-                    standby_state = get_state()
-                    standby_id = str(standby_state.get("standby_node_id") or "")
+                    standby_state = _ui_standby_fields()
                     standby_nodes = []
-                    if standby_state.get("standby_ready") and standby_id:
-                        ep = node_pool.get_endpoint(standby_id)
-                        if not ep:
-                            parts = standby_id.rsplit("_", 2)
-                            if len(parts) == 3 and str(parts[1]).isdigit():
-                                found = node_pool.find_endpoint_id(parts[0], int(parts[1]), "openvpn")
-                                if found:
-                                    ep = node_pool.get_endpoint(found)
-                        if ep:
-                            node = protocol_endpoint_to_ui_node(ep)
-                            if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
-                                standby_nodes = [node]
+                    if standby_state.get("standby_ready") or standby_state.get("standby_prepared"):
+                        node = _load_live_standby_ui_node(standby_state)
+                        if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
+                            node["standby_row"] = True
+                            standby_nodes = [node]
                     page_nodes, total_nodes, cache_building = standby_nodes[offset:offset + limit], len(standby_nodes), False
                 else:
                     page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
@@ -16469,7 +18345,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # All authenticated UI write operations pass through one command gate.
         # Connection endpoints retain their dedicated connection lock below.
-        command_bypass = {"/api/connect", "/api/connect_pool_endpoint"}
+        command_bypass = {"/api/connect", "/api/connect_pool_endpoint", "/api/egress_mode"}
         if effective_path in command_bypass:
             return self._do_POST_impl()
 
@@ -16988,6 +18864,12 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_protocol"] = routing_protocol
                 ui_cfg["routing_min_speed_bps"] = routing_min_speed_bps
                 ui_cfg["routing_latency"] = routing_latency
+                if "routing_blocklist" in payload:
+                    try:
+                        ui_cfg["routing_blocklist"] = normalize_routing_blocklist(payload.get("routing_blocklist"))
+                    except ValueError as exc:
+                        self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = True
                 if routing_mode == "fixed_ip":
@@ -16997,22 +18879,20 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
+                invalidate_ui_config_cache()
 
                 clear_manual_route_pin()
+                invalidate_scheme_snapshot()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
                 switching = False
-                if routing_mode != "fixed_ip" and (
-                    routing_mode == "fixed_region"
-                    or routing_ip_type != "all"
-                    or ui_cfg.get("routing_protocol")
-                    or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0
-                    or ui_cfg.get("routing_latency")
-                    or routing_mode == "favorites"
-                ):
+                if routing_mode != "fixed_ip":
                     current = current_active_routing_endpoint()
-                    switching = not (current and endpoint_matches_explicit_routing(current, ui_cfg))
-                    if switching:
-                        threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
+                    switching = not (
+                        current
+                        and endpoint_matches_explicit_routing(current, ui_cfg)
+                        and not endpoint_is_unstable(current)
+                    )
+                    threading.Thread(target=apply_saved_scheme_now, daemon=True, name="scheme-apply").start()
 
                 restart_needed = (new_proxy_port_int != expected_proxy_port)
                 if restart_needed:
@@ -17025,7 +18905,7 @@ class Handler(BaseHTTPRequestHandler):
 
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
-                    message = policy_message or ("配置已保存，正在按新筛选切换出口" if switching else "配置已保存，当前出口已符合筛选")
+                    message = policy_message or ("配置已保存，正在按新代理设置切换主备" if switching else "配置已保存，当前出口已符合设置，冷备按新设置更新")
                     self.send_json({"ok": True, "restart_needed": False, "switching": switching, "message": message})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -17084,13 +18964,15 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
+                invalidate_ui_config_cache()
 
                 clear_manual_route_pin()
+                invalidate_scheme_snapshot()
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "出站路由配置已更新")
-                if routing_mode == "fixed_region" or routing_ip_type != "all" or ui_cfg.get("routing_protocol") or int(ui_cfg.get("routing_min_speed_bps") or 0) > 0 or ui_cfg.get("routing_latency"):
-                    threading.Thread(target=apply_user_routing_preferences, daemon=True).start()
+                if routing_mode != "fixed_ip":
+                    threading.Thread(target=apply_saved_scheme_now, daemon=True, name="scheme-apply").start()
 
-                self.send_json({"ok": True, "message": policy_message or "出站路由配置更新成功，偏好已即时应用，目标恢复后会自动切回！"})
+                self.send_json({"ok": True, "message": policy_message or "出站路由配置已保存，主备按新代理设置更新"})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -17135,10 +19017,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/refresh_global_pool":
             try:
-                if manual_connection_active or manual_connection_lock.locked():
-                    self.send_json({"ok": False, "busy": True, "error": "当前正在执行人工切换，请完成后再重新轮询全球库"}, HTTPStatus.CONFLICT)
-                    return
-                result = refresh_global_pool_background(force=True)
+                result = library_check_control("start")
+                result["ok"] = True
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/library_check":
+            try:
+                payload = self.read_json_body()
+                result = library_check_control(str(payload.get("action") or "start"))
+                result["ok"] = True
                 self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -17215,6 +19103,56 @@ class Handler(BaseHTTPRequestHandler):
                         is_connecting = False
                     set_state(is_connecting=False)
                     maintenance_lock.release()
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/egress_mode":
+            try:
+                payload = self.read_json_body()
+                mode = str(payload.get("mode") or "").strip().lower()
+                if mode not in ("direct", "proxy"):
+                    self.send_json({"ok": False, "error": "mode 只能是 direct 或 proxy"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if mode == "proxy" and not active_tunnel_running():
+                    self.send_json({"ok": False, "error": "当前没有代理隧道，请先连接节点再切回代理模式"}, HTTPStatus.CONFLICT)
+                    return
+                previous = proxy_server.get_egress_mode()
+                if mode == "proxy":
+                    ready, detail = ensure_active_policy_route()
+                    if not ready:
+                        self.send_json({"ok": False, "error": "代理出口路由未就绪：" + detail}, HTTPStatus.CONFLICT)
+                        return
+                label = "已切换 · 服务器直连" if mode == "direct" else "已切换 · 代理隧道"
+                if previous != mode:
+                    proxy_server.set_egress_mode(mode)
+                    _wait_egress_applied(mode, timeout=1.2)
+                quick = read_json(STATE_FILE, {})
+                if not isinstance(quick, dict):
+                    quick = {}
+                exit_ip = ""
+                if mode == "direct":
+                    exit_ip = str(quick.get("server_public_ip") or "")
+                else:
+                    endpoint = quick.get("active_pool_endpoint") if isinstance(quick.get("active_pool_endpoint"), dict) else {}
+                    exit_ip = str(endpoint.get("current_ip") or "")
+                quick["egress_mode"] = mode
+                quick["egress_switching"] = False
+                quick["proxy_ok"] = True
+                quick["proxy_error"] = ""
+                if exit_ip:
+                    quick["proxy_ip"] = exit_ip
+                quick["last_check_message"] = label
+                write_json(STATE_FILE, quick)
+                global fast_state_cache, fast_state_cache_at
+                with fast_state_cache_lock:
+                    fast_state_cache = None
+                    fast_state_cache_at = 0.0
+                self.send_json({
+                    "ok": True,
+                    "mode": mode,
+                    "switching": False,
+                    "previous": previous,
+                    "state": _get_fast_nodes_state(),
+                })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
@@ -17683,8 +19621,282 @@ def _build_ui_nodes_cache():
     finally:
         ui_nodes_cache_building = False
 
+_server_identity_lock = threading.Lock()
+_server_identity_refreshing = False
+_server_identity_attempt_at = 0.0
+_SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)
+
+
+def _ip_api_fetch(url: str, iface: str = "") -> dict[str, Any]:
+    """HTTP GET to ip-api. Bind the socket to the physical NIC when iface is set."""
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    if not host or parsed.scheme not in ("http", ""):
+        return {}
+    port = parsed.port or 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(5)
+        if iface:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, iface.encode("utf-8") + b"\0")
+            except OSError as exc:
+                log_to_json("WARNING", "Bootstrap", f"绑定物理网卡 {iface} 失败: {exc}")
+        sock.connect((host, port))
+        request = (
+            f"GET {path} HTTP/1.0\r\n"
+            f"Host: {host}\r\n"
+            "User-Agent: aimilivpn/server-identity\r\n"
+            "Accept: application/json\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii", errors="ignore"))
+        chunks: list[bytes] = []
+        total = 0
+        while total < 200000:
+            data = sock.recv(8192)
+            if not data:
+                break
+            chunks.append(data)
+            total += len(data)
+    except Exception as exc:
+        log_to_json("WARNING", "Bootstrap", f"本机直连身份请求失败: {exc}")
+        return {}
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    raw = b"".join(chunks)
+    body = raw.split(b"\r\n\r\n", 1)[-1] if raw else b""
+    try:
+        data = json.loads(body.decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _public_ip_type_from_api(data: dict[str, Any]) -> str:
+    if data.get("hosting") is True:
+        return "hosting"
+    if data.get("mobile") is True:
+        return "mobile"
+    if data.get("proxy") is True:
+        return "proxy"
+    return "residential"
+
+
+def _public_location_from_api(data: dict[str, Any], country: str) -> str:
+    region = str(data.get("regionName") or "").strip()
+    city = str(data.get("city") or "").strip()
+    bits: list[str] = []
+    for part in (region, city):
+        if part and part != country and part not in bits:
+            bits.append(part)
+    return " ".join(bits)
+
+
+def _identity_from_api(data: dict[str, Any]) -> dict[str, str]:
+    if str(data.get("status") or "").lower() not in ("success", ""):
+        return {}
+    ip = str(data.get("query") or "").strip()
+    if not ip:
+        return {}
+    country = str(data.get("country") or "").strip()
+    try:
+        country = normalized_country_name(country) or country
+    except Exception:
+        pass
+    owner = str(data.get("isp") or data.get("org") or "").strip()
+    return {
+        "public_ip": ip,
+        "country": country,
+        "country_code": str(data.get("countryCode") or "").strip().upper(),
+        "location": _public_location_from_api(data, country),
+        "owner": owner,
+        "ip_type": _public_ip_type_from_api(data),
+    }
+
+
+def _known_direct_server_ip() -> str:
+    try:
+        ip = str(_read_bootstrap_state().get("local_server_public_ip") or "").strip()
+    except Exception:
+        ip = ""
+    return ip
+
+
+def _active_tunnel_exit_ip_from_state(state: dict[str, Any] | None = None) -> str:
+    if isinstance(state, dict):
+        ep = state.get("active_pool_endpoint")
+        if isinstance(ep, dict):
+            ip = str(ep.get("current_ip") or "").strip()
+            if ip:
+                return ip
+    try:
+        raw = read_json(STATE_FILE, {})
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        ep = raw.get("active_pool_endpoint")
+        if isinstance(ep, dict):
+            return str(ep.get("current_ip") or "").strip()
+    return ""
+
+
+def _lookup_direct_server_identity() -> dict[str, str]:
+    """Identity of this machine's own egress. Never the VPN tunnel exit."""
+    iface = ""
+    try:
+        iface = str(proxy_server.physical_egress_interface() or "")
+    except Exception:
+        iface = ""
+    tunnel_ip = _active_tunnel_exit_ip_from_state()
+    fields = "status,message,query,country,countryCode,regionName,city,isp,org,mobile,hosting,proxy"
+    bound = _identity_from_api(_ip_api_fetch(
+        f"http://ip-api.com/json/?lang=zh-CN&fields={fields}",
+        iface,
+    ))
+    bound_ip = str(bound.get("public_ip") or "")
+    if bound_ip and bound_ip != tunnel_ip:
+        return bound
+    if bound_ip and bound_ip == tunnel_ip:
+        log_to_json("WARNING", "Bootstrap", f"直连探测走到了隧道出口 {bound_ip}，已丢弃")
+    remembered = _known_direct_server_ip()
+    if remembered and remembered == tunnel_ip:
+        remembered = ""
+    if not remembered:
+        return {}
+    pinned = _identity_from_api(_ip_api_fetch(
+        f"http://ip-api.com/json/{remembered}?lang=zh-CN&fields={fields}",
+        iface,
+    ))
+    if str(pinned.get("public_ip") or "") != remembered:
+        return {
+            "public_ip": remembered,
+            "country": "",
+            "country_code": "",
+            "location": "",
+            "owner": "",
+            "ip_type": "",
+        }
+    pinned["public_ip"] = remembered
+    return pinned
+
+
+def _cached_server_identity() -> dict[str, Any]:
+    try:
+        boot = _read_bootstrap_state()
+    except Exception:
+        boot = {}
+    return {
+        "public_ip": str(boot.get("local_server_public_ip") or "").strip(),
+        "country": str(boot.get("local_server_country") or "").strip(),
+        "country_code": str(boot.get("local_server_country_code") or "").strip().upper(),
+        "location": str(boot.get("local_server_location") or "").strip(),
+        "owner": str(boot.get("local_server_owner") or "").strip(),
+        "ip_type": str(boot.get("local_server_ip_type") or "").strip().lower(),
+        "at": float(boot.get("local_server_identity_at") or 0),
+    }
+
+
+def _schedule_server_identity_refresh() -> None:
+    global _server_identity_refreshing, _server_identity_attempt_at
+    now = time.time()
+    with _server_identity_lock:
+        if _server_identity_refreshing or now - _server_identity_attempt_at < 60:
+            return
+        _server_identity_refreshing = True
+        _server_identity_attempt_at = now
+
+    def _run() -> None:
+        global _server_identity_refreshing, fast_state_cache, fast_state_cache_at
+        try:
+            found = _lookup_direct_server_identity()
+            ip = str(found.get("public_ip") or "").strip()
+            tunnel_ip = _active_tunnel_exit_ip_from_state()
+            if not ip or (tunnel_ip and ip == tunnel_ip):
+                return
+            updates = {
+                "local_server_public_ip": ip,
+                "local_server_identity_at": time.time(),
+                "detection_source": "ip-api-direct-nic",
+            }
+            if found.get("country"):
+                updates["local_server_country"] = found["country"]
+            if found.get("country_code"):
+                updates["local_server_country_code"] = found["country_code"]
+            if found.get("location"):
+                updates["local_server_location"] = found["location"]
+            if found.get("owner"):
+                updates["local_server_owner"] = found["owner"]
+            if found.get("ip_type"):
+                updates["local_server_ip_type"] = found["ip_type"]
+            _write_bootstrap_state(**updates)
+            with fast_state_cache_lock:
+                fast_state_cache = None
+                fast_state_cache_at = 0.0
+        except Exception as exc:
+            log_to_json("WARNING", "Bootstrap", f"本机直连身份写入失败: {exc}")
+        finally:
+            with _server_identity_lock:
+                _server_identity_refreshing = False
+
+    threading.Thread(target=_run, daemon=True, name="server-identity").start()
+
+
+def _attach_local_server_identity(state: dict[str, Any]) -> None:
+    """Expose this machine's direct egress. Never the connected VPN node."""
+    ident = _cached_server_identity()
+    tunnel_ip = _active_tunnel_exit_ip_from_state(state)
+    if tunnel_ip and ident.get("public_ip") == tunnel_ip:
+        ident = {
+            "public_ip": "",
+            "country": ident.get("country") or "",
+            "country_code": ident.get("country_code") or "",
+            "location": "",
+            "owner": "",
+            "ip_type": "",
+            "at": 0,
+        }
+    age = time.time() - float(ident.get("at") or 0)
+    incomplete = not (
+        ident.get("public_ip") and ident.get("location") and ident.get("owner") and ident.get("ip_type")
+    )
+    if incomplete or age > 6 * 3600:
+        _schedule_server_identity_refresh()
+    state["server_public_ip"] = str(ident.get("public_ip") or "")
+    if ident.get("country"):
+        state["server_country"] = str(ident.get("country") or "")
+    else:
+        state.setdefault("server_country", "")
+    if ident.get("country_code"):
+        state["server_country_code"] = str(ident.get("country_code") or "")
+    else:
+        state.setdefault("server_country_code", "")
+    state["server_location"] = str(ident.get("location") or "")
+    state["server_owner"] = str(ident.get("owner") or "")
+    state["server_ip_type"] = str(ident.get("ip_type") or "")
+
+
 def _detect_local_server_country():
-    """Detect this server's public egress country once during first-install bootstrap."""
+    """Detect this server's public egress once during first-install bootstrap."""
+    found = _lookup_direct_server_identity()
+    if found.get("country") or found.get("public_ip"):
+        return {
+            "country": str(found.get("country") or ""),
+            "country_code": str(found.get("country_code") or ""),
+            "public_ip": str(found.get("public_ip") or ""),
+            "location": str(found.get("location") or ""),
+            "owner": str(found.get("owner") or ""),
+            "ip_type": str(found.get("ip_type") or ""),
+            "source": "ip-api-direct-nic",
+        }
+    if active_tunnel_running():
+        return {"country": "", "country_code": "", "public_ip": "", "source": ""}
     urls = (
         "http://ip-api.com/json/?lang=zh-CN&fields=status,query,country,countryCode",
         "https://ipapi.co/json/",
@@ -17781,10 +19993,18 @@ def _sort_ui_nodes_for_page(nodes):
             standby_id = str(standby.get("standby_node_id") or "")
             standby_ip = str(standby.get("standby_ip") or "")
             standby_port = parse_int(standby.get("standby_port"))
-            if standby.get("standby_ready") and standby_id and (
+            standby_protocol = str(standby.get("standby_protocol") or "").strip().lower()
+            node_port = parse_int(n.get("remote_port") or n.get("port"))
+            node_protocol = str(n.get("protocol") or "").strip().lower()
+            pool_id = standby_id[5:] if standby_id.startswith("pool:") else standby_id
+            id_match = bool(standby_id) and (
                 n.get("id") == standby_id or n.get("pool_endpoint_id") == standby_id
-                or (standby_ip and str(n.get("ip") or "") == standby_ip and (not standby_port or parse_int(n.get("remote_port")) == standby_port))
-            ):
+                or n.get("id") == pool_id or n.get("pool_endpoint_id") == pool_id
+            )
+            ip_match = bool(standby_ip) and str(n.get("ip") or "") == standby_ip and (
+                not standby_port or node_port == standby_port
+            ) and (not standby_protocol or node_protocol == standby_protocol)
+            if (standby.get("standby_ready") or standby.get("standby_prepared")) and (id_match or ip_match):
                 active = 1
         status = str(n.get("probe_status") or "not_checked").lower()
         latency = float(n.get("latency_ms") or 0)
@@ -17847,7 +20067,7 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
         probe = str(node.get("probe_status") or "").lower()
         return probe in ("available", "testing", "not_checked") or bool(node.get("active"))
     if status == "standby":
-        return bool(get_state().get("standby_ready")) and str(node.get("id") or "") == str(get_state().get("standby_node_id") or "")
+        return _ui_node_is_live_standby(node, _ui_standby_fields())
     if status == "available":
         return str(node.get("probe_status") or "").lower() == "available" or bool(node.get("active"))
     if status == "testing":
@@ -17857,8 +20077,32 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     return True
 
 
+def _ui_standby_fields() -> dict[str, Any]:
+    """Standby pin for the node table. Do not call get_state() here.
+
+    get_state() also reads pool stats and the active endpoint. Doing that on
+    every filter request stacked behind the country sweep and made the table
+    miss the browser timeout.
+    """
+    try:
+        raw = read_json(STATE_FILE, {})
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "standby_ready": bool(raw.get("standby_ready")),
+        "standby_prepared": bool(raw.get("standby_prepared")),
+        "standby_node_id": str(raw.get("standby_node_id") or ""),
+        "standby_ip": str(raw.get("standby_ip") or ""),
+        "standby_port": parse_int(raw.get("standby_port")),
+        "standby_protocol": str(raw.get("standby_protocol") or "openvpn").strip().lower() or "openvpn",
+        "active_pool_endpoint": raw.get("active_pool_endpoint") if isinstance(raw.get("active_pool_endpoint"), dict) else {},
+    }
+
+
 def _ui_node_is_live_standby(node: dict[str, Any], standby_state: dict[str, Any]) -> bool:
-    if not node or not standby_state.get("standby_ready"):
+    if not node or not (standby_state.get("standby_ready") or standby_state.get("standby_prepared")):
         return False
     sid = str(standby_state.get("standby_node_id") or "")
     pool_id = sid[5:] if sid.startswith("pool:") else sid
@@ -17870,21 +20114,52 @@ def _ui_node_is_live_standby(node: dict[str, Any], standby_state: dict[str, Any]
     protocol = str(standby_state.get("standby_protocol") or "").strip().lower()
     if protocol and str(node.get("protocol") or "").strip().lower() != protocol:
         return False
-    return bool(ip) and str(node.get("ip") or "").strip() == ip and (not port or parse_int(node.get("port")) == port)
+    return bool(ip) and str(node.get("ip") or "").strip() == ip and (not port or parse_int(node.get("remote_port") or node.get("port")) == port)
+
+
+def _repair_standby_node_id(endpoint_id: str) -> None:
+    """Put a prepared cold standby's pool id back after a hot-standby clear."""
+    endpoint_id = str(endpoint_id or "").strip()
+    if not endpoint_id:
+        return
+    wanted = "pool:" + endpoint_id
+    try:
+        raw = read_json(STATE_FILE, {})
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    if str(raw.get("standby_node_id") or "") == wanted:
+        return
+    if not (raw.get("standby_prepared") or raw.get("standby_ready")):
+        return
+    if not str(raw.get("standby_ip") or "").strip():
+        return
+    set_state(standby_node_id=wanted)
 
 
 def _load_live_standby_ui_node(standby_state: dict[str, Any]) -> dict[str, Any] | None:
     sid = str(standby_state.get("standby_node_id") or "")
-    if not sid:
-        return None
-    lookup = sid[5:] if sid.startswith("pool:") else sid
-    endpoint = node_pool.get_endpoint(lookup)
+    endpoint = None
+    if sid:
+        lookup = sid[5:] if sid.startswith("pool:") else sid
+        endpoint = node_pool.get_endpoint(lookup)
+        if not endpoint:
+            parts = sid.rsplit("_", 2)
+            if len(parts) == 3 and str(parts[1]).isdigit():
+                found = node_pool.find_endpoint_id(parts[0], int(parts[1]), str(standby_state.get("standby_protocol") or "openvpn"))
+                if found:
+                    endpoint = node_pool.get_endpoint(found)
     if not endpoint:
-        parts = sid.rsplit("_", 2)
-        if len(parts) == 3 and str(parts[1]).isdigit():
-            found = node_pool.find_endpoint_id(parts[0], int(parts[1]), str(standby_state.get("standby_protocol") or "openvpn"))
+        ip = str(standby_state.get("standby_ip") or "").strip()
+        port = parse_int(standby_state.get("standby_port"))
+        protocol = str(standby_state.get("standby_protocol") or "").strip().lower()
+        if ip and port and protocol:
+            found = node_pool.find_endpoint_id(ip, port, protocol)
             if found:
                 endpoint = node_pool.get_endpoint(found)
+                if endpoint and not sid:
+                    _repair_standby_node_id(found)
     if not endpoint:
         return None
     node = protocol_endpoint_to_ui_node(endpoint)
@@ -17894,7 +20169,7 @@ def _load_live_standby_ui_node(standby_state: dict[str, Any]) -> dict[str, Any] 
 def _pin_connected_then_standby(page_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep the live exit first and its hot standby directly underneath."""
     nodes = [dict(node) for node in (page_nodes or []) if node]
-    standby_state = get_state()
+    standby_state = _ui_standby_fields()
     active_ids = {str(active_pool_endpoint_id or ""), str(active_openvpn_node_id or "")}
     active_ids.discard("")
 
@@ -17907,7 +20182,7 @@ def _pin_connected_then_standby(page_nodes: list[dict[str, Any]]) -> list[dict[s
     standby = next((node for node in rest if _ui_node_is_live_standby(node, standby_state)), None)
     if standby is not None:
         rest = [node for node in rest if node is not standby]
-    elif standby_state.get("standby_ready"):
+    elif standby_state.get("standby_ready") or standby_state.get("standby_prepared"):
         standby = _load_live_standby_ui_node(standby_state)
         if standby and active and {str(standby.get("id") or ""), str(standby.get("pool_endpoint_id") or "")} & {str(active.get("id") or ""), str(active.get("pool_endpoint_id") or "")}:
             standby = None
@@ -17963,26 +20238,23 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
         active_endpoint_id = str(active_pool_endpoint_id or "")
         active_ip = active_protocol = ""
         active_port = 0
-        if active_endpoint_id:
-            try:
-                active_ep = node_pool.get_endpoint(active_endpoint_id) or {}
-                active_ip = str(active_ep.get("current_ip") or "").strip()
-                active_protocol = str(active_ep.get("protocol") or "").strip().lower()
-                active_port = parse_int(active_ep.get("port"))
-            except Exception:
-                pass
+        standby_state = _ui_standby_fields()
+        active_meta = standby_state.get("active_pool_endpoint") or {}
+        if active_endpoint_id and str(active_meta.get("endpoint_id") or "") == active_endpoint_id:
+            active_ip = str(active_meta.get("current_ip") or "").strip()
+            active_protocol = str(active_meta.get("protocol") or "").strip().lower()
+            active_port = parse_int(active_meta.get("port"))
         elif active_openvpn_node_id:
             parts = str(active_openvpn_node_id).rsplit("_", 2)
             if len(parts) == 3 and str(parts[1]).isdigit():
                 active_ip = parts[0].strip()
                 active_port = int(parts[1])
                 active_protocol = "openvpn"
-        standby_state = get_state()
         standby_endpoint_id = ""
         standby_ip = str(standby_state.get("standby_ip") or "").strip()
         standby_protocol = str(standby_state.get("standby_protocol") or "openvpn").strip().lower()
         standby_port = parse_int(standby_state.get("standby_port"))
-        if standby_state.get("standby_ready"):
+        if standby_state.get("standby_ready") or standby_state.get("standby_prepared"):
             standby_id = str(standby_state.get("standby_node_id") or "")
             if standby_id.startswith("pool:"):
                 standby_endpoint_id = standby_id[5:]
@@ -17998,6 +20270,15 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
                     if len(parts) == 3 and str(parts[1]).isdigit():
                         standby_ip = standby_ip or parts[0].strip()
                         standby_port = standby_port or int(parts[1])
+            if not standby_endpoint_id and standby_ip and standby_port > 0 and standby_protocol:
+                try:
+                    found_id = node_pool.find_endpoint_id(standby_ip, standby_port, standby_protocol)
+                except Exception:
+                    found_id = ""
+                if found_id:
+                    standby_endpoint_id = found_id
+                    if not standby_id:
+                        _repair_standby_node_id(found_id)
         scoped_endpoints, endpoint_total = node_pool.list_endpoints_scoped(
             country=country,
             status=status,
@@ -18021,8 +20302,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
             for endpoint in scoped_endpoints
         ]
         scoped_nodes = _sanitize_ui_nodes([node for node in scoped_nodes if node])
-        apply_cached_tcp_rtt(scoped_nodes)
-        schedule_tcp_rtt(scoped_nodes)
+        apply_server_tcp_rtt(scoped_nodes)
         # Keep the browser-facing ranking deterministic inside the returned
         # page. The SQL query already applies the same primary status/latency
         # ordering, so we do not materialize thousands of rows in Python.
@@ -18189,7 +20469,9 @@ def _get_fast_nodes_state():
     now_mono = time.monotonic()
     with fast_state_cache_lock:
         if fast_state_cache is not None and now_mono - fast_state_cache_at < FAST_STATE_CACHE_TTL_SECONDS:
-            return dict(fast_state_cache)
+            cached = dict(fast_state_cache)
+            cached.update(_library_check_public_state())
+            return cached
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     cert_state = web_certificate.snapshot()
@@ -18197,6 +20479,8 @@ def _get_fast_nodes_state():
     state["web_certificate"] = cert_state
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    if not is_connecting and not manual_connection_active:
+        state["manual_switch_active"] = False
     state["probe_engine_running"] = probe_engine_running
     state["probe_engine_message"] = probe_engine_message
     state["probe_engine_target_country"] = probe_engine_target_country
@@ -18220,6 +20504,26 @@ def _get_fast_nodes_state():
         state["active_openvpn_node"] = _openvpn_status_node(active_openvpn_node_id)
     else:
         state["active_openvpn_node"] = None
+    pooled = state.get("active_pool_endpoint") if isinstance(state.get("active_pool_endpoint"), dict) else {}
+    if active_pool_endpoint_id and not (pooled.get("location") and pooled.get("owner") and pooled.get("ip_type")):
+        try:
+            full = node_pool.get_endpoint(active_pool_endpoint_id) or {}
+            meta = full.get("server_metadata") or {}
+            merged = dict(pooled)
+            merged.update({
+                "endpoint_id": active_pool_endpoint_id,
+                "protocol": full.get("protocol") or merged.get("protocol") or "",
+                "hostname": full.get("hostname") or merged.get("hostname") or "",
+                "current_ip": full.get("current_ip") or merged.get("current_ip") or "",
+                "port": full.get("port") or merged.get("port") or 0,
+                "country": full.get("country") or merged.get("country") or "",
+                "location": meta.get("location") or full.get("country") or merged.get("location") or "",
+                "owner": meta.get("owner") or meta.get("as_name") or merged.get("owner") or "",
+                "ip_type": meta.get("ip_type") or merged.get("ip_type") or "",
+            })
+            state["active_pool_endpoint"] = merged
+        except Exception:
+            pass
     # Do not parse nodes.json here. It is a multi-megabyte config snapshot, and
     # doing it on the homepage state request blocks every other UI call.
     cached_pool = state.get("active_pool_endpoint")
@@ -18279,6 +20583,7 @@ def _get_fast_nodes_state():
     state["global_pool_refresh_message"] = global_pool_refresh_message
     state["global_pool_refresh_servers"] = global_pool_refresh_servers
     state["global_pool_refresh_sources"] = global_pool_refresh_sources
+    state.update(_library_check_public_state())
 
     try:
         active = active_tunnel_running()
@@ -18302,6 +20607,7 @@ def _get_fast_nodes_state():
         state["connection_message"] = "当前没有活动 VPN 隧道"
         state["client_status"] = "not_connected"
     state["client_usable"] = state["client_status"] == "usable"
+    state["egress_mode"] = proxy_server.get_egress_mode()
 
     state["resource_engine_running"] = bool(resource_engine_running)
     state["resource_engine_message"] = resource_engine_message
@@ -18326,6 +20632,28 @@ def _get_fast_nodes_state():
     state["upstream_proxy_label"] = proxy_state["label"]
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("favorite_node_ids", [])
+    ui_cfg = load_ui_config()
+    state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
+    state["force_country"] = ui_cfg.get("force_country", "")
+    state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
+    state["routing_protocol"] = str(ui_cfg.get("routing_protocol") or "")
+    state["routing_min_speed_bps"] = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    state["routing_latency"] = str(ui_cfg.get("routing_latency") or "")
+    state["routing_blocklist"] = str(ui_cfg.get("routing_blocklist") or "")
+    state["background_paused"] = background_paused()
+    if state["background_paused"]:
+        state["priority_running"] = False
+        state["priority_full_sweep_running"] = False
+    try:
+        scheme = scheme_match_snapshot(ui_cfg)
+    except Exception:
+        scheme = {}
+    state["scheme_country"] = str((scheme or {}).get("country") or "")
+    state["scheme_available"] = int((scheme or {}).get("available") or 0)
+    state["scheme_inventory"] = int((scheme or {}).get("inventory") or 0)
+    state["scheme_label"] = str((scheme or {}).get("label") or "")
+    state["scheme_capped"] = bool((scheme or {}).get("capped"))
+    _attach_local_server_identity(state)
     with fast_state_cache_lock:
         fast_state_cache = dict(state)
         fast_state_cache_at = time.monotonic()
@@ -18363,6 +20691,8 @@ def _endpoint_country(endpoint):
     return normalized_country_name(endpoint.get("country") or "")
 
 def _endpoint_ip(endpoint):
+    if not endpoint:
+        return ""
     return str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
 
 def _endpoint_ip_type(endpoint):
@@ -18706,6 +21036,10 @@ def initial_install_bootstrap_loop():
         local_server_country=local_country,
         local_server_country_code=str(detected.get("country_code") or ""),
         local_server_public_ip=str(detected.get("public_ip") or ""),
+        local_server_location=str(detected.get("location") or ""),
+        local_server_owner=str(detected.get("owner") or ""),
+        local_server_ip_type=str(detected.get("ip_type") or ""),
+        local_server_identity_at=time.time() if detected.get("public_ip") else 0,
         detection_source=str(detected.get("source") or ""),
     )
     set_state(
@@ -19032,6 +21366,7 @@ def main() -> None:
         enabled_loops.append("protocol-probe")
     threading.Thread(target=warm_first_page_loop, daemon=True, name="warm-first-page").start()
     threading.Thread(target=warm_standby_loop, daemon=True, name="warm-standby").start()
+    threading.Thread(target=cold_standby_loop, daemon=True, name="cold-standby").start()
     enabled_loops.append("warm-standby")
 
     threading.Thread(target=startup_recovery_loop, daemon=True, name="startup-recovery").start()

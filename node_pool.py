@@ -460,16 +460,23 @@ class NodePool:
         # cache TTL and is refreshed automatically.
         self._stats_cache = None
 
-    def _connect(self, busy_ms: int = 8000) -> sqlite3.Connection:
-        db = sqlite3.connect(str(self.db_path), timeout=max(0.05, busy_ms / 1000))
+    def _connect(self, busy_ms: int = 8000, *, readonly: bool = False) -> sqlite3.Connection:
+        timeout = max(0.05, busy_ms / 1000)
+        if readonly:
+            # UI pages must not wait on a writer. WAL snapshots let a read-only
+            # connection proceed while probes update the same database.
+            db = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=timeout)
+        else:
+            db = sqlite3.connect(str(self.db_path), timeout=timeout)
         db.row_factory = sqlite3.Row
         db.execute(f"PRAGMA busy_timeout={max(0, int(busy_ms))}")
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=NORMAL")
+        if not readonly:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA mmap_size=33554432")
         db.execute("PRAGMA temp_store=MEMORY")
-        db.execute("PRAGMA cache_size=-8192")
-        db.execute("PRAGMA mmap_size=33554432")
-        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA cache_size=-16384")
         return db
 
     @staticmethod
@@ -656,6 +663,136 @@ class NodePool:
         if str(source or "").startswith("manual"):
             self.invalidate_ui_lists()
 
+    def upsert_shared_snapshot(self, resources: list[dict[str, Any]], peer_id: str = "", source_name: str = "shared") -> int:
+        """Import peer inventory without copying that peer's latency.
+
+        Domain, IP, protocol, port, country, availability and speed are useful.
+        Latency is measured on this machine. An existing local status is never
+        downgraded, and a shared row is not marked as a trusted local observation.
+        """
+        imported = 0
+        now = time.time()
+        peer_id = str(peer_id or "").strip()
+        source = ("share:" + str(source_name or "shared"))[:80]
+        with self.lock, closing(self._connect()) as db:
+            for row in resources or []:
+                if not isinstance(row, dict):
+                    continue
+                hostname = str(row.get("hostname") or "").strip().lower()
+                ip = str(row.get("ip") or "").strip()
+                key = hostname or ip
+                protocol = str(row.get("protocol") or "").strip().lower()
+                if not key or not protocol:
+                    continue
+                transport = str(row.get("transport") or "unknown").strip().lower() or "unknown"
+                try:
+                    port = int(row.get("port") or 0)
+                except (TypeError, ValueError):
+                    port = 0
+                country = canonical_country_name(row.get("country") or "")
+                shared_status = str(row.get("status") or "NEW").upper()
+                if shared_status not in ("NEW", "AVAILABLE", "HOT", "DEGRADED", "COOLDOWN"):
+                    shared_status = "NEW"
+                try:
+                    speed = max(0, int(row.get("speed_bps") or row.get("speed") or 0))
+                except (TypeError, ValueError):
+                    speed = 0
+                server_row = db.execute("SELECT metadata_json, state FROM servers WHERE server_key=?", (key,)).fetchone()
+                metadata: dict[str, Any] = {}
+                if server_row:
+                    try:
+                        metadata = json.loads(server_row["metadata_json"] or "{}")
+                    except Exception:
+                        metadata = {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                peer_ids = [str(x) for x in (metadata.get("shared_peer_ids") or []) if str(x)]
+                if peer_id and peer_id not in peer_ids:
+                    peer_ids.append(peer_id)
+                metadata["shared_peer_ids"] = peer_ids
+                metadata["shared_peer_count"] = len(peer_ids)
+                metadata["shared_status"] = shared_status
+                if speed > 0:
+                    metadata["shared_speed_bps"] = speed
+                metadata.pop("trusted_observation", None)
+                server_state = "NEW"
+                if server_row and str(server_row["state"] or "") not in ("", "STALE", "RETIRED"):
+                    server_state = str(server_row["state"])
+                db.execute(
+                    """
+                    INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(server_key) DO UPDATE SET
+                      hostname=CASE WHEN excluded.hostname<>'' THEN excluded.hostname ELSE servers.hostname END,
+                      current_ip=CASE WHEN excluded.current_ip<>'' THEN excluded.current_ip ELSE servers.current_ip END,
+                      country=CASE WHEN excluded.country<>'' THEN excluded.country ELSE servers.country END,
+                      last_seen=excluded.last_seen,
+                      last_source=excluded.last_source,
+                      metadata_json=excluded.metadata_json,
+                      state=CASE WHEN servers.state IN ('STALE','RETIRED') THEN 'NEW' ELSE servers.state END
+                    """,
+                    (key, hostname, ip, country, now, now, source, 0, server_state, json.dumps(metadata, ensure_ascii=False)),
+                )
+                existing = None
+                if ip and port > 0:
+                    existing = db.execute(
+                        """
+                        SELECT e.endpoint_id, e.status, e.metadata_json FROM endpoints e
+                        JOIN servers s ON s.server_key=e.server_key
+                        WHERE s.current_ip=? AND e.port=? AND LOWER(e.protocol)=?
+                        LIMIT 1
+                        """,
+                        (ip, port, protocol),
+                    ).fetchone()
+                eid = str(existing["endpoint_id"]) if existing else self.endpoint_id(key, protocol, transport, port)
+                if existing is None:
+                    existing = db.execute(
+                        "SELECT endpoint_id, status, metadata_json FROM endpoints WHERE endpoint_id=?",
+                        (eid,),
+                    ).fetchone()
+                endpoint_meta: dict[str, Any] = {}
+                if existing:
+                    try:
+                        endpoint_meta = json.loads(existing["metadata_json"] or "{}")
+                    except Exception:
+                        endpoint_meta = {}
+                    if not isinstance(endpoint_meta, dict):
+                        endpoint_meta = {}
+                endpoint_meta["hostname"] = hostname
+                endpoint_meta["ip"] = ip
+                endpoint_meta["source"] = source
+                endpoint_meta["shared_status"] = shared_status
+                if peer_id:
+                    endpoint_meta["shared_peer_id"] = peer_id
+                if speed > 0:
+                    endpoint_meta["shared_speed_bps"] = speed
+                endpoint_meta.pop("trusted_observation", None)
+                if existing:
+                    db.execute(
+                        "UPDATE endpoints SET last_seen=?, metadata_json=? WHERE endpoint_id=?",
+                        (now, json.dumps(endpoint_meta, ensure_ascii=False), eid),
+                    )
+                else:
+                    insert_status = "AVAILABLE" if shared_status in ("AVAILABLE", "HOT") else "NEW"
+                    db.execute(
+                        """
+                        INSERT INTO endpoints(endpoint_id, server_key, protocol, transport, port, status, first_seen, last_seen, metadata_json)
+                        VALUES(?,?,?,?,?,?,?,?,?)
+                        """,
+                        (eid, key, protocol, transport, port, insert_status, now, now, json.dumps(endpoint_meta, ensure_ascii=False)),
+                    )
+                if speed > 0:
+                    seen = db.execute("SELECT 1 FROM observations WHERE server_key=? LIMIT 1", (key,)).fetchone()
+                    if not seen:
+                        db.execute(
+                            "INSERT INTO observations(server_key, source, seen_at, ip, ping, speed, sessions, score) VALUES(?,?,?,?,?,?,?,?)",
+                            (key, source, now, ip, 0, speed, 0, 0),
+                        )
+                imported += 1
+            db.commit()
+        self._invalidate_read_caches()
+        return imported
+
     def list_endpoints(self, protocol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         # The UI is paginated; keep the backend ceiling high enough that the
         # persistent Master Pool is not accidentally truncated at 1000 endpoints.
@@ -712,15 +849,19 @@ class NodePool:
                 result.append(item)
             return result
 
-    def list_routing_endpoints(self, limit: int = 400, country: str = "") -> list[dict[str, Any]]:
+    def list_routing_endpoints(self, limit: int = 400, country: str = "", protocol: str = "") -> list[dict[str, Any]]:
         """HOT/AVAILABLE rows for failover. One indexed read, not the full catalog."""
         limit = max(1, min(int(limit), 800))
         country = str(country or "").strip()
+        protocol = str(protocol or "").strip().lower()
         where = "UPPER(e.status) IN ('HOT', 'AVAILABLE')"
         params: list[Any] = []
         if country:
             where += " AND s.country=?"
             params.append(country)
+        if protocol:
+            where += " AND LOWER(e.protocol)=?"
+            params.append(protocol)
         params.append(limit)
         with closing(self._connect()) as db:
             rows = db.execute(
@@ -808,7 +949,7 @@ class NodePool:
             base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
             stale = self._scoped_page_stale.get(cache_key)
             try:
-                with closing(self._connect(250 if stale else 1200)) as db:
+                with closing(self._connect(400, readonly=True)) as db:
                     total=int(db.execute(
                         "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
                         params,
@@ -890,7 +1031,7 @@ class NodePool:
             + " AND ".join(where)
             + ") WHERE _rn=1"
         )
-        with closing(self._connect(800)) as db:
+        with closing(self._connect(800, readonly=True)) as db:
             rows = db.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
@@ -929,7 +1070,7 @@ class NodePool:
             cached = self._country_catalog_cache.get(key)
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
-            with closing(self._connect(1500)) as db:
+            with closing(self._connect(800, readonly=True)) as db:
                 grouped = db.execute(
                     "SELECT s.country AS country, "
                     "COUNT(DISTINCT s.current_ip) AS ip_count, "
@@ -973,7 +1114,7 @@ class NodePool:
         endpoint_id = str(endpoint_id or "").strip()
         if not endpoint_id:
             return None
-        with closing(self._connect()) as db:
+        with closing(self._connect(400, readonly=True)) as db:
             row = db.execute(
                 """
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
@@ -1231,6 +1372,47 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
+    def note_tcp_rtt(self, endpoint_id: str, latency_ms: int) -> None:
+        """Store a TCP port round trip. It is a valid latency, not a tunnel dial."""
+        endpoint_id = str(endpoint_id or "").strip()
+        latency_ms = int(latency_ms or 0)
+        if not endpoint_id or latency_ms <= 0 or latency_ms > 1500:
+            return
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute("SELECT metadata_json FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
+            if not row:
+                return
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if int(meta.get("tcp_rtt_ms") or 0) == latency_ms:
+                return
+            meta["tcp_rtt_ms"] = latency_ms
+            meta["tcp_rtt_at"] = time.time()
+            db.execute(
+                "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                (json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+            db.commit()
+        self._invalidate_read_caches()
+
+    @staticmethod
+    def _probe_failure_should_count(message: str) -> bool:
+        """Foreground abort, speed tests and URL checks are not connectivity failures."""
+        text = str(message or "")
+        lowered = text.lower()
+        for marker in (
+            "让路", "跳过", "测速", "速度测试", "未测速",
+            "ipify", "cloudflare", "cdn-cgi", "speed test",
+            "出口检测", "网页出口",
+        ):
+            if marker in text or marker in lowered:
+                return False
+        return True
+
     def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = None) -> bool:
         endpoint_id = str(endpoint_id or "").strip()
         if not endpoint_id: return False
@@ -1283,15 +1465,33 @@ class NodePool:
                     (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
                 )
             else:
-                meta["last_error"] = msg
-                meta["last_probe_message"] = msg
-                session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
-                stability = self._touch_stability(meta, now, "fail", prev_fail + 1, 0, session_seconds)
-                db.execute(
-                    """UPDATE endpoints SET status='COOLDOWN', last_failure=?, failure_count=failure_count+1,
-                       fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
-                    (now, prev_fail + 1, now + 300, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
-                )
+                if not self._probe_failure_should_count(msg):
+                    meta["last_probe_message"] = msg
+                    db.execute(
+                        "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                        (json.dumps(meta, ensure_ascii=False), endpoint_id),
+                    )
+                else:
+                    new_fail = prev_fail + 1
+                    meta["last_error"] = msg
+                    session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
+                    stability = self._touch_stability(meta, now, "fail", new_fail, 0, session_seconds)
+                    if new_fail >= 3:
+                        meta["last_probe_message"] = msg
+                        db.execute(
+                            """UPDATE endpoints SET status='COOLDOWN', last_failure=?, failure_count=failure_count+1,
+                               fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
+                            (now, new_fail, now + 300, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
+                        )
+                    else:
+                        note = f"第{new_fail}/3次连通失败，暂不标不可用。{msg}"[:1000]
+                        meta["last_error"] = note
+                        meta["last_probe_message"] = note
+                        db.execute(
+                            """UPDATE endpoints SET last_failure=?, failure_count=failure_count+1,
+                               fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
+                            (now, new_fail, now + 1800, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
+                        )
             db.commit()
         self._invalidate_read_caches()
         return True
@@ -1466,7 +1666,7 @@ class NodePool:
             )
             empty = {"usable": 0, "available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
             try:
-                with closing(self._connect(300)) as db:
+                with closing(self._connect(400, readonly=True)) as db:
                     row = db.execute(sql, select_params + params).fetchone()
             except sqlite3.OperationalError:
                 if cached:
@@ -1489,7 +1689,7 @@ class NodePool:
         if cached and cached[0] > now:
             return dict(cached[1])
         try:
-            with closing(self._connect(300)) as db:
+            with closing(self._connect(400, readonly=True)) as db:
                 servers = int(db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"] or 0)
                 endpoints = int(db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"] or 0)
                 distinct_ips = int(db.execute("SELECT COUNT(DISTINCT current_ip) c FROM servers WHERE TRIM(COALESCE(current_ip,''))<>''").fetchone()["c"] or 0)
@@ -1505,3 +1705,15 @@ class NodePool:
             if cached:
                 return dict(cached[1])
             return {"servers": 0, "endpoints": 0, "distinct_ips": 0, "country_ips": 0, "states": {}}
+
+    def count_by_protocol(self, exclude_retired: bool = True) -> dict[str, int]:
+        sql = "SELECT LOWER(protocol) AS p, COUNT(*) AS c FROM endpoints"
+        if exclude_retired:
+            sql += " WHERE UPPER(COALESCE(status,''))!='RETIRED'"
+        sql += " GROUP BY 1"
+        try:
+            with closing(self._connect(400, readonly=True)) as db:
+                rows = db.execute(sql).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {str(row["p"] or ""): int(row["c"] or 0) for row in rows if str(row["p"] or "")}
