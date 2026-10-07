@@ -972,6 +972,17 @@ exit 42
             iface_file = work_dir / "ppp-iface"
             stage_file = work_dir / "stage"
             last_stage = ""
+            fail_hints = (
+                "authentication failed",
+                "chap authentication failed",
+                "pap authentication failed",
+                "lcp timeout",
+                "lcp: timeout",
+                "peer terminated",
+                "connection terminated",
+                "the link was terminated",
+                "modem hangup",
+            )
             while time.time() < deadline:
                 if on_progress is not None and stage_file.exists():
                     try:
@@ -984,6 +995,23 @@ exit 42
                             on_progress(stage)
                         except Exception:
                             pass
+                failed_hint = ""
+                for log_name in ("ppp.log", "xl2tpd.log"):
+                    log_path = work_dir / log_name
+                    try:
+                        blob = log_path.read_text(encoding="utf-8", errors="replace")[-4000:].lower()
+                    except OSError:
+                        continue
+                    for hint in fail_hints:
+                        if hint in blob:
+                            failed_hint = hint
+                            break
+                    if failed_hint:
+                        break
+                if failed_hint:
+                    self.disconnect(namespace)
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    return TunnelResult(False, self.protocol, message=f"L2TP/IPsec 已失败：{failed_hint}")
                 if proc.poll() is not None:
                     output = ""
                     try:

@@ -3552,7 +3552,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 password="vpn",
                 psk="vpn",
                 namespace=f"aimili-l2tp-{token}",
-                timeout=35,
+                timeout=20 if manual else 35,
                 on_progress=_l2tp_progress,
             )
 
@@ -3560,8 +3560,10 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             detail = str(result.message or f"{protocol} 连接失败")
             node_pool.record_endpoint_probe(endpoint_id, False, 0, detail[:500])
             log_to_json("WARNING", "VPN", f"{protocol} 连接失败 {endpoint_id}: {detail[:800]}")
+            if protocol == "l2tp-ipsec" and detail.startswith("L2TP/IPsec 已失败"):
+                raise RuntimeError(detail.splitlines()[0][:180])
             if protocol == "l2tp-ipsec":
-                raise RuntimeError("L2TP/IPsec 未完成：IPsec、L2TP 或 PPP 在 35 秒内没有拿到地址")
+                raise RuntimeError("L2TP/IPsec 未完成：IPsec、L2TP 或 PPP 在时限内没有拿到地址")
             short = " ".join(detail.split())
             raise RuntimeError(short[:180] or f"{protocol} 连接失败")
 
@@ -6074,6 +6076,12 @@ def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
         log_to_json("INFO", "Standby", "冷备已轮换一整轮，仍可用的节点可以重新作为备")
     cold["order"] = order
     cold["failed"] = failed
+    favorites = [
+        eid for eid in order
+        if eid not in failed and int((candidates[eid] or {}).get("routing_favorite_rank") or 1) == 0
+    ]
+    for eid in favorites:
+        return candidates[eid]
     for eid in order:
         if eid not in failed:
             return candidates[eid]
@@ -6208,10 +6216,65 @@ def cold_standby_loop() -> None:
     time.sleep(4)
     while True:
         try:
+            favorite_connectivity_pass()
+        except Exception as exc:
+            log_to_json("WARNING", "Standby", f"收藏连通检测失败: {exc}")
+        try:
             cold_standby_pass()
         except Exception as exc:
             log_to_json("WARNING", "Standby", f"冷备维护失败: {exc}")
         time.sleep(COLD_PORT_SECONDS)
+
+
+FAVORITE_PROBE_SECONDS = 3600
+
+
+def favorite_connectivity_pass() -> None:
+    """Check one saved favorite per hour. Does not touch the live tunnel while it is busy."""
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+        return
+    ui_cfg = load_ui_config()
+    raw_ids = [str(item).strip() for item in (ui_cfg.get("favorite_node_ids") or []) if str(item or "").strip()]
+    if not raw_ids:
+        return
+    try:
+        stamp = read_json(DATA_DIR / "favorite_probe.json", {})
+    except Exception:
+        stamp = {}
+    if not isinstance(stamp, dict):
+        stamp = {}
+    now = time.time()
+    due = [item for item in raw_ids if now - float(stamp.get(item) or 0) >= FAVORITE_PROBE_SECONDS]
+    if not due:
+        return
+    node_id = due[0]
+    endpoint_id = node_id[5:] if node_id.startswith("pool:") else node_id
+    endpoint = None
+    try:
+        endpoint = node_pool.get_endpoint(endpoint_id)
+    except Exception:
+        endpoint = None
+    if endpoint is None:
+        stamp[node_id] = now
+        try:
+            write_json(DATA_DIR / "favorite_probe.json", stamp)
+        except Exception:
+            pass
+        return
+    if proxy_server.proxy_forwarding_busy():
+        return
+    result = probe_pool_endpoint(endpoint_id)
+    if result.get("skipped"):
+        return
+    stamp[node_id] = now
+    try:
+        write_json(DATA_DIR / "favorite_probe.json", stamp)
+    except Exception:
+        pass
+    if result.get("ok"):
+        log_to_json("INFO", "Standby", f"收藏连通检测通过 {endpoint_id}")
+    else:
+        log_to_json("INFO", "Standby", f"收藏连通检测未通过 {endpoint_id}: {result.get('error') or ''}")
 
 def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) -> str:
     """Make-before-break manual OpenVPN switch with rollback before the new route is committed."""
@@ -10295,14 +10358,16 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .node-address-cell {
-      white-space: nowrap;
+      white-space: normal;
     }
 
     .node-address-cell .mono {
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 400;
       color: #8eb8c4;
       letter-spacing: 0;
+      white-space: normal;
+      word-break: break-all;
     }
     .node-address-stack {
       display: flex;
@@ -10316,9 +10381,8 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 500;
       color: #d5dee8;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      white-space: normal;
+      word-break: break-all;
     }
     .node-address-cell.is-blocked .node-domain,
     .node-address-cell.is-blocked .mono {
@@ -11748,7 +11812,7 @@ INDEX_HTML = r"""<!doctype html>
           <tr>
             <th class="col-status" style="width: 8%;">状态</th>
             <th class="col-protocol" style="width: 8%;">协议</th>
-            <th class="col-address" style="width: 14%;">IP 地址 : 端口</th>
+            <th class="col-address" style="width: 22%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 7%;">延迟</th>
             <th class="col-speed" style="width: 11%;">速度</th>
             <th class="col-location" style="width: 18%;">物理位置</th>
@@ -13820,6 +13884,7 @@ function render(){
     state.pending_connection_pool_endpoint_id || "",
     manualConnectionUiBusy ? 1 : 0,
     showFavoritesOnly ? 1 : 0,
+    Array.from(favoriteBusyIds).join(","),
     Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids.join(",") : "",
     Array.from(testingNodeIds).join(","),
     Array.from(waitingNodeIds).join(","),
@@ -13863,7 +13928,7 @@ function render(){
         ? Number(state.proxy_latency_ms || 0)
         : (n.probe_status === "available" ? Number(n.latency_ms || 0) : 0);
       const latencyClass = getLatencyClass(rowLatencyValue);
-      const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}">${rowLatencyValue} ms</span>` : "-";
+      const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}" title="网络延迟，不是拨号耗时">${rowLatencyValue} ms</span>` : "-";
       const rowSpeedValue = Number(n.speed_bps || n.speed || 0);
       const rowSpeedText = rowSpeedValue ? `<span class="node-speed-val">${esc(speed(rowSpeedValue))}</span>` : "-";
       const displayLocation = formatNodeLocation(n);
@@ -13871,8 +13936,9 @@ function render(){
       const protocolName = translateProtocol(n.protocol || "openvpn");
       const displayPort = displayNodePort(n);
       const listIp = String(n.ip || "").trim();
-      const nodeAddress = (listIp || "-") + (displayPort ? ":" + displayPort : "");
       const domainLabel = nodeDomainLabel(n);
+      const domainLine = domainLabel ? (displayPort ? domainLabel + ":" + displayPort : domainLabel) : "";
+      const ipLine = domainLine ? (listIp || "-") : ((listIp || "-") + (displayPort ? ":" + displayPort : ""));
       const blocked = nodeIsBlocked(n);
 
       const canRetest = !isCurrentlyActive && !isTesting && !isWaiting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
@@ -13913,14 +13979,17 @@ function render(){
 
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
-      const favBtn = isFav
+      const favBusy = favoriteBusyIds.has(n.id);
+      const favBtn = favBusy
+        ? `<button class="test-btn" disabled style="padding: 0 8px; height: 28px; opacity: 0.7;">处理中</button>`
+        : isFav
         ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
         : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 28px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
 
       return `<tr ${rowClass}>
         <td class="node-status-cell" data-label="状态">${statusCell}</td>
         <td class="node-protocol-cell" data-label="协议">${renderProtocolCell(n)}</td>
-        <td class="node-address-cell${blocked ? " is-blocked" : ""}" data-label="IP" title="${esc(domainLabel ? domainLabel + " " + nodeAddress : nodeAddress)}"><div class="node-address-stack">${domainLabel ? `<div class="node-domain">${esc(domainLabel)}</div>` : ""}<div class="mono">${esc(nodeAddress)}</div>${blocked ? `<div class="node-blocked-tag">已屏蔽</div>` : ""}</div></td>
+        <td class="node-address-cell${blocked ? " is-blocked" : ""}" data-label="IP" title="${esc((domainLine ? domainLine + " " : "") + (listIp || ""))}"><div class="node-address-stack">${domainLine ? `<div class="node-domain">${esc(domainLine)}</div>` : ""}<div class="mono">${esc(ipLine || "-")}</div>${blocked ? `<div class="node-blocked-tag">已屏蔽</div>` : ""}</div></td>
         <td class="node-latency-cell" data-label="延迟">${latencyText}</td>
         <td class="node-speed-cell" data-label="速度">${rowSpeedText}</td>
         <td class="node-location-cell" data-label="位置" title="${esc(displayLocation)}"><div class="node-location-cell-inner">${displayLocationFlag}<span class="node-cell-ellipsis">${esc(displayLocation)}</span></div></td>
@@ -14184,21 +14253,31 @@ async function runManualTest(id){
   }
 }
 
+let favoriteBusyIds = new Set();
+
 async function toggleFavorite(id, event) {
   if (event) event.stopPropagation();
+  if (favoriteBusyIds.has(id)) return;
+  favoriteBusyIds.add(id);
+  render();
   try {
     const response = await fetch("./api/toggle_favorite", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id })
     });
-    const result = await response.json();
-    if (result.ok) {
+    let result = {};
+    try { result = await response.json(); } catch (e) { result = {}; }
+    if (response.ok && result.ok) {
       state.favorite_node_ids = Array.isArray(result.favorite_node_ids) ? result.favorite_node_ids : [];
-      render();
+    } else {
+      state.last_check_message = (result && result.error) ? result.error : ("收藏失败 HTTP " + response.status);
     }
   } catch (e) {
-    console.error("切换收藏失败", e);
+    state.last_check_message = "收藏失败：" + ((e && e.message) ? e.message : "网络错误");
+  } finally {
+    favoriteBusyIds.delete(id);
+    render();
   }
 }
 
@@ -18469,7 +18548,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # All authenticated UI write operations pass through one command gate.
         # Connection endpoints retain their dedicated connection lock below.
-        command_bypass = {"/api/connect", "/api/connect_pool_endpoint", "/api/egress_mode"}
+        command_bypass = {"/api/connect", "/api/connect_pool_endpoint", "/api/egress_mode", "/api/toggle_favorite"}
         if effective_path in command_bypass:
             return self._do_POST_impl()
 
@@ -19109,27 +19188,37 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "节点 ID 不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
 
-                ui_cfg = load_ui_config()
-                fav_ids = ui_cfg.get("favorite_node_ids", [])
-                if not isinstance(fav_ids, list):
-                    fav_ids = []
-
-                if node_id in fav_ids:
-                    fav_ids.remove(node_id)
-                else:
-                    fav_ids.append(node_id)
-
-                ui_cfg["favorite_node_ids"] = fav_ids
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
+                    try:
+                        current = json.loads(auth_file.read_text(encoding="utf-8")) if auth_file.exists() else {}
+                    except Exception:
+                        current = {}
+                    if not isinstance(current, dict):
+                        current = {}
+                    fav_ids = current.get("favorite_node_ids") or []
+                    if not isinstance(fav_ids, list):
+                        fav_ids = []
+                    fav_ids = [str(item) for item in fav_ids if str(item or "").strip()]
+                    if node_id in fav_ids:
+                        fav_ids.remove(node_id)
+                    else:
+                        fav_ids.append(node_id)
+                    current["favorite_node_ids"] = fav_ids
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    write_json(auth_file, ui_cfg)
+                    write_json(auth_file, current)
+                invalidate_ui_config_cache()
+                invalidate_scheme_snapshot()
 
-                policy_message = None
-                if ui_cfg.get("routing_mode") == "favorites":
-                    policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "收藏列表已更新")
+                policy_message = ""
+                if (
+                    str(current.get("routing_mode") or "") == "favorites"
+                    and not manual_connection_active
+                    and not manual_route_pin
+                ):
+                    policy_message = enforce_active_node_allowed_by_routing(current, "收藏列表已更新") or ""
 
-                self.send_json({"ok": True, "favorite_node_ids": fav_ids, "message": policy_message or ""})
+                self.send_json({"ok": True, "favorite_node_ids": fav_ids, "message": policy_message})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
