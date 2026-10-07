@@ -12800,14 +12800,18 @@ function triState(value) {
 function egressHealthBadge(state) {
   if (state.connection_status === 'connecting') return ['正在连接', 'not_checked'];
   const udpDown = triState(state.client_udp_ok) === false;
+  const quicDown = triState(state.client_quic_ok) === false;
   if (state.egress_mode === 'direct') {
     const ok = triState(state.direct_egress_ok);
-    if (ok === true) return [udpDown ? '直连可用 · UDP异常' : '直连可用', udpDown ? 'unavailable' : 'available'];
+    if (ok === true && udpDown) return ['直连可用 · UDP异常', 'unavailable'];
+    if (ok === true && quicDown) return ['直连可用 · QUIC异常', 'unavailable'];
+    if (ok === true) return ['直连可用', 'available'];
     if (ok === false) return ['直连不可用', 'unavailable'];
     return ['直连检测中', 'not_checked'];
   }
   const proxyOk = triState(state.client_proxy_ok);
   if ((proxyOk === true || state.client_status === 'usable') && udpDown) return ['UDP异常', 'unavailable'];
+  if ((proxyOk === true || state.client_status === 'usable') && quicDown) return ['QUIC异常', 'unavailable'];
   if (proxyOk === true || state.client_status === 'usable') return ['客户端可用', 'available'];
   if (proxyOk === false || state.client_status === 'degraded') return ['客户端不可用', 'unavailable'];
   return ['已连接 · 等待验证', 'not_checked'];
@@ -14003,8 +14007,9 @@ function render(){
       const directOk = triState(state.direct_egress_ok);
       if (directOk === true) {
         const udpDown = triState(state.client_udp_ok) === false;
-        pBadge.className = udpDown ? "badge unavailable" : "badge available";
-        pBadge.textContent = udpDown ? "直连可用 · UDP异常" : "直连可用";
+        const quicDown = triState(state.client_quic_ok) === false;
+        pBadge.className = (udpDown || quicDown) ? "badge unavailable" : "badge available";
+        pBadge.textContent = udpDown ? "直连可用 · UDP异常" : (quicDown ? "直连可用 · QUIC异常" : "直连可用");
         pIpVal.textContent = state.proxy_ip || state.server_public_ip || "-";
         const latencyClass = getLatencyClass(state.proxy_latency_ms);
         pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms || 0} ms</span>`;
@@ -14023,8 +14028,9 @@ function render(){
       const proxyOk = triState(state.client_proxy_ok) !== null ? triState(state.client_proxy_ok) : triState(state.proxy_ok);
       if (proxyOk === true) {
         const udpDown = triState(state.client_udp_ok) === false;
-        pBadge.className = udpDown ? "badge unavailable" : "badge available";
-        pBadge.textContent = udpDown ? "UDP异常" : "客户端可用";
+        const quicDown = triState(state.client_quic_ok) === false;
+        pBadge.className = (udpDown || quicDown) ? "badge unavailable" : "badge available";
+        pBadge.textContent = udpDown ? "UDP异常" : (quicDown ? "QUIC异常" : "客户端可用");
         pIpVal.textContent = state.proxy_ip || "-";
         const latencyClass = getLatencyClass(state.proxy_latency_ms);
         pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
@@ -17870,8 +17876,15 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
             if not owned():
                 return
             udp = proxy_server.probe_socks_udp_dns(timeout=2)
+            quic = proxy_server.probe_socks_quic(timeout=4) if udp.get("ok") else {"ok": False, "error": "UDP DNS 未过，未测 QUIC"}
             if not owned():
                 return
+            quic_ok = bool(quic.get("ok"))
+            note = label
+            if not udp.get("ok"):
+                note += " · UDP异常"
+            elif not quic_ok:
+                note += " · QUIC异常"
             set_state(
                 egress_mode=mode,
                 egress_switching=False,
@@ -17880,14 +17893,15 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                 client_proxy_ok=(mode == "proxy"),
                 client_tcp_ok=True,
                 client_udp_ok=bool(udp.get("ok")),
+                client_quic_ok=quic_ok if udp.get("ok") else False,
                 proxy_ok=(mode == "proxy"),
                 active_tunnel_ok=active_tunnel_running(),
                 proxy_ip=exit_ip,
                 proxy_latency_ms=parse_int(health.get("latency_ms")),
                 proxy_error="" if udp.get("ok") else str(udp.get("error") or "UDP 异常"),
-                last_check_message=label if udp.get("ok") else label + " · UDP异常",
+                last_check_message=note,
             )
-            log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip} · udp={'ok' if udp.get('ok') else udp.get('error')}")
+            log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip} · udp={'ok' if udp.get('ok') else udp.get('error')} · quic={'ok' if quic_ok else quic.get('error')}")
             report = proxy_server.egress_switch_report()
             summary = (
                 f"generation={report.get('generation')} mode={mode} "
@@ -17897,7 +17911,8 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                 f"udp_live={report.get('udp_live')} "
                 f"old_iface={report.get('old_iface') or '-'} "
                 f"new_iface={report.get('new_iface') or '-'} "
-                f"tcp_health=ok udp_health={'ok' if udp.get('ok') else 'fail'}"
+                f"tcp_health=ok udp_health={'ok' if udp.get('ok') else 'fail'} "
+                f"quic_health={'ok' if quic_ok else 'fail'}"
             )
             print(f"[网关] {summary}", flush=True)
             log_to_json("INFO", "Proxy", summary)
@@ -18129,6 +18144,7 @@ def background_proxy_checker() -> None:
                 udp_ok = None
                 if res.get("ok"):
                     udp_ok = bool(proxy_server.probe_socks_udp_dns(timeout=2).get("ok"))
+                    quic_ok = bool(proxy_server.probe_socks_quic(timeout=4).get("ok")) if udp_ok else False
                     if not _egress_observation_live(observed):
                         log_to_json("INFO", "Proxy", "直连 UDP 检测结果已过期，丢弃")
                         time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
@@ -18143,6 +18159,7 @@ def background_proxy_checker() -> None:
                 if udp_ok is not None:
                     direct_state["client_tcp_ok"] = True
                     direct_state["client_udp_ok"] = udp_ok
+                    direct_state["client_quic_ok"] = quic_ok
                 set_state(**direct_state)
                 if res.get("ok"):
                     proxy_health_failures = 0
@@ -18175,6 +18192,7 @@ def background_proxy_checker() -> None:
             if res["ok"]:
                 proxy_health_failures = 0
                 udp_ok = bool(proxy_server.probe_socks_udp_dns(timeout=2).get("ok"))
+                quic_ok = bool(proxy_server.probe_socks_quic(timeout=4).get("ok")) if udp_ok else False
                 if not _egress_observation_live(observed):
                     log_to_json("INFO", "Proxy", "代理 UDP 检测结果已过期，丢弃")
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
@@ -18183,6 +18201,7 @@ def background_proxy_checker() -> None:
                     client_proxy_ok=True,
                     client_tcp_ok=True,
                     client_udp_ok=udp_ok,
+                    client_quic_ok=quic_ok,
                     proxy_ok=True,
                     active_tunnel_ok=True,
                     proxy_ip=res["ip"],

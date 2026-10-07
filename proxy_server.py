@@ -691,12 +691,14 @@ def _socks5_reply_ipv4(client: socket.socket) -> str:
 def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]) -> None:
     """RFC 1928 UDP ASSOCIATE relay over the active VPN interface."""
     relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstreams: dict[int, socket.socket] = {}
+    upstreams: dict[tuple[str, int], socket.socket] = {}
     client_ip = str(control_address[0] or "")
     client_udp_addr: tuple[str, int] | None = None
     last_activity = time.monotonic()
     association_generation = _current_egress_generation()
     association_iface = get_forward_interface() or ""
+    quic_ready: set[tuple[str, int]] = set()
+    quic_drop_logged = False
     _keep_udp_control(client)
 
     def _drop_upstreams() -> None:
@@ -708,7 +710,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         upstreams.clear()
 
     def _rotate_if_needed() -> bool:
-        nonlocal association_generation, association_iface
+        nonlocal association_generation, association_iface, quic_drop_logged
         current_generation = _current_egress_generation()
         current_iface = get_forward_interface() or ""
         if current_generation == association_generation and current_iface == association_iface:
@@ -716,6 +718,8 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         had_upstream = bool(upstreams)
         old_iface = association_iface
         _drop_upstreams()
+        quic_ready.clear()
+        quic_drop_logged = False
         association_generation = current_generation
         association_iface = current_iface
         if had_upstream:
@@ -788,9 +792,26 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         if now_mono - float(getattr(socks5_udp_associate, "ike_log_at", 0.0)) > 2:
                             socks5_udp_associate.ike_log_at = now_mono
                             print(f"[WiFi Calling] UDP {host}:{port} {len(payload)} bytes", flush=True)
+                    elif port == 443:
+                        # Old QUIC 1-RTT packets stay on the previous path. Only a new
+                        # long-header handshake may leave on this generation.
+                        long_header = bool(payload) and (payload[0] & 0x80) != 0
+                        flow = (host, port)
+                        if long_header:
+                            quic_ready.add(flow)
+                        elif flow not in quic_ready:
+                            if not quic_drop_logged:
+                                quic_drop_logged = True
+                                print(
+                                    f"[SOCKS5 UDP] QUIC 旧 flow 已丢弃 generation={association_generation}，等待新的 Initial",
+                                    flush=True,
+                                )
+                            last_activity = time.monotonic()
+                            continue
+                    kind = "wifi" if port in (500, 4500) else ("quic" if port == 443 else "other")
                     sent = False
                     for af, sa in destinations:
-                        sock = upstreams.get(af)
+                        sock = upstreams.get((kind, af))
                         if sock is None:
                             try:
                                 sock = socket.socket(af, socket.SOCK_DGRAM)
@@ -798,7 +819,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                                 bind_addr = ("0.0.0.0", 0) if af == socket.AF_INET else ("::", 0)
                                 sock.bind(bind_addr)
                                 sock.setblocking(False)
-                                upstreams[af] = sock
+                                upstreams[(kind, af)] = sock
                             except OSError:
                                 if sock is not None:
                                     sock.close()
@@ -812,7 +833,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                                 sock.close()
                             except OSError:
                                 pass
-                            upstreams.pop(af, None)
+                            upstreams.pop((kind, af), None)
                             continue
                     if sent:
                         last_activity = time.monotonic()
@@ -981,6 +1002,109 @@ def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
             control.close()
         except OSError:
             pass
+
+
+def probe_socks_quic(timeout: float = 4.0) -> dict[str, Any]:
+    """Real QUIC handshake through 8500. UDP DNS success is not this check."""
+    target_name = "www.google.com"
+    try:
+        infos = socket.getaddrinfo(target_name, 443, socket.AF_INET, socket.SOCK_DGRAM)
+        target_ip = str(infos[0][4][0]) if infos else ""
+    except OSError as exc:
+        return {"ok": False, "error": f"QUIC 目标解析失败: {exc}"}
+    if not target_ip:
+        return {"ok": False, "error": "QUIC 目标没有 IPv4"}
+    port = int(os.environ.get("LOCAL_PROXY_PORT", "8500"))
+    user, password = get_proxy_credentials()
+    control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    query = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    shim = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    stop = threading.Event()
+    bridge: threading.Thread | None = None
+    try:
+        control.settimeout(min(2.0, timeout))
+        control.connect(("127.0.0.1", port))
+        if user is not None and password is not None:
+            control.sendall(b"\x05\x01\x02")
+            if control.recv(2) != b"\x05\x02":
+                return {"ok": False, "error": "SOCKS5 QUIC 认证方法被拒绝"}
+            user_b = user.encode("utf-8")
+            pass_b = password.encode("utf-8")
+            control.sendall(bytes([1, len(user_b)]) + user_b + bytes([len(pass_b)]) + pass_b)
+            if control.recv(2) != b"\x01\x00":
+                return {"ok": False, "error": "SOCKS5 QUIC 认证失败"}
+        else:
+            control.sendall(b"\x05\x01\x00")
+            if control.recv(2) != b"\x05\x00":
+                return {"ok": False, "error": "SOCKS5 QUIC 握手失败"}
+        control.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        reply = control.recv(10)
+        if len(reply) < 10 or reply[1] != 0:
+            return {"ok": False, "error": "SOCKS5 QUIC ASSOCIATE 失败"}
+        relay_port = int.from_bytes(reply[8:10], "big")
+        shim.bind(("127.0.0.1", 0))
+        shim_port = int(shim.getsockname()[1])
+        client_box: dict[str, tuple[str, int]] = {}
+
+        def _bridge() -> None:
+            query.setblocking(False)
+            shim.setblocking(False)
+            while not stop.is_set():
+                try:
+                    readable, _, _ = select.select([shim, query], [], [], 0.2)
+                except OSError:
+                    return
+                for source in readable:
+                    try:
+                        if source is shim:
+                            data, addr = shim.recvfrom(65535)
+                            client_box["peer"] = (str(addr[0]), int(addr[1]))
+                            query.sendto(
+                                _socks5_pack_udp((target_ip, 443), data),
+                                ("127.0.0.1", relay_port),
+                            )
+                        else:
+                            packet, _peer = query.recvfrom(65535)
+                            decoded = _socks5_unpack_udp(packet)
+                            peer = client_box.get("peer")
+                            if not decoded or peer is None:
+                                continue
+                            shim.sendto(decoded[2], peer)
+                    except (BlockingIOError, OSError):
+                        continue
+
+        bridge = threading.Thread(target=_bridge, daemon=True)
+        bridge.start()
+        proc = subprocess.run(
+            [
+                "openssl", "s_client", "-quic",
+                "-connect", f"127.0.0.1:{shim_port}",
+                "-servername", target_name,
+                "-alpn", "h3",
+                "-brief",
+            ],
+            input=b"",
+            capture_output=True,
+            timeout=timeout,
+        )
+        text = ((proc.stdout or b"") + (proc.stderr or b"")).decode("utf-8", "replace")
+        if "CONNECTION ESTABLISHED" in text and "QUIC" in text:
+            return {"ok": True}
+        line = next((item.strip() for item in text.splitlines() if item.strip()), "QUIC 握手失败")
+        return {"ok": False, "error": line[:180]}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "QUIC 握手超时"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        stop.set()
+        for sock in (shim, query, control):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if bridge is not None:
+            bridge.join(timeout=0.5)
 
 def _host_is_ip(host: str) -> str | None:
     host = str(host or "").strip()
