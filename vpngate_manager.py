@@ -1166,7 +1166,7 @@ def schedule_nodes_probe_flush(updates: dict[str, dict[str, Any]]) -> None:
 
 
 def _flush_nodes_probe_updates() -> None:
-    global _nodes_flush_timer
+    global _nodes_flush_timer, _nodes_flush_pending
     with _nodes_flush_lock:
         pending = _nodes_flush_pending
         _nodes_flush_pending = {}
@@ -15478,6 +15478,10 @@ function adoptBackendState(next, sourceGeneration, startedAt) {
     }, 3100);
     return;
   }
+  if (!egressSwitchInFlight) {
+    state.pending_egress_mode = "";
+    return;
+  }
   state.egress_mode = keptMode;
   state.egress_switching = true;
   state.pending_egress_mode = target;
@@ -15763,7 +15767,7 @@ async function setEgressMode(mode) {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({mode})
-    }, 8000);
+    }, 12000);
     if (!mine()) return;
     if (!result || result.ok === false) {
       egressSwitchInFlight = false;
@@ -15789,6 +15793,16 @@ async function setEgressMode(mode) {
       if (!mine()) return;
       if (snap && snap.state) adoptBackendState(snap.state, generation, startedAt);
       paintEgressChrome();
+    }
+    if (mine() && egressSwitchInFlight) {
+      egressSwitchInFlight = false;
+      egressSwitchAcked = false;
+      egressSwitchAckedAt = 0;
+      egressSwitchTarget = "";
+      state.pending_egress_mode = "";
+      state.egress_switching = false;
+      state.last_check_message = state.last_check_message || "切换未在时限内完成";
+      egressHoldUntil = Date.now() + 3000;
     }
   } catch (e) {
     if (!mine()) return;
@@ -18264,16 +18278,22 @@ def preflight_proxy_egress() -> tuple[bool, str]:
     if not ready:
         log_to_json("WARNING", "Proxy", f"table100: FAIL {detail}")
         return False, "table100: " + detail
-    probed = check_root_via_interface(iface, gateway, timeout=3)
+    probed = check_root_via_interface(iface, gateway, timeout=2)
     if not probed.get("ok") and tunnel is not None and str(getattr(tunnel, "protocol", "") or "") == "l2tp-ipsec":
-        ensure_l2tp_namespace_forward(tunnel)
-        probed = check_root_via_interface(iface, gateway, timeout=3)
-        if not probed.get("ok"):
-            log_to_json("WARNING", "Proxy", f"L2TP MSS/PMTU blackhole root→{iface}: {probed.get('error') or ''}")
-            return False, "L2TP MSS/PMTU blackhole"
+        detail = str(probed.get("error") or "")
+        if "timed out" not in detail.lower() and "timeout" not in detail.lower():
+            ensure_l2tp_namespace_forward(tunnel)
+            probed = check_root_via_interface(iface, gateway, timeout=2)
     if not probed.get("ok"):
-        log_to_json("WARNING", "Proxy", f"root→{iface}: FAIL {probed.get('error') or ''}")
-        return False, f"root→{iface}: {probed.get('error') or '不通'}"
+        detail = str(probed.get("error") or "不通")
+        if "timed out" in detail.lower() or "timeout" in detail.lower():
+            log_to_json("WARNING", "Proxy", f"活动隧道 {iface} 数据面超时: {detail}")
+            return False, "活动隧道数据面不通"
+        if tunnel is not None and str(getattr(tunnel, "protocol", "") or "") == "l2tp-ipsec":
+            log_to_json("WARNING", "Proxy", f"L2TP MSS/PMTU blackhole root→{iface}: {detail}")
+            return False, "L2TP MSS/PMTU blackhole"
+        log_to_json("WARNING", "Proxy", f"root→{iface}: FAIL {detail}")
+        return False, f"root→{iface}: {detail}"
     log_to_json("INFO", "Proxy", f"root→{iface}: OK")
     return True, iface
 
@@ -18794,6 +18814,8 @@ def active_tunnel_hard_reason() -> str:
 
 
 _soft_fail_streak = 0
+_direct_plane_checks = 0
+_direct_plane_fails = 0
 
 
 def _invalidate_tunnel_health(reason: str) -> None:
@@ -18894,7 +18916,7 @@ def _promote_live_standby() -> bool:
 
 
 def fast_tunnel_liveness_loop() -> None:
-    global _soft_fail_streak
+    global _soft_fail_streak, _direct_plane_checks, _direct_plane_fails
     time.sleep(1)
     while True:
         try:
@@ -18910,6 +18932,22 @@ def fast_tunnel_liveness_loop() -> None:
                 iface = str(proxy_server.get_active_interface() or "").strip()
                 if iface and not Path("/sys/class/net", iface).exists():
                     set_state(active_tunnel_ok=False, tunnel_role="STALE")
+                    _direct_plane_fails = 0
+                elif iface:
+                    _direct_plane_checks += 1
+                    if _direct_plane_checks >= 5:
+                        _direct_plane_checks = 0
+                        gateway = ""
+                        if active_external_tunnel is not None:
+                            gateway = str(getattr(active_external_tunnel, "gateway", "") or "")
+                        probed = check_root_via_interface(iface, gateway, timeout=1.5)
+                        if probed.get("ok"):
+                            _direct_plane_fails = 0
+                        else:
+                            _direct_plane_fails += 1
+                            if _direct_plane_fails >= 2 and _promote_live_standby():
+                                _direct_plane_fails = 0
+                                log_to_json("WARNING", "Proxy", f"直连期间活动网卡 {iface} 数据面不通，已切到热备")
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             hard = active_tunnel_hard_reason()
@@ -20748,14 +20786,13 @@ class Handler(BaseHTTPRequestHandler):
                 handoff = False
                 try:
                     if mode == "proxy":
-                        ready, detail = ensure_active_policy_route()
-                        if not ready:
-                            self.send_json({"ok": False, "error": "代理出口路由未就绪：" + detail}, HTTPStatus.CONFLICT)
-                            return
+                        failed_endpoint = str(active_pool_endpoint_id or "")
                         path_ok, path_detail = preflight_proxy_egress()
+                        if not path_ok and _promote_live_standby():
+                            path_ok, path_detail = preflight_proxy_egress()
                         if not path_ok:
-                            if active_pool_endpoint_id:
-                                node_pool.note_local_forward(str(active_pool_endpoint_id), False, path_detail)
+                            if failed_endpoint:
+                                node_pool.note_local_forward(failed_endpoint, False, path_detail)
                             set_state(last_check_message="本机代理转发失败：" + path_detail, proxy_error=path_detail)
                             self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
                             return
