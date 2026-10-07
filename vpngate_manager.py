@@ -10455,8 +10455,10 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .node-location-cell,
-    .col-location {
-      padding-left: 4px;
+    .col-location,
+    .node-owner-cell,
+    .col-owner {
+      padding-left: 36px;
     }
 
     .node-address-cell .mono {
