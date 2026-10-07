@@ -1308,6 +1308,7 @@ def get_state() -> dict[str, Any]:
         state.setdefault("pool_servers", 0)
         state.setdefault("pool_endpoints", 0)
         state.setdefault("pool_states", {})
+    _overlay_pool_roles(state)
     _proxy_display = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
     state["local_proxy"] = f"socks5://{_proxy_display}:8500"
     state["local_proxy_scheme"] = "socks5"
@@ -6168,6 +6169,7 @@ def warm_standby_loop() -> None:
 
 COLD_PORT_SECONDS = 60
 COLD_CONNECT_SECONDS = 600
+PRECOLD_TARGET = 5
 _cold_guard = threading.Lock()
 _cold_mem: dict[str, Any] | None = None
 _cold_announced = False
@@ -6180,6 +6182,7 @@ def _load_cold_state() -> dict[str, Any]:
     return {
         "order": [str(item) for item in (raw.get("order") or []) if str(item)],
         "failed": [str(item) for item in (raw.get("failed") or []) if str(item)],
+        "precold": [str(item) for item in (raw.get("precold") or []) if str(item)],
         "published": str(raw.get("published") or ""),
         "last_connect": float(raw.get("last_connect") or 0),
     }
@@ -6234,6 +6237,56 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
             continue
         found[eid] = endpoint
     return found
+
+
+def _select_precold_ids(candidates: dict[str, dict[str, Any]], cold_eid: str) -> list[str]:
+    """Next backups behind the one cold standby. At most five, favorites first."""
+    cold = _cold_state()
+    failed = {str(item) for item in (cold.get("failed") or [])}
+    order = [eid for eid in (cold.get("order") or []) if eid in candidates and eid != cold_eid]
+    for eid in candidates:
+        if eid != cold_eid and eid not in order:
+            order.append(eid)
+    favorites: list[str] = []
+    rest: list[str] = []
+    for eid in order:
+        if eid in failed:
+            continue
+        rank = int((candidates.get(eid) or {}).get("routing_favorite_rank") or 1)
+        if rank == 0:
+            favorites.append(eid)
+        else:
+            rest.append(eid)
+    return (favorites + rest)[:PRECOLD_TARGET]
+
+
+def _remember_precold(candidates: dict[str, dict[str, Any]], cold_eid: str) -> None:
+    precold = _select_precold_ids(candidates, cold_eid)
+    cold = _cold_state()
+    if list(cold.get("precold") or []) == precold:
+        return
+    cold["precold"] = precold
+    _save_cold_state()
+
+
+def _overlay_pool_roles(state: dict[str, Any]) -> None:
+    """Live 1 primary + 1 cold + up to 5 pre-cold. Not the old HOT-row count."""
+    primary = 1 if (active_pool_endpoint_id or active_openvpn_node_id) else 0
+    standby_id = str(state.get("standby_node_id") or "")
+    cold_on = bool(standby_slot.get("ready")) or (
+        bool(standby_id) and bool(state.get("standby_ready") or state.get("standby_prepared"))
+    )
+    active_eid = str(active_pool_endpoint_id or "")
+    cold_eid = standby_id.split(":", 1)[1] if standby_id.startswith("pool:") else standby_id
+    try:
+        raw = [str(item) for item in (_cold_state().get("precold") or []) if str(item)]
+    except Exception:
+        raw = []
+    shown = [eid for eid in raw if eid not in {active_eid, cold_eid}]
+    state["pool_primary"] = primary
+    state["pool_cold"] = 1 if cold_on else 0
+    state["pool_precold"] = min(PRECOLD_TARGET, len(shown))
+    state["pool_precold_target"] = PRECOLD_TARGET
 
 
 def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -6337,6 +6390,7 @@ def cold_standby_pass() -> None:
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
         _publish_cold_standby(None)
+        _remember_precold({}, "")
         return
     if is_connecting or manual_connection_active or ui_command_plane.is_busy():
         return
@@ -6361,6 +6415,7 @@ def cold_standby_pass() -> None:
     ):
         chosen = _pick_cold(candidates)
     _publish_cold_standby(chosen)
+    _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
     if not chosen:
         return
     cold = _cold_state()
@@ -6381,8 +6436,10 @@ def cold_standby_pass() -> None:
         nxt = _pick_cold(candidates)
         if nxt and str(nxt.get("endpoint_id") or "") != eid:
             _publish_cold_standby(nxt)
+            _remember_precold(candidates, str(nxt.get("endpoint_id") or ""))
         else:
             _publish_cold_standby(None)
+            _remember_precold(candidates, "")
 
 
 def cold_standby_loop() -> None:
@@ -13912,11 +13969,10 @@ function getFilteredNodes() {
 }
 
 function hotPoolSummaryHtml() {
-  const standbyOn = !!(state.standby_prepared || state.standby_ready);
-  const standby = standbyOn ? 1 : 0;
-  const cold = Math.max(0, Number(state.hot_pool_size || 0) - 1);
-  const standbyTitle = standbyOn ? "备已准备好" : "备未准备";
-  return '<span title="正在转发">1主</span>+<span title="' + standbyTitle + '">' + standby + '备</span>+<span title="已入库，没有第二条隧道">' + cold + '冷备</span>';
+  const primary = Number(state.pool_primary || 0);
+  const cold = Number(state.pool_cold || 0);
+  const precold = Number(state.pool_precold || 0);
+  return '<span title="当前正在转发">' + primary + '主</span>+<span title="已选定，可接管">' + cold + '冷备</span>+<span title="已排好，尚未升为冷备">' + precold + '预冷备</span>';
 }
 
 function isDomainHost(value) {
@@ -14404,7 +14460,7 @@ function render(){
       const hotStandby = !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
       const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
       const statusCell = isCurrentlyActive
-        ? `<span class="badge ${n.probe_status === "unavailable" ? "unavailable" : "available"}" title="${esc(n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>${n.probe_status === "unavailable" ? "已连接 · 代理不通" : "已连接"}</span>`
+        ? `<span class="badge ${n.probe_status === "unavailable" ? "unavailable" : "available"}" title="${esc(n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>${n.probe_status === "unavailable" ? "主连接 · 代理不通" : "主连接"}</span>`
         : isWaiting
           ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
           : hotStandby
@@ -15106,7 +15162,7 @@ function backendStateRenderSignature(s) {
     x.last_check_message, x.priority_country, x.priority_running,
     x.availability_engine_running,
     x.resource_engine_running, x.global_pool_refresh_running,
-    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.standby_ready, x.standby_prepared, x.standby_node_id,
+    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.standby_ready, x.standby_prepared, x.standby_node_id,
     x.egress_mode, x.egress_switching,
     x.manual_switch_active,
     x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,
@@ -21785,6 +21841,7 @@ def _get_fast_nodes_state():
         if fast_state_cache is not None and now_mono - fast_state_cache_at < FAST_STATE_CACHE_TTL_SECONDS:
             cached = dict(fast_state_cache)
             cached.update(_library_check_public_state())
+            _overlay_pool_roles(cached)
             return cached
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
@@ -21883,6 +21940,7 @@ def _get_fast_nodes_state():
     except Exception:
         state.setdefault("pool_servers", 0)
         state.setdefault("pool_endpoints", 0)
+    _overlay_pool_roles(state)
     state["is_connecting"] = is_connecting
     state["manual_connection_active"] = manual_connection_active
     state["connection_generation"] = connection_generation
