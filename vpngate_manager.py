@@ -19778,7 +19778,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
                         return
                 proxy_server.set_egress_mode(mode)
-                if not _wait_egress_applied(mode, timeout=2.5):
+                if not _wait_egress_applied(mode, timeout=1.2):
                     proxy_server.set_egress_mode(previous)
                     set_state(
                         egress_mode=previous,

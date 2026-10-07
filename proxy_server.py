@@ -278,17 +278,21 @@ def get_forward_interface() -> str:
 
 
 _live_clients: set[socket.socket] = set()
+_client_generation: dict[socket.socket, int] = {}
+_egress_generation = 0
 _live_clients_lock = threading.Lock()
 
 
 def _track_client(client: socket.socket) -> None:
     with _live_clients_lock:
         _live_clients.add(client)
+        _client_generation[client] = _egress_generation
 
 
 def _untrack_client(client: socket.socket) -> None:
     with _live_clients_lock:
         _live_clients.discard(client)
+        _client_generation.pop(client, None)
 
 
 def _close_tracked_clients(clients: list[socket.socket]) -> int:
@@ -312,22 +316,29 @@ def _drop_live_clients() -> int:
     return _close_tracked_clients(clients)
 
 
-def _drain_live_clients(pause: float = 0.8) -> int:
-    """Stop old sockets taking new work, then close only that snapshot.
-
-    The caller publishes the new exit first. Connections opened after this
-    snapshot bind to that exit and are not closed here.
-    """
+def _publish_egress_generation() -> int:
+    """Move new accepts onto the next generation. Return the one being retired."""
+    global _egress_generation
     with _live_clients_lock:
-        clients = list(_live_clients)
-    for client in clients:
-        try:
-            client.shutdown(socket.SHUT_RD)
-        except OSError:
-            pass
-    if clients:
-        time.sleep(pause if pause > 0 else 0.8)
-    return _close_tracked_clients(clients)
+        retired = _egress_generation
+        _egress_generation += 1
+        return retired
+
+
+def _retire_old_generation(retired: int, pause: float = 0.5) -> None:
+    """Let the old generation keep transferring, then close only those sockets.
+
+    No SHUT_RD during the grace window. A half-closed socket still looks alive
+    to the browser and swallows the next request.
+    """
+    def _run() -> None:
+        time.sleep(pause if pause > 0 else 0.5)
+        with _live_clients_lock:
+            stale = [sock for sock, gen in _client_generation.items() if gen <= retired]
+        closed = _close_tracked_clients(stale)
+        print(f"[网关] 旧连接代际 {retired} 已关闭 {closed} 条", flush=True)
+
+    threading.Thread(target=_run, name="egress-retire", daemon=True).start()
 
 
 def _write_applied(name: str, value: str) -> None:
@@ -376,15 +387,16 @@ def _watch_egress_mode() -> None:
         iface_changed = iface != current_iface
         current = mode
         current_iface = iface
+        retired = _publish_egress_generation()
         with DNS_CACHE_LOCK:
             DNS_CACHE.clear()
-        closed = _drain_live_clients(0.8)
         if mode_changed:
             _write_egress_applied(mode)
         if iface_changed:
             _write_applied("active_iface.applied", iface)
+        _retire_old_generation(retired, 0.5)
         label = "服务器直连" if mode == "direct" else (iface or "代理隧道")
-        print(f"[网关] 出口已切到 {label}，排空后断开旧连接 {closed} 条", flush=True)
+        print(f"[网关] 出口已切到 {label}，新连接走代际 {retired + 1}，旧代际 {retired} 0.5 秒后关闭", flush=True)
 
 
 def parse_int(value: Any) -> int:
