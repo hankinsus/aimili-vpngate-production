@@ -8946,6 +8946,8 @@ INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      color: #8b9eaa;
+      font-weight: 600;
     }
     .active-hot-pool {
       display: inline-flex;
@@ -10357,7 +10359,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     table.node-table td {
-      font-weight: 700;
+      font-weight: 600;
     }
 
     th, td {
@@ -10458,9 +10460,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .node-address-cell .mono {
-      font-size: 15px;
-      font-weight: 700;
-      color: #d5e6ee;
+      font-size: 14px;
+      font-weight: 600;
+      color: #7f96a3;
       letter-spacing: 0;
       display: block;
       white-space: nowrap;
@@ -10480,8 +10482,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .node-domain {
       font-size: 13px;
-      font-weight: 700;
-      color: #d5dee8;
+      font-weight: 600;
+      color: #8ea3af;
       display: block;
       white-space: nowrap;
       overflow: hidden;
@@ -10503,9 +10505,9 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-block;
       min-width: 0;
       white-space: nowrap;
-      font-weight: 700;
+      font-weight: 600;
       font-size: 13px;
-      color: #d5dee6;
+      color: #8b9eaa;
       font-variant-numeric: tabular-nums;
     }
     @media (min-width: 1101px) {
