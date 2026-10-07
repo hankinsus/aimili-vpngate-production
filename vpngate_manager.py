@@ -14833,11 +14833,29 @@ function backendStateRenderSignature(s) {
   ].map(v => String(v ?? "")).join("|");
 }
 
-function adoptBackendState(next) {
+function adoptBackendState(next, sourceGeneration, startedAt) {
   if (!next) return;
   const counts = state && state.status_counts;
   const connected = state ? state.connected_count : undefined;
   const keep = !!(counts && Object.keys(counts).length);
+  const inFlight = egressSwitchInFlight;
+  const generation = egressSwitchGeneration;
+  const target = egressSwitchTarget;
+  let acceptEgress = true;
+  if (inFlight) {
+    if (sourceGeneration !== generation) acceptEgress = false;
+    else if (!egressSwitchAcked) {
+      const ack = !!next.egress_switching || next.egress_mode === target;
+      if (ack) {
+        egressSwitchAcked = true;
+        egressSwitchAckedAt = startedAt || Date.now();
+      } else acceptEgress = false;
+    }
+  }
+  const keptMode = state && state.egress_mode;
+  const keptDirect = state && state.direct_egress_ok;
+  const keptClient = state && state.client_proxy_ok;
+  const keptMessage = state && state.last_check_message;
   state = next;
   if (keep) {
     state.status_counts = counts;
@@ -14845,6 +14863,33 @@ function adoptBackendState(next) {
   } else {
     delete state.status_counts;
   }
+  if (!inFlight) {
+    state.pending_egress_mode = "";
+    return;
+  }
+  const freshEnough = !!egressSwitchAckedAt && typeof startedAt === "number" && startedAt >= egressSwitchAckedAt;
+  const ready = target === "proxy" ? triState(next.client_proxy_ok) === true : triState(next.direct_egress_ok) === true;
+  const confirmed = acceptEgress && egressSwitchAcked && freshEnough && !next.egress_switching && next.egress_mode === target && ready;
+  const rolledBack = acceptEgress && egressSwitchAcked && freshEnough && !next.egress_switching && next.egress_mode && next.egress_mode !== target;
+  if (confirmed || rolledBack) {
+    egressSwitchInFlight = false;
+    egressSwitchAcked = false;
+    egressSwitchAckedAt = 0;
+    egressSwitchTarget = "";
+    state.pending_egress_mode = "";
+    state.egress_switching = false;
+    egressHoldUntil = Date.now() + 3000;
+    setTimeout(() => {
+      if (Date.now() >= egressHoldUntil) paintEgressChrome();
+    }, 3100);
+    return;
+  }
+  state.egress_mode = keptMode;
+  state.egress_switching = true;
+  state.pending_egress_mode = target;
+  state.direct_egress_ok = keptDirect;
+  state.client_proxy_ok = keptClient;
+  state.last_check_message = keptMessage || (target === "proxy" ? "正在切换至代理" : "正在切换至直连");
 }
 
 function startBackendStatePolling() {
@@ -14852,13 +14897,15 @@ function startBackendStatePolling() {
   const poll = async () => {
     if (backendStatePollBusy || document.hidden) return;
     backendStatePollBusy = true;
+    const generationAtFetch = egressSwitchGeneration;
+    const startedAt = Date.now();
     try {
       const data = await fetchUiStateOnly(4000);
       if (data?.state) {
         const next = data.state;
         const prevSig = backendStateRenderSignature(state);
-        const nextSig = backendStateRenderSignature(next);
-        adoptBackendState(next);
+        adoptBackendState(next, generationAtFetch, startedAt);
+        const nextSig = backendStateRenderSignature(state);
         followConnectedCountry();
         // Do not rebuild the entire node table every 4 seconds. Only redraw
         // when connection/priority/engine state actually changed.
@@ -14880,9 +14927,11 @@ function startRefreshPolling() {
   refreshPollInterval = setInterval(async () => {
     if (refreshPollBusy) return;
     refreshPollBusy = true;
+    const generationAtFetch = egressSwitchGeneration;
+    const startedAt = Date.now();
     try {
       const data = await fetchUiStateOnly(4000);
-      if (data.state) adoptBackendState(data.state);
+      if (data.state) adoptBackendState(data.state, generationAtFetch, startedAt);
       render();
 
       if (!state.global_pool_refresh_running) {
@@ -14933,6 +14982,8 @@ function startConnectionPolling() {
   pollInterval = setInterval(async () => {
     if (connectionPollBusy) return;
     connectionPollBusy = true;
+    const generationAtFetch = egressSwitchGeneration;
+    const startedAt = Date.now();
     try {
       // Connection progress is state-only. Avoid re-downloading the full ~1.5MB
       // node list every 500ms; refresh the node list once the switch completes.
@@ -14940,7 +14991,7 @@ function startConnectionPolling() {
       if (data.state) {
         const prevTable = switchTableSignature(state);
         const prevSig = backendStateRenderSignature(state);
-        adoptBackendState(data.state);
+        adoptBackendState(data.state, generationAtFetch, startedAt);
         const tableChanged = switchTableSignature(state) !== prevTable;
         const stateChanged = backendStateRenderSignature(state) !== prevSig;
         if (tableChanged) render();
@@ -15069,14 +15120,28 @@ async function connectNode(id){
 }
 
 let egressHoldUntil = 0;
+let egressSwitchInFlight = false;
+let egressSwitchTarget = "";
+let egressSwitchGeneration = 0;
+let egressSwitchAcked = false;
+let egressSwitchAckedAt = 0;
+
+function egressPendingLabel() {
+  if (!egressSwitchInFlight && !(state && state.egress_switching)) return "";
+  const target = egressSwitchTarget || (state && state.pending_egress_mode) || "";
+  if (target === "proxy") return "正在切换至代理";
+  if (target === "direct") return "正在切换至直连";
+  return "切换中";
+}
 
 function paintEgressChrome() {
-  const switching = !!(state && state.egress_switching);
+  const switching = egressSwitchInFlight || !!(state && state.egress_switching);
   const mode = state && state.egress_mode === "direct" ? "direct" : "proxy";
   const showDone = !switching && Date.now() < egressHoldUntil;
   const failed = showDone && /失败|恢复/.test(String(state && state.last_check_message || ""));
+  const label = egressPendingLabel();
   document.querySelectorAll(".egress-status").forEach((statusEl) => {
-    statusEl.textContent = switching ? "切换中" : (failed ? "已恢复" : (showDone ? "已切换" : ""));
+    statusEl.textContent = switching ? (label || "切换中") : (failed ? "已恢复" : (showDone ? "已切换" : ""));
     statusEl.className = "egress-status" + ((switching || showDone) ? " is-live" : "") + ((showDone && !failed) ? " ok" : "");
   });
   document.querySelectorAll(".egress-switch button[data-egress]").forEach((btn) => {
@@ -15088,85 +15153,89 @@ function paintEgressChrome() {
 
 async function setEgressMode(mode) {
   const previous = state.egress_mode === "direct" ? "direct" : "proxy";
-  if (previous === mode || state.egress_switching) return;
+  if (previous === mode || egressSwitchInFlight) return;
+  const generation = ++egressSwitchGeneration;
+  egressSwitchInFlight = true;
+  egressSwitchAcked = false;
+  egressSwitchTarget = mode;
   state.egress_switching = true;
-  state.egress_mode = mode;
-  state.last_check_message = "切换中";
+  state.pending_egress_mode = mode;
+  state.last_check_message = mode === "proxy" ? "正在切换至代理" : "正在切换至直连";
   egressHoldUntil = 0;
   paintEgressChrome();
-  const finish = () => {
-    state.egress_switching = false;
-    egressHoldUntil = Date.now() + 3000;
-    paintEgressChrome();
-    if (egressHoldUntil) {
-      setTimeout(() => {
-        if (Date.now() >= egressHoldUntil) paintEgressChrome();
-      }, 3100);
-    }
-  };
+  const mine = () => generation === egressSwitchGeneration;
   try {
     const result = await fetchJsonWithTimeout("./api/egress_mode", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({mode})
     }, 8000);
-    if (result && result.state) adoptBackendState(result.state);
-    state.egress_mode = (result && result.mode) || mode;
-    state.egress_switching = !!(result && result.switching);
-    state.last_check_message = (result && result.state && result.state.last_check_message) || "已切换";
-    if (result && result.ok && result.switching === false) {
-      finish();
+    if (!mine()) return;
+    if (!result || result.ok === false) {
+      egressSwitchInFlight = false;
+      egressSwitchAcked = false;
+      egressSwitchAckedAt = 0;
+      egressSwitchTarget = "";
+      state.pending_egress_mode = "";
+      state.egress_switching = false;
+      state.egress_mode = (result && result.state && result.state.egress_mode) || previous;
+      state.last_check_message = (result && (result.error || (result.state && result.state.last_check_message))) || "切换出口失败";
+      egressHoldUntil = Date.now() + 3000;
+      paintEgressChrome();
       return;
     }
+    egressSwitchAcked = true;
+    egressSwitchAckedAt = Date.now();
+    if (result.state) adoptBackendState(result.state, generation, Date.now());
     const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
+    while (mine() && egressSwitchInFlight && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 300));
+      const startedAt = Date.now();
       const snap = await fetchUiStateOnly(4000);
-      const next = snap && snap.state;
-      if (!next) continue;
-      state.egress_mode = next.egress_mode || state.egress_mode;
-      state.egress_switching = !!next.egress_switching;
-      state.proxy_ok = next.proxy_ok;
-      state.proxy_ip = next.proxy_ip;
-      state.proxy_error = next.proxy_error;
-      state.proxy_latency_ms = next.proxy_latency_ms;
-      state.last_check_message = next.last_check_message || state.last_check_message;
+      if (!mine()) return;
+      if (snap && snap.state) adoptBackendState(snap.state, generation, startedAt);
       paintEgressChrome();
-      if (!next.egress_switching && next.egress_mode === mode) break;
-      if (!next.egress_switching && next.egress_mode && next.egress_mode !== mode) break;
     }
   } catch (e) {
+    if (!mine()) return;
     try {
+      const startedAt = Date.now();
       const snap = await fetchUiStateOnly(4000);
-      const next = snap && snap.state;
-      if (next && next.egress_mode) {
-        state.egress_mode = next.egress_mode;
-        state.egress_switching = !!next.egress_switching;
-        state.last_check_message = next.last_check_message || ((e && e.message) ? e.message : "切换出口失败");
-      } else {
-        state.egress_mode = previous;
-        state.last_check_message = (e && e.message) ? e.message : "切换出口失败";
-      }
-    } catch (_) {
+      if (snap && snap.state) adoptBackendState(snap.state, generation, startedAt);
+    } catch (_) {}
+    if (mine() && egressSwitchInFlight) {
+      egressSwitchInFlight = false;
+      egressSwitchAcked = false;
+      egressSwitchAckedAt = 0;
+      egressSwitchTarget = "";
+      state.pending_egress_mode = "";
+      state.egress_switching = false;
       state.egress_mode = previous;
       state.last_check_message = (e && e.message) ? e.message : "切换出口失败";
     }
   }
-  finish();
+  if (!mine()) return;
+  paintEgressChrome();
+  if (!egressSwitchInFlight) render();
+  if (egressHoldUntil) {
+    setTimeout(() => {
+      if (Date.now() >= egressHoldUntil) paintEgressChrome();
+    }, 3100);
+  }
 }
 
 function egressStatusHtml() {
-  const switching = !!(state && state.egress_switching);
+  const switching = egressSwitchInFlight || !!(state && state.egress_switching);
   const showDone = !switching && Date.now() < egressHoldUntil;
   const failed = showDone && /失败|恢复/.test(String(state && state.last_check_message || ""));
-  if (switching) return `<div class="egress-status is-live">切换中</div>`;
+  if (switching) return `<div class="egress-status is-live">${esc(egressPendingLabel() || "切换中")}</div>`;
   if (failed) return `<div class="egress-status is-live">已恢复</div>`;
   if (showDone) return `<div class="egress-status is-live ok">已切换</div>`;
   return `<div class="egress-status" aria-hidden="true"></div>`;
 }
 
 function egressSwitchHtml() {
-  const switching = !!(state && state.egress_switching);
+  const switching = egressSwitchInFlight || !!(state && state.egress_switching);
   const mode = state && state.egress_mode === "direct" ? "direct" : "proxy";
   return `<div class="egress-switch-wrap">
     ${egressStatusHtml()}
