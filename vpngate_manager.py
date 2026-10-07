@@ -6478,6 +6478,10 @@ def _overlay_dataplane(state: dict[str, Any]) -> None:
     state["tcp_retrans_delta"] = int(raw.get("tcp_retrans_delta") or 0)
     state["quic_fallback_tcp"] = int(raw.get("quic_fallback_tcp") or 0)
     state["udp443_flows"] = int(raw.get("udp443_flows") or 0)
+    state["active_connections"] = int(raw.get("active_connections") or 0)
+    state["queued_connections"] = int(raw.get("queued_connections") or 0)
+    state["worker_busy"] = int(raw.get("worker_busy") or 0)
+    state["accept_wait_ms"] = int(raw.get("accept_wait_ms") or 0)
 
 
 def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -15412,7 +15416,7 @@ function backendStateRenderSignature(s) {
     x.last_check_message, x.priority_country, x.priority_running,
     x.availability_engine_running,
     x.resource_engine_running, x.global_pool_refresh_running,
-    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.pool_precold_detail, x.dataplane_jitter, x.standby_ready, x.standby_prepared, x.standby_node_id,
+    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.pool_precold_detail, x.dataplane_jitter, x.queued_connections, x.accept_wait_ms, x.standby_ready, x.standby_prepared, x.standby_node_id,
     x.egress_mode, x.egress_switching,
     x.manual_switch_active,
     x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,

@@ -12,7 +12,6 @@ import select
 import socket
 import subprocess
 import threading
-import queue
 import urllib.parse
 import time
 from pathlib import Path
@@ -404,6 +403,7 @@ def dataplane_snapshot() -> dict[str, Any]:
     with _live_clients_lock:
         tcp_sessions = len(_live_clients)
         udp_associations = len(_udp_controls)
+    pressure = _accept_pressure()
     with _dataplane_lock:
         _expire_quic_flows(now)
         _retrans_samples.append((now, retrans, int(_dataplane["quic_fallback_tcp"])))
@@ -420,13 +420,67 @@ def dataplane_snapshot() -> dict[str, Any]:
         snap.update({
             "active_tcp_sessions": tcp_sessions,
             "active_udp_associations": udp_associations,
+            "active_connections": tcp_sessions,
+            "queued_connections": pressure["queued"],
+            "worker_busy": tcp_sessions,
+            "accept_wait_ms": pressure["accept_wait_ms"],
             "udp443_flows": len(_quic_flows),
             "at": time.time(),
         })
     return snap
 
 
+_accept_gate = threading.Lock()
+_accept_queued = 0
+_accept_queued_since = 0.0
+_accept_wait_ms = 0
+_accept_alarm_at = 0.0
+
+
+def _note_accept_queued() -> None:
+    global _accept_queued, _accept_queued_since
+    with _accept_gate:
+        _accept_queued += 1
+        if _accept_queued_since <= 0:
+            _accept_queued_since = time.monotonic()
+
+
+def _note_accept_started(accepted_at: float) -> None:
+    global _accept_queued, _accept_queued_since, _accept_wait_ms
+    wait_ms = max(0, int((time.monotonic() - accepted_at) * 1000))
+    with _accept_gate:
+        _accept_queued = max(0, _accept_queued - 1)
+        if _accept_queued == 0:
+            _accept_queued_since = 0.0
+        _accept_wait_ms = wait_ms
+
+
+def _accept_pressure() -> dict[str, int]:
+    with _accept_gate:
+        queued = _accept_queued
+        since = _accept_queued_since
+        wait_ms = _accept_wait_ms
+    stalled = queued > 0 and since > 0 and (time.monotonic() - since) >= 1.0
+    return {"queued": queued, "accept_wait_ms": wait_ms, "stalled": int(stalled)}
+
+
+def _warn_accept_queue() -> None:
+    global _accept_alarm_at
+    pressure = _accept_pressure()
+    if not pressure["stalled"]:
+        return
+    now = time.monotonic()
+    if now - _accept_alarm_at < 5:
+        return
+    _accept_alarm_at = now
+    print(
+        f"[8500 排队] queued_connections={pressure['queued']} accept_wait_ms={pressure['accept_wait_ms']} 新连接等了超过 1 秒",
+        flush=True,
+    )
+
+
 def _write_dataplane_snapshot() -> None:
+    _warn_accept_queue()
     snap = dataplane_snapshot()
     try:
         path = DATA_DIR / "dataplane.json"
@@ -2231,18 +2285,14 @@ def start_proxy_server(host: str, port: int) -> None:
         print(f"[内核] 出站配置检查失败：{exc}", flush=True)
     threading.Thread(target=_watch_egress_mode, daemon=True, name="egress-watch").start()
     threading.Thread(target=_forward_heartbeat, daemon=True, name="forward-heartbeat").start()
-    jobs: queue.Queue[tuple[socket.socket, tuple[str, int], float]] = queue.Queue(maxsize=MAX_PROXY_CONNECTIONS)
 
-    def run_client() -> None:
-        while True:
-            client, address, accepted_at = jobs.get()
-            try:
-                proxy_client(client, address, accepted_at)
-            finally:
-                proxy_connection_sem.release()
+    def run_client(client: socket.socket, address: tuple[str, int], accepted_at: float) -> None:
+        try:
+            _note_accept_started(accepted_at)
+            proxy_client(client, address, accepted_at)
+        finally:
+            proxy_connection_sem.release()
 
-    for index in range(min(96, MAX_PROXY_CONNECTIONS)):
-        threading.Thread(target=run_client, daemon=True, name=f"socks-{index}").start()
     while True:
         try:
             client, address = server.accept()
@@ -2259,14 +2309,22 @@ def start_proxy_server(host: str, port: int) -> None:
                 except OSError:
                     pass
                 continue
+            _note_accept_queued()
             try:
-                jobs.put_nowait((client, address, accepted_at))
-            except queue.Full:
+                threading.Thread(
+                    target=run_client,
+                    args=(client, address, accepted_at),
+                    daemon=True,
+                    name="socks-client",
+                ).start()
+            except Exception:
+                _note_accept_started(accepted_at)
                 proxy_connection_sem.release()
                 try:
                     client.close()
                 except OSError:
                     pass
+                raise
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)
