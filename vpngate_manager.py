@@ -178,7 +178,7 @@ ENABLE_COLLECTOR_LOOP = env_flag("ENABLE_COLLECTOR_LOOP", not DISABLE_BACKGROUND
 ENABLE_RESOURCE_COLLECT_LOOP = env_flag("ENABLE_RESOURCE_COLLECT_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROXY_HEALTH_LOOP = env_flag("ENABLE_PROXY_HEALTH_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_FAST_LIVENESS_LOOP = env_flag("ENABLE_FAST_LIVENESS_LOOP", not DISABLE_BACKGROUND_LOOPS)
-FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 5, 2, 15)
+FAST_LIVENESS_INTERVAL_SECONDS = env_int("FAST_LIVENESS_INTERVAL_SECONDS", 1, 1, 5)
 ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS)
 ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
@@ -5749,7 +5749,8 @@ def _publish_scheme_standby(endpoint: dict[str, Any]) -> bool:
         release_standby()
     endpoint_id = str(endpoint.get("endpoint_id") or "")
     set_state(
-        standby_ready=True,
+        standby_prepared=True,
+        standby_ready=False,
         standby_node_id=f"pool:{endpoint_id}" if endpoint_id else "",
         standby_ip=_endpoint_ip(endpoint),
         standby_port=int(endpoint.get("port") or 0),
@@ -5758,7 +5759,7 @@ def _publish_scheme_standby(endpoint: dict[str, Any]) -> bool:
     log_to_json(
         "INFO",
         "Standby",
-        f"备连接改为不同 IP {protocol} {_endpoint_ip(endpoint)}",
+        f"冷备已记下不同 IP {protocol} {_endpoint_ip(endpoint)}，尚未拨号，不能当热备接管",
     )
     return True
 
@@ -18081,41 +18082,163 @@ def owned_tunnel_local_liveness() -> tuple[bool, str]:
     return True, "idle"
 
 
+_tunnel_health_epoch = 0
+
+
+def _probe_iface_tcp(iface: str, timeout: float = 1.0) -> tuple[bool, str]:
+    """One TCP handshake on this NIC. Not a Cloudflare request."""
+    iface = str(iface or "").strip()
+    if not iface or not Path("/sys/class/net", iface).exists():
+        return False, "接口不存在"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+        sock.connect(("8.8.8.8", 443))
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+    finally:
+        sock.close()
+
+
+def active_tunnel_stale_reason() -> str:
+    """Empty when the published NIC can still carry traffic. One failure is enough."""
+    if proxy_server.get_egress_mode() != "proxy":
+        return ""
+    if not active_pool_endpoint_id and not active_openvpn_node_id:
+        return ""
+    iface = str(proxy_server.get_active_interface() or "").strip()
+    if not iface:
+        return "活动网卡为空"
+    nic = Path("/sys/class/net") / iface
+    if not nic.exists():
+        return f"活动网卡 {iface} 已消失"
+    try:
+        oper = (nic / "operstate").read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        oper = ""
+    if oper == "down":
+        return f"活动网卡 {iface} 已 down"
+    try:
+        route = subprocess.run(
+            ["ip", "route", "get", "8.8.8.8", "oif", iface],
+            capture_output=True, text=True, timeout=1,
+        )
+    except Exception as exc:
+        return f"策略路由检查失败: {exc}"
+    if route.returncode != 0 or iface not in (route.stdout or ""):
+        return f"策略路由未指向 {iface}"
+    ok, detail = _probe_iface_tcp(iface, 1.0)
+    if not ok:
+        return f"活动网卡 {iface} 数据面失败: {detail}"
+    return ""
+
+
+def _invalidate_tunnel_health(reason: str) -> None:
+    global _tunnel_health_epoch
+    _tunnel_health_epoch += 1
+    set_state(
+        tunnel_role="STALE",
+        active_tunnel_ok=False,
+        client_proxy_ok=False,
+        client_tcp_ok=False,
+        client_udp_ok=False,
+        client_quic_ok=False,
+        proxy_ok=False,
+        proxy_ip="-",
+        proxy_latency_ms=0,
+        proxy_error=reason[:300],
+        last_check_message=reason[:300],
+    )
+
+
+def _detach_dead_forwarding() -> None:
+    """Stop 8500 binding a dead NIC. New connects fail fast until the next tunnel publishes."""
+    try:
+        suspend_policy_routing()
+    except Exception:
+        pass
+    proxy_server.clear_active_interface()
+    set_state(active_tunnel_interface="", tunnel_role="STALE")
+
+
+def _promote_live_standby() -> bool:
+    """Take over only a dialed standby whose NIC just passed the same TCP probe."""
+    global active_openvpn_process, active_openvpn_node_id, active_external_tunnel, active_pool_endpoint_id
+    with standby_guard:
+        if not standby_slot.get("ready") or not _standby_process_alive():
+            return False
+        dev = str(standby_slot.get("dev") or "")
+        node_id = str(standby_slot.get("node_id") or "")
+    if not dev or not Path("/sys/class/net", dev).exists():
+        set_state(standby_ready=False, tunnel_role="STALE")
+        return False
+    ok, detail = _probe_iface_tcp(dev, 1.0)
+    if not ok:
+        log_to_json("WARNING", "Standby", f"热备 {dev} 数据面不可用，不接管: {detail}")
+        set_state(standby_ready=False)
+        return False
+    adopted = take_standby(node_id)
+    if not adopted or adopted.get("process") is None:
+        return False
+    old_tunnel = active_external_tunnel
+    old_proc = active_openvpn_process
+    set_state(tunnel_role="ACTIVE", standby_ready=False, last_check_message=f"热备 {dev} 正在接管")
+    try:
+        cleanup_policy_routing()
+        proxy_server.set_active_interface(dev)
+        setup_policy_routing(dev)
+    except Exception as exc:
+        log_to_json("ERROR", "Standby", f"热备接管路由失败: {exc}")
+        return False
+    active_external_tunnel = None
+    active_pool_endpoint_id = ""
+    active_openvpn_process = adopted["process"]
+    active_openvpn_node_id = node_id
+
+    def _retire() -> None:
+        set_state(tunnel_role="RETIRING")
+        _disconnect_external_tunnel(old_tunnel)
+        if old_proc is not None and old_proc is not adopted["process"]:
+            try:
+                stop_process(old_proc)
+            except Exception:
+                pass
+        set_state(tunnel_role="ACTIVE", active_tunnel_interface=dev)
+
+    threading.Thread(target=_retire, daemon=True, name="retire-stale-tunnel").start()
+    log_to_json("INFO", "Standby", f"热备 {dev} 已接管，旧隧道后台拆除")
+    return True
+
+
 def fast_tunnel_liveness_loop() -> None:
-    liveness_failures = 0
-    last_target = ""
-    time.sleep(3)
+    time.sleep(1)
     while True:
-        if background_paused():
-            time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-            continue
         try:
-            if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or failover_lock.locked():
+            if ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or failover_lock.locked() or egress_switch_lock.locked():
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             if not active_pool_endpoint_id and not active_openvpn_node_id:
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
-            target = active_pool_endpoint_id or active_openvpn_node_id
-            if target != last_target:
-                liveness_failures = 0
-                last_target = target
-            ok, reason = owned_tunnel_local_liveness()
-            if not ok:
-                liveness_failures += 1
-                if liveness_failures < 3:
-                    time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                    continue
-                error_msg = f"本地快速存活检测连续 {liveness_failures} 次失败: {reason}"
-                liveness_failures = 0
-                set_state(
-                    proxy_ok=False,
-                    proxy_ip="-",
-                    proxy_latency_ms=0,
-                    proxy_error=error_msg,
-                )
-                log_to_json("WARNING", "Proxy", error_msg)
-                handle_confirmed_tunnel_failure(error_msg)
+            if proxy_server.get_egress_mode() != "proxy":
+                iface = str(proxy_server.get_active_interface() or "").strip()
+                if iface and not Path("/sys/class/net", iface).exists():
+                    set_state(active_tunnel_ok=False, tunnel_role="STALE")
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            reason = active_tunnel_stale_reason()
+            if not reason:
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            _invalidate_tunnel_health(reason)
+            log_to_json("WARNING", "Proxy", f"活动隧道立即判定失效: {reason}")
+            if _promote_live_standby():
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            _detach_dead_forwarding()
+            handle_confirmed_tunnel_failure(reason)
         except Exception as exc:
             log_to_json("ERROR", "Proxy", f"快速存活守护异常: {exc}")
         time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
@@ -18132,6 +18255,7 @@ def background_proxy_checker() -> None:
                 continue
 
             observed = _egress_observation()
+            health_epoch = _tunnel_health_epoch
             mode = observed[1]
             tunnel_up = active_tunnel_running()
             check_target = observed[3]
@@ -18193,11 +18317,12 @@ def background_proxy_checker() -> None:
                 proxy_health_failures = 0
                 udp_ok = bool(proxy_server.probe_socks_udp_dns(timeout=2).get("ok"))
                 quic_ok = bool(proxy_server.probe_socks_quic(timeout=4).get("ok")) if udp_ok else False
-                if not _egress_observation_live(observed):
+                if not _egress_observation_live(observed) or health_epoch != _tunnel_health_epoch:
                     log_to_json("INFO", "Proxy", "代理 UDP 检测结果已过期，丢弃")
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
                 set_state(
+                    tunnel_role="ACTIVE",
                     client_proxy_ok=True,
                     client_tcp_ok=True,
                     client_udp_ok=udp_ok,
@@ -18220,10 +18345,12 @@ def background_proxy_checker() -> None:
                         pass
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
-                first_error = res.get("error", "未知错误")
+                first_error = str(res.get("error") or "未知错误")
+                if health_epoch == _tunnel_health_epoch:
+                    _invalidate_tunnel_health(first_error)
                 proxy_health_failures += 1
                 if proxy_health_failures < 3:
-                    log_to_json("WARNING", "Proxy", f"出口检查失败 {proxy_health_failures}/3，保持当前隧道: {first_error}")
+                    log_to_json("WARNING", "Proxy", f"出口检查失败 {proxy_health_failures}/3，健康状态已作废: {first_error}")
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
                 proxy_health_failures = 0
@@ -18233,9 +18360,11 @@ def background_proxy_checker() -> None:
                     log_to_json("INFO", "Proxy", "代理复检结果已过期，丢弃")
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
-                if confirm.get("ok"):
+                if confirm.get("ok") and _egress_observation_live(observed) and not failover_lock.locked() and not is_connecting:
                     set_state(
+                        tunnel_role="ACTIVE",
                         client_proxy_ok=True,
+                        client_tcp_ok=True,
                         proxy_ok=True,
                         active_tunnel_ok=True,
                         proxy_ip=confirm["ip"],
