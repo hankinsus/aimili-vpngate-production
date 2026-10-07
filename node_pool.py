@@ -79,10 +79,8 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
         params.append(ip_type)
     if speed_min_bps > 0:
         where.append(
-            "CAST(COALESCE("
-            "json_extract(e.metadata_json,'$.last_probe_speed_bps'),"
-            "json_extract(s.metadata_json,'$.last_ip_speed_bps'),"
-            "'0') AS INTEGER) >= ?"
+            "CAST(COALESCE((SELECT o.speed FROM observations o "
+            "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
         )
         params.append(speed_min_bps)
     if latency == "gt1000":
@@ -1310,7 +1308,7 @@ class NodePool:
     def _selection_score(endpoint: dict[str, Any]) -> tuple[float, float, int]:
         status = str(endpoint.get("status") or "").upper()
         status_score = {"HOT":100.0, "AVAILABLE":80.0, "DEGRADED":30.0, "NEW":10.0, "TESTING":20.0}.get(status, 0.0)
-        speed = int((endpoint.get("metadata") or {}).get("last_probe_speed_bps") or (endpoint.get("server_metadata") or {}).get("last_ip_speed_bps") or 0)
+        speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
         latency = float(endpoint.get("latency_ewma") or endpoint.get("latest_ping") or 999999)
         if latency <= 0: latency = 999999
         return (status_score + min(speed / 10_000_000, 50.0), -latency, int(endpoint.get("success_streak") or 0))
