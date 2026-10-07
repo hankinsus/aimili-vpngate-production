@@ -262,6 +262,8 @@ global_country_coverage_lock = threading.Lock()
 country_priority_request = ""
 country_priority_last_discovery: dict[str, float] = {}
 failover_lock = threading.Lock()
+egress_switch_lock = threading.Lock()
+egress_switch_generation = 0
 link_probe_lock = threading.Lock()
 link_probe_usage: dict[str, tuple[float, int]] = {}
 last_protocol_discovery_at = 0.0
@@ -17784,30 +17786,70 @@ def _wait_iface_applied(iface: str, timeout: float = 1.0) -> bool:
     return False
 
 
-def _refresh_egress_health(mode: str, previous: str = "") -> None:
-    """Confirm the exit after the proxy has dropped sockets on the old NIC.
+def _begin_egress_transaction() -> int | None:
+    """One direct/proxy switch at a time. None means another switch still owns it."""
+    global egress_switch_generation
+    if not egress_switch_lock.acquire(blocking=False):
+        return None
+    egress_switch_generation += 1
+    return egress_switch_generation
 
-    A failed check repairs the policy route once. If it is still dead, put the
-    previous mode back so the browser is not left on an unreachable exit.
+
+def _end_egress_transaction(generation: int) -> None:
+    if generation != egress_switch_generation:
+        return
+    try:
+        egress_switch_lock.release()
+    except RuntimeError:
+        pass
+
+
+def _egress_observation() -> tuple[int, str, str, str]:
+    return (
+        egress_switch_generation,
+        proxy_server.get_egress_mode(),
+        str(proxy_server.get_forward_interface() or ""),
+        str(active_pool_endpoint_id or active_openvpn_node_id or ""),
+    )
+
+
+def _egress_observation_live(observed: tuple[int, str, str, str]) -> bool:
+    if egress_switch_lock.locked():
+        return False
+    return observed == _egress_observation()
+
+
+def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -> None:
+    """Confirm the exit for this switch generation only.
+
+    A late health thread must not change routes or state after a newer switch
+    has started. applied means new sockets already use the new exit; old
+    sockets are retired in the background.
     """
+    def owned() -> bool:
+        return generation == egress_switch_generation
+
     try:
         _wait_egress_applied(mode)
-        if proxy_server.get_egress_mode() != mode:
+        if not owned():
+            log_to_json("INFO", "Proxy", f"丢弃过期出口事务 generation={generation}")
             return
         if mode == "direct":
             suspend_policy_routing()
         else:
             ensure_active_policy_route()
+        if not owned():
+            return
         health = check_proxy_health(fast=True)
-        if health.get("ok") and proxy_server.get_egress_mode() == mode:
+        if health.get("ok") and owned() and proxy_server.get_egress_mode() == mode:
             for url in ("https://ilovestudyip.com/", "https://www.google.com/generate_204"):
-                if proxy_server.get_egress_mode() != mode:
+                if not owned() or proxy_server.get_egress_mode() != mode:
                     return
                 hit = check_proxy_health(fast=True, urls=(url,))
                 if not hit.get("ok"):
                     health = {"ok": False, "error": "8500 切换后验收失败：" + url}
                     break
-        if proxy_server.get_egress_mode() != mode:
+        if not owned() or proxy_server.get_egress_mode() != mode:
             return
         if health.get("ok"):
             label = "已切换 · 服务器直连" if mode == "direct" else "已切换 · 代理隧道"
@@ -17821,9 +17863,12 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
                     except Exception:
                         endpoint = {}
                     exit_ip = str(endpoint.get("current_ip") or "")
+            if not owned():
+                return
             set_state(
                 egress_mode=mode,
                 egress_switching=False,
+                egress_generation=generation,
                 direct_egress_ok=(mode == "direct"),
                 client_proxy_ok=(mode == "proxy"),
                 proxy_ok=(mode == "proxy"),
@@ -17833,45 +17878,61 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
                 proxy_error="",
                 last_check_message=label,
             )
-            log_to_json("INFO", "Proxy", f"{label} · {exit_ip}")
+            log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip}")
         else:
+            if not owned():
+                return
             detail = str(health.get("error") or "出口确认失败")
             fallback = previous if previous in ("direct", "proxy") and previous != mode else ""
             if fallback == "proxy":
                 ensure_active_policy_route()
+                if not owned():
+                    return
                 proxy_server.set_egress_mode("proxy")
                 _wait_egress_applied("proxy", timeout=1.2)
+                if not owned():
+                    return
                 set_state(
                     egress_mode="proxy",
                     egress_switching=False,
+                    egress_generation=generation,
                     proxy_error=detail,
                     last_check_message=f"切换失败，已恢复代理：{detail}",
                 )
                 log_to_json("WARNING", "Proxy", f"出口切换到 {mode} 失败，已恢复 proxy：{detail}")
             elif fallback == "direct":
+                if not owned():
+                    return
                 proxy_server.set_egress_mode("direct")
                 _wait_egress_applied("direct", timeout=1.2)
+                if not owned():
+                    return
                 suspend_policy_routing()
                 set_state(
                     egress_mode="direct",
                     egress_switching=False,
+                    egress_generation=generation,
                     proxy_error=detail,
                     last_check_message=f"切换失败，已恢复直连：{detail}",
                 )
                 log_to_json("WARNING", "Proxy", f"出口切换到 {mode} 失败，已恢复 direct：{detail}")
             else:
+                if not owned():
+                    return
                 set_state(
                     egress_mode=mode,
                     egress_switching=False,
+                    egress_generation=generation,
                     proxy_error=detail,
                     last_check_message="已切换，出口确认失败：" + detail,
                 )
     except Exception as exc:
         try:
-            if proxy_server.get_egress_mode() == mode:
+            if owned():
                 set_state(
                     egress_mode=mode,
                     egress_switching=False,
+                    egress_generation=generation,
                     last_check_message="已切换，出口确认失败：" + str(exc),
                 )
         except Exception:
@@ -18029,15 +18090,20 @@ def background_proxy_checker() -> None:
     while True:
         last_checker_heartbeat = time.time()
         try:
-            if is_connecting:
-                time.sleep(2)
+            if is_connecting or egress_switch_lock.locked():
+                time.sleep(1)
                 continue
 
-            mode = proxy_server.get_egress_mode()
+            observed = _egress_observation()
+            mode = observed[1]
             tunnel_up = active_tunnel_running()
-            check_target = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+            check_target = observed[3]
             if mode == "direct":
                 res = check_proxy_health()
+                if not _egress_observation_live(observed):
+                    log_to_json("INFO", "Proxy", "直连检测结果已过期，丢弃")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 set_state(
                     direct_egress_ok=bool(res.get("ok")),
                     active_tunnel_ok=tunnel_up,
@@ -18069,6 +18135,10 @@ def background_proxy_checker() -> None:
                 res = {"ok": False, "error": "活动 VPN 隧道进程或网卡已消失"}
             else:
                 res = check_proxy_health()
+            if not _egress_observation_live(observed):
+                log_to_json("INFO", "Proxy", "代理检测结果已过期，丢弃")
+                time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                continue
             if res["ok"]:
                 proxy_health_failures = 0
                 set_state(
@@ -18100,6 +18170,10 @@ def background_proxy_checker() -> None:
                 proxy_health_failures = 0
                 time.sleep(PROXY_HEALTH_CONFIRM_DELAY_SECONDS)
                 confirm = check_proxy_health()
+                if not _egress_observation_live(observed):
+                    log_to_json("INFO", "Proxy", "代理复检结果已过期，丢弃")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 if confirm.get("ok"):
                     set_state(
                         client_proxy_ok=True,
@@ -18114,6 +18188,10 @@ def background_proxy_checker() -> None:
                     continue
 
                 error_msg = confirm.get("error") or first_error
+                if not _egress_observation_live(observed):
+                    log_to_json("INFO", "Proxy", "代理失败结果已过期，不触发切换")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 if proxy_server.get_egress_mode() == "direct":
                     set_state(
                         direct_egress_ok=False,
@@ -19765,52 +19843,66 @@ class Handler(BaseHTTPRequestHandler):
                         "state": _get_fast_nodes_state(),
                     })
                     return
-                if mode == "proxy":
-                    ready, detail = ensure_active_policy_route()
-                    if not ready:
-                        self.send_json({"ok": False, "error": "代理出口路由未就绪：" + detail}, HTTPStatus.CONFLICT)
-                        return
-                    path_ok, path_detail = preflight_proxy_egress()
-                    if not path_ok:
-                        if active_pool_endpoint_id:
-                            node_pool.note_local_forward(str(active_pool_endpoint_id), False, path_detail)
-                        set_state(last_check_message="本机代理转发失败：" + path_detail, proxy_error=path_detail)
-                        self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
-                        return
-                proxy_server.set_egress_mode(mode)
-                if not _wait_egress_applied(mode, timeout=1.2):
-                    proxy_server.set_egress_mode(previous)
-                    set_state(
-                        egress_mode=previous,
-                        egress_switching=False,
-                        last_check_message="8500 未确认出口切换，已恢复",
-                    )
-                    self.send_json({"ok": False, "error": "8500 未在时限内应用出口切换"}, HTTPStatus.CONFLICT)
+                generation = _begin_egress_transaction()
+                if generation is None:
+                    self.send_json({"ok": False, "error": "切换失败，上一次出口切换尚未结束"}, HTTPStatus.CONFLICT)
                     return
-                if mode == "direct":
-                    suspend_policy_routing()
-                set_state(
-                    egress_mode=mode,
-                    egress_switching=True,
-                    proxy_error="",
-                    last_check_message="切换中",
-                )
-                threading.Thread(
-                    target=_refresh_egress_health,
-                    args=(mode, previous),
-                    daemon=True,
-                ).start()
-                global fast_state_cache, fast_state_cache_at
-                with fast_state_cache_lock:
-                    fast_state_cache = None
-                    fast_state_cache_at = 0.0
-                self.send_json({
-                    "ok": True,
-                    "mode": mode,
-                    "switching": True,
-                    "previous": previous,
-                    "state": _get_fast_nodes_state(),
-                })
+                handoff = False
+                try:
+                    if mode == "proxy":
+                        ready, detail = ensure_active_policy_route()
+                        if not ready:
+                            self.send_json({"ok": False, "error": "代理出口路由未就绪：" + detail}, HTTPStatus.CONFLICT)
+                            return
+                        path_ok, path_detail = preflight_proxy_egress()
+                        if not path_ok:
+                            if active_pool_endpoint_id:
+                                node_pool.note_local_forward(str(active_pool_endpoint_id), False, path_detail)
+                            set_state(last_check_message="本机代理转发失败：" + path_detail, proxy_error=path_detail)
+                            self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
+                            return
+                    proxy_server.set_egress_mode(mode)
+                    if not _wait_egress_applied(mode, timeout=1.2):
+                        proxy_server.set_egress_mode(previous)
+                        set_state(
+                            egress_mode=previous,
+                            egress_switching=False,
+                            egress_generation=generation,
+                            last_check_message="8500 未确认出口切换，已恢复",
+                        )
+                        self.send_json({"ok": False, "error": "8500 未在时限内应用出口切换"}, HTTPStatus.CONFLICT)
+                        return
+                    if mode == "direct":
+                        suspend_policy_routing()
+                    set_state(
+                        egress_mode=mode,
+                        egress_switching=True,
+                        egress_generation=generation,
+                        proxy_error="",
+                        last_check_message="切换中",
+                    )
+                    def _commit_egress_switch() -> None:
+                        try:
+                            _refresh_egress_health(mode, previous, generation)
+                        finally:
+                            _end_egress_transaction(generation)
+                    threading.Thread(target=_commit_egress_switch, daemon=True).start()
+                    handoff = True
+                    global fast_state_cache, fast_state_cache_at
+                    with fast_state_cache_lock:
+                        fast_state_cache = None
+                        fast_state_cache_at = 0.0
+                    self.send_json({
+                        "ok": True,
+                        "mode": mode,
+                        "switching": True,
+                        "generation": generation,
+                        "previous": previous,
+                        "state": _get_fast_nodes_state(),
+                    })
+                finally:
+                    if not handoff:
+                        _end_egress_transaction(generation)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
