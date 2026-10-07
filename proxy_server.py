@@ -12,6 +12,7 @@ import select
 import socket
 import subprocess
 import threading
+import queue
 import urllib.parse
 import time
 from pathlib import Path
@@ -58,6 +59,8 @@ def _forward_heartbeat() -> None:
     while True:
         time.sleep(1.0)
         if not _forward_dirty:
+            _write_dataplane_snapshot()
+            time.sleep(1.0)
             continue
         _forward_dirty = False
         try:
@@ -66,6 +69,7 @@ def _forward_heartbeat() -> None:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(str(time.time()), encoding="utf-8")
             tmp.replace(path)
+            _write_dataplane_snapshot()
         except OSError:
             pass
 
@@ -305,6 +309,183 @@ def _note_udp_rotation() -> None:
         _switch_report["udp_associations_rotated"] = int(_switch_report.get("udp_associations_rotated") or 0) + 1
 
 
+_dataplane_lock = threading.Lock()
+_quic_flows: dict[str, dict[str, Any]] = {}
+_quic_hosts: dict[str, float] = {}
+_tcp443_at: list[float] = []
+_retrans_samples: list[tuple[float, int, int]] = []
+_dataplane = {
+    "quic_flow_created": 0,
+    "quic_flow_reused": 0,
+    "quic_flow_rotated": 0,
+    "quic_flow_timeout": 0,
+    "quic_fallback_tcp": 0,
+    "tcp_retrans_delta": 0,
+    "tcp443_flows": 0,
+    "jitter": False,
+}
+
+
+def _tcp_retrans_segs() -> int:
+    try:
+        lines = Path("/proc/net/snmp").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0
+    for index, line in enumerate(lines):
+        if not line.startswith("Tcp:") or index + 1 >= len(lines) or not lines[index + 1].startswith("Tcp:"):
+            continue
+        header = line.split()
+        values = lines[index + 1].split()
+        if "RetransSegs" not in header or len(values) <= header.index("RetransSegs"):
+            return 0
+        try:
+            return int(values[header.index("RetransSegs")])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _note_quic_packet(host: str, generation: int, iface: str) -> None:
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host:
+        return
+    now = time.monotonic()
+    with _dataplane_lock:
+        _quic_hosts[host] = now
+        flow = _quic_flows.get(host)
+        if flow is None:
+            _dataplane["quic_flow_created"] = int(_dataplane["quic_flow_created"]) + 1
+            _quic_flows[host] = {"last": now, "generation": generation, "iface": iface}
+            return
+        if int(flow.get("generation") or -1) != generation or str(flow.get("iface") or "") != iface:
+            _dataplane["quic_flow_rotated"] = int(_dataplane["quic_flow_rotated"]) + 1
+            flow["generation"] = generation
+            flow["iface"] = iface
+        else:
+            _dataplane["quic_flow_reused"] = int(_dataplane["quic_flow_reused"]) + 1
+        flow["last"] = now
+
+
+def _note_quic_rotated(count: int) -> None:
+    if count <= 0:
+        return
+    with _dataplane_lock:
+        _dataplane["quic_flow_rotated"] = int(_dataplane["quic_flow_rotated"]) + count
+
+
+def _note_tcp_host(host: str, port: int) -> None:
+    if int(port) != 443:
+        return
+    host = str(host or "").strip().lower().rstrip(".")
+    now = time.monotonic()
+    with _dataplane_lock:
+        _tcp443_at.append(now)
+        del _tcp443_at[:-400]
+        seen = _quic_hosts.get(host)
+        if seen and now - seen < 20:
+            _dataplane["quic_fallback_tcp"] = int(_dataplane["quic_fallback_tcp"]) + 1
+
+
+def _expire_quic_flows(now: float) -> None:
+    stale = [host for host, flow in _quic_flows.items() if now - float(flow.get("last") or 0) > 30]
+    if stale:
+        _dataplane["quic_flow_timeout"] = int(_dataplane["quic_flow_timeout"]) + len(stale)
+        for host in stale:
+            _quic_flows.pop(host, None)
+    cutoff = now - 60
+    for host, seen in list(_quic_hosts.items()):
+        if seen < cutoff:
+            _quic_hosts.pop(host, None)
+
+
+def dataplane_snapshot() -> dict[str, Any]:
+    now = time.monotonic()
+    retrans = _tcp_retrans_segs()
+    with _live_clients_lock:
+        tcp_sessions = len(_live_clients)
+        udp_associations = len(_udp_controls)
+    with _dataplane_lock:
+        _expire_quic_flows(now)
+        _retrans_samples.append((now, retrans, int(_dataplane["quic_fallback_tcp"])))
+        _retrans_samples[:] = [item for item in _retrans_samples if now - item[0] <= 20]
+        base = _retrans_samples[0]
+        delta = max(0, retrans - int(base[1]))
+        fallback_delta = max(0, int(_dataplane["quic_fallback_tcp"]) - int(base[2]))
+        recent_tcp = sum(1 for item in _tcp443_at if now - item <= 15)
+        jitter = delta >= 20 or fallback_delta >= 3
+        _dataplane["tcp_retrans_delta"] = delta
+        _dataplane["tcp443_flows"] = recent_tcp
+        _dataplane["jitter"] = jitter
+        snap = dict(_dataplane)
+        snap.update({
+            "active_tcp_sessions": tcp_sessions,
+            "active_udp_associations": udp_associations,
+            "udp443_flows": len(_quic_flows),
+            "at": time.time(),
+        })
+    return snap
+
+
+def _write_dataplane_snapshot() -> None:
+    snap = dataplane_snapshot()
+    try:
+        path = DATA_DIR / "dataplane.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+_stage_local = threading.local()
+
+
+def _stage_begin(accepted_at: float | None = None) -> None:
+    now = time.monotonic()
+    _stage_local.marks = {"accept": accepted_at or now, "run": now}
+    _stage_local.logged = False
+
+
+def _stage_mark(name: str) -> None:
+    marks = getattr(_stage_local, "marks", None)
+    if marks is not None and name not in marks:
+        marks[name] = time.monotonic()
+
+
+def _stage_ms(start: str, end: str) -> int:
+    marks = getattr(_stage_local, "marks", None) or {}
+    if start not in marks or end not in marks:
+        return 0
+    return max(0, int((marks[end] - marks[start]) * 1000))
+
+
+def _stage_log(host: str, port: int) -> None:
+    marks = getattr(_stage_local, "marks", None)
+    if not marks or getattr(_stage_local, "logged", False):
+        return
+    _stage_local.logged = True
+    _note_tcp_host(host, port)
+    stages = {
+        "socks_accept_ms": _stage_ms("accept", "run"),
+        "auth_ms": _stage_ms("auth_start", "auth"),
+        "dns_ms": _stage_ms("dns_start", "dns"),
+        "upstream_connect_ms": _stage_ms("connect_start", "connect"),
+        "socks_reply_ms": _stage_ms("connect", "reply"),
+        "splice_start_ms": _stage_ms("reply", "splice"),
+        "first_byte_ms": _stage_ms("splice", "first_byte"),
+    }
+    overhead = stages["socks_accept_ms"] + stages["auth_ms"] + stages["dns_ms"] + stages["socks_reply_ms"] + stages["splice_start_ms"]
+    if overhead <= 300 and max(stages.values()) <= 300:
+        return
+    print(
+        "[8500 慢连接] "
+        + f"{host}:{port} "
+        + " ".join(f"{name}={value}" for name, value in stages.items())
+        + f" overhead_ms={overhead}",
+        flush=True,
+    )
+
+
 def _current_egress_generation() -> int:
     with _live_clients_lock:
         return _egress_generation
@@ -471,6 +652,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         if not chunk:
             raise ConnectionError("Unexpected disconnect.")
         data += chunk
+        _quickack(sock)
     return data
 
 def parse_host_port(authority: str, default_port: int) -> tuple[str, int]:
@@ -711,8 +893,11 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         nonlocal association_generation, association_iface
         current_generation = _current_egress_generation()
         current_iface = get_forward_interface() or ""
+        if not current_iface:
+            current_iface = association_iface
         if current_generation == association_generation and current_iface == association_iface:
             return False
+        quic_live = sum(1 for key in upstreams if key and key[0] == "quic")
         had_upstream = bool(upstreams)
         old_iface = association_iface
         _drop_upstreams()
@@ -720,6 +905,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         association_iface = current_iface
         if had_upstream:
             _note_udp_rotation()
+            _note_quic_rotated(quic_live)
             print(
                 f"[SOCKS5 UDP] udp_generation={association_generation} {old_iface or '-'} -> {association_iface or '-'} upstream sockets recreated",
                 flush=True,
@@ -807,6 +993,8 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         try:
                             sock.sendto(payload, sa)
                             sent = True
+                            if kind == "quic":
+                                _note_quic_packet(host, association_generation, association_iface)
                             break
                         except OSError:
                             try:
@@ -1214,24 +1402,60 @@ def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout
 
 
 def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: float) -> tuple[str | None, float]:
-    winner: dict[str, str | float] = {}
-    done = threading.Event()
-
-    def attempt(server: str) -> None:
-        ip, ttl = _dns_udp_query(host, 1, server, timeout, iface)
-        if not ip or done.is_set():
-            return
-        winner["ip"] = ip
-        winner["ttl"] = ttl
-        done.set()
-
-    threads = [threading.Thread(target=attempt, args=(server,), daemon=True) for server in servers]
-    for thread in threads:
-        thread.start()
-    done.wait(timeout)
-    ip = winner.get("ip")
-    ttl = winner.get("ttl")
-    return (str(ip) if ip else None), float(ttl or 0.0)
+    """Ask every resolver at once. Return the first answer. No extra threads."""
+    import random
+    pending: list[tuple[socket.socket, bytes]] = []
+    poller = select.poll()
+    try:
+        for server in servers:
+            tx_id = random.getrandbits(16).to_bytes(2, "big")
+            packet = _build_dns_query(host, 1, tx_id)
+            if packet is None:
+                continue
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            if iface:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+                except OSError as exc:
+                    _log_dns_bind_failure(iface, exc)
+                    sock.close()
+                    continue
+            try:
+                sock.sendto(packet, (server, 53))
+            except OSError:
+                sock.close()
+                continue
+            pending.append((sock, tx_id))
+            poller.register(sock, select.POLLIN)
+        if not pending:
+            return None, 0.0
+        deadline = time.monotonic() + max(0.05, timeout)
+        while time.monotonic() < deadline:
+            remain_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            try:
+                events = poller.poll(remain_ms)
+            except OSError:
+                break
+            for fd, _mask in events:
+                sock = next((item[0] for item in pending if item[0].fileno() == fd), None)
+                tx_id = next((item[1] for item in pending if item[0].fileno() == fd), b"")
+                if sock is None:
+                    continue
+                try:
+                    resp, _addr = sock.recvfrom(4096)
+                except OSError:
+                    continue
+                ip, ttl = _parse_dns_a(resp, tx_id, 1)
+                if ip:
+                    return ip, ttl
+        return None, 0.0
+    finally:
+        for sock, _tx in pending:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def _system_dns_ipv4(host: str, timeout: float) -> str | None:
@@ -1325,6 +1549,14 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
             _DNS_FLIGHTS.pop(cache_key, None)
 
 
+def _quickack(sock: socket.socket) -> None:
+    option = getattr(socket, "TCP_QUICKACK", 12)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, option, 1)
+    except OSError:
+        pass
+
+
 def _tune_socket(sock: socket.socket) -> socket.socket:
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -1334,6 +1566,15 @@ def _tune_socket(sock: socket.socket) -> socket.socket:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
         pass
+    _quickack(sock)
+    for level, opt, value in (
+        (socket.SOL_SOCKET, socket.SO_RCVBUF, PROXY_SOCKET_BUFFER_BYTES),
+        (socket.SOL_SOCKET, socket.SO_SNDBUF, PROXY_SOCKET_BUFFER_BYTES),
+    ):
+        try:
+            sock.setsockopt(level, opt, value)
+        except OSError:
+            pass
     for name, value in (
         # Refresh NAT without treating a quiet session as dead.
         # A 20s user-timeout was aborting idle TCP as soon as the first
@@ -1413,11 +1654,15 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
     iface = get_forward_interface()
     if get_egress_mode() != "direct" and not iface:
         raise OSError("[DNS] 代理模式没有活动网卡")
+    _stage_mark("dns_start")
     if not _host_is_ip(host):
         resolved_ip = resolve_dns_over_active_tunnel(host, iface=iface)
+        _stage_mark("dns")
         if not resolved_ip:
             raise OSError("[DNS] 当前出站没有解析结果")
         host = resolved_ip
+    else:
+        _stage_mark("dns")
 
     try:
         results = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
@@ -1440,7 +1685,9 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
             _tune_socket(sock)
             if iface:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+            _stage_mark("connect_start")
             sock.connect(sa)
+            _stage_mark("connect")
             sock.settimeout(None)
             return sock
         except OSError as e:
@@ -1458,7 +1705,9 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
                     _tune_socket(sock)
                     if iface:
                         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+                    _stage_mark("connect_start")
                     sock.connect(sa)
+                    _stage_mark("connect")
                     sock.settimeout(None)
                     return sock
                 except OSError as retry_error:
@@ -1482,6 +1731,7 @@ def relay(left: socket.socket, right: socket.socket) -> None:
     path stays in userspace. The copy fallback is only for a kernel that
     rejects splice before any byte has moved.
     """
+    _stage_mark("splice")
     try:
         _relay_splice(left, right)
     except _SpliceUnsupported:
@@ -1608,6 +1858,9 @@ def _relay_splice(left: socket.socket, right: socket.socket) -> None:
                         moved = True
                         progressed = True
                         note_proxy_forwarded(sent)
+                        if leg.dst is left:
+                            _stage_mark("first_byte")
+                            _stage_log(getattr(_stage_local, "host", "") or "", int(getattr(_stage_local, "port", 0) or 0))
                 room = leg.cap - leg.pending
                 if room > 0 and not leg.src_eof:
                     got = _splice_once(leg.src.fileno(), leg.pipe_w, room, in_flags, moved)
@@ -1727,7 +1980,10 @@ def _relay_copy(left: socket.socket, right: socket.socket) -> None:
 
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
+    host = ""
+    port = 0
     try:
+        _stage_mark("auth_start")
         methods_count = recv_exact(client, 1)[0]
         methods = recv_exact(client, methods_count)
         if proxy_auth_enabled():
@@ -1747,6 +2003,8 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             client.sendall(b"\x01\x00")
         else:
             client.sendall(b"\x05\x00")
+        _stage_mark("auth")
+        _quickack(client)
         version, command, _, address_type = recv_exact(client, 4)
         if version != 5:
             client.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -1767,6 +2025,8 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             client.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
+        _stage_local.host = host
+        _stage_local.port = port
         try:
             upstream = create_connection((host, port), timeout=20)
         except Exception as e:
@@ -1778,8 +2038,12 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
                 pass
             raise
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        _stage_mark("reply")
+        _quickack(client)
         relay(client, upstream)
     finally:
+        if host:
+            _stage_log(host, port)
         client.close()
         if upstream:
             upstream.close()
@@ -1874,8 +2138,9 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int], accepted_at: float | None = None) -> None:
     _track_client(client)
+    _stage_begin(accepted_at)
     try:
         _tune_socket(client)
         client.settimeout(30)
@@ -1913,7 +2178,7 @@ def start_proxy_server(host: str, port: int) -> None:
                 pass
         _tune_socket(server)
         server.bind((host, port))
-        server.listen(256)
+        server.listen(1024)
         print(f"HTTP/SOCKS5 proxy listening on {host}:{port} (SOCKS5 TCP + UDP ASSOCIATE)", flush=True)
     except Exception as e:
         if server is not None:
@@ -1966,9 +2231,27 @@ def start_proxy_server(host: str, port: int) -> None:
         print(f"[内核] 出站配置检查失败：{exc}", flush=True)
     threading.Thread(target=_watch_egress_mode, daemon=True, name="egress-watch").start()
     threading.Thread(target=_forward_heartbeat, daemon=True, name="forward-heartbeat").start()
+    jobs: queue.Queue[tuple[socket.socket, tuple[str, int], float]] = queue.Queue(maxsize=MAX_PROXY_CONNECTIONS)
+
+    def run_client() -> None:
+        while True:
+            client, address, accepted_at = jobs.get()
+            try:
+                proxy_client(client, address, accepted_at)
+            finally:
+                proxy_connection_sem.release()
+
+    for index in range(min(96, MAX_PROXY_CONNECTIONS)):
+        threading.Thread(target=run_client, daemon=True, name=f"socks-{index}").start()
     while True:
         try:
             client, address = server.accept()
+            accepted_at = time.monotonic()
+            try:
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            _quickack(client)
             if not proxy_connection_sem.acquire(blocking=False):
                 print(f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}", flush=True)
                 try:
@@ -1976,14 +2259,14 @@ def start_proxy_server(host: str, port: int) -> None:
                 except OSError:
                     pass
                 continue
-
-            def run_client() -> None:
+            try:
+                jobs.put_nowait((client, address, accepted_at))
+            except queue.Full:
+                proxy_connection_sem.release()
                 try:
-                    proxy_client(client, address)
-                finally:
-                    proxy_connection_sem.release()
-
-            threading.Thread(target=run_client, daemon=True).start()
+                    client.close()
+                except OSError:
+                    pass
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)

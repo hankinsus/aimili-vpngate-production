@@ -6454,6 +6454,17 @@ def _overlay_pool_roles(state: dict[str, Any]) -> None:
         f" · 未测速待补 {int(detail.get('excluded_unmeasured') or 0)}"
         f" · 主备占用或重复排除 {int(detail.get('excluded_occupied') or 0) + int(detail.get('excluded_duplicate') or 0)}"
     )
+    _overlay_dataplane(state)
+
+
+def _overlay_dataplane(state: dict[str, Any]) -> None:
+    raw = read_json(DATA_DIR / "dataplane.json", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    state["dataplane_jitter"] = bool(raw.get("jitter"))
+    state["tcp_retrans_delta"] = int(raw.get("tcp_retrans_delta") or 0)
+    state["quic_fallback_tcp"] = int(raw.get("quic_fallback_tcp") or 0)
+    state["udp443_flows"] = int(raw.get("udp443_flows") or 0)
 
 
 def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -13343,6 +13354,7 @@ function egressHealthBadge(state) {
   const proxyOk = triState(state.client_proxy_ok);
   if ((proxyOk === true || state.client_status === 'usable') && udpDown) return ['UDP异常', 'unavailable'];
   if ((proxyOk === true || state.client_status === 'usable') && quicDown) return ['QUIC异常', 'unavailable'];
+  if ((proxyOk === true || state.client_status === 'usable') && state.dataplane_jitter) return ['数据面抖动', 'unavailable'];
   if (proxyOk === true || state.client_status === 'usable') return ['客户端可用', 'available'];
   if (proxyOk === false || state.client_status === 'degraded') return ['客户端不可用', 'unavailable'];
   return ['已连接 · 等待验证', 'not_checked'];
@@ -14562,8 +14574,8 @@ function render(){
       if (proxyOk === true) {
         const udpDown = triState(state.client_udp_ok) === false;
         const quicDown = triState(state.client_quic_ok) === false;
-        pBadge.className = (udpDown || quicDown) ? "badge unavailable" : "badge available";
-        pBadge.textContent = udpDown ? "UDP异常" : (quicDown ? "QUIC异常" : "客户端可用");
+        pBadge.className = (udpDown || quicDown || state.dataplane_jitter) ? "badge unavailable" : "badge available";
+        pBadge.textContent = udpDown ? "UDP异常" : (quicDown ? "QUIC异常" : (state.dataplane_jitter ? "数据面抖动" : "客户端可用"));
         pIpVal.textContent = state.proxy_ip || "-";
         const latencyClass = getLatencyClass(state.proxy_latency_ms);
         pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
@@ -15367,7 +15379,7 @@ function backendStateRenderSignature(s) {
     x.last_check_message, x.priority_country, x.priority_running,
     x.availability_engine_running,
     x.resource_engine_running, x.global_pool_refresh_running,
-    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.pool_precold_detail, x.standby_ready, x.standby_prepared, x.standby_node_id,
+    x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.pool_precold_detail, x.dataplane_jitter, x.standby_ready, x.standby_prepared, x.standby_node_id,
     x.egress_mode, x.egress_switching,
     x.manual_switch_active,
     x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,
