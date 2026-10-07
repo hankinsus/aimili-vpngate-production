@@ -7128,92 +7128,18 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
         protocol_probe_lock.release()
 
 def protocol_probe_loop() -> None:
-    """Continuous availability engine for every pending endpoint.
-
-    The previous loop only touched SoftEther/SSTP/L2TP and could leave dozens or
-    hundreds of new OpenVPN endpoints permanently in NOT_CHECKED. The availability
-    sweep is the single scheduler for both OpenVPN and multi-protocol resources.
-    It consumes only due endpoints, prioritises NEW entries, and backs off to the
-    normal recheck window after a successful probe.
-    """
-    time.sleep(15)
+    """Scheduled global library check. Not a continuous scan."""
+    time.sleep(20)
     while True:
         if background_paused():
             time.sleep(5)
             continue
         try:
-            if proxy_server.proxy_forwarding_busy() or ui_query_active() or ui_command_plane.is_busy() or global_pool_refresh_running or is_connecting or manual_connection_active or country_full_sweep_running:
-                time.sleep(5)
-                continue
-            # Detection priority is independent from the browser view:
-            # explicit custom country > configured/default server country >
-            # global coverage rotation. The priority country gets the whole
-            # due probe budget before other countries are considered.
-            ui_cfg = load_ui_config()
-            configured_priority = normalized_country_name(str(ui_cfg.get("force_country") or "").strip())
-            default_priority = routing_target_country(ui_cfg)
-            # Detection order is strict:
-            # 1) explicit custom country;
-            # 2) this server's own country;
-            # 3) only after the priority country reaches the minimum usable
-            #    reserve do we enter global coverage rotation.
-            configured_priority = configured_priority or default_priority
-            priority = (
-                country_priority_request
-                if country_priority_explicit and country_priority_request
-                else configured_priority
-            )
-            if priority:
-                snap = country_priority_snapshot(priority)
-                available = int(snap.get("available") or 0)
-                recent_full_sweep = bool(
-                    country_full_sweep_completed_at.get(priority)
-                    and time.time() - float(country_full_sweep_completed_at.get(priority) or 0) < COUNTRY_FULL_SWEEP_REUSE_SECONDS
-                )
-                # A country is released to normal global rotation only after
-                # its complete resource-pool first sweep has finished. The
-                # number of currently AVAILABLE endpoints no longer controls
-                # whether other countries may be detected.
-                if not recent_full_sweep:
-                    if not country_priority_lock.locked() and not country_priority_request:
-                        start_country_priority(priority)
-                    set_state(
-                        priority_country=priority,
-                        priority_inventory=int(snap.get("inventory") or 0),
-                        priority_available=available,
-                        priority_target=COUNTRY_AVAILABLE_TARGET,
-                        priority_minimum=COUNTRY_AVAILABLE_MIN,
-                        priority_running=True,
-                        priority_full_sweep_running=True,
-                        priority_message=f"{priority} 资源库全量首次检测中：未完成前不进入其它国家检测",
-                    )
-                    time.sleep(3)
-                    continue
-                set_state(
-                    priority_country=priority,
-                    priority_inventory=int(snap.get("inventory") or 0),
-                    priority_available=available,
-                    priority_target=COUNTRY_AVAILABLE_TARGET,
-                    priority_minimum=COUNTRY_AVAILABLE_MIN,
-                    priority_running=False,
-                    priority_full_sweep_running=False,
-                    priority_message=f"{priority} 资源库全量首次检测已完成，进入其它国家默认检测",
-                )
-            # Priority country first-sweep is complete; global rotation can now use
-            # the next-lowest-latency country with a deficit.
-            global global_coverage_pick_cache_country, global_coverage_pick_cache_at
-            now_cov = time.time()
-            if now_cov - global_coverage_pick_cache_at >= 300 or not global_coverage_pick_cache_country:
-                global_coverage_pick_cache_country = _pick_global_country_for_coverage_v2()
-                global_coverage_pick_cache_at = now_cov
-            coverage_priority = coverage_country or global_coverage_pick_cache_country
-            result = availability_sweep_once(coverage_priority)
-            if result.get("skipped"):
-                time.sleep(3)
-                continue
+            maybe_start_scheduled_library_check()
         except Exception as exc:
-            log_to_json("ERROR", "Probe", f"可用性检测循环异常: {exc}")
-        time.sleep(AVAILABILITY_TICK_SECONDS)
+            log_to_json("ERROR", "Probe", f"全球库定时检测异常: {exc}")
+        time.sleep(30)
+
 
 def openvpn_pool_endpoint_id(node: dict[str, Any] | None) -> str:
     if not node:
@@ -7650,6 +7576,8 @@ def _library_check_public_state() -> dict[str, Any]:
         wait = str(library_check_wait_reason or "")
         paused = bool(library_check_paused)
     remaining = max(0, total - tested)
+    if phase in ("", "idle") and total <= 0:
+        remaining = int(library_check_preview_total() or 0)
     eta = 0
     if samples > 0 and rate > 0 and remaining > 0 and phase in ("running", "paused", "stopping"):
         eta = int(remaining * (rate / samples))
@@ -7666,6 +7594,7 @@ def _library_check_public_state() -> dict[str, Any]:
         "library_check_eta_seconds": eta,
         "library_check_message": message,
         "library_check_wait_reason": wait,
+        **global_scan_public_state(),
     }
 
 
@@ -7828,6 +7757,169 @@ def _library_probe_openvpn(endpoint: dict[str, Any]) -> dict[str, Any]:
         protocol_probe_lock.release()
 
 
+_GLOBAL_SCAN_MODES = ("loop", "daily", "mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def global_scan_settings() -> dict[str, Any]:
+    cfg = load_ui_config()
+    mode = str(cfg.get("global_scan_mode") or "loop").strip().lower()
+    if mode not in _GLOBAL_SCAN_MODES:
+        mode = "loop"
+    try:
+        hour = int(cfg.get("global_scan_hour") if cfg.get("global_scan_hour") is not None else 0)
+    except (TypeError, ValueError):
+        hour = 0
+    hour = max(0, min(23, hour))
+    try:
+        last = float(cfg.get("last_global_scan_at") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    return {
+        "auto": bool(cfg.get("global_scan_auto")),
+        "mode": mode,
+        "hour": hour,
+        "last": last,
+    }
+
+
+def global_scan_public_state() -> dict[str, Any]:
+    settings = global_scan_settings()
+    return {
+        "global_scan_auto": settings["auto"],
+        "global_scan_mode": settings["mode"],
+        "global_scan_hour": settings["hour"],
+        "last_global_scan_at": settings["last"],
+    }
+
+
+def save_global_scan_settings(changes: dict[str, Any]) -> dict[str, Any]:
+    current = global_scan_settings()
+    auto = bool(changes.get("global_scan_auto")) if "global_scan_auto" in changes else current["auto"]
+    mode = str(changes.get("global_scan_mode") or current["mode"]).strip().lower()
+    if mode not in _GLOBAL_SCAN_MODES:
+        mode = current["mode"]
+    try:
+        hour = int(changes.get("global_scan_hour") if "global_scan_hour" in changes else current["hour"])
+    except (TypeError, ValueError):
+        hour = current["hour"]
+    hour = max(0, min(23, hour))
+    with lock:
+        path = DATA_DIR / "ui_auth.json"
+        stored: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    stored = loaded
+            except Exception:
+                stored = {}
+        stored["global_scan_auto"] = auto
+        stored["global_scan_mode"] = mode
+        stored["global_scan_hour"] = hour
+        write_json(path, stored)
+    invalidate_ui_config_cache()
+    return global_scan_public_state()
+
+
+def remember_global_scan(when: float | None = None) -> None:
+    with lock:
+        path = DATA_DIR / "ui_auth.json"
+        stored: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    stored = loaded
+            except Exception:
+                stored = {}
+        stored["last_global_scan_at"] = float(when if when is not None else time.time())
+        write_json(path, stored)
+    invalidate_ui_config_cache()
+
+
+def global_scan_due(now: float | None = None) -> bool:
+    settings = global_scan_settings()
+    now = time.time() if now is None else now
+    local = time.localtime(now)
+    if not settings["auto"]:
+        last = settings["last"]
+        if last <= 0:
+            remember_global_scan(now)
+            return False
+        return (now - last) >= 6 * 3600
+    if local.tm_hour < settings["hour"]:
+        return False
+    if settings["mode"] == "loop":
+        return True
+    if settings["last"] <= 0:
+        return True
+    previous = time.localtime(settings["last"])
+    if settings["mode"] == "daily":
+        return (previous.tm_year, previous.tm_yday) != (local.tm_year, local.tm_yday)
+    names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    if names[local.tm_wday] != settings["mode"]:
+        return False
+    return (previous.tm_year, previous.tm_yday) != (local.tm_year, local.tm_yday)
+
+
+def maybe_start_scheduled_library_check() -> None:
+    if library_check_phase in ("running", "paused", "stopping"):
+        return
+    if not global_scan_due():
+        return
+    if (
+        proxy_server.proxy_forwarding_busy()
+        or is_connecting
+        or manual_connection_active
+        or ui_command_plane.is_busy()
+    ):
+        return
+    library_check_control("start")
+    remember_global_scan()
+    mode = "每 6 小时" if not global_scan_settings()["auto"] else global_scan_settings()["mode"]
+    log_to_json("INFO", "Probe", f"空闲，按计划开始全球库检测（{mode}）")
+
+
+def _hostname_ipv4s(host: str) -> set[str]:
+    host = str(host or "").strip()
+    if not host or re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host):
+        return set()
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:
+        return set()
+    return {str(item[4][0]) for item in infos if item and item[4]}
+
+
+def reconcile_endpoint_address(endpoint: dict[str, Any]) -> dict[str, Any]:
+    """Drop a stale IP when the hostname no longer resolves to it."""
+    host = str(endpoint.get("hostname") or "").strip()
+    current = str(endpoint.get("current_ip") or "").strip()
+    if not host or re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host):
+        return endpoint
+    found = _hostname_ipv4s(host)
+    if not found or current in found:
+        return endpoint
+    time.sleep(0.2)
+    found = _hostname_ipv4s(host)
+    if not found or current in found:
+        return endpoint
+    new_ip = sorted(found)[0]
+    try:
+        changed = node_pool.replace_hostname_ip(host, new_ip)
+    except Exception as exc:
+        log_to_json("WARNING", "Probe", f"域名 IP 修订失败 {host}: {exc}")
+        return endpoint
+    if changed:
+        log_to_json("INFO", "Probe", f"DNS_IP_CHANGED {host} {current or '-'} -> {new_ip}")
+    updated = dict(endpoint)
+    updated["current_ip"] = new_ip
+    metadata = dict(updated.get("metadata") or {})
+    metadata["ip"] = new_ip
+    updated["metadata"] = metadata
+    return updated
+
+
 def _library_probe_one(endpoint_id: str) -> str:
     if library_check_stop:
         return "stop"
@@ -7837,6 +7929,8 @@ def _library_probe_one(endpoint_id: str) -> str:
         return "deferred:读取端点失败，稍后重试 " + str(exc)
     if not endpoint:
         return "unavailable"
+    endpoint = reconcile_endpoint_address(endpoint)
+    endpoint_id = str(endpoint.get("endpoint_id") or endpoint_id)
     if _library_is_live_production(endpoint):
         return "live"
     protocol = str(endpoint.get("protocol") or "").lower()
@@ -7967,13 +8061,16 @@ def _library_check_worker(generation: int) -> None:
                 pass
 
 
-def library_check_control(action: str) -> dict[str, Any]:
+def library_check_control(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     global library_check_generation, library_check_stop, library_check_paused
     global library_check_phase, library_check_total, library_check_tested
     global library_check_available, library_check_unavailable
     global library_check_rate_seconds, library_check_rate_samples
     global library_check_message, library_check_wait_reason
     action = str(action or "start").strip().lower()
+    if action == "save_schedule":
+        save_global_scan_settings(payload or {})
+        return _library_check_public_state()
     if action not in ("start", "pause", "resume", "stop"):
         action = "start"
     start_thread = False
@@ -8017,6 +8114,7 @@ def library_check_control(action: str) -> dict[str, Any]:
             library_check_wait_reason = ""
             start_thread = True
     if start_thread:
+        remember_global_scan()
         threading.Thread(
             target=_library_check_worker, args=(generation,), daemon=True, name="library-check",
         ).start()
@@ -8443,7 +8541,10 @@ def collector_loop() -> None:
         last_collector_heartbeat = time.time()
         success = False
         try:
-            print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
+            if active_tunnel_running() or proxy_server.proxy_forwarding_busy() or is_connecting or manual_connection_active:
+                time.sleep(30)
+                continue
+            print("[守护线程] 当前没有活动隧道，执行一轮节点检测...", flush=True)
             log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
             res = maintain_valid_nodes(force=False)
             if "没有拉取到新节点" not in res:
@@ -12116,7 +12217,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">只拨真实隧道，记录往返延迟和可用性。不测速，不访问 Cloudflare / CDN。空闲时才拨，转发或筛选时等待，等待不算失败。</div>
       <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
-        <span style="color:var(--text-secondary);">检节点数</span>
+        <span style="color:var(--text-secondary);">检测节点数</span>
         <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>
       </div>
       <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
@@ -12140,8 +12241,28 @@ INDEX_HTML = r"""<!doctype html>
         <strong id="library_check_eta" style="font-variant-numeric:tabular-nums;">计算中</strong>
       </div>
       <div id="library_check_message" style="margin-top: 8px; min-height: 20px; color: var(--text-secondary); font-size: 13px; line-height: 1.45;"></div>
+      <div style="margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,0.06); display:flex; flex-direction:column; gap:10px;">
+        <label style="display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; color:var(--text-primary);">
+          <input type="checkbox" id="library_scan_auto"> 开启自动更新
+        </label>
+        <div style="display:flex; gap:8px;">
+          <select id="library_scan_mode" class="input-field" style="flex:1; height:36px;">
+            <option value="loop">循环</option>
+            <option value="daily">每天</option>
+            <option value="mon">周一</option>
+            <option value="tue">周二</option>
+            <option value="wed">周三</option>
+            <option value="thu">周四</option>
+            <option value="fri">周五</option>
+            <option value="sat">周六</option>
+            <option value="sun">周日</option>
+          </select>
+          <select id="library_scan_hour" class="input-field" style="flex:1; height:36px;"></select>
+        </div>
+        <div style="color:var(--text-secondary); font-size:12px; line-height:1.45;">不勾选时，每 6 小时在空闲时检测一次。勾选后才按上面的时间开始，系统忙就等到空闲。</div>
+      </div>
       <div style="display:flex; gap:12px; margin-top:18px;">
-        <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">开始检测</button>
+        <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">手动检测</button>
         <button type="button" id="library_check_stop" disabled style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px; border:1px solid rgba(225,29,72,0.35); background:rgba(225,29,72,0.22); color:rgba(255,255,255,0.55); cursor:not-allowed;">停止检测</button>
       </div>
     </div>
@@ -15805,6 +15926,7 @@ let libraryCheckSeenPhase = "";
 
 function formatLibraryEta(phase, snapshot) {
   const current = String(phase || "");
+  if (current === "idle" || current === "") return "待开始";
   if (current === "done") return "已完成";
   if (current === "stopped") return "已停止";
   if (current === "error") return "已中断";
@@ -15842,14 +15964,17 @@ function paintLibraryCheckModal() {
   write("library_check_tested", Number(snapshot.library_check_tested || 0));
   write("library_check_available", Number(snapshot.library_check_available || 0));
   write("library_check_unavailable", Number(snapshot.library_check_unavailable || 0));
-  write("library_check_remaining", Number(snapshot.library_check_remaining || 0));
+  write("library_check_remaining", (phase === "idle" || phase === "")
+    ? Number(snapshot.library_check_preview_total || snapshot.pool_endpoints || snapshot.library_check_remaining || 0)
+    : Number(snapshot.library_check_remaining || 0));
   const eta = $("library_check_eta");
   if (eta) eta.textContent = formatLibraryEta(phase, snapshot);
   const message = $("library_check_message");
   if (message) message.textContent = String(snapshot.library_check_wait_reason || snapshot.library_check_message || "");
+  paintLibraryScanForm(snapshot);
   const toggle = $("library_check_toggle");
   if (toggle) {
-    toggle.textContent = phase === "running" ? "暂停" : (phase === "paused" ? "恢复检测" : "开始检测");
+    toggle.textContent = phase === "running" ? "暂停" : (phase === "paused" ? "恢复" : "手动检测");
     toggle.disabled = phase === "stopping";
   }
   const stop = $("library_check_stop");
@@ -15886,16 +16011,16 @@ function closeLibraryCheckModal() {
   }
 }
 
-async function libraryCheckAction(action) {
+async function libraryCheckAction(action, extra) {
   try {
     const data = await fetchJsonWithTimeout("./api/library_check", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({action: action})
+      body: JSON.stringify(Object.assign({action: action}, extra || {}))
     }, 15000);
     if (!state) state = {};
     Object.keys(data || {}).forEach((key) => {
-      if (key.indexOf("library_check_") === 0) state[key] = data[key];
+      if (key.indexOf("library_check_") === 0 || key.indexOf("global_scan_") === 0 || key === "last_global_scan_at") state[key] = data[key];
     });
     paintLibraryCheckModal();
   } catch (e) {
@@ -15931,6 +16056,37 @@ if (libraryToggle) libraryToggle.onclick = () => {
 };
 const libraryStop = $("library_check_stop");
 if (libraryStop) libraryStop.onclick = () => libraryCheckAction("stop");
+
+function paintLibraryScanForm(snapshot) {
+  const hour = $("library_scan_hour");
+  if (hour && !hour.options.length) {
+    for (let i = 0; i < 24; i += 1) {
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = String(i).padStart(2, "0") + ":00";
+      hour.appendChild(opt);
+    }
+  }
+  const focused = document.activeElement;
+  const auto = $("library_scan_auto");
+  const mode = $("library_scan_mode");
+  if (auto && focused !== auto) auto.checked = !!(snapshot && snapshot.global_scan_auto);
+  if (mode && focused !== mode && snapshot && snapshot.global_scan_mode) mode.value = snapshot.global_scan_mode;
+  if (hour && focused !== hour && snapshot && snapshot.global_scan_hour != null) hour.value = String(snapshot.global_scan_hour);
+}
+
+function saveLibraryScanForm() {
+  const hour = $("library_scan_hour");
+  libraryCheckAction("save_schedule", {
+    global_scan_auto: !!($("library_scan_auto") && $("library_scan_auto").checked),
+    global_scan_mode: ($("library_scan_mode") && $("library_scan_mode").value) || "loop",
+    global_scan_hour: Number(hour && hour.value || 0)
+  });
+}
+["library_scan_auto", "library_scan_mode", "library_scan_hour"].forEach((id) => {
+  const el = $(id);
+  if (el) el.addEventListener("change", saveLibraryScanForm);
+});
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
   const badge = $("proxy_status_badge");
@@ -20127,7 +20283,7 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/library_check":
             try:
                 payload = self.read_json_body()
-                result = library_check_control(str(payload.get("action") or "start"))
+                result = library_check_control(str(payload.get("action") or "start"), payload)
                 result["ok"] = True
                 self.send_json(result)
             except Exception as exc:

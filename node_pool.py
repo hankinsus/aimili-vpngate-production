@@ -1145,6 +1145,20 @@ class NodePool:
         }
         return item
 
+    def replace_hostname_ip(self, hostname: str, new_ip: str) -> int:
+        """Point a hostname at its current DNS address. History stays on the same server."""
+        hostname = str(hostname or "").strip().lower()
+        new_ip = str(new_ip or "").strip()
+        if not hostname:
+            return 0
+        with closing(self._connect()) as db:
+            cur = db.execute(
+                "UPDATE servers SET current_ip=? WHERE LOWER(hostname)=? AND COALESCE(current_ip,'')<>?",
+                (new_ip, hostname, new_ip),
+            )
+            db.commit()
+            return int(cur.rowcount or 0)
+
     def find_endpoint_id(self, ip: str, port: int, protocol: str) -> str:
         ip = str(ip or "").strip()
         protocol = str(protocol or "").strip().lower()
