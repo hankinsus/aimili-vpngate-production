@@ -17458,9 +17458,23 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
     rules = [
         ["filter", "FORWARD", "-i", ns_dev, "-o", inner, "-j", "ACCEPT"],
         ["filter", "FORWARD", "-i", inner, "-o", ns_dev, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
+        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
+    ]
+    stale = [
         ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
         ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
+        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
     ]
+    for table, *rule in stale:
+        try:
+            subprocess.run(
+                ["ip", "netns", "exec", namespace, "iptables", "-t", table, "-D", *rule],
+                capture_output=True, text=True, timeout=3,
+            )
+        except Exception:
+            pass
     for table, *rule in rules:
         try:
             check = subprocess.run(
@@ -17528,6 +17542,12 @@ def preflight_proxy_egress() -> tuple[bool, str]:
         log_to_json("WARNING", "Proxy", f"table100: FAIL {detail}")
         return False, "table100: " + detail
     probed = check_root_via_interface(iface, gateway, timeout=3)
+    if not probed.get("ok") and tunnel is not None and str(getattr(tunnel, "protocol", "") or "") == "l2tp-ipsec":
+        ensure_l2tp_namespace_forward(tunnel)
+        probed = check_root_via_interface(iface, gateway, timeout=3)
+        if not probed.get("ok"):
+            log_to_json("WARNING", "Proxy", f"L2TP MSS/PMTU blackhole root→{iface}: {probed.get('error') or ''}")
+            return False, "L2TP MSS/PMTU blackhole"
     if not probed.get("ok"):
         log_to_json("WARNING", "Proxy", f"root→{iface}: FAIL {probed.get('error') or ''}")
         return False, f"root→{iface}: {probed.get('error') or '不通'}"
