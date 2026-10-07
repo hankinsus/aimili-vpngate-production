@@ -10301,7 +10301,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     table.node-table td {
-      font-weight: 600;
+      font-weight: 700;
     }
 
     th, td {
@@ -10391,14 +10391,20 @@ INDEX_HTML = r"""<!doctype html>
     .col-speed,
     .node-latency-cell,
     .node-speed-cell {
-      padding-left: 2px;
+      text-align: left;
+      padding-left: 4px;
       padding-right: 2px;
     }
 
+    .node-location-cell,
+    .col-location {
+      padding-left: 4px;
+    }
+
     .node-address-cell .mono {
-      font-size: 13px;
-      font-weight: 600;
-      color: #8eb8c4;
+      font-size: 15px;
+      font-weight: 700;
+      color: #d5e6ee;
       letter-spacing: 0;
       display: block;
       white-space: nowrap;
@@ -10418,7 +10424,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .node-domain {
       font-size: 13px;
-      font-weight: 600;
+      font-weight: 700;
       color: #d5dee8;
       display: block;
       white-space: nowrap;
@@ -10441,9 +10447,9 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-block;
       min-width: 0;
       white-space: nowrap;
-      font-weight: 600;
+      font-weight: 700;
       font-size: 13px;
-      color: #b7c3ce;
+      color: #d5dee6;
       font-variant-numeric: tabular-nums;
     }
     @media (min-width: 1101px) {
@@ -10761,7 +10767,7 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       min-width: 0;
-      font-weight: 600;
+      font-weight: 700;
       padding: 0;
       border-radius: 0;
       background: transparent;
@@ -11857,8 +11863,8 @@ INDEX_HTML = r"""<!doctype html>
             <th class="col-address" style="width: 26%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 6%;">延迟</th>
             <th class="col-speed" style="width: 8%;">速度</th>
-            <th class="col-location" style="width: 12%;">物理位置</th>
-            <th class="col-owner" style="width: 12%;">运营主体 / ISP</th>
+            <th class="col-location" style="width: 16%;">物理位置</th>
+            <th class="col-owner" style="width: 8%;">运营主体 / ISP</th>
             <th class="col-iptype" style="width: 7%;">IP 类型</th>
             <th class="col-actions" style="width: 13%;">操作</th>
           </tr>
@@ -12632,8 +12638,9 @@ function formatNodeLocationRaw(n) {
 }
 
 function formatNodeLocation(n) {
-  const text = formatNodeLocationRaw(n);
-  return String(text || "").replace(/\s+[A-Za-z][A-Za-z0-9 .'-]*$/g, "").trim() || text;
+  const text = String(formatNodeLocationRaw(n) || "");
+  const cleaned = text.replace(/[A-Za-z]+(?:[ .'-][A-Za-z]+)*/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned || text;
 }
 
 function renderProtocolCell(n) {
