@@ -697,8 +697,6 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
     last_activity = time.monotonic()
     association_generation = _current_egress_generation()
     association_iface = get_forward_interface() or ""
-    quic_ready: set[tuple[str, int]] = set()
-    quic_drop_logged = False
     _keep_udp_control(client)
 
     def _drop_upstreams() -> None:
@@ -710,7 +708,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         upstreams.clear()
 
     def _rotate_if_needed() -> bool:
-        nonlocal association_generation, association_iface, quic_drop_logged
+        nonlocal association_generation, association_iface
         current_generation = _current_egress_generation()
         current_iface = get_forward_interface() or ""
         if current_generation == association_generation and current_iface == association_iface:
@@ -718,8 +716,6 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         had_upstream = bool(upstreams)
         old_iface = association_iface
         _drop_upstreams()
-        quic_ready.clear()
-        quic_drop_logged = False
         association_generation = current_generation
         association_iface = current_iface
         if had_upstream:
@@ -792,22 +788,6 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         if now_mono - float(getattr(socks5_udp_associate, "ike_log_at", 0.0)) > 2:
                             socks5_udp_associate.ike_log_at = now_mono
                             print(f"[WiFi Calling] UDP {host}:{port} {len(payload)} bytes", flush=True)
-                    elif port == 443:
-                        # Old QUIC 1-RTT packets stay on the previous path. Only a new
-                        # long-header handshake may leave on this generation.
-                        long_header = bool(payload) and (payload[0] & 0x80) != 0
-                        flow = (host, port)
-                        if long_header:
-                            quic_ready.add(flow)
-                        elif flow not in quic_ready:
-                            if not quic_drop_logged:
-                                quic_drop_logged = True
-                                print(
-                                    f"[SOCKS5 UDP] QUIC 旧 flow 已丢弃 generation={association_generation}，等待新的 Initial",
-                                    flush=True,
-                                )
-                            last_activity = time.monotonic()
-                            continue
                     kind = "wifi" if port in (500, 4500) else ("quic" if port == 443 else "other")
                     sent = False
                     for af, sa in destinations:
