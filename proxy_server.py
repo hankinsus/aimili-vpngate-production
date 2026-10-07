@@ -33,7 +33,7 @@ DNS_NEGATIVE_TTL_SECONDS = 2.0
 DNS_POSITIVE_MIN_SECONDS = 30.0
 DNS_POSITIVE_MAX_SECONDS = 300.0
 DNS_STAGE_TIMEOUT_SECONDS = 1.0
-DNS_TUNNEL_RESOLVERS = ("1.1.1.1", "8.8.8.8")
+DNS_TUNNEL_RESOLVERS = ("8.8.8.8", "8.8.4.4")
 DNS_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
 DNS_CACHE_LOCK = threading.Lock()
 _DNS_FLIGHTS: dict[tuple[str, str], tuple[threading.Event, dict[str, str | None]]] = {}
@@ -933,7 +933,7 @@ def ensure_kernel_socks_outbounds() -> None:
 
 
 def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
-    """Open a new SOCKS5 UDP association and ask 1.1.1.1:53 for example.com."""
+    """Open a new SOCKS5 UDP association and ask 8.8.8.8:53 for example.com."""
     port = int(os.environ.get("LOCAL_PROXY_PORT", "8500"))
     user, password = get_proxy_credentials()
     control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -963,7 +963,7 @@ def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
         dns = _build_dns_query("example.com", 1, tx_id)
         if not dns:
             return {"ok": False, "error": "DNS 查询构造失败"}
-        header = b"\x00\x00\x00\x01" + socket.inet_aton("1.1.1.1") + (53).to_bytes(2, "big")
+        header = b"\x00\x00\x00\x01" + socket.inet_aton("8.8.8.8") + (53).to_bytes(2, "big")
         query.settimeout(timeout)
         query.sendto(header + dns, ("127.0.0.1", relay_port))
         packet, _peer = query.recvfrom(2048)
@@ -1165,8 +1165,8 @@ def _remember_dns(key: tuple[str, str], ip: str | None, raw_ttl: float, now: flo
 def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeout: float = DNS_STAGE_TIMEOUT_SECONDS, iface: str | None = None) -> str | None:
     """Resolve on the same NIC 8500 will bind.
 
-    Direct binds the server NIC. Proxy binds the tunnel NIC. First of 1.1.1.1
-    and 8.8.8.8 wins inside one second. Same name shares one flight. The cache
+    Direct binds the server NIC. Proxy binds the tunnel NIC. 8.8.8.8 and
+    8.8.4.4 race inside one second. Same name shares one flight. The cache
     key includes the NIC, so a mode switch cannot reuse the other path.
     """
     literal = _host_is_ip(host)
@@ -1272,7 +1272,7 @@ def _repair_policy_route(iface: str) -> None:
     table = str(os.environ.get("ACTIVE_ROUTE_TABLE") or "100")
     try:
         probe = subprocess.run(
-            ["ip", "route", "get", "1.1.1.1", "oif", iface],
+            ["ip", "route", "get", "8.8.8.8", "oif", iface],
             capture_output=True, text=True, timeout=2,
         )
     except Exception:

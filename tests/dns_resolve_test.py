@@ -47,7 +47,7 @@ def test_singleflight_and_scope():
     def slow_query(host, qtype, server, timeout, iface):
         calls.append((server, iface))
         time.sleep(0.05)
-        if server == "1.1.1.1":
+        if server == "8.8.8.8":
             return "9.9.9.9", 45
         time.sleep(0.2)
         return "8.8.4.4", 45
@@ -64,9 +64,9 @@ def test_singleflight_and_scope():
     for thread in threads:
         thread.join()
     assert results == ["9.9.9.9"] * 8
-    assert sum(1 for server, _iface in calls if server == "1.1.1.1") == 1
+    assert sum(1 for server, _iface in calls if server == "8.8.8.8") == 1
     assert ps.resolve_dns_over_active_tunnel("google.com", iface="vpn_aimili") == "9.9.9.9"
-    assert sum(1 for server, _iface in calls if server == "1.1.1.1") == 1
+    assert sum(1 for server, _iface in calls if server == "8.8.8.8") == 1
 
     system = []
     ps._system_dns_ipv4 = lambda host, timeout: system.append(host) or "34.4.110.244"

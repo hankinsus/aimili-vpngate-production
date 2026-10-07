@@ -395,9 +395,9 @@ def check_and_fix_dns() -> None:
     # Test IPv4 DNS servers first, then IPv6
     dns_targets = [
         ("8.8.8.8", 53, socket.AF_INET),
-        ("1.1.1.1", 53, socket.AF_INET),
+        ("8.8.4.4", 53, socket.AF_INET),
         ("2001:4860:4860::8888", 53, socket.AF_INET6),
-        ("2606:4700:4700::1111", 53, socket.AF_INET6),
+        ("2001:4860:4860::8844", 53, socket.AF_INET6),
     ]
     for ip, port, af in dns_targets:
         s = None
@@ -423,10 +423,10 @@ def check_and_fix_dns() -> None:
     if resolv_file.exists():
         try:
             content = resolv_file.read_text(encoding="utf-8", errors="replace")
-            if "nameserver 1.1.1.1" not in content and "nameserver 8.8.8.8" not in content:
+            if "nameserver 8.8.8.8" not in content and "nameserver 8.8.4.4" not in content:
                 print("[dns_heal] Resolving names failed, but IP network is OK. Appending public DNS to /etc/resolv.conf...", flush=True)
                 with open("/etc/resolv.conf", "a", encoding="utf-8") as f:
-                    f.write("\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+                    f.write("\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n")
         except Exception as e:
             print(f"[dns_heal] Failed to write DNS fallback: {e}", flush=True)
 
@@ -576,7 +576,7 @@ def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -
 
     # 1. 检查本地 DNS 解析是否完全失效
     dns_ok = False
-    for test_domain in ["api.ipify.org", "dns.google", "one.one.one.one"]:
+    for test_domain in ["api.ipify.org", "dns.google"]:
         try:
             socket.getaddrinfo(test_domain, 443)
             dns_ok = True
@@ -624,9 +624,9 @@ def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -
         # Test both IPv4 and IPv6 external connectivity
         ext_targets = [
             ("8.8.8.8", 53, socket.AF_INET),
-            ("1.1.1.1", 53, socket.AF_INET),
+            ("8.8.4.4", 53, socket.AF_INET),
             ("2001:4860:4860::8888", 53, socket.AF_INET6),
-            ("2606:4700:4700::1111", 53, socket.AF_INET6),
+            ("2001:4860:4860::8844", 53, socket.AF_INET6),
         ]
         for test_ip, test_port, af in ext_targets:
             s = None

@@ -2545,7 +2545,7 @@ def ensure_active_policy_route() -> tuple[bool, str]:
             gateway = ""
     setup_policy_routing(iface, gateway=gateway)
     try:
-        probe = subprocess.run(["ip", "route", "get", "1.1.1.1", "oif", iface], capture_output=True, text=True, timeout=2)
+        probe = subprocess.run(["ip", "route", "get", "8.8.8.8", "oif", iface], capture_output=True, text=True, timeout=2)
     except Exception as exc:
         return False, str(exc)
     text = ((probe.stdout or "") + " " + (probe.stderr or "")).strip()
@@ -6771,7 +6771,7 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
     ]
     try:
         proven = None
-        for url in ("http://1.1.1.1/", "https://1.1.1.1/cdn-cgi/trace", "https://example.com/"):
+        for url in ("https://8.8.8.8/resolve?name=example.com&type=A", "https://www.google.com/generate_204", "https://example.com/"):
             res = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=6)
             parts = (res.stdout or "").strip().split()
             if res.returncode == 0 and len(parts) == 2 and parts[0] in {"200", "204", "301", "302"}:
@@ -6782,7 +6782,7 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
             for label, diag_cmd in [
                 ("addr", ["ip", "-4", "addr", "show", "dev", interface]),
                 ("probe_table", ["ip", "route", "show", "table", str(table)]),
-                ("route_get", ["ip", "route", "get", "1.1.1.1", "oif", interface]),
+                ("route_get", ["ip", "route", "get", "8.8.8.8", "oif", interface]),
             ]:
                 try:
                     diag = subprocess.run(diag_cmd, capture_output=True, text=True, timeout=3)
@@ -17588,7 +17588,7 @@ def check_root_via_interface(interface: str, gateway: str = "", timeout: float =
                 "-w", "%{http_code} %{time_total}",
                 "--connect-timeout", "2",
                 "--max-time", str(timeout),
-                "https://1.1.1.1/cdn-cgi/trace",
+                "https://8.8.8.8/resolve?name=example.com&type=A",
             ],
             capture_output=True, text=True, timeout=timeout + 2,
         )

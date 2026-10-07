@@ -77,7 +77,7 @@ def proxy_business_probe(port: int, timeout: float = 4.0) -> tuple[bool, str]:
         "--proxy", f"socks5h://127.0.0.1:{int(port)}",
         "--connect-timeout", "2",
         "--max-time", str(max(2, int(timeout))),
-        "https://1.1.1.1/cdn-cgi/trace",
+        "https://api.ipify.org",
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
@@ -85,12 +85,8 @@ def proxy_business_probe(port: int, timeout: float = 4.0) -> tuple[bool, str]:
         return False, str(exc)
     if res.returncode != 0:
         return False, (res.stderr or f"curl exit {res.returncode}")[-300:]
-    exit_ip = ""
-    for line in res.stdout.splitlines():
-        if line.startswith("ip="):
-            exit_ip = line.split("=", 1)[1].strip()
-            break
-    return bool(exit_ip), exit_ip or "missing ip= in trace"
+    body = (res.stdout or "").strip()
+    return bool(body and "." in body), body or "missing ip"
 
 
 def wait_for_active(

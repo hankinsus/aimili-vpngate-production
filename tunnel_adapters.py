@@ -1224,61 +1224,32 @@ exit 42
             )
 
         errors: list[str] = []
+        doh_ok: dict[str, Any] | None = None
 
-        # First choice: fixed IP, no DNS dependency, returns the observed exit IP.
-        cf_args = [
+        # Fixed Google address. Do not use 1.1.1.1: that path is Cloudflare and billed.
+        doh_args = [
             "-4", "-k", "-sS",
             "--interface", f"if!{result.inner_interface}",
-            "-w", "\\n%{time_total} %{http_code}",
-            "https://1.1.1.1/cdn-cgi/trace",
+            "-o", "/dev/null",
+            "-w", "%{time_total} %{http_code}",
+            "https://8.8.8.8/resolve?name=example.com&type=A",
             "--connect-timeout", "4",
             "--max-time", "8",
         ]
         try:
-            res = run_in_ns(cf_args)
-            if res.returncode == 0:
-                lines = res.stdout.strip().splitlines()
-                timing = lines[-1].split() if lines else []
-                exit_ip = ""
-                for line in lines[:-1]:
-                    if line.startswith("ip="):
-                        exit_ip = line.split("=", 1)[1].strip()
-                        break
-                if len(timing) == 2 and timing[1] == "200" and exit_ip:
-                    return {
-                        "ok": True,
-                        "ip": exit_ip,
-                        "latency_ms": int(float(timing[0]) * 1000),
-                        "check": "cloudflare-trace",
-                    }
-                errors.append(f"cloudflare_bad_response={lines[-3:] if lines else []}")
-            else:
-                errors.append(f"cloudflare_exit={res.returncode} err={(res.stderr or '').strip()[-500:]}")
-        except Exception as exc:
-            errors.append(f"cloudflare_exception={exc}")
-
-        http_args = [
-            "-4", "-sS",
-            "--interface", f"if!{result.inner_interface}",
-            "-o", "/dev/null",
-            "-w", "%{time_total} %{http_code}",
-            "http://1.1.1.1/",
-            "--connect-timeout", "3",
-            "--max-time", "5",
-        ]
-        try:
-            res = run_in_ns(http_args, command_timeout=6)
+            res = run_in_ns(doh_args)
             parts = (res.stdout or "").strip().split()
-            if res.returncode == 0 and len(parts) == 2 and parts[1] in {"200", "301", "302"}:
-                return {
+            if res.returncode == 0 and len(parts) == 2 and parts[1] in {"200", "400"}:
+                doh_ok = {
                     "ok": True,
                     "ip": "",
                     "latency_ms": int(float(parts[0]) * 1000),
-                    "check": "fixed-ip-http",
+                    "check": "google-doh",
                 }
-            errors.append(f"fixed_ip_http={parts or (res.stderr or '').strip()[-200:]}")
+            else:
+                errors.append(f"google_doh={parts or (res.stderr or '').strip()[-200:]}")
         except Exception as exc:
-            errors.append(f"fixed_ip_http_exception={exc}")
+            errors.append(f"google_doh_exception={exc}")
 
         # Second choice: resolve on root namespace, then force that address in netns.
         try:
@@ -1320,7 +1291,7 @@ exit 42
         for label, cmd in (
             ("addr", ["ip", "netns", "exec", result.namespace, "ip", "-4", "addr", "show", "dev", result.inner_interface]),
             ("route", ["ip", "netns", "exec", result.namespace, "ip", "-4", "route"]),
-            ("route_get", ["ip", "netns", "exec", result.namespace, "ip", "-4", "route", "get", "1.1.1.1"]),
+            ("route_get", ["ip", "netns", "exec", result.namespace, "ip", "-4", "route", "get", "8.8.8.8"]),
         ):
             try:
                 diag = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
@@ -1328,6 +1299,8 @@ exit 42
             except Exception as exc:
                 errors.append(f"{label}_exception={exc}")
 
+        if doh_ok:
+            return doh_ok
         return {"ok": False, "error": " | ".join(errors)[-3500:]}
 
 def capability_report() -> dict[str, Any]:
