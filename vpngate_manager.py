@@ -2061,11 +2061,22 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
+def _delete_route_rules(table: int) -> None:
+    """ip rule del removes a single match. Mode switches used to leave stale oif rules."""
+    for _ in range(32):
+        try:
+            result = subprocess.run(
+                ["ip", "rule", "del", "table", str(table)],
+                capture_output=True, text=True, timeout=2,
+            )
+        except Exception:
+            return
+        if result.returncode != 0:
+            return
+
+
 def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
-    try:
-        subprocess.run(["ip", "rule", "del", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
-    except Exception:
-        pass
+    _delete_route_rules(ACTIVE_ROUTE_TABLE)
     try:
         subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
     except Exception:
@@ -2107,7 +2118,7 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
 
 def cleanup_policy_routing() -> None:
     try:
-        subprocess.run(["ip", "rule", "del", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
+        _delete_route_rules(ACTIVE_ROUTE_TABLE)
         subprocess.run(["ip", "route", "flush", "table", str(ACTIVE_ROUTE_TABLE)], capture_output=True, timeout=2)
         print(f"[policy_routing] Cleared policy routing table {ACTIVE_ROUTE_TABLE}", flush=True)
     except Exception:
@@ -5605,10 +5616,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
 PROBE_ROUTE_TABLE = 200
 
 def cleanup_probe_policy_routing(table: int = PROBE_ROUTE_TABLE) -> None:
-    try:
-        subprocess.run(["ip", "rule", "del", "table", str(table)], capture_output=True, timeout=2)
-    except Exception:
-        pass
+    _delete_route_rules(table)
     try:
         subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
     except Exception:
@@ -15306,14 +15314,15 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测当前活动 VPN 网卡是否存在，不再写死 tun0。
+    # 2. 代理模式才要求隧道网卡存在。直连是空接口，走主机默认路由。
     active_iface = proxy_server.get_active_interface()
-    iface_path = Path("/sys/class/net") / active_iface
-    if sys.platform.startswith("linux") and not iface_path.exists():
-        return {
-            "ok": False,
-            "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 当前 VPN 网卡 ({active_iface}) 不存在，请确保隧道已成功建立"
-        }
+    if active_iface:
+        iface_path = Path("/sys/class/net") / active_iface
+        if sys.platform.startswith("linux") and not iface_path.exists():
+            return {
+                "ok": False,
+                "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 当前 VPN 网卡 ({active_iface}) 不存在，请确保隧道已成功建立"
+            }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
     def _curl_check_ip(url: str) -> dict[str, Any] | None:

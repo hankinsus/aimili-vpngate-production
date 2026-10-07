@@ -26,9 +26,16 @@ proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 # Keep DNS results for a short time so each HTTPS connection does not pay for
 # another DNS round trip over the active VPN interface.
 DNS_CACHE_TTL_SECONDS = 60.0
-DNS_NEGATIVE_TTL_SECONDS = 5.0
-DNS_CACHE: dict[str, tuple[float, str | None]] = {}
+DNS_NEGATIVE_TTL_SECONDS = 15.0
+DNS_POSITIVE_MIN_SECONDS = 30.0
+DNS_POSITIVE_MAX_SECONDS = 300.0
+# One stage. Tunnel UDP is raced inside this budget; system DNS is a second stage only if that fails.
+DNS_STAGE_TIMEOUT_SECONDS = 1.0
+DNS_TUNNEL_RESOLVERS = ("1.1.1.1", "8.8.8.8")
+DNS_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
 DNS_CACHE_LOCK = threading.Lock()
+_DNS_FLIGHTS: dict[tuple[str, str], tuple[threading.Event, dict[str, str | None]]] = {}
+_DNS_BIND_LOG_AT: dict[str, float] = {}
 PROXY_SOCKET_BUFFER_BYTES = 262144
 PROXY_UDP_ASSOCIATION_IDLE_SECONDS = 6 * 3600
 PROXY_UDP_MAX_PACKET_BYTES = 65535
@@ -74,24 +81,45 @@ ACTIVE_IFACE_FILE = DATA_DIR / "active_iface.txt"
 
 _iface_cache_value = ""
 _iface_cache_at = 0.0
+_iface_cache_token: tuple[int, int] | None = None
+_DIRECT_IFACE_SENTINELS = {"", "-", "direct", "default"}
+
+def _normalize_iface(iface: str) -> str:
+    iface = str(iface or "").strip()
+    if iface.lower() in _DIRECT_IFACE_SENTINELS:
+        return ""
+    return iface
 
 def get_active_interface() -> str:
-    global _iface_cache_value, _iface_cache_at
+    """Return the 8500 egress NIC, or "" for direct (host default route).
+
+    Missing, empty, or an explicit direct sentinel must not fall back to tun0.
+    SSL-VPN has no tun0; binding DNS and TCP there blackholes every name.
+    The file mtime is the cross-process switch signal, so a mode change is
+    visible on the next lookup instead of sticking for the cache window.
+    """
+    global _iface_cache_value, _iface_cache_at, _iface_cache_token
     env_iface = str(os.environ.get("ACTIVE_TUNNEL_IFACE") or "").strip()
     if env_iface:
-        return env_iface
-    now = time.monotonic()
-    if _iface_cache_value and now - _iface_cache_at < 0.25:
+        return _normalize_iface(env_iface)
+    try:
+        st = ACTIVE_IFACE_FILE.stat()
+        token = (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        _iface_cache_value = ""
+        _iface_cache_token = None
+        _iface_cache_at = time.monotonic()
+        return ""
+    if token == _iface_cache_token:
         return _iface_cache_value
     try:
-        iface = ACTIVE_IFACE_FILE.read_text(encoding="utf-8").strip()
-        if iface:
-            _iface_cache_value = iface
-            _iface_cache_at = now
-            return iface
+        iface = _normalize_iface(ACTIVE_IFACE_FILE.read_text(encoding="utf-8"))
     except OSError:
-        pass
-    return _iface_cache_value or "tun0"
+        iface = ""
+    _iface_cache_value = iface
+    _iface_cache_token = token
+    _iface_cache_at = time.monotonic()
+    return iface
 
 _last_tuned_iface = ""
 
@@ -153,10 +181,25 @@ def set_active_interface(iface: str) -> None:
     tune_forwarding_interface(iface)
 
 def clear_active_interface() -> None:
+    """Switch 8500 to direct. Write an empty file so the proxy process sees it.
+
+    Unlink used to look like a read error and the proxy kept the previous NIC,
+    or worse, invented tun0.
+    """
+    global _iface_cache_value, _iface_cache_at, _iface_cache_token
     try:
-        ACTIVE_IFACE_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = ACTIVE_IFACE_FILE.with_suffix(".tmp")
+        tmp.write_text("", encoding="utf-8")
+        tmp.replace(ACTIVE_IFACE_FILE)
+    except OSError:
+        try:
+            ACTIVE_IFACE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    _iface_cache_value = ""
+    _iface_cache_token = None
+    _iface_cache_at = 0.0
 
 def parse_int(value: Any) -> int:
     try:
@@ -331,11 +374,15 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
 
 
 def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
+    """Use the same egress-scoped resolver as TCP so UDP does not leak off-tunnel."""
+    ip = resolve_dns_over_active_tunnel(host)
+    if not ip:
+        return []
     try:
         return [
             (af, sa)
             for af, socktype, proto, canonname, sa in socket.getaddrinfo(
-                host, port, 0, socket.SOCK_DGRAM
+                ip, port, 0, socket.SOCK_DGRAM
             )
             if af in (socket.AF_INET, socket.AF_INET6)
         ]
@@ -456,56 +503,41 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
             except Exception:
                 pass
 
-def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
-    import random
-    sock = None
-    try:
-        tx_id = random.getrandbits(16).to_bytes(2, "big")
-        flags = b"\x01\x00"
-        questions = b"\x00\x01"
-        rrs = b"\x00\x00\x00\x00\x00\x00"
-
-        qname = b""
-        for part in host.split("."):
-            if not part:
-                continue
-            part_bytes = part.encode("idna")
-            if len(part_bytes) > 63:
-                return None
-            qname += len(part_bytes).to_bytes(1, "big") + part_bytes
-        qname += b"\x00"
-
-        qtype_qclass = qtype.to_bytes(2, "big") + b"\x00\x01"
-        packet = tx_id + flags + questions + rrs + qname + qtype_qclass
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
-        except OSError as e:
-            if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定当前 VPN 网卡 权限不足，请确保程序以 root 权限运行！", flush=True)
-            elif "no such device" in str(e).lower() or e.errno == 19:
-                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定当前 VPN 网卡 失败，当前活动 VPN 网卡不存在，请检查 VPN 连接！", flush=True)
-            return None
-        sock.sendto(packet, (dns_server, 53))
-        resp, _ = sock.recvfrom(4096)
-    except Exception:
+def _host_is_ip(host: str) -> str | None:
+    host = str(host or "").strip()
+    if not host:
         return None
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+    try:
+        socket.inet_aton(host)
+        return host
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, host)
+        return host
+    except OSError:
+        return None
 
+
+def _build_dns_query(host: str, qtype: int, tx_id: bytes) -> bytes | None:
+    qname = b""
+    for part in host.split("."):
+        if not part:
+            continue
+        part_bytes = part.encode("idna")
+        if len(part_bytes) > 63:
+            return None
+        qname += len(part_bytes).to_bytes(1, "big") + part_bytes
+    qname += b"\x00"
+    return tx_id + b"\x01\x00" + b"\x00\x01" + b"\x00\x00\x00\x00\x00\x00" + qname + qtype.to_bytes(2, "big") + b"\x00\x01"
+
+
+def _parse_dns_a(resp: bytes, tx_id: bytes, qtype: int) -> tuple[str | None, float]:
     try:
         if len(resp) < 12 or resp[:2] != tx_id:
-            return None
-        rcode = resp[3] & 0x0F
-        if rcode != 0:
-            return None
-
+            return None, 0.0
+        if resp[3] & 0x0F:
+            return None, 0.0
         offset = 12
         while offset < len(resp):
             length = resp[offset]
@@ -516,10 +548,9 @@ def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout
                 offset += 2
                 break
             offset += 1 + length
-
         offset += 4
-        answers_count = int.from_bytes(resp[6:8], "big")
-        for _ in range(answers_count):
+        answers = int.from_bytes(resp[6:8], "big")
+        for _ in range(answers):
             if offset >= len(resp):
                 break
             while offset < len(resp):
@@ -533,54 +564,186 @@ def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout
                 offset += 1 + length
             if offset + 10 > len(resp):
                 break
-            atype = int.from_bytes(resp[offset : offset + 2], "big")
-            aclass = int.from_bytes(resp[offset + 2 : offset + 4], "big")
-            rdlength = int.from_bytes(resp[offset + 8 : offset + 10], "big")
+            atype = int.from_bytes(resp[offset:offset + 2], "big")
+            aclass = int.from_bytes(resp[offset + 2:offset + 4], "big")
+            ttl = int.from_bytes(resp[offset + 4:offset + 8], "big")
+            rdlength = int.from_bytes(resp[offset + 8:offset + 10], "big")
             offset += 10
             if offset + rdlength > len(resp):
                 break
-            record = resp[offset : offset + rdlength]
+            record = resp[offset:offset + rdlength]
+            offset += rdlength
             if atype == qtype and aclass == 1:
                 if qtype == 1 and rdlength == 4:
-                    return socket.inet_ntoa(record)
+                    return socket.inet_ntoa(record), float(ttl)
                 if qtype == 28 and rdlength == 16:
-                    return socket.inet_ntop(socket.AF_INET6, record)
-            offset += rdlength
+                    return socket.inet_ntop(socket.AF_INET6, record), float(ttl)
     except Exception:
-        return None
-    return None
+        return None, 0.0
+    return None, 0.0
 
-def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
-    try:
-        socket.inet_aton(host)
-        return host
-    except OSError:
-        pass
-    try:
-        socket.inet_pton(socket.AF_INET6, host)
-        return host
-    except OSError:
-        pass
 
-    key = str(host or "").strip().rstrip(".").lower()
-    if not key:
-        return None
+def _log_dns_bind_failure(iface: str, exc: OSError) -> None:
     now = time.monotonic()
-    with DNS_CACHE_LOCK:
-        cached = DNS_CACHE.get(key)
-        if cached and cached[0] > now:
-            return cached[1]
+    if now - _DNS_BIND_LOG_AT.get(iface, 0.0) < 30.0:
+        return
+    _DNS_BIND_LOG_AT[iface] = now
+    message = str(exc).lower()
+    errno = getattr(exc, "errno", None)
+    if "operation not permitted" in message or errno == 1:
+        print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定当前 VPN 网卡 权限不足，请确保程序以 root 权限运行！", flush=True)
+    elif "no such device" in message or errno == 19:
+        print(f"[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 {iface} 失败，当前活动 VPN 网卡不存在，请检查 VPN 连接！", flush=True)
 
-    resolved = dns_query_over_active_tunnel(key, 1, dns_server, timeout)
-    ttl = DNS_CACHE_TTL_SECONDS if resolved else DNS_NEGATIVE_TTL_SECONDS
+
+def _dns_udp_query(host: str, qtype: int, dns_server: str, timeout: float, iface: str) -> tuple[str | None, float]:
+    import random
+    sock = None
+    try:
+        tx_id = random.getrandbits(16).to_bytes(2, "big")
+        packet = _build_dns_query(host, qtype, tx_id)
+        if packet is None:
+            return None, 0.0
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        if iface:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
+            except OSError as exc:
+                _log_dns_bind_failure(iface, exc)
+                return None, 0.0
+        sock.sendto(packet, (dns_server, 53))
+        resp, _ = sock.recvfrom(4096)
+    except Exception:
+        return None, 0.0
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return _parse_dns_a(resp, tx_id, qtype)
+
+
+def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
+    ip, _ttl = _dns_udp_query(host, qtype, dns_server, timeout, get_active_interface())
+    return ip
+
+
+def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: float) -> tuple[str | None, float]:
+    winner: dict[str, str | float] = {}
+    done = threading.Event()
+
+    def attempt(server: str) -> None:
+        ip, ttl = _dns_udp_query(host, 1, server, timeout, iface)
+        if not ip or done.is_set():
+            return
+        winner["ip"] = ip
+        winner["ttl"] = ttl
+        done.set()
+
+    threads = [threading.Thread(target=attempt, args=(server,), daemon=True) for server in servers]
+    for thread in threads:
+        thread.start()
+    done.wait(timeout)
+    ip = winner.get("ip")
+    ttl = winner.get("ttl")
+    return (str(ip) if ip else None), float(ttl or 0.0)
+
+
+def _system_dns_ipv4(host: str, timeout: float) -> str | None:
+    """Local stub resolver. Used for direct mode, and as a last resort on the tunnel path."""
+    box: dict[str, str] = {}
+
+    def run() -> None:
+        try:
+            infos = socket.getaddrinfo(host, 80, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError:
+            return
+        if infos:
+            box["ip"] = str(infos[0][4][0])
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return box.get("ip")
+
+
+def _remember_dns(key: tuple[str, str], ip: str | None, raw_ttl: float, now: float) -> None:
+    if ip:
+        ttl = raw_ttl if raw_ttl > 0 else DNS_CACHE_TTL_SECONDS
+        ttl = min(DNS_POSITIVE_MAX_SECONDS, max(DNS_POSITIVE_MIN_SECONDS, ttl))
+    else:
+        ttl = DNS_NEGATIVE_TTL_SECONDS
     with DNS_CACHE_LOCK:
-        DNS_CACHE[key] = (now + ttl, resolved)
+        DNS_CACHE[key] = (now + ttl, ip)
         if len(DNS_CACHE) > 1024:
             cutoff = time.monotonic()
-            stale = [k for k, (expiry, _) in DNS_CACHE.items() if expiry <= cutoff]
-            for k in stale[:256]:
-                DNS_CACHE.pop(k, None)
-    return resolved
+            stale = [item for item, (expiry, _ip) in DNS_CACHE.items() if expiry <= cutoff]
+            for item in stale[:256]:
+                DNS_CACHE.pop(item, None)
+
+
+def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeout: float = DNS_STAGE_TIMEOUT_SECONDS, iface: str | None = None) -> str | None:
+    """Resolve on the same egress 8500 will connect through.
+
+    Proxy (iface set): race 1.1.1.1 and 8.8.8.8 bound to that NIC. First answer
+    wins, usually one tunnel RTT, not a 3s serial timeout. Direct (iface empty):
+    ask the host stub and do not bind a device. Concurrent lookups of the same
+    name share one flight. Cache keys include the iface, so 直连/代理切换 drops
+    the other path's answers immediately.
+    """
+    literal = _host_is_ip(host)
+    if literal:
+        return literal
+    key_host = str(host or "").strip().rstrip(".").lower()
+    if not key_host:
+        return None
+    if iface is None:
+        iface = get_active_interface()
+    scope = iface or "@direct"
+    cache_key = (scope, key_host)
+    stage_timeout = timeout if timeout and timeout > 0 else DNS_STAGE_TIMEOUT_SECONDS
+    now = time.monotonic()
+    with DNS_CACHE_LOCK:
+        cached = DNS_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+        flight = _DNS_FLIGHTS.get(cache_key)
+        if flight is None:
+            flight = (threading.Event(), {})
+            _DNS_FLIGHTS[cache_key] = flight
+            owner = True
+        else:
+            owner = False
+    event, box = flight
+    if not owner:
+        event.wait(stage_timeout * 2 + 0.5)
+        return box.get("ip")
+
+    ip: str | None = None
+    raw_ttl = 0.0
+    try:
+        if not iface:
+            ip = _system_dns_ipv4(key_host, stage_timeout)
+        else:
+            servers = []
+            for server in (dns_server, *DNS_TUNNEL_RESOLVERS):
+                server = str(server or "").strip()
+                if server and server not in servers:
+                    servers.append(server)
+            ip, raw_ttl = _race_tunnel_dns(key_host, iface, tuple(servers), stage_timeout)
+            if not ip:
+                ip = _system_dns_ipv4(key_host, stage_timeout)
+                raw_ttl = DNS_POSITIVE_MIN_SECONDS if ip else 0.0
+        box["ip"] = ip
+        _remember_dns(cache_key, ip, raw_ttl, time.monotonic())
+        return ip
+    finally:
+        event.set()
+        with DNS_CACHE_LOCK:
+            _DNS_FLIGHTS.pop(cache_key, None)
+
 
 def _tune_socket(sock: socket.socket) -> socket.socket:
     try:
@@ -620,8 +783,11 @@ def _tune_socket(sock: socket.socket) -> socket.socket:
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_active_tunnel(host)
-    if resolved_ip:
+    iface = get_active_interface()
+    if not _host_is_ip(host):
+        resolved_ip = resolve_dns_over_active_tunnel(host, iface=iface)
+        if not resolved_ip:
+            raise OSError("[DNS] 当前出站模式没有解析结果")
         host = resolved_ip
 
     err = None
@@ -632,7 +798,8 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
             _tune_socket(sock)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, get_active_interface().encode("utf-8"))
+            if iface:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
             sock.connect(sa)
             # The timeout protects only connection establishment. Long-lived
             # HTTPS/WebSocket sessions should not be dropped after 30 seconds
