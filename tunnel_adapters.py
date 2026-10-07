@@ -920,6 +920,10 @@ for _ in $(seq 1 60); do
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
       iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+    iptables -C FORWARD -i "{ns_veth}" -o "$IFACE" -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "{ns_veth}" -o "$IFACE" -j ACCEPT
+    iptables -C FORWARD -i "$IFACE" -o "{ns_veth}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$IFACE" -o "{ns_veth}" -m state --state ESTABLISHED,RELATED -j ACCEPT
     echo "$IFACE" > "{work_dir / 'ppp-iface'}"
     touch "{work_dir / 'ready'}"
     wait "$XL2TP_PID"

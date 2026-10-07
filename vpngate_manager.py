@@ -3578,6 +3578,13 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             message = str(direct_health.get("error") or "候选隧道出口检测失败")
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
             raise RuntimeError(message)
+        if protocol == "l2tp-ipsec":
+            ensure_l2tp_namespace_forward(result)
+            forwarded = check_root_via_interface(str(result.interface or ""), str(result.gateway or ""))
+            layer = "OK" if forwarded.get("ok") else ("FAIL " + str(forwarded.get("error") or ""))
+            log_to_json("INFO", "VPN", f"L2TP inner PPP: OK; root→{result.interface}: {layer}")
+            if not forwarded.get("ok"):
+                raise RuntimeError("L2TP 隧道内部已通，但主网络进不了这条隧道：" + str(forwarded.get("error") or "root→host_veth 失败"))
 
         # Candidate is independently verified. Only now release the old tunnel.
         # Never tear down the live SSTP/L2TP interface if the candidate did not
@@ -3610,7 +3617,11 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         connection_generation += 1
         active_connection_generation = connection_generation
 
-        health = check_proxy_health()
+        health = (
+            {"ok": True, "ip": str(direct_health.get("ip") or ""), "latency_ms": direct_health.get("latency_ms") or 0}
+            if proxy_server.get_egress_mode() == "direct"
+            else check_proxy_health(fast=True)
+        )
         if not health.get("ok"):
             node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "8500 代理出口检测失败"))
             stop_active_external_tunnel()
@@ -3649,6 +3660,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             active_tunnel_protocol=protocol,
             manual_switch_message=("切换完成，正在确认客户端状态…" if manual else ""),
             active_tunnel_interface=result.interface,
+            tunnel_forward_ok=True,
             proxy_ok=True,
             proxy_ip=health.get("ip", ""),
             proxy_latency_ms=latency,
@@ -13694,8 +13706,14 @@ function render(){
     const endpointAddress = addressPair(ep.hostname, ep.current_ip, ep.port);
     const clientBadge = state.connection_status === "connecting"
       ? "正在连接"
-      : (state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证"));
-    const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
+      : (state.egress_mode === "direct"
+        ? (state.proxy_ok ? "直连可用" : "直连不可用")
+        : (state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证")));
+    const clientBadgeClass = state.connection_status === "connecting"
+      ? "not_checked"
+      : (state.egress_mode === "direct"
+        ? (state.proxy_ok ? "available" : "unavailable")
+        : (state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked")));
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
@@ -13733,8 +13751,14 @@ function render(){
     const displayLocationFlag = countryFlag(activeNode.country || displayLocation, displayLocation, "eager");
     const clientBadge = state.connection_status === "connecting"
       ? "正在连接"
-      : (state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证"));
-    const clientBadgeClass = state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked");
+      : (state.egress_mode === "direct"
+        ? (state.proxy_ok ? "直连可用" : "直连不可用")
+        : (state.client_status === "usable" ? "客户端可用" : (state.client_status === "degraded" ? "客户端不可用" : "已连接 · 等待验证")));
+    const clientBadgeClass = state.connection_status === "connecting"
+      ? "not_checked"
+      : (state.egress_mode === "direct"
+        ? (state.proxy_ok ? "available" : "unavailable")
+        : (state.client_status === "usable" ? "available" : (state.client_status === "degraded" ? "unavailable" : "not_checked")));
     const activeAddress = addressPair(activeNode.host_name || activeNode.remote_host, activeNode.ip, activeNode.remote_port);
     activeCardContainer.innerHTML = `
       <div class="active-card">
@@ -17268,7 +17292,116 @@ def reserve_link_probe_bytes(client_ip: str, requested: int) -> tuple[bool, int]
                 link_probe_usage.pop(ip, None)
         return True, 0
 
-def check_proxy_health() -> dict[str, Any]:
+def ensure_l2tp_namespace_forward(result: Any) -> None:
+    """Let packets that arrive from the host veth leave through PPP."""
+    namespace = str(getattr(result, "namespace", "") or "")
+    inner = str(getattr(result, "inner_interface", "") or "")
+    gateway = str(getattr(result, "gateway", "") or "")
+    if not namespace or not inner or not gateway:
+        return
+    try:
+        shown = subprocess.run(
+            ["ip", "netns", "exec", namespace, "ip", "-4", "-o", "addr"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return
+    ns_dev = ""
+    for line in (shown.stdout or "").splitlines():
+        if f"inet {gateway}/" not in line and f"inet {gateway} " not in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            ns_dev = parts[1]
+            break
+    if not ns_dev:
+        return
+    rules = [
+        ["FORWARD", "-i", ns_dev, "-o", inner, "-j", "ACCEPT"],
+        ["FORWARD", "-i", inner, "-o", ns_dev, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+    ]
+    for rule in rules:
+        try:
+            check = subprocess.run(
+                ["ip", "netns", "exec", namespace, "iptables", "-C", *rule],
+                capture_output=True, text=True, timeout=3,
+            )
+            if check.returncode != 0:
+                subprocess.run(
+                    ["ip", "netns", "exec", namespace, "iptables", "-A", *rule],
+                    capture_output=True, text=True, timeout=3,
+                )
+        except Exception:
+            pass
+    try:
+        subprocess.run(
+            ["ip", "netns", "exec", namespace, "sysctl", "-w", "net.ipv4.ip_forward=1"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        pass
+
+
+def check_root_via_interface(interface: str, gateway: str = "", timeout: float = 3) -> dict[str, Any]:
+    """Prove root-namespace traffic enters this NIC, not a curl inside the tunnel namespace."""
+    interface = str(interface or "").strip()
+    if not interface:
+        return {"ok": False, "layer": "root-route", "error": "缺少隧道网卡"}
+    route_ok, route_error = setup_probe_policy_routing(interface, gateway)
+    if not route_ok:
+        return {"ok": False, "layer": "root-route", "error": route_error}
+    try:
+        subprocess.run(
+            ["sysctl", "-w", f"net.ipv4.conf.{interface}.rp_filter=2"],
+            capture_output=True, text=True, timeout=2,
+        )
+        res = subprocess.run(
+            [
+                "curl", "-4", "-k", "-sS",
+                "--interface", f"if!{interface}",
+                "-o", "/dev/null",
+                "-w", "%{http_code} %{time_total}",
+                "--connect-timeout", "2",
+                "--max-time", str(timeout),
+                "https://1.1.1.1/cdn-cgi/trace",
+            ],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        parts = (res.stdout or "").strip().split()
+        if res.returncode == 0 and len(parts) == 2 and parts[0] in {"200", "204", "301", "302"}:
+            return {"ok": True, "layer": "root-interface", "latency_ms": int(float(parts[1]) * 1000)}
+        detail = ((res.stderr or res.stdout or "无响应").strip())[:180]
+        return {"ok": False, "layer": "root-interface", "error": detail or "固定 IP 不通"}
+    except Exception as exc:
+        return {"ok": False, "layer": "root-interface", "error": str(exc)}
+    finally:
+        cleanup_probe_policy_routing()
+
+
+def preflight_proxy_egress() -> tuple[bool, str]:
+    """Fail in about a second when the tunnel NIC cannot carry traffic. Do not wait on 8500."""
+    if not active_tunnel_running():
+        return False, "没有活动隧道"
+    iface = str(proxy_server.get_active_interface() or "").strip()
+    if not iface or not Path("/sys/class/net", iface).exists():
+        return False, f"隧道网卡不存在 {iface or '-'}"
+    tunnel = active_external_tunnel
+    gateway = str(getattr(tunnel, "gateway", "") or "") if tunnel is not None else ""
+    if tunnel is not None and str(getattr(tunnel, "protocol", "") or "") == "l2tp-ipsec":
+        ensure_l2tp_namespace_forward(tunnel)
+    ready, detail = ensure_active_policy_route()
+    if not ready:
+        log_to_json("WARNING", "Proxy", f"table100: FAIL {detail}")
+        return False, "table100: " + detail
+    probed = check_root_via_interface(iface, gateway, timeout=3)
+    if not probed.get("ok"):
+        log_to_json("WARNING", "Proxy", f"root→{iface}: FAIL {probed.get('error') or ''}")
+        return False, f"root→{iface}: {probed.get('error') or '不通'}"
+    log_to_json("INFO", "Proxy", f"root→{iface}: OK")
+    return True, iface
+
+
+def check_proxy_health(fast: bool = False) -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
@@ -17382,16 +17515,18 @@ def check_proxy_health() -> dict[str, Any]:
         # the tunnel and used to hold 「切换中」 for ~20s, then revert a path
         # that could already open web pages.
         result = None
+        page_budget = 2 if fast else 4
         for url in ("https://example.com/", "https://www.google.com/generate_204"):
-            result = _curl_via_proxy(url, 4, False)
+            result = _curl_via_proxy(url, page_budget, False)
             if result:
                 break
         if not result:
-            return {"ok": False, "error": "出口连接测试失败 (example.com 与 google 均无法连通)"}
-        identity = _curl_via_proxy("http://api.ipify.org", 2, True)
-        if identity and identity.get("ip"):
-            result["ip"] = identity["ip"]
-            result["latency_ms"] = identity.get("latency_ms") or result.get("latency_ms")
+            return {"ok": False, "error": "8500 SOCKS5H: FAIL", "layer": "8500"}
+        if not fast:
+            identity = _curl_via_proxy("http://api.ipify.org", 2, True)
+            if identity and identity.get("ip"):
+                result["ip"] = identity["ip"]
+                result["latency_ms"] = identity.get("latency_ms") or result.get("latency_ms")
         return result
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
@@ -17423,13 +17558,7 @@ def _refresh_egress_health(mode: str, previous: str = "") -> None:
             suspend_policy_routing()
         else:
             ensure_active_policy_route()
-        health = check_proxy_health()
-        if not health.get("ok") and proxy_server.get_egress_mode() == mode:
-            if mode == "direct":
-                suspend_policy_routing()
-            else:
-                ensure_active_policy_route()
-            health = check_proxy_health()
+        health = check_proxy_health(fast=True)
         if proxy_server.get_egress_mode() != mode:
             return
         if health.get("ok"):
@@ -19360,6 +19489,10 @@ class Handler(BaseHTTPRequestHandler):
                     ready, detail = ensure_active_policy_route()
                     if not ready:
                         self.send_json({"ok": False, "error": "代理出口路由未就绪：" + detail}, HTTPStatus.CONFLICT)
+                        return
+                    path_ok, path_detail = preflight_proxy_egress()
+                    if not path_ok:
+                        self.send_json({"ok": False, "error": "代理预检失败：" + path_detail}, HTTPStatus.CONFLICT)
                         return
                 proxy_server.set_egress_mode(mode)
                 _wait_egress_applied(mode, timeout=1.2)
