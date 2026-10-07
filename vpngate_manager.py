@@ -13371,7 +13371,6 @@ function egressHealthBadge(state) {
   const proxyOk = triState(state.client_proxy_ok);
   if ((proxyOk === true || state.client_status === 'usable') && udpDown) return ['UDP异常', 'unavailable'];
   if ((proxyOk === true || state.client_status === 'usable') && quicDown) return ['QUIC异常', 'unavailable'];
-  if ((proxyOk === true || state.client_status === 'usable') && state.dataplane_jitter) return ['数据面抖动', 'unavailable'];
   if (proxyOk === true || state.client_status === 'usable') return ['客户端可用', 'available'];
   if (proxyOk === false || state.client_status === 'degraded') return ['客户端不可用', 'unavailable'];
   return ['已连接 · 等待验证', 'not_checked'];
@@ -14591,8 +14590,8 @@ function render(){
       if (proxyOk === true) {
         const udpDown = triState(state.client_udp_ok) === false;
         const quicDown = triState(state.client_quic_ok) === false;
-        pBadge.className = (udpDown || quicDown || state.dataplane_jitter) ? "badge unavailable" : "badge available";
-        pBadge.textContent = udpDown ? "UDP异常" : (quicDown ? "QUIC异常" : (state.dataplane_jitter ? "数据面抖动" : "客户端可用"));
+        pBadge.className = (udpDown || quicDown) ? "badge unavailable" : "badge available";
+        pBadge.textContent = udpDown ? "UDP异常" : (quicDown ? "QUIC异常" : "客户端可用");
         pIpVal.textContent = state.proxy_ip || "-";
         const latencyClass = getLatencyClass(state.proxy_latency_ms);
         pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;

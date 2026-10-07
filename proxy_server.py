@@ -412,7 +412,9 @@ def dataplane_snapshot() -> dict[str, Any]:
         delta = max(0, retrans - int(base[1]))
         fallback_delta = max(0, int(_dataplane["quic_fallback_tcp"]) - int(base[2]))
         recent_tcp = sum(1 for item in _tcp443_at if now - item <= 15)
-        jitter = delta >= 20 or fallback_delta >= 3
+        # Whole-host RetransSegs also counts probes. A healthy Japan path
+        # can retransmit a few dozen segments with no client session open.
+        jitter = tcp_sessions > 0 and (delta >= 80 or fallback_delta >= 8)
         _dataplane["tcp_retrans_delta"] = delta
         _dataplane["tcp443_flows"] = recent_tcp
         _dataplane["jitter"] = jitter
