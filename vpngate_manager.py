@@ -10300,6 +10300,10 @@ INDEX_HTML = r"""<!doctype html>
       font-variant-numeric: tabular-nums;
     }
 
+    table.node-table td {
+      font-weight: 600;
+    }
+
     th, td {
       padding: 6px 8px;
       border-bottom: 1px solid var(--border-color);
@@ -10383,9 +10387,17 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
 
+    .col-latency,
+    .col-speed,
+    .node-latency-cell,
+    .node-speed-cell {
+      padding-left: 2px;
+      padding-right: 2px;
+    }
+
     .node-address-cell .mono {
       font-size: 13px;
-      font-weight: 400;
+      font-weight: 600;
       color: #8eb8c4;
       letter-spacing: 0;
       display: block;
@@ -10405,8 +10417,8 @@ INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
     }
     .node-domain {
-      font-size: 12px;
-      font-weight: 500;
+      font-size: 13px;
+      font-weight: 600;
       color: #d5dee8;
       display: block;
       white-space: nowrap;
@@ -10429,7 +10441,7 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-block;
       min-width: 0;
       white-space: nowrap;
-      font-weight: 500;
+      font-weight: 600;
       font-size: 13px;
       color: #b7c3ce;
       font-variant-numeric: tabular-nums;
@@ -10749,7 +10761,7 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       min-width: 0;
-      font-weight: 400;
+      font-weight: 600;
       padding: 0;
       border-radius: 0;
       background: transparent;
@@ -11841,12 +11853,12 @@ INDEX_HTML = r"""<!doctype html>
         <thead>
           <tr>
             <th class="col-status" style="width: 7%;">状态</th>
-            <th class="col-protocol" style="width: 10%;">协议</th>
-            <th class="col-address" style="width: 16%;">域名 : 端口 / IP</th>
-            <th class="col-latency" style="width: 7%;">延迟</th>
-            <th class="col-speed" style="width: 10%;">速度</th>
-            <th class="col-location" style="width: 16%;">物理位置</th>
-            <th class="col-owner" style="width: 14%;">运营主体 / ISP</th>
+            <th class="col-protocol" style="width: 9%;">协议</th>
+            <th class="col-address" style="width: 26%;">域名 : 端口 / IP</th>
+            <th class="col-latency" style="width: 6%;">延迟</th>
+            <th class="col-speed" style="width: 8%;">速度</th>
+            <th class="col-location" style="width: 12%;">物理位置</th>
+            <th class="col-owner" style="width: 12%;">运营主体 / ISP</th>
             <th class="col-iptype" style="width: 7%;">IP 类型</th>
             <th class="col-actions" style="width: 13%;">操作</th>
           </tr>
@@ -12594,7 +12606,7 @@ const base=p=>(p||"").split(/[\\/]/).pop();
 
 function getProtocolUrl(n) { return ""; }
 
-function formatNodeLocation(n) {
+function formatNodeLocationRaw(n) {
   const country = getNodeCountry(n);
   let location = String(n && n.location || "").trim().replace(/\s+/g, " ");
   if (!country) return location || "—";
@@ -12617,6 +12629,11 @@ function formatNodeLocation(n) {
     location = location.slice(enMatch[0].length).trim();
   }
   return location ? (location === country || location.startsWith(country + " ") ? location : country + " " + location) : country;
+}
+
+function formatNodeLocation(n) {
+  const text = formatNodeLocationRaw(n);
+  return String(text || "").replace(/\s+[A-Za-z][A-Za-z0-9 .'-]*$/g, "").trim() || text;
 }
 
 function renderProtocolCell(n) {
