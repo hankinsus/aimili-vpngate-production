@@ -7829,6 +7829,11 @@ def global_scan_settings() -> dict[str, Any]:
         hour = 0
     hour = max(0, min(23, hour))
     try:
+        interval = int(cfg.get("global_scan_interval_hours") if cfg.get("global_scan_interval_hours") is not None else 1)
+    except (TypeError, ValueError):
+        interval = 1
+    interval = max(1, min(24, interval))
+    try:
         last = float(cfg.get("last_global_scan_at") or 0)
     except (TypeError, ValueError):
         last = 0.0
@@ -7836,6 +7841,7 @@ def global_scan_settings() -> dict[str, Any]:
         "auto": bool(cfg.get("global_scan_auto")),
         "mode": mode,
         "hour": hour,
+        "interval": interval,
         "last": last,
     }
 
@@ -7846,6 +7852,7 @@ def global_scan_public_state() -> dict[str, Any]:
         "global_scan_auto": settings["auto"],
         "global_scan_mode": settings["mode"],
         "global_scan_hour": settings["hour"],
+        "global_scan_interval_hours": settings["interval"],
         "last_global_scan_at": settings["last"],
     }
 
@@ -7861,6 +7868,15 @@ def save_global_scan_settings(changes: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         hour = current["hour"]
     hour = max(0, min(23, hour))
+    try:
+        interval = int(changes.get("global_scan_interval_hours") if "global_scan_interval_hours" in changes else current["interval"])
+    except (TypeError, ValueError):
+        interval = current["interval"]
+    interval = max(1, min(24, interval))
+    if mode == "loop":
+        hour = current["hour"]
+    else:
+        interval = current["interval"]
     with lock:
         path = DATA_DIR / "ui_auth.json"
         stored: dict[str, Any] = {}
@@ -7874,6 +7890,7 @@ def save_global_scan_settings(changes: dict[str, Any]) -> dict[str, Any]:
         stored["global_scan_auto"] = auto
         stored["global_scan_mode"] = mode
         stored["global_scan_hour"] = hour
+        stored["global_scan_interval_hours"] = interval
         write_json(path, stored)
     invalidate_ui_config_cache()
     return global_scan_public_state()
@@ -7905,10 +7922,13 @@ def global_scan_due(now: float | None = None) -> bool:
             remember_global_scan(now)
             return False
         return (now - last) >= 6 * 3600
+    if settings["mode"] == "loop":
+        last = settings["last"]
+        if last <= 0:
+            return True
+        return (now - last) >= int(settings["interval"]) * 3600
     if local.tm_hour < settings["hour"]:
         return False
-    if settings["mode"] == "loop":
-        return True
     if settings["last"] <= 0:
         return True
     previous = time.localtime(settings["last"])
@@ -12351,22 +12371,22 @@ INDEX_HTML = r"""<!doctype html>
             <div id="library_scan_mode_menu" class="toolbar-custom-select-menu" role="listbox"></div>
           </div>
           <select id="library_scan_hour" aria-hidden="true" tabindex="-1" style="display:none;">
-            <option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option>
-            <option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option>
-            <option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option>
-            <option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option>
-            <option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option>
-            <option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option>
+            <option value="1">1小时</option><option value="2">2小时</option><option value="3">3小时</option><option value="4">4小时</option>
+            <option value="5">5小时</option><option value="6">6小时</option><option value="7">7小时</option><option value="8">8小时</option>
+            <option value="9">9小时</option><option value="10">10小时</option><option value="11">11小时</option><option value="12">12小时</option>
+            <option value="13">13小时</option><option value="14">14小时</option><option value="15">15小时</option><option value="16">16小时</option>
+            <option value="17">17小时</option><option value="18">18小时</option><option value="19">19小时</option><option value="20">20小时</option>
+            <option value="21">21小时</option><option value="22">22小时</option><option value="23">23小时</option><option value="24">24小时</option>
           </select>
-          <div id="library_scan_hour_widget" class="toolbar-custom-select unified-select library-scan-select" data-unified-select-id="library_scan_hour" aria-label="开始时间">
+          <div id="library_scan_hour_widget" class="toolbar-custom-select unified-select library-scan-select" data-unified-select-id="library_scan_hour" aria-label="间隔">
             <button id="library_scan_hour_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-              <span id="library_scan_hour_label" class="toolbar-custom-select-label">00:00</span>
+              <span id="library_scan_hour_label" class="toolbar-custom-select-label">1小时</span>
               <span class="toolbar-custom-select-arrow">⌄</span>
             </button>
             <div id="library_scan_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
           </div>
         </div>
-        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">不勾选时，每 6 小时在空闲时检测一次。勾选后才按上面的时间开始，系统忙就等到空闲。</div>
+        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">不勾选时，每 6 小时在空闲时检测一次。勾选循环后按右边的间隔重复；每天或星期几按右边的钟点开始。系统忙就等到空闲。</div>
       </div>
       <div style="display:flex; gap:12px; margin-top:18px;">
         <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">手动检测</button>
@@ -16165,6 +16185,23 @@ if (libraryToggle) libraryToggle.onclick = () => {
 const libraryStop = $("library_check_stop");
 if (libraryStop) libraryStop.onclick = () => libraryCheckAction("stop");
 
+function fillLibraryScanHourOptions(mode) {
+  const hour = $("library_scan_hour");
+  if (!hour) return;
+  const loop = String(mode || "loop") === "loop";
+  const kind = loop ? "interval" : "clock";
+  if (hour.dataset.kind === kind) return;
+  const previous = Number(hour.value || 0);
+  const values = loop
+    ? Array.from({length: 24}, (_, index) => ({value: index + 1, text: (index + 1) + "小时"}))
+    : Array.from({length: 24}, (_, index) => ({value: index, text: String(index).padStart(2, "0") + ":00"}));
+  hour.innerHTML = values.map(item => '<option value="' + item.value + '">' + item.text + '</option>').join("");
+  hour.value = String(loop ? (previous >= 1 && previous <= 24 ? previous : 1) : Math.max(0, Math.min(23, previous)));
+  hour.dataset.kind = kind;
+  const widget = $("library_scan_hour_widget");
+  if (widget) widget.setAttribute("aria-label", loop ? "间隔" : "开始时间");
+}
+
 function paintLibraryScanForm(snapshot) {
   const hour = $("library_scan_hour");
   const mode = $("library_scan_mode");
@@ -16175,20 +16212,28 @@ function paintLibraryScanForm(snapshot) {
   if (mode && !modeOpen && snapshot && snapshot.global_scan_mode && mode.value !== snapshot.global_scan_mode) {
     mode.value = snapshot.global_scan_mode;
   }
-  if (hour && !hourOpen && snapshot && snapshot.global_scan_hour != null && hour.value !== String(snapshot.global_scan_hour)) {
-    hour.value = String(snapshot.global_scan_hour);
-  }
+  const modeValue = (mode && mode.value) || "loop";
+  fillLibraryScanHourOptions(modeValue);
+  const stored = modeValue === "loop"
+    ? (snapshot && snapshot.global_scan_interval_hours != null ? snapshot.global_scan_interval_hours : 1)
+    : (snapshot && snapshot.global_scan_hour != null ? snapshot.global_scan_hour : 0);
+  if (hour && !hourOpen && stored != null && hour.value !== String(stored)) hour.value = String(stored);
   if (!modeOpen) renderUnifiedSelect("library_scan_mode");
   if (!hourOpen) renderUnifiedSelect("library_scan_hour");
 }
 
 function saveLibraryScanForm() {
+  const modeValue = ($("library_scan_mode") && $("library_scan_mode").value) || "loop";
+  fillLibraryScanHourOptions(modeValue);
   const hour = $("library_scan_hour");
+  const picked = Number(hour && hour.value || (modeValue === "loop" ? 1 : 0));
   libraryCheckAction("save_schedule", {
     global_scan_auto: !!($("library_scan_auto") && $("library_scan_auto").checked),
-    global_scan_mode: ($("library_scan_mode") && $("library_scan_mode").value) || "loop",
-    global_scan_hour: Number(hour && hour.value || 0)
+    global_scan_mode: modeValue,
+    global_scan_hour: modeValue === "loop" ? undefined : picked,
+    global_scan_interval_hours: modeValue === "loop" ? picked : undefined
   });
+  renderUnifiedSelect("library_scan_hour");
 }
 ["library_scan_auto", "library_scan_mode", "library_scan_hour"].forEach((id) => {
   const el = $(id);
