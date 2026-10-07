@@ -10461,7 +10461,7 @@ INDEX_HTML = r"""<!doctype html>
 
     .node-address-cell .mono {
       font-size: 14px;
-      font-weight: 600;
+      font-weight: 700;
       color: #7f96a3;
       letter-spacing: 0;
       display: block;
@@ -10505,7 +10505,7 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-block;
       min-width: 0;
       white-space: nowrap;
-      font-weight: 600;
+      font-weight: 700;
       font-size: 13px;
       color: #8b9eaa;
       font-variant-numeric: tabular-nums;
@@ -11918,11 +11918,11 @@ INDEX_HTML = r"""<!doctype html>
           <tr>
             <th class="col-status" style="width: 7%;">状态</th>
             <th class="col-protocol" style="width: 9%;">协议</th>
-            <th class="col-address" style="width: 26%;">域名 : 端口 / IP</th>
+            <th class="col-address" style="width: 22%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 6%;">延迟</th>
-            <th class="col-speed" style="width: 8%;">速度</th>
-            <th class="col-location" style="width: 16%;">物理位置</th>
-            <th class="col-owner" style="width: 8%;">运营主体 / ISP</th>
+            <th class="col-speed" style="width: 7%;">速度</th>
+            <th class="col-location" style="width: 13%;">物理位置</th>
+            <th class="col-owner" style="width: 16%;">运营主体 / ISP</th>
             <th class="col-iptype" style="width: 7%;">IP 类型</th>
             <th class="col-actions" style="width: 13%;">操作</th>
           </tr>
