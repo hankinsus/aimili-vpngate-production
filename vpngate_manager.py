@@ -3164,7 +3164,9 @@ def manual_direct_verify(value: str, promote: bool = True) -> dict[str, Any]:
                 candidates = sorted(candidates, key=lambda item: 0 if str(item[0]).lower() == "tcp" else 1)
             protocol_passed = False
             for transport, test_port in candidates:
-                reachable = protocol == "l2tp-ipsec" or int(test_port or 0) <= 0 or _tcp_port_open(resolved_ip or host, int(test_port))
+                transport_name = str(transport or "").strip().lower()
+                udp_endpoint = protocol == "l2tp-ipsec" or transport_name == "udp"
+                reachable = udp_endpoint or int(test_port or 0) <= 0 or _tcp_port_open(resolved_ip or host, int(test_port))
                 if not reachable:
                     attempts.append({
                         "protocol": protocol,
@@ -3569,6 +3571,8 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
 
         if manual:
             set_state(manual_switch_message="目标隧道已建立，正在验证真实出口与网络质量…", last_check_message="目标节点已建立隧道，正在进行真实出口验证…")
+        if protocol == "l2tp-ipsec":
+            ensure_l2tp_namespace_forward(result)
         direct_health = (
             tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
             if protocol == "l2tp-ipsec"
@@ -3578,13 +3582,14 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             message = str(direct_health.get("error") or "候选隧道出口检测失败")
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
             raise RuntimeError(message)
+        local_forward_note = ""
         if protocol == "l2tp-ipsec":
-            ensure_l2tp_namespace_forward(result)
             forwarded = check_root_via_interface(str(result.interface or ""), str(result.gateway or ""))
             layer = "OK" if forwarded.get("ok") else ("FAIL " + str(forwarded.get("error") or ""))
             log_to_json("INFO", "VPN", f"L2TP inner PPP: OK; root→{result.interface}: {layer}")
             if not forwarded.get("ok"):
-                raise RuntimeError("L2TP 隧道内部已通，但主网络进不了这条隧道：" + str(forwarded.get("error") or "root→host_veth 失败"))
+                local_forward_note = "节点可用，本机转发未通过：" + str(forwarded.get("error") or "root→host_veth 失败")
+                node_pool.note_local_forward(endpoint_id, False, local_forward_note)
 
         # Candidate is independently verified. Only now release the old tunnel.
         # Never tear down the live SSTP/L2TP interface if the candidate did not
@@ -3660,13 +3665,13 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             active_tunnel_protocol=protocol,
             manual_switch_message=("切换完成，正在确认客户端状态…" if manual else ""),
             active_tunnel_interface=result.interface,
-            tunnel_forward_ok=True,
+            tunnel_forward_ok=not bool(local_forward_note),
             proxy_ok=True,
             proxy_ip=health.get("ip", ""),
             proxy_latency_ms=latency,
-            proxy_error="",
+            proxy_error=local_forward_note,
             is_connecting=False,
-            last_check_message=f"Connected {protocol} {endpoint_id}",
+            last_check_message=local_forward_note or f"Connected {protocol} {endpoint_id}",
         )
         log_to_json(
             "INFO",
@@ -6907,20 +6912,21 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             return {"ok": False, "protocol": protocol, "error": message}
 
         if protocol == "l2tp-ipsec":
+            ensure_l2tp_namespace_forward(result)
             inner = tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
             if not inner.get("ok"):
                 message = "L2TP 已拨通，但 PPP 出不了网"
                 node_pool.mark_endpoint_degraded(endpoint_id, message)
                 log_to_json("INFO", "Probe", f"L2TP inner PPP: FAIL {endpoint_id}")
                 return {"ok": False, "protocol": protocol, "error": message}
-            ensure_l2tp_namespace_forward(result)
             forwarded = check_root_via_interface(str(result.interface or ""), str(result.gateway or ""))
             if not forwarded.get("ok"):
-                message = "L2TP PPP 通，但主机进不了隧道"
-                node_pool.mark_endpoint_degraded(endpoint_id, message)
+                note = "节点可用，本机转发未通过"
+                node_pool.note_local_forward(endpoint_id, False, note)
                 log_to_json("INFO", "Probe", f"L2TP inner PPP: OK; root→{result.interface}: FAIL {endpoint_id}")
-                return {"ok": False, "protocol": protocol, "error": message}
-            log_to_json("INFO", "Probe", f"L2TP inner PPP: OK; root→{result.interface}: OK {endpoint_id}")
+            else:
+                node_pool.note_local_forward(endpoint_id, True, "")
+                log_to_json("INFO", "Probe", f"L2TP inner PPP: OK; root→{result.interface}: OK {endpoint_id}")
 
         latency_ms = max(1, int((time.perf_counter() - started) * 1000))
         probe_message = f"{protocol} 生产出口可用 {latency_ms} ms"
@@ -12295,7 +12301,7 @@ INDEX_HTML = r"""<!doctype html>
 
       <div class="add-node-flow">
         <div class="add-node-flow-title">识别流程</div>
-        <div>先读取官方端口，再用约 1 秒确认端口是否开放。没开放的直接跳过，不再空等完整握手。开放的端口按 OpenVPN → SSL-VPN → L2TP/IPsec → MS-SSTP 真连接，通过的才入库并置顶。</div>
+        <div>TCP 端口先用约 1 秒确认是否开放，没开放就跳过。UDP（含 L2TP、OpenVPN UDP）不做端口探测，直接做真实连接。通过的才入库并置顶。</div>
       </div>
 
       <div id="add_node_result" style="display:none; margin-top:14px;"></div>
@@ -17363,30 +17369,36 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
             break
     if not ns_dev:
         return
-    rules = [
-        ["FORWARD", "-i", ns_dev, "-o", inner, "-j", "ACCEPT"],
-        ["FORWARD", "-i", inner, "-o", ns_dev, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-    ]
-    for rule in rules:
-        try:
-            check = subprocess.run(
-                ["ip", "netns", "exec", namespace, "iptables", "-C", *rule],
-                capture_output=True, text=True, timeout=3,
-            )
-            if check.returncode != 0:
-                subprocess.run(
-                    ["ip", "netns", "exec", namespace, "iptables", "-A", *rule],
-                    capture_output=True, text=True, timeout=3,
-                )
-        except Exception:
-            pass
     try:
+        subprocess.run(
+            ["ip", "netns", "exec", namespace, "ip", "link", "set", inner, "mtu", "1200"],
+            capture_output=True, text=True, timeout=3,
+        )
         subprocess.run(
             ["ip", "netns", "exec", namespace, "sysctl", "-w", "net.ipv4.ip_forward=1"],
             capture_output=True, text=True, timeout=3,
         )
     except Exception:
         pass
+    rules = [
+        ["filter", "FORWARD", "-i", ns_dev, "-o", inner, "-j", "ACCEPT"],
+        ["filter", "FORWARD", "-i", inner, "-o", ns_dev, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+    ]
+    for table, *rule in rules:
+        try:
+            check = subprocess.run(
+                ["ip", "netns", "exec", namespace, "iptables", "-t", table, "-C", *rule],
+                capture_output=True, text=True, timeout=3,
+            )
+            if check.returncode != 0:
+                subprocess.run(
+                    ["ip", "netns", "exec", namespace, "iptables", "-t", table, "-A", *rule],
+                    capture_output=True, text=True, timeout=3,
+                )
+        except Exception:
+            pass
 
 
 def check_root_via_interface(interface: str, gateway: str = "", timeout: float = 3) -> dict[str, Any]:
@@ -19540,9 +19552,9 @@ class Handler(BaseHTTPRequestHandler):
                     path_ok, path_detail = preflight_proxy_egress()
                     if not path_ok:
                         if active_pool_endpoint_id:
-                            node_pool.mark_endpoint_degraded(str(active_pool_endpoint_id), path_detail)
-                        set_state(last_check_message="代理预检失败：" + path_detail, proxy_error=path_detail)
-                        self.send_json({"ok": False, "error": "代理预检失败：" + path_detail}, HTTPStatus.CONFLICT)
+                            node_pool.note_local_forward(str(active_pool_endpoint_id), False, path_detail)
+                        set_state(last_check_message="本机代理转发失败：" + path_detail, proxy_error=path_detail)
+                        self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
                         return
                 proxy_server.set_egress_mode(mode)
                 _wait_egress_applied(mode, timeout=1.2)

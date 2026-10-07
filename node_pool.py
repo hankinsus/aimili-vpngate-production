@@ -1401,6 +1401,35 @@ class NodePool:
         self._invalidate_read_caches()
         return True
 
+    def note_local_forward(self, endpoint_id: str, ok: bool, message: str = "") -> bool:
+        """Record whether this server can forward into the tunnel. Does not change node availability."""
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return False
+        note = str(message or "")[:1000]
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute("SELECT metadata_json FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
+            if not row:
+                return False
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["local_forward_ok"] = bool(ok)
+            if ok:
+                meta.pop("local_forward_error", None)
+            else:
+                meta["local_forward_error"] = note or "本机代理转发失败"
+            db.execute(
+                "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                (json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+            db.commit()
+        self._invalidate_read_caches()
+        return True
+
     def note_tcp_rtt(self, endpoint_id: str, latency_ms: int) -> None:
         """Store a TCP port round trip. It is a valid latency, not a tunnel dial."""
         endpoint_id = str(endpoint_id or "").strip()
