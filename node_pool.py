@@ -1001,7 +1001,7 @@ class NodePool:
             base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
             stale = self._scoped_page_stale.get(cache_key)
             try:
-                with closing(self._connect(400, readonly=True)) as db:
+                with closing(self._connect(4000, readonly=True)) as db:
                     total=int(db.execute(
                         "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
                         params,
@@ -1122,7 +1122,7 @@ class NodePool:
             cached = self._country_catalog_cache.get(key)
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
-            with closing(self._connect(800, readonly=True)) as db:
+            with closing(self._connect(4000, readonly=True)) as db:
                 grouped = db.execute(
                     "SELECT s.country AS country, "
                     "COUNT(DISTINCT s.current_ip) AS ip_count, "
@@ -1166,7 +1166,7 @@ class NodePool:
         endpoint_id = str(endpoint_id or "").strip()
         if not endpoint_id:
             return None
-        with closing(self._connect(400, readonly=True)) as db:
+        with closing(self._connect(4000, readonly=True)) as db:
             row = db.execute(
                 """
                 SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state,
@@ -1804,7 +1804,7 @@ class NodePool:
             )
             empty = {"usable": 0, "available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
             try:
-                with closing(self._connect(400, readonly=True)) as db:
+                with closing(self._connect(4000, readonly=True)) as db:
                     row = db.execute(sql, select_params + params).fetchone()
             except sqlite3.OperationalError:
                 if cached:
@@ -1827,7 +1827,7 @@ class NodePool:
         if cached and cached[0] > now:
             return dict(cached[1])
         try:
-            with closing(self._connect(400, readonly=True)) as db:
+            with closing(self._connect(4000, readonly=True)) as db:
                 servers = int(db.execute("SELECT COUNT(*) c FROM servers").fetchone()["c"] or 0)
                 endpoints = int(db.execute("SELECT COUNT(*) c FROM endpoints").fetchone()["c"] or 0)
                 distinct_ips = int(db.execute("SELECT COUNT(DISTINCT current_ip) c FROM servers WHERE TRIM(COALESCE(current_ip,''))<>''").fetchone()["c"] or 0)
@@ -1850,7 +1850,7 @@ class NodePool:
             sql += " WHERE UPPER(COALESCE(status,''))!='RETIRED'"
         sql += " GROUP BY 1"
         try:
-            with closing(self._connect(400, readonly=True)) as db:
+            with closing(self._connect(4000, readonly=True)) as db:
                 rows = db.execute(sql).fetchall()
         except sqlite3.OperationalError:
             return {}

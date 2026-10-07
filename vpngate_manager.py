@@ -15299,8 +15299,9 @@ async function loadScope(country, {preserveState = true, signal = null} = {}) {
         const b = translateCountry(scope) || scope;
         return a === scope || b === rawCountry || a === b;
       });
+      const catalogTotal = Number(countryCatalogData.total_ip_count || 0);
       const ipCount = Number(selected?.[1]?.ip_count || 0);
-      if (!selected || ipCount <= 0) {
+      if (catalogTotal > 0 && (!selected || ipCount <= 0)) {
         nodes = [];
         totalNodeCount = 0;
         nodeListLoading = false;
