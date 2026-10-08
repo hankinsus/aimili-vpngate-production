@@ -3856,6 +3856,18 @@ def routing_block_rules(ui_cfg: dict[str, Any]) -> list[str]:
         text = str(ui_cfg.get("routing_blocklist") or "")
     return [line.strip().lower() for line in text.splitlines() if line.strip()]
 
+def _block_rule_is_ip(rule: str) -> bool:
+    return bool(re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", rule) or re.fullmatch(r"(?:\d{1,3}\.){1,3}\*", rule))
+
+def _ip_rule_matches(rule: str, ip: str) -> bool:
+    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip):
+        return False
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", rule):
+        return rule == ip
+    if not re.fullmatch(r"(?:\d{1,3}\.){1,3}\*", rule):
+        return False
+    return ip.startswith(rule[:-1])
+
 def _block_rule_matches(rule: str, value: str) -> bool:
     if not rule or not value:
         return False
@@ -3891,8 +3903,13 @@ def endpoint_is_blocked(endpoint: dict[str, Any] | None, ui_cfg: dict[str, Any])
         return False
     if "*" in rules:
         return True
-    for value in endpoint_block_values(endpoint):
-        if any(_block_rule_matches(rule, value) for rule in rules):
+    ips = [value for value in endpoint_block_values(endpoint) if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value)]
+    hosts = [value for value in endpoint_block_values(endpoint) if value not in ips]
+    for rule in rules:
+        if _block_rule_is_ip(rule):
+            if any(_ip_rule_matches(rule, ip) for ip in ips):
+                return True
+        elif any(_block_rule_matches(rule, host) for host in hosts):
             return True
     return False
 
@@ -10682,7 +10699,10 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 15px;
       font-weight: 500;
     }
-    /* Menus are portaled to body, so they are no longer under #network_modal. */
+    body > .toolbar-custom-select-menu {
+      position: fixed !important;
+      z-index: 300000 !important;
+    }
     #net_force_country_menu .toolbar-custom-option,
     #net_routing_protocol_menu .toolbar-custom-option,
     #net_routing_latency_menu .toolbar-custom-option,
@@ -11072,9 +11092,9 @@ INDEX_HTML = r"""<!doctype html>
       text-overflow: ellipsis;
       word-break: normal;
     }
-    .node-address-cell.is-blocked .node-domain,
-    .node-address-cell.is-blocked .mono {
-      color: #cbb992;
+    .node-address-cell.is-blocked-domain .node-domain,
+    .node-address-cell.is-blocked-ip .mono {
+      color: #d4b483;
     }
     .node-blocked-tag {
       margin-top: 2px;
@@ -12812,8 +12832,8 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="form-group" style="margin-top: 4px; margin-bottom: 16px;">
             <label class="form-label" for="net_routing_blocklist">屏蔽列表</label>
-            <textarea id="net_routing_blocklist" class="input-field" rows="4" spellcheck="false" placeholder="每行一个域名或 IP。* 屏蔽全部。vpn_87* 屏蔽该前缀及后面全部。" style="height: auto; min-height: 96px; padding: 8px 12px; resize: vertical; line-height: 1.45;"></textarea>
-            <div style="margin-top: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.45;">命中的域名或 IP 不会进入出站方案。一行一条。列表里标黄。</div>
+            <textarea id="net_routing_blocklist" class="input-field" rows="4" spellcheck="false" placeholder="一行一条。112.67.* 屏蔽该段全部 IP。public-vpn-* 屏蔽该域名前缀。" style="height: auto; min-height: 96px; padding: 8px 12px; resize: vertical; line-height: 1.45;"></textarea>
+            <div style="margin-top: 6px; color: var(--text-secondary); font-size: 12px; line-height: 1.45;">IP 规则只标黄 IP，域名规则只标黄域名。命中的节点不进入主连接和冷备。</div>
           </div>
         </div>
 
@@ -13440,6 +13460,17 @@ function blockRules() {
     .filter(Boolean);
 }
 
+function blockRuleIsIp(rule) {
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(rule) || /^(?:\d{1,3}\.){1,3}\*$/.test(rule);
+}
+
+function ipRuleMatches(rule, ip) {
+  if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)) return false;
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(rule)) return rule === ip;
+  if (!/^(?:\d{1,3}\.){1,3}\*$/.test(rule)) return false;
+  return ip.indexOf(rule.slice(0, -1)) === 0;
+}
+
 function blockRuleMatches(rule, value) {
   if (!rule || !value) return false;
   if (rule === "*") return true;
@@ -13452,14 +13483,32 @@ function blockRuleMatches(rule, value) {
   }
 }
 
-function nodeIsBlocked(node) {
+function nodeBlockHit(node) {
+  const hit = {ip: false, domain: false};
   const rules = blockRules();
-  if (!rules.length || !node) return false;
-  if (rules.indexOf("*") >= 0) return true;
-  const values = [nodeDomainLabel(node), node.ip, node.current_ip, node.host_name, node.hostname, node.remote_host]
+  if (!rules.length || !node) return hit;
+  if (rules.indexOf("*") >= 0) {
+    hit.ip = true;
+    hit.domain = true;
+    return hit;
+  }
+  const domain = String(nodeDomainLabel(node) || "").trim().toLowerCase();
+  const ips = [node.ip, node.current_ip]
     .map(value => String(value || "").trim().toLowerCase())
-    .filter(Boolean);
-  return values.some(value => rules.some(rule => blockRuleMatches(rule, value)));
+    .filter(value => /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value));
+  rules.forEach(rule => {
+    if (blockRuleIsIp(rule)) {
+      if (ips.some(ip => ipRuleMatches(rule, ip))) hit.ip = true;
+    } else if (domain && blockRuleMatches(rule, domain)) {
+      hit.domain = true;
+    }
+  });
+  return hit;
+}
+
+function nodeIsBlocked(node) {
+  const hit = nodeBlockHit(node);
+  return hit.ip || hit.domain;
 }
 
 function matchesNodeFilters(n, ignoreCountry = false) {
@@ -13615,7 +13664,10 @@ function toggleUnifiedSelect(selectId, event) {
   if (button) button.setAttribute("aria-expanded", "true");
   if (menu.parentElement !== document.body) document.body.appendChild(menu);
   menu.style.display = "block";
-  placeAnchoredMenu(menu, button || widget, !!widget.closest("#network_modal, #library_check_modal"));
+  if (!placeAnchoredMenu(menu, button || widget, !!widget.closest("#network_modal, #library_check_modal"))) {
+    closeUnifiedSelects("");
+    return;
+  }
   queueMenuTrack();
 }
 
@@ -13632,9 +13684,15 @@ function chooseUnifiedSelect(selectId, value) {
 }
 
 function placeAnchoredMenu(menu, trigger, exact) {
-  if (!menu || !trigger || !trigger.getBoundingClientRect) return;
-  const rect = trigger.getBoundingClientRect();
-  if (rect.width < 2 && rect.height < 2) return;
+  if (!menu || !trigger || !trigger.getBoundingClientRect) return false;
+  const raw = trigger.getBoundingClientRect();
+  if (raw.width < 2 && raw.height < 2) return false;
+  const scroller = trigger.closest(".net-modal-scroll");
+  if (scroller) {
+    const box = scroller.getBoundingClientRect();
+    if (raw.bottom < box.top + 8 || raw.top > box.bottom - 8) return false;
+  }
+  const rect = raw;
   const viewW = window.innerWidth;
   const viewH = window.innerHeight;
   const width = exact ? Math.max(120, Math.round(rect.width)) : Math.max(168, Math.round(rect.width));
@@ -13646,16 +13704,16 @@ function placeAnchoredMenu(menu, trigger, exact) {
   set("right", "auto");
   set("width", width + "px");
   set("min-width", width + "px");
-  set("max-width", (exact ? width : Math.max(width, 280)) + "px");
+  set("max-width", width + "px");
   set("margin", "0");
   set("transform", "none");
   set("overflow-y", "auto");
-  set("z-index", "200000");
+  set("z-index", "300000");
   set("display", "block");
-  const spaceBelow = Math.max(0, viewH - rect.bottom - 8);
-  const spaceAbove = Math.max(0, rect.top - 8);
+  const spaceBelow = Math.max(0, viewH - rect.bottom - 12);
+  const spaceAbove = Math.max(0, rect.top - 12);
   const needed = Math.min(320, Math.max(96, menu.scrollHeight || 240));
-  const openUp = spaceBelow < Math.min(needed, 200) && spaceAbove > spaceBelow;
+  const openUp = spaceBelow < Math.min(needed, 180) && spaceAbove > spaceBelow;
   if (openUp) {
     set("max-height", Math.max(96, Math.min(320, spaceAbove)) + "px");
     set("top", "auto");
@@ -13665,6 +13723,7 @@ function placeAnchoredMenu(menu, trigger, exact) {
     set("bottom", "auto");
     set("top", Math.round(rect.bottom + 4) + "px");
   }
+  return true;
 }
 
 function placeFilterMenu(menu, trigger) {
@@ -13697,8 +13756,10 @@ function repositionOpenMenus() {
     const menu = cfg ? $(cfg.menu) : null;
     const button = cfg ? $(cfg.button) : null;
     if (!menu || !button) return;
-    if (widget.closest("#network_modal") || widget.closest("#library_check_modal")) placeAnchoredMenu(menu, button, true);
-    else if (menu.parentElement === document.body) placeAnchoredMenu(menu, button);
+    if (widget.closest("#network_modal") || widget.closest("#library_check_modal")) {
+      if (menu.parentElement !== document.body) document.body.appendChild(menu);
+      if (!placeAnchoredMenu(menu, button, true)) closeUnifiedSelects("");
+    } else if (menu.parentElement === document.body) placeAnchoredMenu(menu, button);
   });
 }
 
@@ -13748,7 +13809,9 @@ function bindUnifiedSelectEvents() {
         const selectId = widget.getAttribute("data-unified-select-id");
         const menu = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].menu) : null;
         const button = selectId && UNIFIED_SELECT_CONFIG[selectId] ? $(UNIFIED_SELECT_CONFIG[selectId].button) : null;
-        if (menu && button) placeAnchoredMenu(menu, button, true);
+        if (!menu || !button) return;
+        if (menu.parentElement !== document.body) document.body.appendChild(menu);
+        if (!placeAnchoredMenu(menu, button, true)) closeUnifiedSelects("");
       });
     }, {passive: true});
   }
@@ -14720,7 +14783,8 @@ function render(){
       const domainLabel = nodeDomainLabel(n);
       const domainLine = domainLabel ? (displayPort ? domainLabel + ":" + displayPort : domainLabel) : "";
       const ipLine = domainLine ? (listIp || "-") : ((listIp || "-") + (displayPort ? ":" + displayPort : ""));
-      const blocked = nodeIsBlocked(n);
+      const blockedHit = nodeBlockHit(n);
+      const blocked = blockedHit.ip || blockedHit.domain;
 
       const canRetest = !isCurrentlyActive && !isTesting && !isWaiting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
       const standbyShown = !!(state?.standby_ready || state?.standby_prepared);
@@ -14770,7 +14834,7 @@ function render(){
       return `<tr ${rowClass}>
         <td class="node-status-cell" data-label="状态">${statusCell}</td>
         <td class="node-protocol-cell" data-label="协议">${renderProtocolCell(n)}</td>
-        <td class="node-address-cell${blocked ? " is-blocked" : ""}" data-label="IP" title="${esc((domainLine ? domainLine + " " : "") + (listIp || ""))}"><div class="node-address-stack">${domainLine ? `<div class="node-domain">${esc(domainLine)}</div>` : ""}<div class="mono">${esc(ipLine || "-")}</div>${blocked ? `<div class="node-blocked-tag">已屏蔽</div>` : ""}</div></td>
+        <td class="node-address-cell${blockedHit.domain ? " is-blocked-domain" : ""}${blockedHit.ip ? " is-blocked-ip" : ""}" data-label="IP" title="${esc((domainLine ? domainLine + " " : "") + (listIp || ""))}"><div class="node-address-stack">${domainLine ? `<div class="node-domain">${esc(domainLine)}</div>` : ""}<div class="mono">${esc(ipLine || "-")}</div>${blocked ? `<div class="node-blocked-tag">已屏蔽</div>` : ""}</div></td>
         <td class="node-latency-cell" data-label="延迟">${latencyText}</td>
         <td class="node-speed-cell" data-label="速度">${rowSpeedText}</td>
         <td class="node-location-cell" data-label="位置" title="${esc(displayLocation)}"><div class="node-location-cell-inner">${displayLocationFlag}<span class="node-cell-ellipsis">${esc(displayLocation)}</span></div></td>
