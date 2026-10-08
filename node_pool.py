@@ -764,6 +764,11 @@ class NodePool:
                 metadata["shared_peer_ids"] = peer_ids
                 metadata["shared_peer_count"] = len(peer_ids)
                 metadata["shared_status"] = shared_status
+                server_info = row.get("server") if isinstance(row.get("server"), dict) else {}
+                for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                    incoming = str(server_info.get(field) or "").strip()
+                    if incoming and not str(metadata.get(field) or "").strip():
+                        metadata[field] = incoming
                 if speed > 0:
                     metadata["shared_speed_bps"] = speed
                 metadata.pop("trusted_observation", None)
@@ -900,6 +905,45 @@ class NodePool:
                 item["country"] = canonical_country_name(item.get("country") or "")
                 result.append(item)
             return result
+
+    def list_share_endpoints(self, offset: int = 0, limit: int = 2000) -> list[dict[str, Any]]:
+        """One stable page of the catalog for peer sync. Not the UI hot-path query."""
+        limit = max(1, min(int(limit), 2000))
+        offset = max(0, int(offset))
+        with closing(self._connect()) as db:
+            rows = db.execute(
+                """
+                SELECT e.server_key, e.protocol, e.transport, e.port, e.status,
+                       e.success_count, e.failure_count, e.success_streak,
+                       e.first_seen, e.last_seen, e.last_success, e.metadata_json,
+                       s.hostname, s.current_ip, s.country,
+                       s.metadata_json AS server_metadata_json,
+                       COALESCE((SELECT o.speed FROM observations o
+                                 WHERE o.server_key=e.server_key
+                                 ORDER BY o.seen_at DESC LIMIT 1), 0) AS latest_speed
+                FROM endpoints e
+                JOIN servers s ON s.server_key=e.server_key
+                ORDER BY e.endpoint_id
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            except Exception:
+                item["metadata"] = {}
+                item.pop("metadata_json", None)
+            try:
+                item["server_metadata"] = json.loads(item.pop("server_metadata_json") or "{}")
+            except Exception:
+                item["server_metadata"] = {}
+                item.pop("server_metadata_json", None)
+            item["country"] = canonical_country_name(item.get("country") or "")
+            result.append(item)
+        return result
 
     def list_routing_endpoints(self, limit: int = 400, country: str = "", protocol: str = "") -> list[dict[str, Any]]:
         """HOT/AVAILABLE rows for failover. One indexed read, not the full catalog."""

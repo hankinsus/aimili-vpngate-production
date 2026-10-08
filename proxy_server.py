@@ -1733,6 +1733,14 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
                 return None
             else:
                 ip = _system_dns_ipv4(key_host, stage_timeout)
+        if (
+            not ip
+            and get_egress_mode() == "direct"
+            and _iface_has_global_ipv6(iface or "")
+        ):
+            # Direct NIC has a global IPv6 address. A-only names stay on IPv4.
+            # Names with no A record leave via IPv6 instead of failing closed.
+            ip, raw_ttl = _query_aaaa(key_host, iface or "", stage_timeout)
         box["ip"] = ip
         _remember_dns(cache_key, ip, raw_ttl, time.monotonic())
         return ip
@@ -1800,6 +1808,33 @@ def _iface_has_ipv6(iface: str) -> bool:
         if parts and parts[-1] == iface:
             return True
     return False
+
+
+def _iface_has_global_ipv6(iface: str) -> bool:
+    """True only for a global address. Link-local on a tunnel is not egress."""
+    iface = str(iface or "").strip()
+    if not iface:
+        return False
+    try:
+        lines = Path("/proc/net/if_inet6").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        parts = line.split()
+        # addr ifindex prefix_len scope flags name; scope 00 is global.
+        if len(parts) >= 6 and parts[-1] == iface and parts[3] == "00":
+            return True
+    return False
+
+
+def _query_aaaa(host: str, iface: str, timeout: float) -> tuple[str | None, float]:
+    """AAAA over the existing IPv4 DNS socket. Used only when A has no answer."""
+    per = max(0.2, min(1.0, float(timeout or 1.0)))
+    for server in DNS_TUNNEL_RESOLVERS:
+        ip, ttl = _dns_udp_query(host, 28, server, per, iface)
+        if ip:
+            return ip, ttl
+    return None, 0.0
 
 
 def _repair_policy_route(iface: str) -> None:

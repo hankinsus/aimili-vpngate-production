@@ -835,15 +835,18 @@ class ResourceShareManager:
             "last_success": float(endpoint.get("last_success") or 0),
         }
 
-    def export_resources(self, exclude_peer_id: str = "", max_nodes: int = DEFAULT_MAX_NODES) -> dict[str, Any]:
-        limit = self._safe_max_nodes(max_nodes)
+    def export_resources(self, exclude_peer_id: str = "", max_nodes: int = DEFAULT_MAX_NODES, offset: int = 0) -> dict[str, Any]:
+        limit = min(2000, self._safe_max_nodes(max_nodes))
+        offset = max(0, int(offset or 0))
         excluded_local_peer_ids: set[str] = set()
         if exclude_peer_id:
             with self.lock:
                 for local_peer_id, peer in self._read()["peers"].items():
                     if str(local_peer_id) == str(exclude_peer_id) or str(peer.get("remote_peer_id") or "") == str(exclude_peer_id):
                         excluded_local_peer_ids.add(str(local_peer_id))
-        endpoints = self.node_pool.list_endpoints(limit=min(self.MAX_MAX_NODES, limit))
+        endpoints = self.node_pool.list_share_endpoints(offset, limit)
+        complete = len(endpoints) < limit
+        next_offset = offset + len(endpoints)
         rows: list[dict[str, Any]] = []
         for endpoint in endpoints:
             metadata = endpoint.get("metadata") or {}
@@ -855,13 +858,14 @@ class ResourceShareManager:
             row = self._sanitized_endpoint(endpoint)
             if row["server_key"] and row["protocol"]:
                 rows.append(row)
-            if len(rows) >= limit:
-                break
         return {
             "schema": 2,
             "instance_id": self.instance_id,
             "generated_at": time.time(),
             "count": len(rows),
+            "offset": offset,
+            "next_offset": next_offset,
+            "complete": complete,
             "resources": rows,
         }
     def sync_peer(self, peer_id: str, timeout: int = 20, force: bool = False) -> dict[str, Any]:
@@ -898,35 +902,57 @@ class ResourceShareManager:
                 "sync_interval_unit": interval_unit,
             }
 
-        query = urllib.parse.urlencode({"exclude_peer_id": str(self.instance_id)})
-        url = remote_url + "/resources?" + query
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "AimiliVPN-ResourceShare/2.0",
-                "Accept": "application/json",
-                "X-Aimili-Resource-Token": token,
-            },
-        )
+        query_base = {"exclude_peer_id": str(self.instance_id)}
         started = time.time()
+        offset = 0
+        page_size = 2000
+        received = 0
+        imported = 0
+        remote_instance_id = ""
         try:
-            with urllib.request.urlopen(req, timeout=max(5, min(int(timeout), 60))) as response:
-                raw = response.read()
-            payload = json.loads(raw.decode("utf-8", errors="replace"))
-            resources = payload.get("resources") if isinstance(payload, dict) else None
-            if not isinstance(resources, list):
-                raise ValueError("远端返回的资源格式无效")
-            resources = resources[: self.MAX_MAX_NODES]
-            imported = self.node_pool.upsert_shared_snapshot(
-                resources,
-                peer_id=str(peer_id),
-                source_name=str(peer.get("name") or "shared"),
-            )
+            while offset < 50000:
+                query = dict(query_base)
+                query["limit"] = str(page_size)
+                query["offset"] = str(offset)
+                url = remote_url + "/resources?" + urllib.parse.urlencode(query)
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "AimiliVPN-ResourceShare/2.0",
+                        "Accept": "application/json",
+                        "X-Aimili-Resource-Token": token,
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=max(5, min(int(timeout), 60))) as response:
+                    raw = response.read()
+                payload = json.loads(raw.decode("utf-8", errors="replace"))
+                resources = payload.get("resources") if isinstance(payload, dict) else None
+                if not isinstance(resources, list):
+                    raise ValueError("远端返回的资源格式无效")
+                remote_instance_id = str((payload or {}).get("instance_id") or remote_instance_id)
+                resources = resources[: self.MAX_MAX_NODES]
+                received += len(resources)
+                imported += self.node_pool.upsert_shared_snapshot(
+                    resources,
+                    peer_id=str(peer_id),
+                    source_name=str(peer.get("name") or "shared"),
+                )
+                if "complete" not in (payload or {}):
+                    break
+                if payload.get("complete"):
+                    break
+                try:
+                    next_offset = int(payload.get("next_offset") or 0)
+                except (TypeError, ValueError):
+                    next_offset = 0
+                if next_offset <= offset:
+                    break
+                offset = next_offset
             result = {
                 "ok": True,
                 "peer_id": str(peer_id),
-                "remote_instance_id": payload.get("instance_id", ""),
-                "received": len(resources),
+                "remote_instance_id": remote_instance_id,
+                "received": received,
                 "imported": imported,
                 "duration_ms": int((time.time() - started) * 1000),
                 "sync_interval_value": interval_value,
@@ -935,7 +961,7 @@ class ResourceShareManager:
             self._mark_sync(peer_id, result, "")
             return result
         except Exception as exc:
-            self._mark_sync(peer_id, {"ok": False}, str(exc))
+            self._mark_sync(peer_id, {"ok": False, "imported": imported, "received": received}, str(exc))
             raise
 
     def _mark_sync(self, peer_id: str, result: dict[str, Any], error: str) -> None:

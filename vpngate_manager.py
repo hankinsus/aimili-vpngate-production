@@ -12281,11 +12281,14 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       gap: 14px;
-      align-items: start;
+      align-items: stretch;
     }
     .rs-form-card {
       padding: 16px;
-      align-self: start;
+      display: flex;
+      flex-direction: column;
+      align-self: stretch;
+      min-width: 0;
     }
     .rs-step-title {
       display: flex;
@@ -12307,12 +12310,18 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
     }
     .rs-form-help {
-      min-height: 35px;
+      min-height: 54px;
       margin-bottom: 11px;
     }
     .rs-form-grid {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 9px;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .rs-form-grid > .rs-help {
+      margin-top: auto;
     }
     .rs-auto-row { display: flex; flex-direction: column; gap: 8px; }
     .rs-auto-check {
@@ -20370,7 +20379,8 @@ class Handler(BaseHTTPRequestHandler):
                     10,
                     min(resource_share.MAX_MAX_NODES, int(peer.get("max_nodes") or resource_share.DEFAULT_MAX_NODES)),
                 )
-                payload = resource_share.export_resources(exclude_peer_id=exclude_id, max_nodes=requested)
+                offset = bounded_int((query.get("offset") or ["0"])[0], 0, 0, 200000)
+                payload = resource_share.export_resources(exclude_peer_id=exclude_id, max_nodes=requested, offset=offset)
                 payload["authorized_peer_id"] = peer_id
                 self.send_json(payload)
                 return True
