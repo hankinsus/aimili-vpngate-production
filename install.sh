@@ -103,13 +103,36 @@ swap_bytes=0
 if swapon --show=SIZE --bytes --noheadings >/dev/null 2>&1; then
     swap_bytes=$(swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk '{s+=$1} END {print s+0}')
 fi
-if [ "${swap_bytes}" -lt 4294967296 ] && [ ! -f /swapfile ]; then
-    echo -e "${YELLOW}  -> 添加 4G 虚拟内存...${PLAIN}"
-    fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
-    chmod 600 /swapfile
-    mkswap /swapfile >/dev/null
-    swapon /swapfile || true
-    grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+if [ "${swap_bytes}" -lt 4294967296 ]; then
+    avail_bytes=$(df -B1 --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
+    if [ -z "${avail_bytes}" ]; then
+        avail_bytes=$(df -B1 / | awk 'NR==2{print $4}')
+    fi
+    if [ "${avail_bytes:-0}" -lt 4500000000 ]; then
+        echo -e "${YELLOW}  -> 磁盘剩余不足 4G，跳过虚拟内存，继续安装。${PLAIN}"
+    else
+        echo -e "${YELLOW}  -> 添加 4G 虚拟内存。磁盘较慢时会停几十秒。${PLAIN}"
+        swapoff /swapfile >/dev/null 2>&1 || true
+        rm -f /swapfile
+        if ! fallocate -l 4G /swapfile 2>/dev/null; then
+            dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress || true
+        fi
+        chmod 600 /swapfile 2>/dev/null || true
+        if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile >/dev/null 2>&1; then
+            swapoff /swapfile >/dev/null 2>&1 || true
+            rm -f /swapfile
+            dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress || true
+            chmod 600 /swapfile 2>/dev/null || true
+            mkswap /swapfile >/dev/null 2>&1 || true
+            swapon /swapfile >/dev/null 2>&1 || true
+        fi
+        if swapon --show=NAME --noheadings 2>/dev/null | grep -q '/swapfile'; then
+            grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        else
+            rm -f /swapfile
+            echo -e "${YELLOW}  -> 虚拟内存未启用，继续安装。${PLAIN}"
+        fi
+    fi
 fi
 if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
