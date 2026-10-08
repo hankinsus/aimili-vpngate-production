@@ -703,6 +703,7 @@ def parse_int(value: Any) -> int:
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = b""
+    _quickack(sock)
     while len(data) < size:
         chunk = sock.recv(size - len(data))
         if not chunk:
@@ -981,7 +982,8 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
         current_iface = get_forward_interface() or ""
         if not current_iface:
             current_iface = association_iface
-        if current_generation == association_generation and current_iface == association_iface:
+        if current_iface == association_iface:
+            association_generation = current_generation
             return False
         quic_live = sum(1 for key in upstreams if key and key[0] == "quic")
         had_upstream = bool(upstreams)
