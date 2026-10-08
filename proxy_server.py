@@ -755,6 +755,17 @@ def parse_host_port(authority: str, default_port: int) -> tuple[str, int]:
     return authority, default_port
 
 def get_proxy_credentials() -> tuple[str | None, str | None]:
+    """Saved SOCKS account wins. The file is re-read so a panel save applies without restart."""
+    path = DATA_DIR / "proxy_auth.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        user = str(payload.get("user") or "").strip()
+        password = str(payload.get("password") or "")
+        if user or password:
+            return user or "socks5", password or "ilovestudy"
     user = os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME")
     password = os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD")
     if user is None and password is None:

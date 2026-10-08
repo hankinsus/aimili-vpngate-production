@@ -95,6 +95,145 @@ class WebCertificateManager:
         # harmless "保存修改" for the same domain would start a second ACME order.
         if not state.get("domain"):
             state["status"] = "not_configured"
+            return state
+        if str(state.get("status") or "") == "error" and time.time() >= getattr(self, "_heal_after", 0):
+            self._heal_after = time.time() + 60
+            healed = self._heal_existing_certificate(str(state.get("domain") or ""))
+            if healed:
+                return healed
+        return state
+
+    def _cert_text(self, cert: Path) -> str:
+        result = self._run(
+            ["openssl", "x509", "-in", str(cert), "-noout", "-issuer", "-subject", "-checkend", "0", "-ext", "subjectAltName"],
+            5,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout or ""
+
+    def _cert_matches(self, cert: Path, domain: str) -> bool:
+        text = self._cert_text(cert)
+        if not text:
+            return False
+        subject = ""
+        issuer = ""
+        for line in text.splitlines():
+            if line.startswith("subject="):
+                subject = line.split("=", 1)[1].strip()
+            elif line.startswith("issuer="):
+                issuer = line.split("=", 1)[1].strip()
+        if not subject or subject == issuer:
+            return False
+        domain = domain.lower().rstrip(".")
+        blob = text.lower()
+        return domain in blob
+
+    def _key_beside(self, cert: Path) -> Path | None:
+        directory = cert.parent
+        stem = cert.stem
+        names = [
+            directory / "privkey.pem",
+            directory / "private.key",
+            directory / f"{stem}.key",
+            directory / f"{stem}.pem",
+            cert.with_suffix(".key"),
+        ]
+        if cert.name.endswith(".crt"):
+            names.append(cert.with_name(cert.name[:-4] + ".key"))
+        for candidate in names:
+            if candidate.is_file() and candidate != cert and candidate.stat().st_size > 0:
+                return candidate
+        return None
+
+    def _local_certificate_candidates(self, domain: str) -> list[tuple[Path, Path]]:
+        found: list[tuple[Path, Path]] = []
+        seen: set[str] = set()
+
+        def add(cert: Path) -> None:
+            try:
+                cert = cert.resolve()
+            except OSError:
+                return
+            key = str(cert)
+            if key in seen or not cert.is_file():
+                return
+            if not self._cert_matches(cert, domain):
+                return
+            private = self._key_beside(cert)
+            if private is None:
+                return
+            seen.add(key)
+            found.append((cert, private))
+
+        add(self.fullchain)
+        live = Path("/etc/letsencrypt/live")
+        if live.is_dir():
+            add(live / domain / "fullchain.pem")
+            for cert in live.glob("*/fullchain.pem"):
+                add(cert)
+        agent = Path("/etc/v2ray-agent/tls")
+        if agent.is_dir():
+            for cert in list(agent.glob("*.crt")) + list(agent.glob("*.pem")):
+                add(cert)
+        nginx = Path("/etc/nginx")
+        if nginx.is_dir():
+            try:
+                listed = self._run(["grep", "-R", "--include=*.conf", "-h", "ssl_certificate ", str(nginx)], 5)
+            except Exception:
+                listed = None
+            if listed and listed.returncode == 0:
+                for line in (listed.stdout or "").splitlines():
+                    parts = line.split()
+                    if len(parts) < 2 or parts[0] != "ssl_certificate":
+                        continue
+                    add(Path(parts[1].rstrip(";")))
+        return found
+
+    def _install_certificate_files(self, cert: Path, private: Path, domain: str) -> dict[str, Any]:
+        self.tls_dir.mkdir(parents=True, exist_ok=True)
+        if cert.resolve() != self.fullchain.resolve():
+            shutil.copy2(cert, self.fullchain)
+        if private.resolve() != self.privkey.resolve():
+            shutil.copy2(private, self.privkey)
+            os.chmod(self.privkey, 0o600)
+        self._write_nginx_config(domain)
+        self._reload_nginx()
+        try:
+            self._ensure_acme_cron(self._acme_bin())
+        except Exception:
+            pass
+        meta = self._cert_meta()
+        return {
+            "message": f"HTTPS 已启用：{domain}，已使用本机证书，未重新申请。自动续期保持不变。",
+            "expires_at": int(meta.get("expires_at") or 0),
+            "issuer": str(meta.get("issuer") or ""),
+        }
+
+    def _heal_existing_certificate(self, domain: str) -> dict[str, Any] | None:
+        domain = str(domain or "").strip().lower()
+        if not domain:
+            return None
+        try:
+            pairs = self._local_certificate_candidates(domain)
+        except Exception:
+            return None
+        if not pairs:
+            return None
+        try:
+            installed = self._install_certificate_files(*pairs[0], domain)
+        except Exception:
+            return None
+        state = self._write_state(
+            status="active",
+            domain=domain,
+            message=installed["message"],
+            expires_at=installed["expires_at"],
+            issuer=installed["issuer"],
+            last_error="",
+        )
+        state["running"] = bool(self.running)
+        state["ok"] = True
         return state
 
     def _acme_bin(self) -> str:
@@ -378,6 +517,10 @@ server {{
         self._ensure_selfsigned_backup()
 
         current = self._read_state()
+        adopted = self._local_certificate_candidates(domain)
+        if adopted:
+            return self._install_certificate_files(*adopted[0], domain)
+
         meta = self._cert_meta()
         # Reuse a still-valid certificate for the same domain instead of
         # needlessly consuming an ACME issuance.
@@ -417,7 +560,16 @@ server {{
             240,
         )
         if issue.returncode != 0:
-            raise RuntimeError(f"Let's Encrypt 申请失败：{self._tail_output(issue)}")
+            text = self._tail_output(issue)
+            lowered = text.lower()
+            skipped = "domains not changed" in lowered or ("skipping" in lowered and "next renewal" in lowered)
+            if skipped:
+                adopted = self._local_certificate_candidates(domain)
+                if adopted:
+                    installed = self._install_certificate_files(*adopted[0], domain)
+                    installed["message"] = f"证书已存在，无需重新申请：{domain}。自动续期保持不变。"
+                    return installed
+            raise RuntimeError(f"Let's Encrypt 申请失败：{text}")
 
         self._write_state(status="installing", domain=domain, message="证书申请成功，正在安装证书并重新加载 Nginx…")
         install = self._run(

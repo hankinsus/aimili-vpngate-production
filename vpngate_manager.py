@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.72"
+APP_VERSION = "V1.0.76"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -656,6 +656,28 @@ def generate_random_username() -> str:
             if has_lower and has_upper and has_digit:
                 return uname
 
+def publish_proxy_auth(user: str, password: str) -> None:
+    """8500 reads this file on each login, so a saved password does not need a restart."""
+    user = str(user or "").strip() or "socks5"
+    password = str(password or "")
+    if not password:
+        password = "ilovestudy"
+    payload = {"user": user[:64], "password": password[:64]}
+    path = DATA_DIR / "proxy_auth.json"
+    try:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        text = json.dumps(payload, ensure_ascii=False)
+        current = path.read_text(encoding="utf-8") if path.exists() else ""
+        if current != text:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+    except OSError:
+        pass
+    os.environ["LOCAL_PROXY_USER"] = payload["user"]
+    os.environ["LOCAL_PROXY_PASS"] = payload["password"]
+
+
 def load_ui_config() -> dict[str, Any]:
     global ui_config_cache, ui_config_cache_at
     now_mono = time.monotonic()
@@ -685,6 +707,8 @@ def load_ui_config() -> dict[str, Any]:
             "fav_fail_fallback": True,
             "web_domain": "",
             "routing_blocklist": "",
+            "proxy_user": "socks5",
+            "proxy_pass": "ilovestudy",
         }
         updated = False
         if auth_file.exists():
@@ -692,7 +716,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain", "routing_blocklist"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain", "routing_blocklist", "proxy_user", "proxy_pass"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -728,6 +752,13 @@ def load_ui_config() -> dict[str, Any]:
             config["proxy_port"] = normalized_proxy_port
             updated = True
 
+        if not str(config.get("proxy_user") or "").strip():
+            config["proxy_user"] = "socks5"
+            updated = True
+        if not str(config.get("proxy_pass") or ""):
+            config["proxy_pass"] = "ilovestudy"
+            updated = True
+
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
@@ -739,6 +770,7 @@ def load_ui_config() -> dict[str, Any]:
             ui_config_cache = dict(config)
             ui_config_cache["favorite_node_ids"] = list(config.get("favorite_node_ids") or [])
             ui_config_cache_at = time.monotonic()
+        publish_proxy_auth(str(config.get("proxy_user") or "socks5"), str(config.get("proxy_pass") or "ilovestudy"))
         return dict(config)
 
 
@@ -1327,6 +1359,8 @@ def get_state() -> dict[str, Any]:
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["password_set"] = bool(ui_cfg.get("password"))
     state["proxy_port"] = 8500
+    state["proxy_user"] = str(ui_cfg.get("proxy_user") or "socks5")
+    state["proxy_pass"] = str(ui_cfg.get("proxy_pass") or "ilovestudy")
     state["proxy_access"] = os.environ.get("LOCAL_PROXY_ALLOW", "127.0.0.1/32,::1/128")
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
@@ -9521,9 +9555,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     .active-location-with-flag,
     .node-location-cell-inner {
-      display: inline-flex;
+      display: flex;
       align-items: center;
       gap: 7px;
+      width: 100%;
       min-width: 0;
       max-width: 100%;
       vertical-align: middle;
@@ -11054,11 +11089,22 @@ INDEX_HTML = r"""<!doctype html>
       padding-right: 2px;
     }
 
-    .node-location-cell,
-    .col-location,
     .node-owner-cell,
     .col-owner {
-      padding-left: 36px;
+      padding-left: 12px;
+    }
+    .node-location-cell,
+    .col-location {
+      padding-left: 8px;
+    }
+    .node-location-cell .country-flag-img,
+    .node-location-cell .country-flag-fallback {
+      width: 18px;
+      height: 14px;
+      min-width: 18px;
+      max-width: 18px;
+      max-height: 14px;
+      flex: 0 0 18px;
     }
 
     .node-address-cell .mono {
@@ -12516,8 +12562,8 @@ INDEX_HTML = r"""<!doctype html>
             <th class="col-address" style="width: 22%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 6%;">延迟</th>
             <th class="col-speed" style="width: 7%;">速度</th>
-            <th class="col-location" style="width: 13%;">物理位置</th>
-            <th class="col-owner" style="width: 16%;">运营主体 / ISP</th>
+            <th class="col-location" style="width: 16%;">物理位置</th>
+            <th class="col-owner" style="width: 13%;">运营主体 / ISP</th>
             <th class="col-iptype" style="width: 7%;">IP 类型</th>
             <th class="col-actions" style="width: 13%;">操作</th>
           </tr>
@@ -12705,6 +12751,14 @@ INDEX_HTML = r"""<!doctype html>
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理端口</label>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" value="8500" disabled title="代理端口固定为 8500">
+        </div>
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label class="form-label" for="net_proxy_user">SOCKS5 用户名</label>
+          <input type="text" id="net_proxy_user" class="input-field" autocomplete="off" value="socks5" maxlength="64">
+        </div>
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label class="form-label" for="net_proxy_pass">SOCKS5 密码</label>
+          <input type="text" id="net_proxy_pass" class="input-field" autocomplete="off" value="ilovestudy" maxlength="64">
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
@@ -16906,10 +16960,22 @@ function renderCertificateStatus(certState) {
       ? `HTTPS 已启用：${esc(domain)} · 证书到期：${esc(expiryText)} · 自动续期已开启`
       : "HTTPS 证书已启用。";
   } else if (status === "error" || status === "interrupted") {
-    badgeText = status === "interrupted" ? "任务中断" : "申请失败";
-    badgeBg = "rgba(244,63,94,.12)";
-    badgeColor = "var(--danger)";
-    detail = error || message || "HTTPS 证书申请失败，请检查域名解析及 80 端口。";
+    const raw = `${error}\n${message}`;
+    const alreadyIssued = /domains not changed|skipping|next renewal|force renewal/i.test(raw);
+    if (alreadyIssued) {
+      badgeText = "已启用";
+      badgeBg = "rgba(16,185,129,.14)";
+      badgeColor = "var(--success)";
+      const expiryText = expiresAt ? new Date(expiresAt * 1000).toLocaleString() : "";
+      detail = domain
+        ? `HTTPS 已启用：${esc(domain)}${expiryText ? " · 证书到期：" + esc(expiryText) : ""} · 本机已有证书，未重新申请`
+        : "本机已有证书，未重新申请。";
+    } else {
+      badgeText = status === "interrupted" ? "任务中断" : "申请失败";
+      badgeBg = "rgba(244,63,94,.12)";
+      badgeColor = "var(--danger)";
+      detail = error || message || "HTTPS 证书申请失败，请检查域名解析及 80 端口。";
+    }
   }
 
   el.innerHTML = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -17121,6 +17187,10 @@ function openNetworkModal() {
 
   if (state) {
     $("net_proxy_port").value = 8500;
+    const userEl = $("net_proxy_user");
+    const passEl = $("net_proxy_pass");
+    if (userEl) userEl.value = state.proxy_user || "socks5";
+    if (passEl) passEl.value = state.proxy_pass || "ilovestudy";
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
 
@@ -17170,6 +17240,8 @@ async function saveNetwork(e) {
   successDiv.style.display = "none";
 
   const proxyPort = parseInt($("net_proxy_port").value);
+  const proxyUser = String($("net_proxy_user")?.value || "").trim() || "socks5";
+  const proxyPass = String($("net_proxy_pass")?.value || "") || "ilovestudy";
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
@@ -17210,6 +17282,8 @@ async function saveNetwork(e) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           proxy_port: proxyPort,
+          proxy_user: proxyUser,
+          proxy_pass: proxyPass,
           routing_mode: routingMode,
           force_country: forceCountry,
           routing_ip_type: routingIpType,
@@ -20641,6 +20715,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 ui_cfg["proxy_port"] = 8500
+                proxy_user = str(payload.get("proxy_user") or "").strip() or "socks5"
+                proxy_pass = str(payload.get("proxy_pass") or "") or "ilovestudy"
+                if len(proxy_user) > 64 or len(proxy_pass) > 64 or not re.fullmatch(r"[A-Za-z0-9._@-]{1,64}", proxy_user):
+                    self.send_json({"ok": False, "error": "SOCKS5 用户名只能包含字母、数字和 . _ @ -"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if any(ch in proxy_pass for ch in "\r\n\x00"):
+                    self.send_json({"ok": False, "error": "SOCKS5 密码包含无效字符"}, HTTPStatus.BAD_REQUEST)
+                    return
+                ui_cfg["proxy_user"] = proxy_user
+                ui_cfg["proxy_pass"] = proxy_pass
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
@@ -20663,6 +20747,7 @@ class Handler(BaseHTTPRequestHandler):
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
                 invalidate_ui_config_cache()
+                publish_proxy_auth(proxy_user, proxy_pass)
 
                 clear_manual_route_pin()
                 invalidate_scheme_snapshot()
