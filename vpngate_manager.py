@@ -9920,6 +9920,13 @@ INDEX_HTML = r"""<!doctype html>
     .active-card-title strong {
       font-weight: 400;
     }
+    .active-card-fault {
+      color: #fb7185;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+      max-width: 720px;
+    }
 
     .active-card-value,
     .active-card-value.mono {
@@ -11492,7 +11499,7 @@ INDEX_HTML = r"""<!doctype html>
     .node-status-cell {
       white-space: nowrap;
       text-align: center;
-      overflow: visible !important;
+      overflow: hidden;
     }
 
     .node-status-cell .badge,
@@ -11501,12 +11508,15 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       white-space: nowrap;
-      width: auto !important;
-      min-width: 64px;
-      max-width: max-content;
+      width: auto;
+      max-width: 100%;
+      min-width: 0;
       min-height: 24px;
-      flex: 0 0 auto;
-      overflow: visible;
+      padding: 3px 8px;
+      font-size: 12px;
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
       box-sizing: border-box;
     }
 
@@ -11674,7 +11684,7 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-width: 84px;
+      min-width: 0;
       max-width: 100%;
       min-height: 28px;
       box-sizing: border-box;
@@ -11688,6 +11698,8 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1;
       text-decoration: none;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .protocol-link:hover {
@@ -13101,15 +13113,15 @@ INDEX_HTML = r"""<!doctype html>
       <table class="node-table">
         <thead>
           <tr>
-            <th class="col-status" style="width: 7%;">状态</th>
-            <th class="col-protocol" style="width: 9%;">协议</th>
-            <th class="col-address" style="width: 22%;">域名 : 端口 / IP</th>
+            <th class="col-status" style="width: 15%;">状态</th>
+            <th class="col-protocol" style="width: 10%;">协议</th>
+            <th class="col-address" style="width: 18%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 6%;">延迟</th>
             <th class="col-speed" style="width: 7%;">速度</th>
-            <th class="col-location" style="width: 16%;">物理位置</th>
-            <th class="col-owner" style="width: 13%;">运营主体 / ISP</th>
-            <th class="col-iptype" style="width: 7%;">IP 类型</th>
-            <th class="col-actions" style="width: 13%;">操作</th>
+            <th class="col-location" style="width: 14%;">物理位置</th>
+            <th class="col-owner" style="width: 12%;">运营主体 / ISP</th>
+            <th class="col-iptype" style="width: 6%;">IP 类型</th>
+            <th class="col-actions" style="width: 12%;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -15138,17 +15150,20 @@ function render(){
     const clientBadgePair = egressHealthBadge(state);
     const clientBadge = clientBadgePair[0];
     const clientBadgeClass = clientBadgePair[1];
+    const clientDown = clientBadgeClass === "unavailable";
+    const clientFault = clientDown ? String(state.proxy_error || state.last_check_message || "") : "";
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+          <div class="stat-icon-wrapper" style="background: ${clientDown ? "rgba(244, 63, 94, 0.15)" : "rgba(16, 185, 129, 0.15)"}; border-color: ${clientDown ? "rgba(244, 63, 94, 0.3)" : "rgba(16, 185, 129, 0.3)"}; width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: ${clientDown ? "#fb7185" : "#34d399"}; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
           </div>
           <div class="active-card-details">
             <div class="active-card-title">
               <span class="badge ${clientBadgeClass}"><span class="badge-pulse"></span>${esc(clientBadge)}</span>
               <strong>${esc(protocolName)} · ${esc(translateCountry(ep.country || "-"))}</strong>
             </div>
+            ${clientFault ? `<div class="active-card-fault">${esc(clientFault)}</div>` : ""}
             <div class="active-card-value mono">
               ${esc(endpointAddress.top)}
             </div>
@@ -15176,18 +15191,21 @@ function render(){
     const clientBadgePair = egressHealthBadge(state);
     const clientBadge = clientBadgePair[0];
     const clientBadgeClass = clientBadgePair[1];
+    const clientDown = clientBadgeClass === "unavailable";
+    const clientFault = clientDown ? String(state.proxy_error || state.last_check_message || "") : "";
     const activeAddress = addressPair(activeNode.host_name || activeNode.remote_host, activeNode.ip, activeNode.remote_port);
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+          <div class="stat-icon-wrapper" style="background: ${clientDown ? "rgba(244, 63, 94, 0.15)" : "rgba(16, 185, 129, 0.15)"}; border-color: ${clientDown ? "rgba(244, 63, 94, 0.3)" : "rgba(16, 185, 129, 0.3)"}; width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: ${clientDown ? "#fb7185" : "#34d399"}; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
           </div>
           <div class="active-card-details">
             <div class="active-card-title">
               <span class="badge ${clientBadgeClass}"><span class="badge-pulse"></span>${esc(clientBadge)}</span>
               <strong>${esc(translateCountry(activeNode.country))} · ${esc(translateProtocol(activeNode.protocol || "openvpn"))}</strong>
             </div>
+            ${clientFault ? `<div class="active-card-fault">${esc(clientFault)}</div>` : ""}
             <div class="active-card-value mono">
               ${esc(activeAddress.top)}
             </div>
@@ -15427,7 +15445,7 @@ function render(){
       const hotStandby = !blocked && !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
       const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
       const statusCell = isCurrentlyActive && !blocked
-        ? `<span class="badge ${n.probe_status === "unavailable" ? "unavailable" : "available"}" title="${esc(n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>${n.probe_status === "unavailable" ? "主连接 · 代理不通" : "主连接"}</span>`
+        ? `<span class="badge ${n.probe_status === "unavailable" || triState(state.client_proxy_ok) === false ? "unavailable" : "available"}" title="${esc((triState(state.client_proxy_ok) === false && state.proxy_error) || n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>${n.probe_status === "unavailable" || triState(state.client_proxy_ok) === false ? "主连接 · 代理不通" : "主连接"}</span>`
         : isWaiting
           ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
           : hotStandby
