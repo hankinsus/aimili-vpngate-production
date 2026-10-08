@@ -1154,6 +1154,10 @@ def align_proxy_settings_to_manual(country: str, ip_type: str, protocol: str = "
         if not isinstance(current, dict):
             current = {}
         changed = False
+        if country_name and str(current.get("routing_mode") or cfg.get("routing_mode") or "auto") != "fixed_ip":
+            if str(current.get("routing_mode") or "") != "fixed_region":
+                current["routing_mode"] = "fixed_region"
+                changed = True
         if country_name and str(current.get("force_country") or cfg.get("force_country") or "") != country_name:
             current["force_country"] = country_name
             changed = True
@@ -4939,12 +4943,23 @@ def _connect_recently_failed(endpoint: dict[str, Any]) -> bool:
     return bool(ip) and time.time() < float(_connect_fail_until.get(ip) or 0)
 
 
-def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """智能模式：本机国家，移动、住宅、机房，延迟低的优先，带宽不低于 50 Mbps。
+def _ladder_home(ui_cfg: dict[str, Any]) -> str:
+    """Manual country first, then the saved proxy country, then the server country."""
+    pinned = normalized_country_name((manual_route_pin or {}).get("country") or "")
+    if pinned:
+        return pinned
+    chosen = normalized_country_name((ui_cfg or {}).get("force_country") or "")
+    if chosen:
+        return chosen
+    return server_home_country()
 
-    本机国家没有可连节点时，按国家延迟从低到高继续。不启动批量检测。
+
+def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """智能模式：本机或已选国家，移动、住宅、机房，延迟低的优先，带宽不低于 50 Mbps。
+
+    这个国家没有可连节点时，按国家延迟从低到高继续。不启动批量检测。
     """
-    home = server_home_country() or routing_target_country(ui_cfg)
+    home = _ladder_home(ui_cfg)
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for country in ([home] if home else []) + [""]:
@@ -5033,6 +5048,10 @@ def apply_saved_scheme_now() -> None:
             return
         if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
             return
+        if manual_route_pin and active_tunnel_running():
+            set_state(last_check_message="手动切换优先，保持当前主连接")
+            _refresh_cold_standby_now()
+            return
         current = current_active_routing_endpoint()
         if (
             current
@@ -5111,7 +5130,7 @@ def apply_saved_scheme_now() -> None:
                     "Routing",
                     f"{message} {endpoint.get('protocol')} {endpoint.get('country')} {endpoint.get('endpoint_id')}",
                 )
-                if _auto_direct_fallback_active() or proxy_server.get_egress_mode() == "direct":
+                if _auto_direct_fallback_active():
                     _engage_proxy_egress(message)
                 _refresh_cold_standby_now()
                 connected = True
@@ -5165,7 +5184,7 @@ def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool 
     apply_saved_scheme_now()
     if not active_tunnel_running():
         return
-    if proxy_server.get_egress_mode() != "proxy":
+    if (engage_proxy or _auto_direct_fallback_active()) and proxy_server.get_egress_mode() != "proxy":
         _engage_proxy_egress(reason)
 
 
@@ -7031,6 +7050,13 @@ def _fallback_direct_egress(reason: str) -> bool:
     if manual_connection_active or ui_command_plane.is_busy():
         return False
     if proxy_server.get_egress_mode() == "direct":
+        if not _auto_direct_fallback_active():
+            try:
+                manual_direct = str(read_json(STATE_FILE, {}).get("manual_egress_mode") or "") == "direct"
+            except Exception:
+                manual_direct = False
+            if not manual_direct:
+                set_state(auto_direct_fallback=True)
         return True
     if active_tunnel_running():
         return False
@@ -7328,8 +7354,10 @@ def cold_standby_pass() -> None:
             promote_cold_standby_to_main()
         return
     current = current_active_routing_endpoint()
+    manual_hold = bool(manual_route_pin) and active_tunnel_running()
     if (
-        active_tunnel_running()
+        not manual_hold
+        and active_tunnel_running()
         and current
         and _explicit_scheme_configured(ui_cfg)
         and not endpoint_matches_explicit_routing(current, ui_cfg)
@@ -7340,7 +7368,7 @@ def cold_standby_pass() -> None:
             cold_standby_pass.scheme_at = now_scheme
             if enter_explicit_scheme(immediate=True):
                 return
-    if current and endpoint_is_blocked(current, ui_cfg):
+    if current and endpoint_is_blocked(current, ui_cfg) and not manual_hold:
         blocked_eid = str(current.get("endpoint_id") or "")
         log_to_json("INFO", "Routing", f"屏蔽节点退出主连接 {_endpoint_ip(current)}")
         if not try_unified_failover(exclude_endpoint_id=blocked_eid, attempts=4):
@@ -22120,6 +22148,7 @@ class Handler(BaseHTTPRequestHandler):
                         suspend_policy_routing()
                     set_state(
                         egress_mode=mode,
+                        manual_egress_mode=mode,
                         egress_switching=True,
                         egress_generation=generation,
                         auto_direct_fallback=False,
@@ -24159,7 +24188,7 @@ def _ensure_active_client_v2() -> bool:
         if ui_cfg.get("routing_mode") == "fixed_ip":
             reconnect_fixed_node_if_needed(ui_cfg)
         else:
-            auto_switch_node()
+            apply_saved_scheme_now()
     except Exception as exc:
         log_to_json("WARNING","VPN",f"启动/恢复活动 VPN 失败: {exc}")
     finally:
