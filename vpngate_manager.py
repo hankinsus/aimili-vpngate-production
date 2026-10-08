@@ -18968,9 +18968,9 @@ def fast_tunnel_liveness_loop() -> None:
                     handle_confirmed_tunnel_failure(hard)
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
-            if proxy_server.proxy_forwarding_busy(1.0):
+            if proxy_server.proxy_forwarding_busy(3.0):
                 if _soft_fail_streak:
-                    log_to_json("INFO", "Proxy", "最近 1 秒仍有业务流量，忽略一次探测超时")
+                    log_to_json("INFO", "Proxy", "最近仍有业务流量，忽略探测超时")
                 _soft_fail_streak = 0
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue

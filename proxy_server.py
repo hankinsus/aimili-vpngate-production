@@ -1100,6 +1100,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                             try:
                                 sock.sendto(payload, sa)
                                 sent = True
+                                note_proxy_forwarded(len(payload))
                                 if kind == "quic":
                                     _note_quic_packet(host, association_generation, association_iface)
                                 break
@@ -1130,6 +1131,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                                 _socks5_pack_udp((str(source_addr[0]), int(source_addr[1])), response),
                                 client_udp_addr,
                             )
+                            note_proxy_forwarded(len(response))
                         except OSError:
                             break
                         last_activity = time.monotonic()
