@@ -135,8 +135,9 @@ def _iptables_mss(action: str, iface: str) -> None:
     )
 
 def tune_forwarding_interface(iface: str) -> None:
-    """Raise the transmit queue and clamp TCP MSS to the path MTU.
+    """Keep a short fair queue on the tunnel NIC and clamp TCP MSS.
 
+    One video flow must not fill a 1000-packet FIFO and block web requests.
     Do not overwrite a negotiated MTU that is already at or below 1400.
     Only an oversized device, such as an SSTP PPP that came up at 1500, is
     lowered. OpenVPN, SoftEther and L2TP keep the MTU they negotiated.
@@ -152,7 +153,12 @@ def tune_forwarding_interface(iface: str) -> None:
             pass
     try:
         subprocess.run(
-            ["ip", "link", "set", "dev", iface, "txqueuelen", "1000"],
+            ["ip", "link", "set", "dev", iface, "txqueuelen", "80"],
+            capture_output=True, text=True, timeout=3,
+        )
+        subprocess.run(
+            ["tc", "qdisc", "replace", "dev", iface, "root", "fq_codel",
+             "limit", "1024", "flows", "1024", "target", "20ms", "interval", "100ms"],
             capture_output=True, text=True, timeout=3,
         )
         shown = subprocess.run(
