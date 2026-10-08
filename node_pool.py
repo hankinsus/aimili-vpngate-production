@@ -790,6 +790,29 @@ class NodePool:
                     """,
                     (key, hostname, ip, country, now, now, source, 0, server_state, json.dumps(metadata, ensure_ascii=False)),
                 )
+                if ip:
+                    twins = db.execute(
+                        "SELECT server_key, metadata_json FROM servers WHERE current_ip=? AND server_key<>?",
+                        (ip, key),
+                    ).fetchall()
+                    for twin in twins:
+                        try:
+                            twin_meta = json.loads(twin["metadata_json"] or "{}")
+                        except Exception:
+                            twin_meta = {}
+                        if not isinstance(twin_meta, dict):
+                            twin_meta = {}
+                        changed = False
+                        for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                            incoming = str(metadata.get(field) or "").strip()
+                            if incoming and not str(twin_meta.get(field) or "").strip():
+                                twin_meta[field] = incoming
+                                changed = True
+                        if changed:
+                            db.execute(
+                                "UPDATE servers SET metadata_json=? WHERE server_key=?",
+                                (json.dumps(twin_meta, ensure_ascii=False), twin["server_key"]),
+                            )
                 existing = None
                 if ip and port > 0:
                     existing = db.execute(

@@ -1712,6 +1712,16 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
 
     ip: str | None = None
     raw_ttl = 0.0
+    aaaa_box: dict[str, Any] = {}
+    aaaa_thread = None
+    if get_egress_mode() == "direct" and _iface_has_global_ipv6(iface or ""):
+        def _fetch_aaaa() -> None:
+            found, ttl = _query_aaaa(key_host, iface or "", stage_timeout)
+            if found:
+                aaaa_box["ip"] = found
+                aaaa_box["ttl"] = ttl
+        aaaa_thread = threading.Thread(target=_fetch_aaaa, daemon=True)
+        aaaa_thread.start()
     try:
         if not iface:
             ip = _system_dns_ipv4(key_host, stage_timeout)
@@ -1733,14 +1743,11 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
                 return None
             else:
                 ip = _system_dns_ipv4(key_host, stage_timeout)
-        if (
-            not ip
-            and get_egress_mode() == "direct"
-            and _iface_has_global_ipv6(iface or "")
-        ):
-            # Direct NIC has a global IPv6 address. A-only names stay on IPv4.
-            # Names with no A record leave via IPv6 instead of failing closed.
-            ip, raw_ttl = _query_aaaa(key_host, iface or "", stage_timeout)
+        if not ip and aaaa_thread is not None:
+            aaaa_thread.join(max(0.2, stage_timeout))
+            if aaaa_box.get("ip"):
+                ip = str(aaaa_box["ip"])
+                raw_ttl = float(aaaa_box.get("ttl") or 0.0)
         box["ip"] = ip
         _remember_dns(cache_key, ip, raw_ttl, time.monotonic())
         return ip

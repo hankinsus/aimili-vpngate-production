@@ -10564,19 +10564,20 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 500;
     }
     .library-server-meta {
-      flex: 1 1 100%;
+      flex: 1 0 100%;
+      width: 100%;
       min-width: 0;
-      max-width: none;
+      max-width: 100%;
       margin-left: 0;
       display: flex;
       align-items: center;
       justify-content: flex-start;
-      flex-wrap: wrap;
-      gap: 4px 6px;
+      flex-wrap: nowrap;
+      gap: 0 6px;
       color: #d5dee8;
       font-weight: 500;
-      white-space: normal;
-      overflow: visible;
+      white-space: nowrap;
+      overflow: hidden;
     }
     .library-server-meta > span {
       flex: 0 0 auto;
@@ -10585,6 +10586,17 @@ INDEX_HTML = r"""<!doctype html>
       overflow: visible;
       text-overflow: clip;
       white-space: nowrap;
+    }
+    .library-server-meta .active-location-with-flag {
+      width: auto;
+      max-width: none;
+      flex: 0 0 auto;
+    }
+    .library-server-meta .active-location-with-flag > span:last-child {
+      overflow: visible;
+      text-overflow: clip;
+      color: inherit;
+      font-weight: 500;
     }
     .library-server-meta .mono {
       flex: 0 0 auto;
@@ -12321,7 +12333,10 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
     }
     .rs-form-grid > .rs-help {
-      margin-top: auto;
+      margin-top: 2px;
+    }
+    #rs_invite_allowed_cidrs {
+      margin-top: 30px;
     }
     .rs-auto-row { display: flex; flex-direction: column; gap: 8px; }
     .rs-auto-check {
@@ -12974,8 +12989,8 @@ INDEX_HTML = r"""<!doctype html>
     <select id="ip_type_filter" aria-hidden="true" tabindex="-1" style="display:none;">
       <option value="">所有IP类型</option>
       <option value="mobile">移动网</option>
-      <option value="residential">住宅IP</option>
-      <option value="hosting">机房IP</option>
+      <option value="residential">住宅</option>
+      <option value="hosting">机房</option>
     </select>
     <div id="ip_type_filter_widget" class="toolbar-custom-select" data-filter-id="ip_type_filter" aria-label="IP 类型筛选">
       <button id="ip_type_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -13367,11 +13382,11 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-desc">机房 + 住宅均可</div>
               </div>
               <div class="option-card" data-value="residential" onclick="setRoutingIpType('residential')">
-                <div class="option-card-title">住宅 IP+移动网</div>
+                <div class="option-card-title">住宅+移动网</div>
                 <div class="option-card-desc">家宽和移动网，不可用自动回退</div>
               </div>
               <div class="option-card" data-value="hosting" onclick="setRoutingIpType('hosting')">
-                <div class="option-card-title">机房IP</div>
+                <div class="option-card-title">机房</div>
                 <div class="option-card-desc">普通机房</div>
               </div>
             </div>
@@ -13942,7 +13957,7 @@ const translateQuality = q => {
 };
 
 const translateIpType = t => {
-  const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "proxy": "代理 IP"};
+  const dict = {"residential": "住宅", "hosting": "机房", "mobile": "移动网", "proxy": "代理"};
   const key = String(t || "").trim().toLowerCase();
   if (!key || ["unknown","unclassified","unavailable","n/a","na","null","undefined","-","—"].includes(key)) return "-";
   return dict[key] || key;
@@ -16130,6 +16145,12 @@ function adoptBackendState(next, sourceGeneration, startedAt) {
   const inFlight = egressSwitchInFlight;
   const generation = egressSwitchGeneration;
   const target = egressSwitchTarget;
+  if (egressDirectHold && inFlight && sourceGeneration === generation) {
+    state.egress_switching = true;
+    state.pending_egress_mode = target;
+    state.last_check_message = "正在切换至直连";
+    return;
+  }
   let acceptEgress = true;
   if (inFlight) {
     if (sourceGeneration !== generation) acceptEgress = false;
@@ -16161,16 +16182,38 @@ function adoptBackendState(next, sourceGeneration, startedAt) {
   const confirmed = acceptEgress && egressSwitchAcked && freshEnough && !next.egress_switching && next.egress_mode === target && ready;
   const rolledBack = acceptEgress && egressSwitchAcked && freshEnough && !next.egress_switching && next.egress_mode && next.egress_mode !== target;
   if (confirmed || rolledBack) {
-    egressSwitchInFlight = false;
-    egressSwitchAcked = false;
-    egressSwitchAckedAt = 0;
-    egressSwitchTarget = "";
-    state.pending_egress_mode = "";
-    state.egress_switching = false;
-    egressHoldUntil = Date.now() + 3000;
-    setTimeout(() => {
-      if (Date.now() >= egressHoldUntil) paintEgressChrome();
-    }, 3100);
+    const elapsed = Date.now() - (egressSwitchStartedAt || Date.now());
+    const hold = confirmed && target === "direct" ? Math.max(0, 1100 - elapsed) : 0;
+    const finish = () => {
+      if (generation !== egressSwitchGeneration) return;
+      egressDirectHold = false;
+      egressSwitchInFlight = false;
+      egressSwitchAcked = false;
+      egressSwitchAckedAt = 0;
+      egressSwitchTarget = "";
+      state.egress_mode = next.egress_mode || target || state.egress_mode;
+      state.direct_egress_ok = next.direct_egress_ok;
+      state.client_proxy_ok = next.client_proxy_ok;
+      state.last_check_message = next.last_check_message || state.last_check_message;
+      state.egress_switching = false;
+      state.pending_egress_mode = "";
+      egressHoldUntil = Date.now() + 1400;
+      paintEgressChrome();
+      render();
+      setTimeout(() => {
+        if (Date.now() >= egressHoldUntil) paintEgressChrome();
+      }, 1500);
+    };
+    if (hold > 0) {
+      egressDirectHold = true;
+      state.egress_mode = keptMode;
+      state.egress_switching = true;
+      state.pending_egress_mode = target;
+      state.last_check_message = "正在切换至直连";
+      setTimeout(finish, hold);
+      return;
+    }
+    finish();
     return;
   }
   if (!egressSwitchInFlight) {
@@ -16418,6 +16461,8 @@ let egressSwitchTarget = "";
 let egressSwitchGeneration = 0;
 let egressSwitchAcked = false;
 let egressSwitchAckedAt = 0;
+let egressSwitchStartedAt = 0;
+let egressDirectHold = false;
 
 function egressPendingLabel() {
   if (!egressSwitchInFlight && !(state && state.egress_switching)) return "";
@@ -16451,6 +16496,8 @@ async function setEgressMode(mode) {
   egressSwitchInFlight = true;
   egressSwitchAcked = false;
   egressSwitchTarget = mode;
+  egressSwitchStartedAt = Date.now();
+  egressDirectHold = false;
   state.egress_switching = true;
   state.pending_egress_mode = mode;
   state.last_check_message = mode === "proxy" ? "正在切换至代理" : "正在切换至直连";
