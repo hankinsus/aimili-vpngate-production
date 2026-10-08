@@ -10071,6 +10071,19 @@ INDEX_HTML = r"""<!doctype html>
       justify-content: center;
       border: 1px solid rgba(255, 255, 255, 0.06);
     }
+    .active-card .stat-icon-wrapper {
+      flex: 0 0 48px;
+      width: 48px;
+      height: 48px;
+      min-width: 48px;
+      min-height: 48px;
+      max-width: 48px;
+      max-height: 48px;
+      aspect-ratio: 1 / 1;
+      align-self: center;
+      box-sizing: border-box;
+      border-radius: 4px !important;
+    }
 
     .stat-icon {
       width: 22px;
@@ -15570,7 +15583,7 @@ function currentServerMetaHtml() {
   if (place) bits.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
   if (owner) bits.push('<span>' + esc(owner) + '</span>');
   if (ipType) bits.push('<span>' + esc(translateIpType(ipType)) + '</span>');
-  return bits.join('<span class="meta-dot"> · </span>');
+  return bits.join('<span class="meta-dot"> </span>');
 }
 
 function paintPriorityStatus() {
