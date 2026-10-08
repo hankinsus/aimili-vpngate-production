@@ -11463,8 +11463,8 @@ INDEX_HTML = r"""<!doctype html>
 
     table.node-table td {
       font-size: 15px;
-      font-weight: 700;
-      color: #d7e1e8;
+      font-weight: 600;
+      color: #b7c3cb;
     }
 
     th, td {
@@ -11556,7 +11556,7 @@ INDEX_HTML = r"""<!doctype html>
     .node-speed-cell {
       text-align: left;
       padding-left: 4px;
-      padding-right: 2px;
+      padding-right: 10px;
     }
 
     .node-owner-cell,
@@ -11565,7 +11565,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .node-location-cell,
     .col-location {
-      padding-left: 8px;
+      padding-left: 22px;
     }
     .node-location-cell .country-flag-img,
     .node-location-cell .country-flag-fallback {
@@ -11579,8 +11579,8 @@ INDEX_HTML = r"""<!doctype html>
 
     .node-address-cell .mono {
       font-size: 15px;
-      font-weight: 700;
-      color: #c5d3db;
+      font-weight: 600;
+      color: #8fa0aa;
       letter-spacing: 0;
       display: block;
       white-space: nowrap;
@@ -11600,8 +11600,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .node-domain {
       font-size: 15px;
-      font-weight: 700;
-      color: #e2eaee;
+      font-weight: 600;
+      color: #b7c3cb;
       display: block;
       white-space: nowrap;
       overflow: hidden;
@@ -11616,9 +11616,9 @@ INDEX_HTML = r"""<!doctype html>
       display: inline-block;
       min-width: 0;
       white-space: nowrap;
-      font-weight: 700;
+      font-weight: 600;
       font-size: 15px;
-      color: #d7e1e8;
+      color: #b7c3cb;
       font-variant-numeric: tabular-nums;
     }
     @media (min-width: 1101px) {
@@ -11941,13 +11941,23 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: center;
       min-width: 0;
-      font-weight: 700;
+      font-weight: 600;
       padding: 0;
       border-radius: 0;
       background: transparent;
       font-size: 15px;
       font-variant-numeric: tabular-nums;
       line-height: 1.2;
+    }
+
+    .node-latency-cell .latency-good {
+      color: #6fbf9a;
+    }
+    .node-latency-cell .latency-medium {
+      color: #d4b06a;
+    }
+    .node-latency-cell .latency-poor {
+      color: #e08b8b;
     }
 
     .latency-good {
@@ -13112,9 +13122,9 @@ INDEX_HTML = r"""<!doctype html>
           <tr>
             <th class="col-status" style="width: 7%;">状态</th>
             <th class="col-protocol" style="width: 9%;">协议</th>
-            <th class="col-address" style="width: 22%;">域名 : 端口 / IP</th>
+            <th class="col-address" style="width: 20%;">域名 : 端口 / IP</th>
             <th class="col-latency" style="width: 6%;">延迟</th>
-            <th class="col-speed" style="width: 7%;">速度</th>
+            <th class="col-speed" style="width: 9%;">速度</th>
             <th class="col-location" style="width: 16%;">物理位置</th>
             <th class="col-owner" style="width: 13%;">运营主体 / ISP</th>
             <th class="col-iptype" style="width: 7%;">IP 类型</th>
