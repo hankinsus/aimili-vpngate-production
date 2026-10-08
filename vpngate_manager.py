@@ -5724,7 +5724,10 @@ def auto_switch_node(attempt: int = 0) -> None:
         log_to_json("INFO", "VPN", "用户正在手动操作，自动切换暂缓")
         return
     if attempt >= 3:
-        print("[自动切换] 连续切换失败已达 3 次，等待后台检测周期继续恢复。", flush=True)
+        print("[自动切换] 连续切换失败已达 3 次，备用节点不可用，切换直连模式。", flush=True)
+        _fallback_direct_egress("连续切换失败已达 3 次")
+        return
+    if proxy_server.get_egress_mode() == "direct" and bool(read_json(STATE_FILE, {}).get("auto_direct_fallback")):
         return
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)):
@@ -5734,10 +5737,22 @@ def auto_switch_node(attempt: int = 0) -> None:
     target_country = str(ui_cfg.get("force_country") or "").strip()
     if routing_mode == "fixed_ip":
         return
+    if attempt == 0 and not active_tunnel_running() and proxy_server.get_egress_mode() == "proxy":
+        outcome = promote_cold_standby_to_main()
+        if outcome in ("up", "direct", "busy"):
+            return
 
+    if attempt == 0:
+        auto_switch_node.failed_ids = set()
+    failed_ids = getattr(auto_switch_node, "failed_ids", set())
     current = current_active_routing_endpoint()
     exclude_endpoint_id = str(current.get("endpoint_id") or "") if current else ""
-    candidates = unified_hot_pool_candidates(ui_cfg, exclude_endpoint_id=exclude_endpoint_id, limit=30)
+    if exclude_endpoint_id:
+        failed_ids.add(exclude_endpoint_id)
+    candidates = [
+        ep for ep in unified_hot_pool_candidates(ui_cfg, exclude_endpoint_id=exclude_endpoint_id, limit=30)
+        if str(ep.get("endpoint_id") or "") not in failed_ids
+    ]
     if candidates:
         preferred = candidates[0]
         msg = (
@@ -5747,15 +5762,22 @@ def auto_switch_node(attempt: int = 0) -> None:
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
         for endpoint in candidates[:max(1, min(5, len(candidates)))]:
+            eid = str(endpoint.get("endpoint_id") or "")
+            if eid:
+                failed_ids.add(eid)
             try:
                 connect_ranked_endpoint(endpoint)
+                auto_switch_node.failed_ids = set()
+                if bool(read_json(STATE_FILE, {}).get("auto_direct_fallback")):
+                    _engage_proxy_egress("备用节点已接上，切回代理模式")
                 return
             except Exception as exc:
                 log_to_json("WARNING", "VPN", f"备用节点 {endpoint.get('endpoint_id')} 切换失败: {exc}")
+        auto_switch_node.failed_ids = failed_ids
         auto_switch_node(attempt + 1)
         return
 
-    msg = "没有经过验证的备用节点，保留服务状态并进入后台补齐/重测。"
+    msg = "没有经过验证的备用节点，切换直连模式，并在后台继续补齐。"
     print(f"[自动切换] {msg}", flush=True)
     log_to_json("WARNING", "VPN", msg)
     stop_all_tunnels()
@@ -5765,6 +5787,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             item["active"] = False
         write_json(NODES_FILE, nodes)
     set_state(active_openvpn_node_id="", active_pool_endpoint_id="", active_tunnel_protocol="", last_check_message=msg, proxy_ok=False, proxy_ip="-", proxy_latency_ms=0)
+    _fallback_direct_egress(msg)
 
     def bg_fetch_and_switch():
         try:
@@ -5772,8 +5795,6 @@ def auto_switch_node(attempt: int = 0) -> None:
                 start_country_priority(target_country)
             time.sleep(5)
             maintain_valid_nodes(force=False)
-            time.sleep(2)
-            auto_switch_node(attempt + 1)
         except Exception as exc:
             print(f"[自动切换后台补齐] 获取并测试节点失败: {exc}", flush=True)
     threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
@@ -6757,6 +6778,280 @@ def _cold_port_open(endpoint: dict[str, Any]) -> bool | None:
     return _tcp_port_open(host, port, timeout=1.5)
 
 
+_cold_promote_lock = threading.Lock()
+_cold_promote_cooldown_until = 0.0
+
+
+def _auto_direct_fallback_active() -> bool:
+    try:
+        return bool(read_json(STATE_FILE, {}).get("auto_direct_fallback"))
+    except Exception:
+        return False
+
+
+def _fallback_direct_egress(reason: str) -> bool:
+    """Last resort when every prepared backup failed. Leaves 8500 on the server NIC."""
+    ui_cfg = load_ui_config()
+    if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+        return False
+    if not bool(ui_cfg.get("connection_enabled", True)):
+        return False
+    if manual_connection_active or ui_command_plane.is_busy():
+        return False
+    if proxy_server.get_egress_mode() == "direct":
+        return True
+    if active_tunnel_running():
+        return False
+    generation = _begin_egress_transaction()
+    if generation is None:
+        log_to_json("INFO", "Standby", "出口切换进行中，直连兜底稍后再试")
+        return False
+    try:
+        try:
+            stop_all_tunnels()
+        except Exception:
+            pass
+        try:
+            _detach_dead_forwarding()
+        except Exception:
+            pass
+        proxy_server.set_egress_mode("direct")
+        if not _wait_egress_applied("direct", timeout=1.2):
+            proxy_server.set_egress_mode("proxy")
+            log_to_json("WARNING", "Standby", "冷备失败后切直连未确认，已恢复代理模式")
+            return False
+        suspend_policy_routing()
+        note = "备用节点不可用，已切换直连：" + str(reason or "")
+        set_state(
+            auto_direct_fallback=True,
+            egress_mode="direct",
+            egress_switching=True,
+            egress_generation=generation,
+            proxy_ok=False,
+            proxy_error="",
+            active_tunnel_ok=False,
+            last_check_message=note[:300],
+        )
+        log_to_json("WARNING", "Standby", note)
+
+        def _commit() -> None:
+            try:
+                _refresh_egress_health("direct", "proxy", generation)
+            finally:
+                _end_egress_transaction(generation)
+
+        threading.Thread(target=_commit, daemon=True, name="cold-direct-fallback").start()
+        return True
+    except Exception as exc:
+        try:
+            _end_egress_transaction(generation)
+        except Exception:
+            pass
+        log_to_json("WARNING", "Standby", f"切换直连失败: {exc}")
+        return False
+
+
+def _engage_proxy_egress(reason: str) -> bool:
+    """A backup tunnel is up. Leave automatic direct mode and forward 8500 through it."""
+    if not active_tunnel_running():
+        return False
+    if proxy_server.get_egress_mode() == "proxy" and not _auto_direct_fallback_active():
+        return True
+    generation = _begin_egress_transaction()
+    if generation is None:
+        log_to_json("INFO", "Standby", "出口切换进行中，切回代理稍后再试")
+        return False
+    try:
+        proxy_server.set_egress_mode("proxy")
+        if not _wait_egress_applied("proxy", timeout=1.2):
+            proxy_server.set_egress_mode("direct")
+            log_to_json("WARNING", "Standby", "冷备接上后切回代理未确认，仍保持直连")
+            return False
+        try:
+            ensure_active_policy_route()
+        except Exception as exc:
+            log_to_json("WARNING", "Standby", f"切回代理路由失败: {exc}")
+        note = str(reason or "冷备已接上，切回代理模式")
+        set_state(
+            auto_direct_fallback=False,
+            egress_mode="proxy",
+            egress_switching=True,
+            egress_generation=generation,
+            proxy_error="",
+            last_check_message=note[:300],
+        )
+        log_to_json("INFO", "Standby", note)
+
+        def _commit() -> None:
+            try:
+                _refresh_egress_health("proxy", "direct", generation)
+            finally:
+                _end_egress_transaction(generation)
+
+        threading.Thread(target=_commit, daemon=True, name="cold-proxy-restore").start()
+        return True
+    except Exception as exc:
+        try:
+            _end_egress_transaction(generation)
+        except Exception:
+            pass
+        log_to_json("WARNING", "Standby", f"切回代理失败: {exc}")
+        return False
+
+
+def _cold_eid(raw: str) -> str:
+    raw = str(raw or "").strip()
+    if raw.startswith("pool:"):
+        return raw.split(":", 1)[1]
+    return raw
+
+
+def _lookup_cold_endpoint(eid: str, candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    eid = str(eid or "").strip()
+    if not eid:
+        return None
+    found = candidates.get(eid)
+    if found is None:
+        try:
+            found = node_pool.get_endpoint(eid)
+        except Exception:
+            found = None
+    if not isinstance(found, dict):
+        return None
+    try:
+        if endpoint_is_blocked(found, load_ui_config()):
+            return None
+    except Exception:
+        return None
+    return found
+
+
+def _promote_next_cold(promoted_eid: str, candidates: dict[str, dict[str, Any]]) -> None:
+    """The promoted node is now primary. Slide one precold into the cold slot and refill."""
+    cold = _cold_state()
+    failed = {str(item) for item in (cold.get("failed") or [])}
+    nxt: dict[str, Any] | None = None
+    for eid in [str(item) for item in (cold.get("precold") or [])]:
+        if not eid or eid == promoted_eid or eid in failed:
+            continue
+        found = _lookup_cold_endpoint(eid, candidates)
+        if found:
+            nxt = found
+            break
+    if nxt is None:
+        for eid, found in candidates.items():
+            if eid and eid != promoted_eid and eid not in failed:
+                nxt = found
+                break
+    new_cold = str((nxt or {}).get("endpoint_id") or "")
+    _publish_cold_standby(nxt)
+    _remember_precold(candidates, new_cold or promoted_eid)
+    filled = [str(item) for item in (_cold_state().get("precold") or []) if str(item)]
+    if len(filled) < PRECOLD_TARGET:
+        log_to_json("INFO", "Standby", f"预冷备不足，已补到 {len(filled)}/{PRECOLD_TARGET}")
+    else:
+        log_to_json("INFO", "Standby", f"冷备已前移，预冷备 {len(filled)}/{PRECOLD_TARGET}")
+
+
+def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict[str, dict[str, Any]] | None = None) -> str:
+    """Main is down. Promote prepared cold, then one precold. up/direct/busy/cooldown/skip."""
+    global _cold_promote_cooldown_until
+    if active_tunnel_running():
+        return "up"
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+        return "busy"
+    ui_cfg = load_ui_config()
+    if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+        return "skip"
+    mode = proxy_server.get_egress_mode()
+    auto_direct = _auto_direct_fallback_active()
+    if mode == "direct" and not auto_direct:
+        return "skip"
+    if mode not in ("proxy", "direct"):
+        return "skip"
+    now = time.time()
+    if now < _cold_promote_cooldown_until:
+        return "cooldown"
+    if not _cold_promote_lock.acquire(blocking=False):
+        return "busy"
+    try:
+        if active_tunnel_running():
+            return "up"
+        if _promote_live_standby():
+            _cold_promote_cooldown_until = 0.0
+            pool = candidates if isinstance(candidates, dict) else (_cold_candidates(ui_cfg) or {})
+            _promote_next_cold(str(exclude_endpoint_id or ""), pool)
+            if auto_direct or proxy_server.get_egress_mode() == "direct":
+                _engage_proxy_egress("热备已接管，切回代理模式")
+            log_to_json("INFO", "Standby", "主连接未启动，已由就绪热备接管")
+            return "up"
+        if candidates is None:
+            candidates = _cold_candidates(ui_cfg)
+        if candidates is None:
+            return "busy"
+        cold = _cold_state()
+        published = _cold_eid(str(cold.get("published") or ""))
+        precold = [_cold_eid(item) for item in (cold.get("precold") or [])]
+        exclude = str(exclude_endpoint_id or "").strip()
+        order: list[str] = []
+        for eid in [published] + precold:
+            if eid and eid != exclude and eid not in order:
+                order.append(eid)
+        if not order:
+            chosen = _pick_cold(candidates)
+            if chosen:
+                eid = str(chosen.get("endpoint_id") or "")
+                if eid and eid != exclude:
+                    order.append(eid)
+                for extra in _select_precold_ids(candidates, eid):
+                    if extra and extra != exclude and extra not in order:
+                        order.append(extra)
+        order = order[: 1 + PRECOLD_TARGET]
+        if not order:
+            return "skip"
+        for eid in order:
+            if active_tunnel_running() or manual_connection_active or is_connecting:
+                break
+            endpoint = _lookup_cold_endpoint(eid, candidates)
+            if not endpoint:
+                continue
+            probed = _cold_port_open(endpoint)
+            if probed is False:
+                log_to_json("INFO", "Standby", f"冷备端口不可用，跳过 {_endpoint_ip(endpoint)}:{endpoint.get('port')}")
+                _rotate_cold(eid, candidates)
+                continue
+            log_to_json(
+                "INFO",
+                "Standby",
+                f"主连接未启动，冷备接管 {endpoint.get('protocol')} {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}",
+            )
+            try:
+                connect_ranked_endpoint(endpoint)
+            except Exception as exc:
+                log_to_json("WARNING", "Standby", f"冷备接管失败 {eid}: {exc}")
+                _rotate_cold(eid, candidates)
+                continue
+            if not active_tunnel_running():
+                _rotate_cold(eid, candidates)
+                continue
+            _cold_promote_cooldown_until = 0.0
+            _promote_next_cold(eid, candidates)
+            if auto_direct or proxy_server.get_egress_mode() == "direct":
+                _engage_proxy_egress("冷备已接上，切回代理模式")
+            return "up"
+        _cold_promote_cooldown_until = time.time() + 180
+        if proxy_server.get_egress_mode() == "proxy":
+            _fallback_direct_egress("冷备与预冷备均不可用或切换失败")
+        if proxy_server.get_egress_mode() == "direct":
+            return "direct"
+        return "skip"
+    except Exception as exc:
+        log_to_json("WARNING", "Standby", f"冷备接管异常: {exc}")
+        return "skip"
+    finally:
+        _cold_promote_lock.release()
+
+
 def _refill_unblocked_primary(ui_cfg: dict[str, Any]) -> None:
     if active_tunnel_running() or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
         return
@@ -6776,7 +7071,15 @@ def cold_standby_pass() -> None:
         _cold_candidates.stats = {}
         _remember_precold({}, "")
         return
-    if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+        return
+    if ui_query_active():
+        if (
+            not active_tunnel_running()
+            and not proxy_server.proxy_forwarding_busy()
+            and (proxy_server.get_egress_mode() == "proxy" or _auto_direct_fallback_active())
+        ):
+            promote_cold_standby_to_main()
         return
     current = current_active_routing_endpoint()
     if current and endpoint_is_blocked(current, ui_cfg):
@@ -6807,36 +7110,26 @@ def cold_standby_pass() -> None:
         chosen = _pick_cold(candidates)
     _publish_cold_standby(chosen)
     _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
-    if not chosen:
-        _refill_unblocked_primary(ui_cfg)
-        return
-    cold = _cold_state()
-    now = time.time()
-    if now - float(cold.get("last_connect") or 0) < COLD_CONNECT_SECONDS:
-        return
-    cold["last_connect"] = now
-    _save_cold_state()
     if active_tunnel_running() or proxy_server.proxy_forwarding_busy():
+        if active_tunnel_running() and proxy_server.get_egress_mode() == "direct" and _auto_direct_fallback_active():
+            _engage_proxy_egress("备用已接上，切回代理模式")
         return
-    eid = str(chosen.get("endpoint_id") or "")
-    result = probe_pool_endpoint(eid)
-    if result.get("skipped") or result.get("active"):
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
         return
-    if not result.get("ok"):
-        log_to_json("INFO", "Standby", f"冷备实连不可用，排到队尾 {eid}: {result.get('error') or ''}")
-        _rotate_cold(eid, candidates)
-        nxt = _pick_cold(candidates)
-        if nxt and str(nxt.get("endpoint_id") or "") != eid:
-            _publish_cold_standby(nxt)
-            _remember_precold(candidates, str(nxt.get("endpoint_id") or ""))
-        else:
-            _publish_cold_standby(None)
-            _remember_precold(candidates, "")
+    mode = proxy_server.get_egress_mode()
+    if mode == "direct" and not _auto_direct_fallback_active():
+        return
+    if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+        return
+    outcome = promote_cold_standby_to_main(candidates=candidates)
+    if outcome in ("up", "direct", "busy", "cooldown"):
+        return
+    if mode == "proxy":
         _refill_unblocked_primary(ui_cfg)
 
 
 def cold_standby_loop() -> None:
-    """One prepared standby. Port check each minute. Real connect only when the exit is idle."""
+    """Keep one cold standby and up to five precold. Promote when the main tunnel is down."""
     time.sleep(4)
     while True:
         try:
@@ -10239,9 +10532,10 @@ INDEX_HTML = r"""<!doctype html>
     .country-priority {
       display: flex;
       align-items: center;
-      gap: 10px;
+      flex-wrap: wrap;
+      gap: 6px 10px;
       margin: 0 0 8px;
-      padding: 6px 52px 6px 14px;
+      padding: 6px 72px 6px 14px;
       min-height: 36px;
       box-sizing: border-box;
       border: 1px solid rgba(20,184,166,.14);
@@ -10262,7 +10556,7 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .library-status-main {
-      flex: 1 1 auto;
+      flex: 1 1 280px;
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -10270,23 +10564,26 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 500;
     }
     .library-server-meta {
-      flex: 1 1 auto;
-      min-width: 168px;
-      max-width: 58%;
-      margin-left: 12px;
+      flex: 1 1 100%;
+      min-width: 0;
+      max-width: none;
+      margin-left: 0;
       display: flex;
       align-items: center;
-      justify-content: flex-end;
-      gap: 6px;
+      justify-content: flex-start;
+      flex-wrap: wrap;
+      gap: 4px 6px;
       color: #d5dee8;
       font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
+      white-space: normal;
+      overflow: visible;
     }
     .library-server-meta > span {
+      flex: 0 0 auto;
       min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      max-width: none;
+      overflow: visible;
+      text-overflow: clip;
       white-space: nowrap;
     }
     .library-server-meta .mono {
@@ -11784,10 +12081,11 @@ INDEX_HTML = r"""<!doctype html>
 
     /* Modal styles */
     #logs_modal .modal-content {
-      max-width: 860px;
-      width: min(860px, calc(100vw - 24px));
-      max-height: calc(100vh - 16px);
-      padding: 22px 22px 16px;
+      max-width: 960px;
+      width: min(960px, calc(100vw - 24px));
+      height: calc(100vh - 24px);
+      max-height: calc(100vh - 24px);
+      padding: 18px 22px 14px;
       display: flex;
       flex-direction: column;
       overflow: hidden;
@@ -11795,8 +12093,8 @@ INDEX_HTML = r"""<!doctype html>
     #logs_modal .log-terminal {
       height: auto;
       flex: 1 1 auto;
-      min-height: 180px;
-      max-height: calc(100vh - 210px);
+      min-height: 0;
+      max-height: none;
       margin-bottom: 12px;
     }
     #logs_modal .log-actions {
@@ -14850,18 +15148,19 @@ function render(){
       </div>
     `;
   } else {
+    const directIdle = state.egress_mode === "direct";
     activeCardContainer.innerHTML = `
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--border-color); box-shadow: none;">
         <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(244, 63, 94, 0.1); border-color: rgba(244, 63, 94, 0.2); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: var(--danger); width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
+          <div class="stat-icon-wrapper" style="background: ${directIdle ? "rgba(20, 184, 166, 0.12)" : "rgba(244, 63, 94, 0.1)"}; border-color: ${directIdle ? "rgba(20, 184, 166, 0.28)" : "rgba(244, 63, 94, 0.2)"}; width: 48px; height: 48px; border-radius: 12px;">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: ${directIdle ? "#2dd4bf" : "var(--danger)"}; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
           </div>
           <div class="active-card-details">
             <div class="active-card-title" style="color: var(--text-secondary);">
-              <span class="badge unavailable" style="padding: 2px 8px;">未连接</span> 当前未连接 VPN 节点
+              <span class="badge ${directIdle ? "available" : "unavailable"}" style="padding: 2px 8px;">${directIdle ? "直连模式" : "未连接"}</span> ${directIdle ? "备用节点不可用，当前走服务器直连" : "当前未连接 VPN 节点"}
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
-              在下方列表中选择一个可用备用节点并点击 “切换” 按钮开始连接。
+              ${directIdle ? esc(state.last_check_message || "8500 当前走服务器网卡。列表里的冷备恢复后会自动切回代理。") : "在下方列表中选择一个可用备用节点并点击 “切换” 按钮开始连接。"}
             </div>
           </div>
         </div>
@@ -19182,6 +19481,11 @@ def handle_confirmed_tunnel_failure(error_msg: str, expected_target: str = "") -
             node_pool.record_endpoint_probe(failed_endpoint, False, 0, error_msg)
         except Exception:
             pass
+        outcome = promote_cold_standby_to_main(exclude_endpoint_id=failed_endpoint)
+        if outcome in ("up", "direct", "busy"):
+            return
+        if outcome == "cooldown" and (proxy_server.get_egress_mode() == "direct" or _auto_direct_fallback_active()):
+            return
         if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=3):
             stop_active_external_tunnel()
             auto_switch_node()
@@ -19205,6 +19509,11 @@ def handle_confirmed_tunnel_failure(error_msg: str, expected_target: str = "") -
                         node_pool.record_probe(active_node, False, 0, error_msg)
                     except Exception:
                         pass
+            outcome = promote_cold_standby_to_main(exclude_endpoint_id=failed_endpoint)
+            if outcome in ("up", "direct", "busy"):
+                return
+            if outcome == "cooldown" and (proxy_server.get_egress_mode() == "direct" or _auto_direct_fallback_active()):
+                return
             if not try_unified_failover(exclude_endpoint_id=failed_endpoint, attempts=4):
                 auto_switch_node()
         else:
@@ -21390,6 +21699,7 @@ class Handler(BaseHTTPRequestHandler):
                         egress_mode=mode,
                         egress_switching=True,
                         egress_generation=generation,
+                        auto_direct_fallback=False,
                         proxy_error="",
                         last_check_message="切换中",
                     )
