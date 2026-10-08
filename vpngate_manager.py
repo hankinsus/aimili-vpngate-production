@@ -4918,6 +4918,102 @@ def _smart_floor_configs(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 _scheme_apply_lock = threading.Lock()
+_connect_fail_until: dict[str, float] = {}
+
+
+def _note_connect_fail(endpoint: dict[str, Any]) -> None:
+    ip = ""
+    try:
+        ip = _endpoint_ip(endpoint)
+    except Exception:
+        ip = str(endpoint.get("current_ip") or "")
+    if ip:
+        _connect_fail_until[ip] = time.time() + 180
+
+
+def _connect_recently_failed(endpoint: dict[str, Any]) -> bool:
+    try:
+        ip = _endpoint_ip(endpoint)
+    except Exception:
+        ip = str(endpoint.get("current_ip") or "")
+    return bool(ip) and time.time() < float(_connect_fail_until.get(ip) or 0)
+
+
+def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """智能模式：本机国家，移动、住宅、机房，延迟低的优先，带宽不低于 50 Mbps。
+
+    本机国家没有可连节点时，按国家延迟从低到高继续。不启动批量检测。
+    """
+    home = server_home_country() or routing_target_country(ui_cfg)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for country in ([home] if home else []) + [""]:
+        try:
+            batch = node_pool.list_routing_endpoints(limit=800, country=country)
+        except Exception:
+            continue
+        for endpoint in batch:
+            eid = str(endpoint.get("endpoint_id") or "")
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            rows.append(endpoint)
+    qualified: list[dict[str, Any]] = []
+    identities: set[str] = set()
+    country_latency: dict[str, int] = {}
+    for endpoint in rows:
+        protocol = str(endpoint.get("protocol") or "").lower()
+        if protocol not in ("openvpn", "softether", "sstp", "l2tp-ipsec"):
+            continue
+        if str(endpoint.get("status") or "").upper() not in ("HOT", "AVAILABLE"):
+            continue
+        if endpoint_is_blocked(endpoint, ui_cfg) or endpoint_is_unstable(endpoint):
+            continue
+        if int(endpoint.get("fail_streak") or 0) >= 3:
+            continue
+        if _endpoint_speed_bps(endpoint) < ROUTING_MIN_LINE_SPEED_BPS:
+            continue
+        ip = _endpoint_ip(endpoint)
+        if not ip:
+            continue
+        identity = f"{protocol}|{ip}|{int(endpoint.get('port') or 0)}"
+        if identity in identities:
+            continue
+        identities.add(identity)
+        qualified.append(endpoint)
+        country = normalized_country_name(endpoint.get("country"))
+        ip_type = str(endpoint_ip_type(endpoint) or "").lower()
+        if country and ip_type in ("mobile", "residential"):
+            latency = endpoint_display_latency_ms(endpoint) or 999999
+            country_latency[country] = min(country_latency.get(country, 999999), latency)
+
+    def tier(endpoint: dict[str, Any]) -> int:
+        country = normalized_country_name(endpoint.get("country"))
+        ip_type = str(endpoint_ip_type(endpoint) or "").lower()
+        same = bool(home) and country == home
+        if same and ip_type == "mobile":
+            return 0
+        if same and ip_type == "residential":
+            return 1
+        if same and ip_type == "hosting":
+            return 2
+        if ip_type == "mobile":
+            return 3
+        if ip_type == "residential":
+            return 4
+        if ip_type == "hosting":
+            return 5
+        return 6
+
+    def sort_key(endpoint: dict[str, Any]) -> tuple:
+        country = normalized_country_name(endpoint.get("country"))
+        level = tier(endpoint)
+        latency = endpoint_display_latency_ms(endpoint) or 999999
+        country_rank = country_latency.get(country, 999999) if level >= 3 else 0
+        return (level, country_rank, latency, -_endpoint_speed_bps(endpoint))
+
+    qualified.sort(key=sort_key)
+    return qualified
 
 
 def apply_saved_scheme_now() -> None:
@@ -4947,25 +5043,45 @@ def apply_saved_scheme_now() -> None:
             set_state(routing_degraded=False, last_check_message="当前出口符合代理设置")
             _refresh_cold_standby_now()
             return
-        strict = _scheme_candidates(ui_cfg)
+        strict = [
+            ep for ep in _scheme_candidates(ui_cfg)
+            if not _connect_recently_failed(ep)
+        ]
+        ladder = [
+            ep for ep in _smart_ladder(ui_cfg)
+            if not _connect_recently_failed(ep)
+        ]
+        plans: list[tuple[list[dict[str, Any]], str, bool, int]] = []
         if strict:
-            plans: list[tuple[list[dict[str, Any]], str, bool]] = [(strict, "已按代理设置连接", False)]
-        else:
-            plans = [
-                (_scheme_candidates(cfg), "当前方案没有可连节点，已按智能模式保底连接（≥50 Mbps）", True)
-                for cfg in _smart_floor_configs(ui_cfg)
-            ]
+            plans.append((strict, "已按代理设置连接", False, 2))
+        plans.append((
+            ladder,
+            "当前方案连不上，已按智能模式连接：本机国家优先，移动/住宅/机房，≥50 Mbps，不够再换延迟更低的国家",
+            True,
+            6,
+        ))
         last_error = ""
-        for matching, message, degraded in plans:
+        seen_ips: set[str] = set()
+        for matching, message, degraded, limit in plans:
             if not matching:
                 continue
             replacing = active_tunnel_running()
             connected = False
-            for endpoint in matching[:3]:
+            tried = 0
+            for endpoint in matching:
+                ip = _endpoint_ip(endpoint)
+                if ip and ip in seen_ips:
+                    continue
+                if tried >= limit:
+                    break
+                tried += 1
+                if ip:
+                    seen_ips.add(ip)
                 try:
                     connect_ranked_endpoint(endpoint, manual=replacing)
                 except Exception as exc:
                     last_error = str(exc)
+                    _note_connect_fail(endpoint)
                     log_to_json(
                         "WARNING",
                         "Routing",
@@ -4974,6 +5090,7 @@ def apply_saved_scheme_now() -> None:
                     continue
                 if not active_tunnel_running():
                     last_error = "连接后隧道未起来"
+                    _note_connect_fail(endpoint)
                     continue
                 clear_manual_route_pin()
                 set_state(
@@ -4994,15 +5111,13 @@ def apply_saved_scheme_now() -> None:
                     "Routing",
                     f"{message} {endpoint.get('protocol')} {endpoint.get('country')} {endpoint.get('endpoint_id')}",
                 )
-                if _auto_direct_fallback_active():
+                if _auto_direct_fallback_active() or proxy_server.get_egress_mode() == "direct":
                     _engage_proxy_egress(message)
                 _refresh_cold_standby_now()
                 connected = True
                 break
             if connected:
                 return
-            if not degraded:
-                break
         set_state(
             routing_degraded=True,
             last_check_message="代理设置暂无可用节点，主连接继续等待",
@@ -5050,9 +5165,8 @@ def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool 
     apply_saved_scheme_now()
     if not active_tunnel_running():
         return
-    if engage_proxy or _auto_direct_fallback_active():
-        if proxy_server.get_egress_mode() != "proxy":
-            _engage_proxy_egress(reason)
+    if proxy_server.get_egress_mode() != "proxy":
+        _engage_proxy_egress(reason)
 
 
 def _refresh_cold_standby_now() -> None:
@@ -6600,8 +6714,13 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         "excluded_blocked": 0,
     }
     try:
-        home_filter = home if _explicit_scheme_configured(ui_cfg) and home else ""
-        rows = node_pool.list_routing_endpoints(limit=800, country=home_filter)
+        rows = node_pool.list_routing_endpoints(limit=800, country=home) if home else []
+        seen_rows = {str(item.get("endpoint_id") or "") for item in rows}
+        for item in node_pool.list_routing_endpoints(limit=800):
+            eid = str(item.get("endpoint_id") or "")
+            if eid and eid not in seen_rows:
+                seen_rows.add(eid)
+                rows.append(item)
     except Exception as exc:
         log_to_json("WARNING", "Standby", f"冷备候选读取失败: {exc}")
         return None
@@ -6690,7 +6809,10 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
 
     qualified.sort(key=_sort_key)
     if _explicit_scheme_configured(ui_cfg):
-        qualified = [ep for ep in qualified if endpoint_matches_explicit_routing(ep, ui_cfg)]
+        matched = [ep for ep in qualified if endpoint_matches_explicit_routing(ep, ui_cfg)]
+        # 1 main is chosen elsewhere. Cold needs 1 + 5. Fewer than that, keep the ladder.
+        if len(matched) >= 1 + PRECOLD_TARGET:
+            qualified = matched
     found: dict[str, dict[str, Any]] = {}
     for endpoint in qualified:
         endpoint["_precold_tier"] = _tier(endpoint)
