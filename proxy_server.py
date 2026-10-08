@@ -29,7 +29,7 @@ proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 # Keep DNS results for a short time so each HTTPS connection does not pay for
 # another DNS round trip over the active VPN interface.
 DNS_CACHE_TTL_SECONDS = 60.0
-DNS_NEGATIVE_TTL_SECONDS = 2.0
+DNS_NEGATIVE_TTL_SECONDS = 30.0
 DNS_POSITIVE_MIN_SECONDS = 30.0
 DNS_POSITIVE_MAX_SECONDS = 300.0
 DNS_STAGE_TIMEOUT_SECONDS = 1.0
@@ -1410,6 +1410,20 @@ def _parse_dns_a(resp: bytes, tx_id: bytes, qtype: int) -> tuple[str | None, flo
     return None, 0.0
 
 
+def _dns_is_final_negative(resp: bytes, tx_id: bytes) -> bool:
+    """A finished NODATA/NXDOMAIN. Do not sit out the rest of the timeout."""
+    if len(resp) < 12 or resp[:2] != tx_id:
+        return False
+    if resp[2] & 0x02:
+        return False
+    rcode = resp[3] & 0x0F
+    if rcode == 3:
+        return True
+    if rcode != 0:
+        return False
+    return int.from_bytes(resp[6:8], "big") == 0
+
+
 def _log_dns_bind_failure(iface: str, exc: OSError) -> None:
     now = time.monotonic()
     if now - _DNS_BIND_LOG_AT.get(iface, 0.0) < 30.0:
@@ -1457,7 +1471,7 @@ def dns_query_over_active_tunnel(host: str, qtype: int, dns_server: str, timeout
     return ip
 
 
-def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: float) -> tuple[str | None, float]:
+def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: float) -> tuple[str | None, float, bool]:
     """Ask every resolver at once. Return the first answer. No extra threads."""
     import random
     pending: list[tuple[socket.socket, bytes]] = []
@@ -1485,7 +1499,7 @@ def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: f
             pending.append((sock, tx_id))
             poller.register(sock, select.POLLIN)
         if not pending:
-            return None, 0.0
+            return None, 0.0, False
         deadline = time.monotonic() + max(0.05, timeout)
         while time.monotonic() < deadline:
             remain_ms = max(1, int((deadline - time.monotonic()) * 1000))
@@ -1504,8 +1518,10 @@ def _race_tunnel_dns(host: str, iface: str, servers: tuple[str, ...], timeout: f
                     continue
                 ip, ttl = _parse_dns_a(resp, tx_id, 1)
                 if ip:
-                    return ip, ttl
-        return None, 0.0
+                    return ip, ttl, False
+                if _dns_is_final_negative(resp, tx_id):
+                    return None, 0.0, True
+        return None, 0.0, False
     finally:
         for sock, _tx in pending:
             try:
@@ -1592,8 +1608,8 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
                 server = str(server or "").strip()
                 if server and server not in servers:
                     servers.append(server)
-            ip, raw_ttl = _race_tunnel_dns(key_host, iface, tuple(servers), stage_timeout)
-            if not ip:
+            ip, raw_ttl, negative = _race_tunnel_dns(key_host, iface, tuple(servers), stage_timeout)
+            if not ip and not negative:
                 ip = _system_dns_ipv4(key_host, stage_timeout)
                 raw_ttl = DNS_POSITIVE_MIN_SECONDS if ip else 0.0
         box["ip"] = ip
