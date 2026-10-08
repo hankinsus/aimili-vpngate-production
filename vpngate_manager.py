@@ -11096,13 +11096,6 @@ INDEX_HTML = r"""<!doctype html>
     .node-address-cell.is-blocked-ip .mono {
       color: #d4b483;
     }
-    .node-blocked-tag {
-      margin-top: 2px;
-      font-size: 11px;
-      font-weight: 600;
-      color: #b7a67e;
-      letter-spacing: 0;
-    }
     .node-speed-val {
       display: inline-block;
       min-width: 0;
@@ -14834,7 +14827,7 @@ function render(){
       return `<tr ${rowClass}>
         <td class="node-status-cell" data-label="状态">${statusCell}</td>
         <td class="node-protocol-cell" data-label="协议">${renderProtocolCell(n)}</td>
-        <td class="node-address-cell${blockedHit.domain ? " is-blocked-domain" : ""}${blockedHit.ip ? " is-blocked-ip" : ""}" data-label="IP" title="${esc((domainLine ? domainLine + " " : "") + (listIp || ""))}"><div class="node-address-stack">${domainLine ? `<div class="node-domain">${esc(domainLine)}</div>` : ""}<div class="mono">${esc(ipLine || "-")}</div>${blocked ? `<div class="node-blocked-tag">已屏蔽</div>` : ""}</div></td>
+        <td class="node-address-cell${blockedHit.domain ? " is-blocked-domain" : ""}${blockedHit.ip ? " is-blocked-ip" : ""}" data-label="IP" title="${esc((domainLine ? domainLine + " " : "") + (listIp || ""))}"><div class="node-address-stack">${domainLine ? `<div class="node-domain">${esc(domainLine)}</div>` : ""}<div class="mono">${esc(ipLine || "-")}</div></div></td>
         <td class="node-latency-cell" data-label="延迟">${latencyText}</td>
         <td class="node-speed-cell" data-label="速度">${rowSpeedText}</td>
         <td class="node-location-cell" data-label="位置" title="${esc(displayLocation)}"><div class="node-location-cell-inner">${displayLocationFlag}<span class="node-cell-ellipsis">${esc(displayLocation)}</span></div></td>
