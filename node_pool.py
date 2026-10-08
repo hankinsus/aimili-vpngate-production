@@ -596,6 +596,7 @@ class NodePool:
                     except Exception:
                         pass
                 located = country_from_location(metadata.get("location"))
+                metadata["catalog_country"] = country
                 if located:
                     country = located
                 db.execute(
@@ -776,6 +777,7 @@ class NodePool:
                     metadata["shared_speed_bps"] = speed
                 metadata.pop("trusted_observation", None)
                 located = country_from_location(metadata.get("location"))
+                metadata["catalog_country"] = country
                 if located:
                     country = located
                 server_state = "NEW"

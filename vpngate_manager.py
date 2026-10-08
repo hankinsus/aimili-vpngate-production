@@ -4102,6 +4102,17 @@ def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
 ROUTING_MIN_LINE_SPEED_BPS = 50_000_000
 ROUTING_HIGH_SPEED_BPS = 500_000_000
 
+
+def _speed_floor_bps(ui_cfg: dict[str, Any]) -> int:
+    """Lowest speed that may be selected. User choice wins when it is at least 50 Mbps."""
+    try:
+        chosen = int((ui_cfg or {}).get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        chosen = 0
+    if chosen < ROUTING_MIN_LINE_SPEED_BPS:
+        return ROUTING_MIN_LINE_SPEED_BPS
+    return chosen
+
 def routing_target_country(ui_cfg: dict[str, Any]) -> str:
     """Manual switch country first, then an explicit preference, then the server."""
     pinned = str((manual_route_pin or {}).get("country") or "").strip()
@@ -4368,17 +4379,12 @@ def unified_hot_pool_candidates(ui_cfg: dict[str, Any], exclude_endpoint_id: str
         ]
         if matched:
             candidates = matched
-    try:
-        min_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
-    except (TypeError, ValueError):
-        min_speed = 0
-    if min_speed > 0:
-        fast = [
-            ep for ep in candidates
-            if int(ep.get("latest_speed") or ep.get("speed") or 0) >= min_speed
-        ]
-        if fast:
-            candidates = fast
+    # 速度是硬门槛：没设时保底 ≥50 Mbps，设了 300 就只留 ≥300。不够就空，不改挑更慢的。
+    floor = _speed_floor_bps(ui_cfg)
+    candidates = [
+        ep for ep in candidates
+        if int(ep.get("latest_speed") or ep.get("speed") or 0) >= floor
+    ]
     latency_filter = str(ui_cfg.get("routing_latency") or "").strip().lower()
     if latency_filter:
         matched = [
@@ -4571,8 +4577,7 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     """True when this exit already satisfies the filters the user just saved.
 
     Country is only required in 优先地区. 住宅 IP accepts residential and mobile.
-    Empty protocol or speed means no extra constraint. A healthy tunnel that
-    already matches is left alone.
+    Speed is never optional: unset means ≥50 Mbps, and a saved 300 Mbps keeps only ≥300 Mbps.
     """
     if not endpoint:
         return False
@@ -4594,14 +4599,10 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     protocol = str(ui_cfg.get("routing_protocol") or "").strip().lower()
     if protocol and str(endpoint.get("protocol") or "").lower() != protocol:
         return False
-    try:
-        min_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
-    except (TypeError, ValueError):
-        min_speed = 0
-    if min_speed > 0:
-        speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
-        if speed < min_speed:
-            return False
+    floor = _speed_floor_bps(ui_cfg)
+    speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+    if speed < floor:
+        return False
     if not latency_filter_matches(endpoint_display_latency_ms(endpoint), str(ui_cfg.get("routing_latency") or "")):
         return False
     if mode == "favorites" and routing_favorite_rank(endpoint, ui_cfg) != 0:
@@ -5886,23 +5887,12 @@ def _standby_speed_gap(endpoint: dict[str, Any], target: int) -> int:
 
 
 def _select_standby_endpoint() -> dict[str, Any] | None:
-    """Pick a standby on another IP. Protocol stays; speed is the first thing relaxed."""
+    """Standby must meet the same speed floor as the main. No closest-under match."""
     ui_cfg = load_ui_config()
     active_ip = _active_exit_ip()
     active_eid = str(active_pool_endpoint_id or "")
-    wanted = str(ui_cfg.get("routing_protocol") or "").strip().lower()
-    if not wanted:
-        wanted = str((current_active_routing_endpoint() or {}).get("protocol") or "").strip().lower()
     try:
-        target_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
-    except (TypeError, ValueError):
-        target_speed = 0
-    wide = dict(ui_cfg)
-    wide["routing_min_speed_bps"] = 0
-    wide["routing_latency"] = ""
-    wide["routing_protocol"] = ""
-    try:
-        pool = unified_hot_pool_candidates(wide, limit=80)
+        pool = unified_hot_pool_candidates(ui_cfg, limit=80)
     except Exception as exc:
         log_to_json("WARNING", "Standby", f"热备候选读取失败: {exc}")
         return None
@@ -5914,45 +5904,13 @@ def _select_standby_endpoint() -> dict[str, Any] | None:
             continue
         if endpoint_is_unstable(endpoint):
             continue
+        if not endpoint_matches_explicit_routing(endpoint, ui_cfg):
+            continue
         rows.append(endpoint)
     if not rows:
         return None
-
-    def closest(items: list[dict[str, Any]]) -> dict[str, Any]:
-        items.sort(key=lambda ep: (
-            0 if not wanted or str(ep.get("protocol") or "").lower() == wanted else 1,
-            _standby_speed_gap(ep, target_speed),
-            float(ep.get("latency_ewma") or 999999),
-        ))
-        return items[0]
-
-    full = [ep for ep in rows if endpoint_matches_explicit_routing(ep, ui_cfg)]
-    if full:
-        full.sort(key=lambda ep: routing_service_key(ep, ui_cfg))
-        return full[0]
-    relaxed = dict(ui_cfg)
-    relaxed["routing_min_speed_bps"] = 0
-    near = [ep for ep in rows if endpoint_matches_explicit_routing(ep, relaxed)]
-    if wanted:
-        same = [ep for ep in near if str(ep.get("protocol") or "").lower() == wanted]
-        if same:
-            near = same
-    if near:
-        return closest(near)
-    looser = dict(relaxed)
-    looser["routing_latency"] = ""
-    near = [ep for ep in rows if endpoint_matches_explicit_routing(ep, looser)]
-    if wanted:
-        same = [ep for ep in near if str(ep.get("protocol") or "").lower() == wanted]
-        if same:
-            near = same
-    if near:
-        return closest(near)
-    if wanted:
-        same = [ep for ep in rows if str(ep.get("protocol") or "").lower() == wanted]
-        if same:
-            return closest(same)
-    return closest(rows)
+    rows.sort(key=lambda ep: routing_service_key(ep, ui_cfg))
+    return rows[0]
 
 
 def _publish_scheme_standby(endpoint: dict[str, Any]) -> bool:
@@ -6505,7 +6463,8 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         "excluded_blocked": 0,
     }
     try:
-        rows = node_pool.list_routing_endpoints(limit=800)
+        home_filter = home if _explicit_scheme_configured(ui_cfg) and home else ""
+        rows = node_pool.list_routing_endpoints(limit=800, country=home_filter)
     except Exception as exc:
         log_to_json("WARNING", "Standby", f"冷备候选读取失败: {exc}")
         return None
@@ -6698,14 +6657,21 @@ def _overlay_dataplane(state: dict[str, Any]) -> None:
     state["accept_wait_ms"] = int(raw.get("accept_wait_ms") or 0)
 
 
-def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+def _open_cold_round(candidates: dict[str, dict[str, Any]]) -> None:
+    """One new round per pass. Do not un-fail a node again inside the same pass."""
     cold = _cold_state()
     failed = [eid for eid in cold["failed"] if eid in candidates]
     if candidates and failed and all(eid in failed for eid in candidates):
         failed = []
         log_to_json("INFO", "Standby", "冷备已轮换一整轮，仍可用的节点可以重新作为备")
-    cold["order"] = list(candidates.keys())
     cold["failed"] = failed
+    cold["order"] = list(candidates.keys())
+    _save_cold_state()
+
+
+def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    cold = _cold_state()
+    failed = {eid for eid in cold["failed"] if eid in candidates}
     for eid in candidates:
         if eid not in failed:
             return candidates[eid]
@@ -6723,9 +6689,6 @@ def _rotate_cold(eid: str, candidates: dict[str, dict[str, Any]]) -> None:
         cold["failed"].append(eid)
     cold["order"] = order
     cold["failed"] = [item for item in cold["failed"] if item in candidates or item == eid]
-    if candidates and all(item in cold["failed"] for item in candidates):
-        cold["failed"] = []
-        log_to_json("INFO", "Standby", "冷备已轮换一整轮，仍可用的节点可以重新作为备")
     cold["published"] = ""
     _save_cold_state()
 
@@ -7130,6 +7093,7 @@ def cold_standby_pass() -> None:
     candidates = _cold_candidates(ui_cfg)
     if candidates is None:
         return
+    _open_cold_round(candidates)
     chosen: dict[str, Any] | None = None
     for _ in range(3):
         chosen = _pick_cold(candidates)
