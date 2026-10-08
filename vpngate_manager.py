@@ -20049,6 +20049,25 @@ def active_tunnel_hard_reason() -> str:
         return ""
     iface = str(proxy_server.get_active_interface() or "").strip()
     if not iface:
+        tunnel = active_external_tunnel
+        live = str(getattr(tunnel, "interface", "") or "").strip()
+        if live and Path("/sys/class/net", live).exists() and _tunnel_carrier_alive():
+            gateway = str(getattr(tunnel, "gateway", "") or "")
+            try:
+                proxy_server.set_active_interface(live)
+                setup_policy_routing(live, gateway=gateway)
+            except Exception as exc:
+                log_to_json("WARNING", "Proxy", f"活动网卡恢复失败 {live}: {exc}")
+                return "活动网卡为空"
+            set_state(
+                active_tunnel_interface=live,
+                active_tunnel_ok=True,
+                tunnel_role="ACTIVE",
+                proxy_error="",
+                last_check_message=f"活动网卡已恢复 {live}",
+            )
+            log_to_json("INFO", "Proxy", f"活动网卡名丢失，已按存活隧道恢复 {live}")
+            return ""
         return "活动网卡为空"
     nic = Path("/sys/class/net") / iface
     if not nic.exists():
@@ -20219,6 +20238,11 @@ def fast_tunnel_liveness_loop() -> None:
                 continue
             hard = active_tunnel_hard_reason()
             if hard:
+                now_hard = time.time()
+                if now_hard - float(getattr(fast_tunnel_liveness_loop, "hard_at", 0) or 0) < 15:
+                    time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                    continue
+                fast_tunnel_liveness_loop.hard_at = now_hard
                 _soft_fail_streak = 0
                 _invalidate_tunnel_health(hard)
                 log_to_json("WARNING", "Proxy", f"活动隧道硬故障: {hard}")
