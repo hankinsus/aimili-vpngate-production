@@ -709,6 +709,7 @@ def load_ui_config() -> dict[str, Any]:
             "routing_blocklist": "",
             "proxy_user": "socks5",
             "proxy_pass": "ilovestudy",
+            "log_auto_cleanup": True,
         }
         updated = False
         if auth_file.exists():
@@ -716,7 +717,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain", "routing_blocklist", "proxy_user", "proxy_pass"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "routing_protocol", "routing_min_speed_bps", "routing_latency", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "web_domain", "routing_blocklist", "proxy_user", "proxy_pass", "log_auto_cleanup"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -863,6 +864,102 @@ def get_session_token(password: str, username: str = "admin") -> str:
     return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
 _last_cleanup_time = 0.0
+LOG_AUTO_CLEAN_SECONDS = 6 * 60 * 60
+try:
+    log_auto_cleanup_on = bool(load_ui_config().get("log_auto_cleanup", True))
+except Exception:
+    log_auto_cleanup_on = True
+_last_auto_clean_check = 0.0
+
+
+def log_auto_cleanup_enabled() -> bool:
+    return bool(log_auto_cleanup_on)
+
+
+def set_log_auto_cleanup(enabled: bool) -> bool:
+    global log_auto_cleanup_on
+    log_auto_cleanup_on = bool(enabled)
+    cfg = load_ui_config()
+    cfg["log_auto_cleanup"] = log_auto_cleanup_on
+    auth_file = DATA_DIR / "ui_auth.json"
+    with lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        write_json(auth_file, cfg)
+    invalidate_ui_config_cache()
+    return log_auto_cleanup_on
+
+
+def _auto_clean_stamp_path(logs_dir: Path) -> Path:
+    return logs_dir / ".auto_clean_at"
+
+
+def maybe_auto_cleanup_logs(logs_dir: Path, force: bool = False) -> str:
+    """When enabled, drop log lines older than 6 hours. The first run only starts the clock."""
+    global _last_auto_clean_check
+    if not force and not log_auto_cleanup_enabled():
+        return ""
+    now = time.time()
+    if not force and now - _last_auto_clean_check < 60:
+        return ""
+    _last_auto_clean_check = now
+    logs_dir.mkdir(exist_ok=True, parents=True)
+    stamp_path = _auto_clean_stamp_path(logs_dir)
+    now = time.time()
+    try:
+        last = float(stamp_path.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        last = 0.0
+    if not force and last <= 0:
+        try:
+            stamp_path.write_text(str(now), encoding="utf-8")
+        except OSError:
+            pass
+        return ""
+    if not force and now - last < LOG_AUTO_CLEAN_SECONDS:
+        return ""
+    cutoff = now - LOG_AUTO_CLEAN_SECONDS
+    removed_files = 0
+    kept = 0
+    dropped = 0
+    today_name = time.strftime("%Y-%m-%d", time.localtime()) + ".json"
+    try:
+        with log_lock:
+            for path in list(logs_dir.glob("*.json")):
+                if path.name != today_name:
+                    try:
+                        path.unlink()
+                        removed_files += 1
+                    except OSError:
+                        pass
+                    continue
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                fresh: list[str] = []
+                for line in lines:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        item = json.loads(text)
+                    except Exception:
+                        dropped += 1
+                        continue
+                    raw_time = str(item.get("timestamp") or "") if isinstance(item, dict) else ""
+                    try:
+                        stamp = time.mktime(time.strptime(raw_time, "%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        stamp = 0.0
+                    if stamp >= cutoff:
+                        fresh.append(text)
+                        kept += 1
+                    else:
+                        dropped += 1
+                path.write_text(("\n".join(fresh) + ("\n" if fresh else "")), encoding="utf-8")
+            stamp_path.write_text(str(now), encoding="utf-8")
+    except Exception as exc:
+        print(f"[清理错误] 自动清理日志失败: {exc}", flush=True)
+        return ""
+    return f"已自动清理 6 小时前的日志，保留 {kept} 条，删除 {dropped} 条，旧文件 {removed_files} 个"
+
 
 def cleanup_old_logs(logs_dir: Path, force: bool = False) -> None:
     global _last_cleanup_time
@@ -898,8 +995,7 @@ def read_recent_log_entries(log_file: Path, max_entries: int = 1200, max_bytes: 
     entries: list[dict[str, Any]] = []
     truncated = False
     try:
-        with lock:
-            with open(log_file, "rb") as f:
+        with open(log_file, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
                 start = max(0, size - max_bytes)
@@ -952,6 +1048,7 @@ def log_to_json(level: str, module: str, message: str) -> None:
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(line)
         cleanup_old_logs(logs_dir)
+        maybe_auto_cleanup_logs(logs_dir)
     except Exception as e:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
@@ -11661,6 +11758,45 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     /* Modal styles */
+    #logs_modal .modal-content {
+      max-width: 860px;
+      width: min(860px, calc(100vw - 24px));
+      max-height: calc(100vh - 16px);
+      padding: 22px 22px 16px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #logs_modal .log-terminal {
+      height: auto;
+      flex: 1 1 auto;
+      min-height: 180px;
+      max-height: calc(100vh - 210px);
+      margin-bottom: 12px;
+    }
+    #logs_modal .log-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: nowrap;
+    }
+    #logs_modal .log-actions-main {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    #logs_modal .log-actions button {
+      white-space: nowrap;
+      flex: 0 0 auto;
+      height: 36px;
+      padding: 0 12px;
+      font-size: 13px;
+    }
+    #logs_modal .log-actions .log-close {
+      margin-left: auto;
+    }
     .modal {
       display: none;
       position: fixed;
@@ -13203,7 +13339,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Logs Modal (日志监控与分类筛选) -->
   <div id="logs_modal" class="modal">
-    <div class="modal-content" style="max-width: 800px; width: 95%;">
+    <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
         <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
@@ -13233,30 +13369,31 @@ INDEX_HTML = r"""<!doctype html>
       </div>
 
       <!-- Terminal Log Container -->
-      <div id="log_terminal_container" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px; height: 400px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.5; text-align: left; white-space: pre-wrap; word-break: break-all; color: #a5b4fc; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); position: relative; margin-bottom: 20px;">
-        <div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">
-          暂无今日运行日志记录。
+      <div id="log_terminal_container" class="log-terminal" style="background: #050811; border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px; padding: 16px; overflow-y: auto; font-family: 'JetBrains Mono', Consolas, Courier, monospace; font-size: 12px; line-height: 1.5; text-align: left; white-space: pre-wrap; word-break: break-all; color: #a5b4fc; box-shadow: inset 0 4px 20px rgba(0,0,0,0.8); position: relative;">
+        <div style="color: var(--text-secondary); text-align: center; margin-top: 80px;">
+          正在读取今日日志…
         </div>
       </div>
 
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <div style="display: flex; gap: 8px;">
-          <button type="button" onclick="copyLogContent()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">
-            <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px; margin-right: 4px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3" /></svg>
+      <div class="log-actions">
+        <div class="log-actions-main">
+          <button type="button" onclick="copyLogContent()" class="btn-primary" style="background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">
             一键复制
           </button>
-          <button type="button" onclick="exportLogContent()" class="btn-primary" style="height: 38px; padding: 0 16px; background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">
-            <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px; margin-right: 4px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+          <button type="button" onclick="exportLogContent()" class="btn-primary" style="background: rgba(255,255,255,0.05); color: var(--text-primary); border: 1px solid var(--border-color);">
             导出日志
           </button>
-          <button type="button" onclick="clearTodayLogs()" class="btn-primary" style="height: 38px; padding: 0 12px; background: rgba(244,63,94,0.08); color: var(--danger); border: 1px solid rgba(244,63,94,0.25);">
+          <button type="button" onclick="clearTodayLogs()" class="btn-primary" style="background: rgba(244,63,94,0.08); color: var(--danger); border: 1px solid rgba(244,63,94,0.25);">
             清空今日
           </button>
-          <button type="button" onclick="cleanupOldLogs()" class="btn-primary" style="height: 38px; padding: 0 12px; background: rgba(245,158,11,0.08); color: var(--warning); border: 1px solid rgba(245,158,11,0.25);">
+          <button type="button" onclick="cleanupOldLogs()" class="btn-primary" style="background: rgba(245,158,11,0.08); color: var(--warning); border: 1px solid rgba(245,158,11,0.25);">
             清理旧日志
           </button>
+          <button type="button" id="log_auto_cleanup_btn" onclick="toggleLogAutoCleanup()" class="btn-primary" style="background: rgba(16,185,129,0.12); color: var(--success); border: 1px solid rgba(16,185,129,0.35);" title="开启后每 6 小时清理一次日志">
+            自动清理：开
+          </button>
         </div>
-        <button type="button" onclick="closeLogsModal()" style="height: 38px; padding: 0 20px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
+        <button type="button" class="log-close" onclick="closeLogsModal()" style="height: 36px; padding: 0 16px; font-weight: 600; border-radius: 8px; border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary); cursor: pointer;">关闭</button>
       </div>
     </div>
   </div>
@@ -18165,6 +18302,38 @@ async function cleanupOldLogs() {
 
 let logsPollInterval = null;
 let rawLogsCache = [];
+let logAutoCleanupOn = true;
+
+function setLogAutoCleanupButton(on) {
+  logAutoCleanupOn = !!on;
+  const btn = $("log_auto_cleanup_btn");
+  if (!btn) return;
+  btn.textContent = logAutoCleanupOn ? "自动清理：开" : "自动清理：关";
+  btn.title = logAutoCleanupOn ? "每 6 小时清理一次。点击关闭" : "当前不自动清理。点击开启，每 6 小时清理一次";
+  btn.style.background = logAutoCleanupOn ? "rgba(16,185,129,0.12)" : "rgba(255,255,255,0.05)";
+  btn.style.color = logAutoCleanupOn ? "var(--success)" : "var(--text-secondary)";
+  btn.style.borderColor = logAutoCleanupOn ? "rgba(16,185,129,0.35)" : "var(--border-color)";
+}
+
+async function toggleLogAutoCleanup() {
+  const next = !logAutoCleanupOn;
+  const btn = $("log_auto_cleanup_btn");
+  if (btn) btn.disabled = true;
+  try {
+    const response = await fetch("./api/logs/manage", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({action:"auto_cleanup", enabled: next})
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || "保存失败");
+    setLogAutoCleanupButton(data.auto_cleanup);
+  } catch (err) {
+    alert("自动清理设置失败：\n" + (err.message || err));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
 
 function openLogsModal() {
   $("admin_dropdown").style.display = "none";
@@ -18184,15 +18353,21 @@ function closeLogsModal() {
 }
 
 async function loadLogs() {
+  const term = $("log_terminal_container");
   try {
     const res = await fetch("./api/logs");
     const data = await res.json();
-    if (data.logs) {
+    if (!res.ok) throw new Error(data.error || "日志接口失败");
+    if (typeof data.auto_cleanup === "boolean") setLogAutoCleanupButton(data.auto_cleanup);
+    if (Array.isArray(data.logs)) {
       rawLogsCache = data.logs;
       filterAndRenderLogs();
     }
   } catch (e) {
     console.error("加载日志失败", e);
+    if (term && rawLogsCache.length === 0) {
+      term.innerHTML = `<div style="color: var(--danger); text-align: center; margin-top: 80px;">日志读取失败：${esc(e.message || e)}</div>`;
+    }
   }
 }
 
@@ -18211,7 +18386,8 @@ function filterAndRenderLogs() {
   }
 
   if (filtered.length === 0) {
-    term.innerHTML = `<div style="color: var(--text-secondary); text-align: center; margin-top: 150px;">暂无该类型日志。</div>`;
+    const emptyText = filterVal === "all" ? "今日还没有运行日志。" : "暂无该类型日志。";
+    term.innerHTML = `<div style="color: var(--text-secondary); text-align: center; margin-top: 80px;">${emptyText}</div>`;
     return;
   }
 
@@ -20189,7 +20365,14 @@ class Handler(BaseHTTPRequestHandler):
             date_str = time.strftime("%Y-%m-%d", time.localtime())
             log_file = logs_dir / f"{date_str}.json"
             entries, truncated = read_recent_log_entries(log_file, max_entries=1200, max_bytes=1048576)
-            self.send_json({"logs": entries, "truncated": truncated, "max_entries": 1200, "max_bytes": 1048576})
+            self.send_json({
+                "logs": entries,
+                "truncated": truncated,
+                "count": len(entries),
+                "auto_cleanup": log_auto_cleanup_enabled(),
+                "max_entries": 1200,
+                "max_bytes": 1048576,
+            })
         elif effective_path == "/api/logs/size":
             logs_dir = DATA_DIR / "logs"
             date_str = time.strftime("%Y-%m-%d", time.localtime())
@@ -20344,7 +20527,15 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "cleanup_old":
                     logs_dir = DATA_DIR / "logs"
                     cleanup_old_logs(logs_dir, force=True)
-                    self.send_json({"ok": True, "message": "已执行旧日志清理（保留最近 3 天）"})
+                    self.send_json({"ok": True, "message": "已执行旧日志清理（保留最近 3 天）", "auto_cleanup": log_auto_cleanup_enabled()})
+                elif action == "auto_cleanup":
+                    enabled = bool(payload.get("enabled"))
+                    set_log_auto_cleanup(enabled)
+                    self.send_json({
+                        "ok": True,
+                        "auto_cleanup": log_auto_cleanup_enabled(),
+                        "message": "自动清理已开启，每 6 小时清理一次" if enabled else "自动清理已关闭",
+                    })
                 else:
                     self.send_json({"ok": False, "error": "未知日志管理操作"}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
