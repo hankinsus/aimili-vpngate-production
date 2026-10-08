@@ -966,7 +966,7 @@ def _socks5_reply_ipv4(client: socket.socket) -> str:
 def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]) -> None:
     """RFC 1928 UDP ASSOCIATE relay over the active VPN interface."""
     relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    upstreams: dict[tuple[str, int], socket.socket] = {}
+    upstreams: dict[tuple, socket.socket] = {}
     client_ip = str(control_address[0] or "")
     client_udp_addr: tuple[str, int] | None = None
     last_activity = time.monotonic()
@@ -1041,7 +1041,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                     continue
 
                 if source is relay:
-                    while True:
+                    for _ in range(24):
                         try:
                             packet, peer = relay.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
                         except BlockingIOError:
@@ -1072,15 +1072,27 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         kind = "wifi" if port in (500, 4500) else ("quic" if port == 443 else "other")
                         sent = False
                         for af, sa in destinations:
-                            sock = upstreams.get((kind, af))
+                            flow_key = (kind, af, "") if kind == "wifi" else (kind, af, sa[0])
+                            sock = upstreams.get(flow_key)
                             if sock is None:
+                                if len(upstreams) >= 32:
+                                    for old_key in list(upstreams):
+                                        if old_key == flow_key or old_key[0] == "wifi":
+                                            continue
+                                        old_sock = upstreams.pop(old_key, None)
+                                        if old_sock is not None:
+                                            try:
+                                                old_sock.close()
+                                            except OSError:
+                                                pass
+                                        break
                                 try:
                                     sock = socket.socket(af, socket.SOCK_DGRAM)
                                     _set_udp_socket_options(sock)
                                     bind_addr = ("0.0.0.0", 0) if af == socket.AF_INET else ("::", 0)
                                     sock.bind(bind_addr)
                                     sock.setblocking(False)
-                                    upstreams[(kind, af)] = sock
+                                    upstreams[flow_key] = sock
                                 except OSError:
                                     if sock is not None:
                                         sock.close()
@@ -1093,21 +1105,21 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                                 break
                             except OSError as exc:
                                 # One destination refused or the datagram is too big.
-                                # The socket is shared by every flow of this kind.
+                                # This socket belongs to one peer, not every QUIC site.
                                 if exc.errno in (11, 90, 101, 113):
                                     continue
                                 try:
                                     sock.close()
                                 except OSError:
                                     pass
-                                upstreams.pop((kind, af), None)
+                                upstreams.pop(flow_key, None)
                                 continue
                         if sent:
                             last_activity = time.monotonic()
                     continue
 
                 # Upstream UDP response -> SOCKS5 client UDP socket.
-                while True:
+                for _ in range(24):
                     try:
                         response, source_addr = source.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
                     except BlockingIOError:

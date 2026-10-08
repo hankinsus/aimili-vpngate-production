@@ -18225,6 +18225,14 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
                 )
         except Exception:
             pass
+    for dev in (inner, ns_dev):
+        try:
+            subprocess.run(
+                ["ip", "netns", "exec", namespace, "tc", "qdisc", "replace", "dev", dev, "root", "fq_codel", "limit", "256", "target", "20ms", "interval", "100ms"],
+                capture_output=True, text=True, timeout=3,
+            )
+        except Exception:
+            pass
 
 
 def check_root_via_interface(interface: str, gateway: str = "", timeout: float = 3) -> dict[str, Any]:
