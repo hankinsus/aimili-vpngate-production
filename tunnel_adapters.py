@@ -939,7 +939,7 @@ for _ in $(seq 1 60); do
     iptables -t mangle -C INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
       iptables -t mangle -A INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
     ip link set dev "$IFACE" mtu 1280 2>/dev/null || true
-    ip link set dev "{ns_veth}" mtu 1280 2>/dev/null || true
+    # Keep the outer veth MTU. L2TP/IPsec encapsulation needs that headroom.
     tc qdisc replace dev "$IFACE" root fq_codel limit 256 target 20ms interval 100ms 2>/dev/null || true
     tc qdisc replace dev "{ns_veth}" root fq_codel limit 256 target 20ms interval 100ms 2>/dev/null || true
     echo "$IFACE" > "{work_dir / 'ppp-iface'}"

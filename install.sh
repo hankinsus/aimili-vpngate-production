@@ -1293,6 +1293,19 @@ if [ -x "${INSTALL_DIR}/scripts/setup_https.sh" ]; then
 fi
 
 if [ -n "${AIMILIVPN_DOMAIN:-}" ]; then
+    EXISTING_OK=0
+    if [ -s /etc/aimilivpn/tls/fullchain.pem ] \
+        && openssl x509 -in /etc/aimilivpn/tls/fullchain.pem -noout -checkend 0 >/dev/null 2>&1 \
+        && openssl x509 -in /etc/aimilivpn/tls/fullchain.pem -noout -subject -ext subjectAltName 2>/dev/null | grep -Fqi "${AIMILIVPN_DOMAIN}"; then
+        subj=$(openssl x509 -in /etc/aimilivpn/tls/fullchain.pem -noout -subject 2>/dev/null || true)
+        iss=$(openssl x509 -in /etc/aimilivpn/tls/fullchain.pem -noout -issuer 2>/dev/null || true)
+        if [ -n "$subj" ] && [ "$subj" != "$iss" ]; then
+            EXISTING_OK=1
+        fi
+    fi
+    if [ "$EXISTING_OK" = "1" ]; then
+        echo -e "\n${GREEN}已有 ${AIMILIVPN_DOMAIN} 的正式证书，直接使用，不再重新申请。${PLAIN}"
+    else
     echo -e "\n${YELLOW}正在为 ${AIMILIVPN_DOMAIN} 申请 Let's Encrypt 证书（约 90 天，自动续期）...${PLAIN}"
     if ! python3 - "${INSTALL_DIR}" "${AIMILIVPN_DOMAIN}" <<'PY'
 import sys
@@ -1305,6 +1318,7 @@ print("域名证书已安装")
 PY
     then
         echo -e "${YELLOW}域名证书申请失败，面板继续使用自签证书。请把域名解析到本机并放开 80 端口后，在网页里重试。${PLAIN}"
+    fi
     fi
 fi
 

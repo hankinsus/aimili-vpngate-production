@@ -309,7 +309,7 @@ probe_engine_target_country = ""
 # Separate manual connection ownership from background node detection.
 # Manual switching is allowed while a background detection/refresh is running,
 # but two manual connection operations can never overlap.
-manual_connection_lock = threading.RLock()
+manual_connection_lock = threading.Lock()
 manual_connection_active = False
 manual_connection_epoch = 0
 manual_connection_quiet_until = 0.0
@@ -14819,7 +14819,7 @@ function render(){
       const isFav = favoriteIds.includes(n.id);
       const favBusy = favoriteBusyIds.has(n.id);
       const favBtn = favBusy
-        ? `<button class="test-btn" disabled style="padding: 0 8px; height: 28px; opacity: 0.7;">处理中</button>`
+        ? `<button class="test-btn" disabled style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px; cursor: wait;">★ 收藏中</button>`
         : isFav
         ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
         : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 28px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
@@ -15097,7 +15097,16 @@ async function toggleFavorite(id, event) {
   if (event) event.stopPropagation();
   if (favoriteBusyIds.has(id)) return;
   favoriteBusyIds.add(id);
-  render();
+  const btn = event && event.currentTarget;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "★ 收藏中";
+    btn.style.color = "var(--warning)";
+    btn.style.borderColor = "rgba(245, 158, 11, 0.4)";
+    btn.style.opacity = "1";
+    btn.style.cursor = "wait";
+  }
+  const started = Date.now();
   try {
     const response = await fetch("./api/toggle_favorite", {
       method: "POST",
@@ -15114,6 +15123,8 @@ async function toggleFavorite(id, event) {
   } catch (e) {
     state.last_check_message = "收藏失败：" + ((e && e.message) ? e.message : "网络错误");
   } finally {
+    const wait = 400 - (Date.now() - started);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     favoriteBusyIds.delete(id);
     render();
   }
@@ -18320,10 +18331,11 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
             pass
     for dev in (inner, ns_dev):
         try:
-            subprocess.run(
-                ["ip", "netns", "exec", namespace, "ip", "link", "set", "dev", dev, "mtu", "1280"],
-                capture_output=True, text=True, timeout=3,
-            )
+            if dev == inner:
+                subprocess.run(
+                    ["ip", "netns", "exec", namespace, "ip", "link", "set", "dev", dev, "mtu", "1280"],
+                    capture_output=True, text=True, timeout=3,
+                )
             subprocess.run(
                 ["ip", "netns", "exec", namespace, "tc", "qdisc", "replace", "dev", dev, "root", "fq_codel", "limit", "256", "target", "20ms", "interval", "100ms"],
                 capture_output=True, text=True, timeout=3,
@@ -18866,13 +18878,13 @@ def _probe_iface_tcp(iface: str, timeout: float = 1.0, host: str = "8.8.8.8") ->
         sock.close()
 
 
-def _soft_round_failures(iface: str) -> int:
+def _soft_round_failures(iface: str, timeout: float = 1.0) -> int:
     """How many of 8.8.8.8:443 and 8.8.4.4:443 failed. One miss is jitter."""
     failed = {"n": 0}
     guard = threading.Lock()
 
     def _one(host: str) -> None:
-        ok, _detail = _probe_iface_tcp(iface, 1.0, host)
+        ok, _detail = _probe_iface_tcp(iface, timeout, host)
         if not ok:
             with guard:
                 failed["n"] += 1
@@ -18881,7 +18893,7 @@ def _soft_round_failures(iface: str) -> int:
     for worker in workers:
         worker.start()
     for worker in workers:
-        worker.join(1.3)
+        worker.join(timeout + 0.3)
     return failed["n"] + sum(1 for worker in workers if worker.is_alive())
 
 
@@ -18896,6 +18908,12 @@ def active_tunnel_hard_reason() -> str:
         return "活动网卡为空"
     nic = Path("/sys/class/net") / iface
     if not nic.exists():
+        time.sleep(1.0)
+        if nic.exists():
+            return ""
+        current = str(proxy_server.get_active_interface() or "").strip()
+        if current and current != iface and Path("/sys/class/net", current).exists():
+            return ""
         return f"活动网卡 {iface} 已消失"
     try:
         oper = (nic / "operstate").read_text(encoding="utf-8").strip().lower()
@@ -19085,7 +19103,23 @@ def fast_tunnel_liveness_loop() -> None:
                 log_to_json("INFO", "Proxy", f"活动网卡 {iface} 探测超时，标为 SUSPECT，不切换")
                 time.sleep(0.25)
                 continue
-            reason = f"活动网卡 {iface} 数据面连续两轮失败"
+            observed = _egress_observation()
+            if not _egress_observation_live(observed) or proxy_server.proxy_forwarding_busy(3.0):
+                _soft_fail_streak = 0
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            confirmed = _soft_round_failures(iface, timeout=4.0)
+            if (
+                not _egress_observation_live(observed)
+                or proxy_server.proxy_forwarding_busy(3.0)
+                or confirmed < 2
+            ):
+                _soft_fail_streak = 0
+                set_state(tunnel_role="ACTIVE", last_check_message="较长超时复测通过，保持当前隧道")
+                log_to_json("INFO", "Proxy", "快速探测超时，但较长超时复测通过，不切换")
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
+            reason = f"活动网卡 {iface} 数据面快速探测及4秒复测均失败"
             _soft_fail_streak = 0
             _invalidate_tunnel_health(reason)
             log_to_json("WARNING", "Proxy", reason)

@@ -58,7 +58,88 @@ if ! openssl req -x509 -nodes -newkey rsa:2048 -days "$CERT_DAYS" -keyout "$KEY_
 fi
 chmod 600 "$KEY_FILE"; chmod 644 "$CERT_FILE"
 
+# 机器上已经有 CA 签发、未过期的证书时，直接用它，不再盖成自签 IP 证书。
+cert_is_signed() {
+  local file="$1" subject issuer
+  [ -s "$file" ] || return 1
+  openssl x509 -in "$file" -noout -checkend 0 >/dev/null 2>&1 || return 1
+  subject=$(openssl x509 -in "$file" -noout -subject 2>/dev/null || true)
+  issuer=$(openssl x509 -in "$file" -noout -issuer 2>/dev/null || true)
+  [ -n "$subject" ] && [ "$subject" != "$issuer" ]
+}
+cert_matches_name() {
+  local file="$1" name="$2"
+  [ -z "$name" ] && return 0
+  openssl x509 -in "$file" -noout -subject -ext subjectAltName 2>/dev/null | grep -Fqi "$name"
+}
+cert_dns_name() {
+  openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
+    | sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -n 1
+}
+key_for_cert() {
+  local cert="$1" dir base stem candidate
+  dir=$(dirname "$cert")
+  base=$(basename "$cert")
+  stem="${base%.*}"
+  for candidate in "$dir/privkey.pem" "$dir/$stem.key" "${cert%.crt}.key" "${cert%.pem}.key"; do
+    if [ -s "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+ADOPTED_CERT=""
+ADOPTED_DOMAIN=""
+consider_cert() {
+  local cert="$1" key
+  [ -z "$ADOPTED_CERT" ] || return 0
+  cert_is_signed "$cert" || return 0
+  cert_matches_name "$cert" "${AIMILIVPN_DOMAIN:-}" || return 0
+  key=$(key_for_cert "$cert") || return 0
+  if [ -z "${AIMILIVPN_DOMAIN:-}" ]; then
+    cert_dns_name "$cert" >/dev/null || return 0
+    [ -n "$(cert_dns_name "$cert")" ] || return 0
+  fi
+  ADOPTED_CERT="$cert"
+  ADOPTED_KEY="$key"
+  ADOPTED_DOMAIN="${AIMILIVPN_DOMAIN:-$(cert_dns_name "$cert")}"
+}
+if [ -n "${AIMILIVPN_DOMAIN:-}" ] && [ -s "/etc/letsencrypt/live/${AIMILIVPN_DOMAIN}/fullchain.pem" ]; then
+  consider_cert "/etc/letsencrypt/live/${AIMILIVPN_DOMAIN}/fullchain.pem"
+fi
+if [ -d /etc/letsencrypt/live ]; then
+  for cert in /etc/letsencrypt/live/*/fullchain.pem; do
+    [ -e "$cert" ] || continue
+    consider_cert "$cert"
+  done
+fi
+if [ -d /etc/v2ray-agent/tls ]; then
+  for cert in /etc/v2ray-agent/tls/*.crt /etc/v2ray-agent/tls/*.pem; do
+    [ -e "$cert" ] || continue
+    consider_cert "$cert"
+  done
+fi
+if [ -z "$ADOPTED_CERT" ] && [ -d /etc/nginx ]; then
+  while read -r cert; do
+    [ -n "$cert" ] || continue
+    case "$cert" in
+      "$CERT_FILE"|*aimilivpn/tls/*) continue ;;
+    esac
+    consider_cert "$cert"
+  done < <(grep -R --include='*.conf' -h '^\s*ssl_certificate\s' /etc/nginx 2>/dev/null | awk '{print $2}' | tr -d ';')
+fi
+if [ -n "$ADOPTED_CERT" ]; then
+  install -m 0644 "$ADOPTED_CERT" "$CERT_FILE"
+  install -m 0600 "$ADOPTED_KEY" "$KEY_FILE"
+  ENABLE_IP_ACME=0
+  echo "已使用服务器上已有的正式证书：${ADOPTED_DOMAIN:-$ADOPTED_CERT}"
+fi
+
 install -m 0644 "$ROOT_DIR/scripts/nginx/aimilivpn-production.conf" "$NGINX_CONF"
+if [ -n "$ADOPTED_DOMAIN" ]; then
+  sed -i "s/server_name _;/server_name ${ADOPTED_DOMAIN};/" "$NGINX_CONF"
+fi
 rm -f "$ACME_CONF"
 
 # 只有 80 端口空闲时才启用 HTTP-01，避免抢占用户已有网站。

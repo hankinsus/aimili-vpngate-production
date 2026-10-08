@@ -168,7 +168,7 @@ def tune_forwarding_interface(iface: str) -> None:
         parts = (shown.stdout or "").split()
         if "mtu" in parts:
             mtu = parse_int(parts[parts.index("mtu") + 1])
-        if mtu != 1280:
+        if not iface.startswith("alh") and mtu > 1280:
             subprocess.run(
                 ["ip", "link", "set", "dev", iface, "mtu", "1280"],
                 capture_output=True, text=True, timeout=3,
@@ -284,6 +284,28 @@ def get_forward_interface() -> str:
     if get_egress_mode() == "direct":
         return physical_egress_interface()
     return get_active_interface()
+
+
+def _netif_exists(iface: str) -> bool:
+    iface = str(iface or "").strip()
+    return bool(iface) and Path("/sys/class/net", iface).exists()
+
+
+def await_forward_interface(timeout: float = 1.0) -> str:
+    """Return a forward NIC that exists now.
+
+    A republish can leave the old name in active_iface.txt for a moment after
+    the netdev is gone. Binding that name fails the next page and used to
+    start a failover that deleted the route while the same NIC was coming back.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        iface = get_forward_interface()
+        if not iface or _netif_exists(iface):
+            return iface
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.1)
 
 
 _live_clients: set[socket.socket] = set()
@@ -1347,7 +1369,7 @@ def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
 
 
 def probe_socks_quic(timeout: float = 4.0) -> dict[str, Any]:
-    """Real QUIC handshake through 8500. UDP DNS success is not this check."""
+    """QUIC path check through 8500. OpenSSL 3.0 has no s_client -quic."""
     target_name = "www.google.com"
     try:
         infos = socket.getaddrinfo(target_name, 443, socket.AF_INET, socket.SOCK_DGRAM)
@@ -1360,9 +1382,6 @@ def probe_socks_quic(timeout: float = 4.0) -> dict[str, Any]:
     user, password = get_proxy_credentials()
     control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     query = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    shim = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    stop = threading.Event()
-    bridge: threading.Thread | None = None
     try:
         control.settimeout(min(2.0, timeout))
         control.connect(("127.0.0.1", port))
@@ -1384,69 +1403,34 @@ def probe_socks_quic(timeout: float = 4.0) -> dict[str, Any]:
         if len(reply) < 10 or reply[1] != 0:
             return {"ok": False, "error": "SOCKS5 QUIC ASSOCIATE 失败"}
         relay_port = int.from_bytes(reply[8:10], "big")
-        shim.bind(("127.0.0.1", 0))
-        shim_port = int(shim.getsockname()[1])
-        client_box: dict[str, tuple[str, int]] = {}
-
-        def _bridge() -> None:
-            query.setblocking(False)
-            shim.setblocking(False)
-            while not stop.is_set():
-                try:
-                    readable, _, _ = select.select([shim, query], [], [], 0.2)
-                except OSError:
-                    return
-                for source in readable:
-                    try:
-                        if source is shim:
-                            data, addr = shim.recvfrom(65535)
-                            client_box["peer"] = (str(addr[0]), int(addr[1]))
-                            query.sendto(
-                                _socks5_pack_udp((target_ip, 443), data),
-                                ("127.0.0.1", relay_port),
-                            )
-                        else:
-                            packet, _peer = query.recvfrom(65535)
-                            decoded = _socks5_unpack_udp(packet)
-                            peer = client_box.get("peer")
-                            if not decoded or peer is None:
-                                continue
-                            shim.sendto(decoded[2], peer)
-                    except (BlockingIOError, OSError):
-                        continue
-
-        bridge = threading.Thread(target=_bridge, daemon=True)
-        bridge.start()
-        proc = subprocess.run(
-            [
-                "openssl", "s_client", "-quic",
-                "-connect", f"127.0.0.1:{shim_port}",
-                "-servername", target_name,
-                "-alpn", "h3",
-                "-brief",
-            ],
-            input=b"",
-            capture_output=True,
-            timeout=timeout,
-        )
-        text = ((proc.stdout or b"") + (proc.stderr or b"")).decode("utf-8", "replace")
-        if "CONNECTION ESTABLISHED" in text and "QUIC" in text:
-            return {"ok": True}
-        line = next((item.strip() for item in text.splitlines() if item.strip()), "QUIC 握手失败")
-        return {"ok": False, "error": line[:180]}
-    except subprocess.TimeoutExpired:
+        dcid = secrets.token_bytes(8)
+        scid = secrets.token_bytes(8)
+        packet = bytes([0xC0]) + b"\x1a\x1a\x1a\x1a" + bytes([8]) + dcid + bytes([8]) + scid
+        if len(packet) < 1200:
+            packet += b"\x00" * (1200 - len(packet))
+        query.settimeout(timeout)
+        query.sendto(_socks5_pack_udp((target_ip, 443), packet), ("127.0.0.1", relay_port))
+        data, _peer = query.recvfrom(2048)
+        decoded = _socks5_unpack_udp(data)
+        if not decoded:
+            return {"ok": False, "error": "SOCKS5 QUIC 回包无效"}
+        payload = decoded[2]
+        if len(payload) < 7 or (payload[0] & 0x80) == 0:
+            return {"ok": False, "error": "QUIC 回包不是长包头"}
+        version = int.from_bytes(payload[1:5], "big")
+        if version not in (0, 1):
+            return {"ok": False, "error": f"QUIC 回包版本异常 {version:#x}"}
+        return {"ok": True}
+    except socket.timeout:
         return {"ok": False, "error": "QUIC 握手超时"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:
-        stop.set()
-        for sock in (shim, query, control):
+        for sock in (query, control):
             try:
                 sock.close()
             except OSError:
                 pass
-        if bridge is not None:
-            bridge.join(timeout=0.5)
 
 def _host_is_ip(host: str) -> str | None:
     host = str(host or "").strip()
@@ -1721,15 +1705,23 @@ def resolve_dns_over_active_tunnel(host: str, dns_server: str = "8.8.8.8", timeo
         if not iface:
             ip = _system_dns_ipv4(key_host, stage_timeout)
         else:
-            servers = []
-            for server in (dns_server, *DNS_TUNNEL_RESOLVERS):
-                server = str(server or "").strip()
-                if server and server not in servers:
-                    servers.append(server)
-            ip, raw_ttl, negative = _race_tunnel_dns(key_host, iface, tuple(servers), stage_timeout)
-            if not ip and not negative:
+            if iface and not _netif_exists(iface):
+                iface = await_forward_interface(0.8)
+            if iface and _netif_exists(iface):
+                servers = []
+                for server in (dns_server, *DNS_TUNNEL_RESOLVERS):
+                    server = str(server or "").strip()
+                    if server and server not in servers:
+                        servers.append(server)
+                ip, raw_ttl, negative = _race_tunnel_dns(key_host, iface, tuple(servers), stage_timeout)
+                if not ip and not negative:
+                    ip = _system_dns_ipv4(key_host, stage_timeout)
+                    raw_ttl = DNS_POSITIVE_MIN_SECONDS if ip else 0.0
+            elif get_egress_mode() != "direct":
+                box["ip"] = None
+                return None
+            else:
                 ip = _system_dns_ipv4(key_host, stage_timeout)
-                raw_ttl = DNS_POSITIVE_MIN_SECONDS if ip else 0.0
         box["ip"] = ip
         _remember_dns(cache_key, ip, raw_ttl, time.monotonic())
         return ip
@@ -1841,9 +1833,9 @@ def _repair_policy_route(iface: str) -> None:
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
-    iface = get_forward_interface()
+    iface = await_forward_interface(1.0)
     if get_egress_mode() != "direct" and not iface:
-        raise OSError("[DNS] 代理模式没有活动网卡")
+        raise OSError("[错误代码 3004] 活动网卡暂时不存在，本连接未绑定失效网卡")
     _stage_mark("dns_start")
     if not _host_is_ip(host):
         resolved_ip = resolve_dns_over_active_tunnel(host, iface=iface)
