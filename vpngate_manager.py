@@ -10569,37 +10569,38 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       max-width: 100%;
       margin-left: 0;
-      display: flex;
-      align-items: center;
-      justify-content: flex-start;
-      flex-wrap: nowrap;
-      gap: 0 6px;
+      display: block;
       color: #d5dee8;
       font-weight: 500;
+      line-height: 22px;
       white-space: nowrap;
       overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .library-server-meta > span {
-      flex: 0 0 auto;
-      min-width: 0;
-      max-width: none;
-      overflow: visible;
-      text-overflow: clip;
+    .library-server-meta > span,
+    .library-server-meta .meta-dot {
+      display: inline;
       white-space: nowrap;
     }
     .library-server-meta .active-location-with-flag {
-      width: auto;
-      max-width: none;
-      flex: 0 0 auto;
+      display: inline-flex !important;
+      width: auto !important;
+      max-width: none !important;
+      min-width: 0;
+      vertical-align: middle;
+      flex: none;
     }
     .library-server-meta .active-location-with-flag > span:last-child {
+      display: inline;
+      width: auto;
+      max-width: none;
       overflow: visible;
       text-overflow: clip;
       color: inherit;
       font-weight: 500;
     }
     .library-server-meta .mono {
-      flex: 0 0 auto;
+      display: inline;
       overflow: visible;
       text-overflow: clip;
       color: #e7eef6;
@@ -12334,9 +12335,15 @@ INDEX_HTML = r"""<!doctype html>
     }
     .rs-form-grid > .rs-help {
       margin-top: 2px;
+      min-height: 34px;
     }
-    #rs_invite_allowed_cidrs {
-      margin-top: 30px;
+    .rs-form-grid > .rs-full-btn {
+      margin-top: auto;
+    }
+    .rs-align-phantom {
+      visibility: hidden;
+      pointer-events: none;
+      user-select: none;
     }
     .rs-auto-row { display: flex; flex-direction: column; gap: 8px; }
     .rs-auto-check {
@@ -13574,7 +13581,10 @@ INDEX_HTML = r"""<!doctype html>
           <div class="rs-help rs-form-help">邀请链接长期有效。生成后系统会自动复制完整链接；对方只需粘贴这一条链接即可加入，无需单独处理邀请码。</div>
           <div class="rs-form-grid">
             <input id="rs_invite_peer_name" class="input-field" placeholder="邀请服务器名称，例如 日本资源库">
-            <input id="rs_invite_allowed_cidrs" class="input-field" value="0.0.0.0/0, ::/0" placeholder="允许来源（可选，默认 IPv4/IPv6 全部允许）">
+            <div class="rs-auto-row">
+              <label class="rs-auto-check rs-align-phantom" aria-hidden="true"><input type="checkbox" tabindex="-1" disabled> 开启自动同步</label>
+              <input id="rs_invite_allowed_cidrs" class="input-field" value="0.0.0.0/0, ::/0" placeholder="允许来源（可选，默认 IPv4/IPv6 全部允许）">
+            </div>
             <div class="rs-help">默认允许 IPv4 / IPv6 来源；如需限制来源，可填写单个 IP 或 CIDR。</div>
             <button id="rs_generate_btn" type="button" class="btn-primary rs-full-btn" onclick="generateResourceInvite()">生成并复制邀请链接</button>
           </div>
@@ -15548,7 +15558,7 @@ function currentServerMetaHtml() {
   if (place) bits.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
   if (owner) bits.push('<span>' + esc(owner) + '</span>');
   if (ipType) bits.push('<span>' + esc(translateIpType(ipType)) + '</span>');
-  return bits.join('<span>·</span>');
+  return bits.join('<span class="meta-dot"> · </span>');
 }
 
 function paintPriorityStatus() {
