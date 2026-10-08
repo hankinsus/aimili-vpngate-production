@@ -11,7 +11,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from vpn_utils import COUNTRY_TRANSLATIONS, canonical_country_name
+from vpn_utils import COUNTRY_TRANSLATIONS, canonical_country_name, country_from_location
 
 # Same buckets as protocol_endpoint_to_ui_node. DEGRADED and UNAVAILABLE
 # render as 不可用; only TESTING renders as 检测中. Counting DEGRADED as
@@ -595,6 +595,9 @@ class NodePool:
                             metadata = previous_meta
                     except Exception:
                         pass
+                located = country_from_location(metadata.get("location"))
+                if located:
+                    country = located
                 db.execute(
                     """
                     INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)
@@ -772,6 +775,9 @@ class NodePool:
                 if speed > 0:
                     metadata["shared_speed_bps"] = speed
                 metadata.pop("trusted_observation", None)
+                located = country_from_location(metadata.get("location"))
+                if located:
+                    country = located
                 server_state = "NEW"
                 if server_row and str(server_row["state"] or "") not in ("", "STALE", "RETIRED"):
                     server_state = str(server_row["state"])
@@ -1739,7 +1745,14 @@ class NodePool:
                 if not isinstance(meta, dict): meta = {}
                 for field, val in meta_update.items():
                     if val not in (None, ""): meta[field] = val
-                db.execute("UPDATE servers SET metadata_json=? WHERE server_key=?", (json.dumps(meta, ensure_ascii=False), row["server_key"]))
+                located = country_from_location(meta.get("location"))
+                if located:
+                    db.execute(
+                        "UPDATE servers SET metadata_json=?, country=? WHERE server_key=?",
+                        (json.dumps(meta, ensure_ascii=False), located, row["server_key"]),
+                    )
+                else:
+                    db.execute("UPDATE servers SET metadata_json=? WHERE server_key=?", (json.dumps(meta, ensure_ascii=False), row["server_key"]))
                 count += 1
             db.commit()
         self._invalidate_read_caches()
@@ -1774,19 +1787,16 @@ class NodePool:
             rows = db.execute("SELECT server_key, country, metadata_json FROM servers").fetchall()
             for row in rows:
                 old = str(row["country"] or "").strip()
-                new = canonical_country_name(old)
-                # Older discovery snapshots sometimes stored the country only
-                # in the enriched location string (e.g. “日本 大阪府 大阪市”).
-                # Recover that value before the UI builds its country/IP index.
-                if not new:
-                    try:
-                        meta = json.loads(row["metadata_json"] or "{}")
-                    except Exception:
-                        meta = {}
-                    location = str((meta or {}).get("location") or "").strip()
-                    if location:
-                        new = canonical_country_name(location.split()[0])
-                if old != new:
+                try:
+                    meta = json.loads(row["metadata_json"] or "{}")
+                except Exception:
+                    meta = {}
+                location = str((meta or {}).get("location") or "").strip() if isinstance(meta, dict) else ""
+                located = country_from_location(location)
+                new = located or canonical_country_name(old)
+                if not new and location:
+                    new = canonical_country_name(location.split()[0])
+                if new and old != new:
                     db.execute("UPDATE servers SET country=? WHERE server_key=?", (new, row["server_key"]))
                     repaired_servers += 1
             rows = db.execute("SELECT endpoint_id, protocol, transport, port, metadata_json FROM endpoints").fetchall()

@@ -11617,7 +11617,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .node-address-cell .mono {
-      font-size: 15px;
+      font-size: 16px;
       font-weight: 600;
       color: #8fa0aa;
       letter-spacing: 0;

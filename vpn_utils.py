@@ -176,6 +176,26 @@ def canonical_country_name(value: Any) -> str:
     translated = COUNTRY_ALIASES.get(raw, COUNTRY_TRANSLATIONS.get(raw, ""))
     return translated if translated.casefold() not in INVALID_COUNTRY_LABELS else ""
 
+
+_LOCATION_COUNTRY_LABELS = sorted(
+    {str(name).strip() for name in list(COUNTRY_CODE_TO_ZH.values()) + list(COUNTRY_NAME_TO_CODE.keys()) if str(name).strip()},
+    key=len,
+    reverse=True,
+)
+
+
+def country_from_location(location: Any) -> str:
+    """Country named at the start of an IP-geo location, or empty."""
+    text = " ".join(str(location or "").strip().split())
+    if not text:
+        return ""
+    lowered = text.casefold()
+    for label in _LOCATION_COUNTRY_LABELS:
+        lab = label.casefold()
+        if lowered == lab or lowered.startswith(lab + " "):
+            return canonical_country_name(label) or ""
+    return ""
+
 def _safe_int(val: Any, default: int = 0) -> int:
     try:
         return int(val)
