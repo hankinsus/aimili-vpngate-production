@@ -2429,6 +2429,12 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
                 )
                 if rule.returncode != 0 and "File exists" not in (rule.stderr or ""):
                     raise RuntimeError((rule.stderr or rule.stdout or "策略规则添加失败").strip())
+            mark = subprocess.run(
+                ["ip", "rule", "add", "fwmark", "100", "lookup", table],
+                capture_output=True, text=True, timeout=2,
+            )
+            if mark.returncode != 0 and "File exists" not in (mark.stderr or ""):
+                raise RuntimeError((mark.stderr or mark.stdout or "标记路由添加失败").strip())
             _drop_foreign_oif_rules(interface, ACTIVE_ROUTE_TABLE)
             for proc_path in ["all", "default", interface]:
                 try:

@@ -1166,10 +1166,10 @@ def _write_json_if_changed(path: Path, payload: dict[str, Any]) -> bool:
 
 
 def ensure_kernel_socks_outbounds() -> None:
-    """Keep Xray on the same SOCKS5 path as sing-box.
+    """Send sing-box and Xray out the tunnel with one fwmark.
 
-    Xray's SOCKS outbound schema has no udp field. TCP, UDP and XUDP all use
-    that outbound. This does not restart sing-box or Xray.
+    Table 100 is updated when the tunnel changes. These processes are not
+    reloaded for that. 8500 stays on 127.0.0.1 for health checks only.
     """
     user, password = get_proxy_credentials()
     user = str(user or "")
@@ -1182,26 +1182,84 @@ def ensure_kernel_socks_outbounds() -> None:
             password = password or str(outbound.get("password") or "")
         except (OSError, KeyError, IndexError, TypeError, json.JSONDecodeError):
             pass
+    sing_dir = Path("/etc/v2ray-agent/sing-box/conf/config")
+    sing_root = Path("/etc/v2ray-agent/sing-box/conf")
+    sing_bin = Path("/etc/v2ray-agent/sing-box/sing-box")
+    changed = False
+    if sing_dir.is_dir():
+        changed = _write_json_if_changed(sing_dir / "socks5_outbound.json", {
+            "outbounds": [{
+                "type": "direct",
+                "tag": "socks5_outbound",
+                "routing_mark": 100,
+                "domain_resolver": "tunnel-dns",
+            }],
+        }) or changed
+        changed = _write_json_if_changed(sing_dir / "00_dns.json", {
+            "dns": {
+                "servers": [{
+                    "type": "udp",
+                    "tag": "tunnel-dns",
+                    "server": "8.8.8.8",
+                    "server_port": 53,
+                    "routing_mark": 100,
+                }],
+                "strategy": "ipv4_only",
+                "final": "tunnel-dns",
+            },
+        }) or changed
+        if user and password:
+            changed = _write_json_if_changed(sing_dir / "14_socks_inbounds.json", {
+                "inbounds": [{
+                    "type": "socks",
+                    "tag": "aimili-socks",
+                    "listen": "::",
+                    "listen_port": 10808,
+                    "users": [{"username": user, "password": password}],
+                }],
+            }) or changed
+        if changed and sing_bin.is_file():
+            config_path = sing_root / "config.json"
+            backup = sing_root / "config.json.bak-direct"
+            try:
+                if config_path.is_file():
+                    backup.write_bytes(config_path.read_bytes())
+                merge = subprocess.run(
+                    [str(sing_bin), "merge", "config.json", "-C", str(sing_dir), "-D", str(sing_root)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                check = subprocess.run(
+                    [str(sing_bin), "check", "-c", str(config_path)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                if merge.returncode != 0 or check.returncode != 0:
+                    detail = ((check.stderr or check.stdout or merge.stderr or merge.stdout or "").strip().splitlines() or ["未知错误"])[-1]
+                    if backup.is_file():
+                        config_path.write_bytes(backup.read_bytes())
+                    print(f"[内核] sing-box 直连出站检查失败，保持原配置：{detail}", flush=True)
+                else:
+                    restarted = subprocess.run(["systemctl", "restart", "sing-box"], capture_output=True, text=True, timeout=20)
+                    if restarted.returncode == 0:
+                        print("[内核] sing-box 已改走标记 100，经路由表进入当前隧道。SOCKS 入站 10808。", flush=True)
+                    else:
+                        print(f"[内核] sing-box 重启失败：{(restarted.stderr or restarted.stdout or '').strip()}", flush=True)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"[内核] sing-box 出站没有切过去：{exc}", flush=True)
     if not user or not password:
-        print("[内核] 未写 Xray 出站：缺少 8500 账号", flush=True)
+        print("[内核] 未写 Xray 出站：缺少账号", flush=True)
         return
     conf_dir = Path("/etc/v2ray-agent/xray/conf")
-    if not Path("/etc/v2ray-agent/xray").is_dir():
+    if not conf_dir.is_dir():
         return
     outbound_doc = {
         "outbounds": [{
-            "protocol": "socks",
+            "protocol": "freedom",
             "tag": "socks5_outbound",
-            "settings": {
-                "servers": [{
-                    "address": "127.0.0.1",
-                    "port": int(os.environ.get("LOCAL_PROXY_PORT", "8500")),
-                    "users": [{"user": user, "pass": password}],
-                }]
-            },
+            "settings": {"domainStrategy": "UseIPv4"},
+            "streamSettings": {"sockopt": {"mark": 100}},
         }]
     }
-    wrote = _write_json_if_changed(conf_dir / "00_socks5_outbound.json", outbound_doc)
+    _write_json_if_changed(conf_dir / "00_socks5_outbound.json", outbound_doc)
     route_path = conf_dir / "09_routing.json"
     route_text = ""
     try:
@@ -1209,7 +1267,7 @@ def ensure_kernel_socks_outbounds() -> None:
     except OSError:
         route_text = ""
     if "socks5_outbound" not in route_text:
-        wrote = _write_json_if_changed(route_path, {
+        _write_json_if_changed(route_path, {
             "routing": {
                 "domainStrategy": "AsIs",
                 "rules": [{
@@ -1218,10 +1276,10 @@ def ensure_kernel_socks_outbounds() -> None:
                     "outboundTag": "socks5_outbound",
                 }],
             }
-        }) or wrote
+        })
     binary = Path("/etc/v2ray-agent/xray/xray")
     if not binary.is_file():
-        print("[内核] Xray 程序不在。已准备 SOCKS 出站，TCP/UDP 进 127.0.0.1:8500，没有 udp 字段。当前仍用 sing-box。", flush=True)
+        print("[内核] Xray 程序不在。sing-box 已走标记路由。", flush=True)
         return
     try:
         test = subprocess.run(
@@ -1232,7 +1290,7 @@ def ensure_kernel_socks_outbounds() -> None:
         print(f"[内核] Xray 配置测试没有跑起来：{exc}", flush=True)
         return
     if test.returncode == 0:
-        print("[内核] Xray 配置测试通过。未重启，避免抢 sing-box 端口。", flush=True)
+        print("[内核] Xray freedom 标记 100 配置测试通过。未启动，避免抢 sing-box 端口。", flush=True)
     else:
         detail = ((test.stderr or test.stdout or "").strip().splitlines() or ["未知错误"])[-1]
         print(f"[内核] Xray 配置测试失败，未启动：{detail}", flush=True)
