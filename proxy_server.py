@@ -795,7 +795,15 @@ def proxy_client_allowed(address: tuple[str, int]) -> bool:
     except ValueError:
         return False
     allowlist = get_proxy_allowlist()
-    return bool(allowlist) and any(client_ip in network for network in allowlist)
+    # Exact entries the operator typed (/32, /128) are checked first.
+    # A different address family must not raise and skip that entry.
+    ordered = sorted(allowlist, key=lambda network: 0 if network.prefixlen == network.max_prefixlen else 1)
+    for network in ordered:
+        if network.version != client_ip.version:
+            continue
+        if client_ip in network:
+            return True
+    return False
 
 def proxy_auth_enabled() -> bool:
     user, password = get_proxy_credentials()
@@ -995,6 +1003,39 @@ def _socks5_reply_ipv4(client: socket.socket) -> str:
     return "0.0.0.0"
 
 
+def _canonical_ip(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("::ffff:"):
+        mapped = text[7:]
+        try:
+            socket.inet_aton(mapped)
+            return mapped
+        except OSError:
+            pass
+    return text
+
+
+def _udp_client_matches(peer_ip: str, client_ip: str) -> bool:
+    """::ffff:67.10.84.82 and 67.10.84.82 are the same UDP client."""
+    peer = _canonical_ip(peer_ip)
+    client = _canonical_ip(client_ip)
+    if peer == client:
+        return True
+    return client in ("127.0.0.1", "::1") and peer in ("127.0.0.1", "::1")
+
+
+def _udp_destinations_for_send(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
+    destinations = _udp_destinations_ready(host, port)
+    allow_v6 = _iface_has_global_ipv6(get_forward_interface() or "")
+    kept = [
+        (af, sa)
+        for af, sa in destinations
+        if af == socket.AF_INET or (af == socket.AF_INET6 and allow_v6)
+    ]
+    kept.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    return kept
+
+
 def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]) -> None:
     """RFC 1928 UDP ASSOCIATE relay over the active VPN interface."""
     relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1079,10 +1120,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         except BlockingIOError:
                             break
                         peer_ip = str(peer[0] or "")
-                        if peer_ip != client_ip and not (
-                            client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
-                            and peer_ip == "127.0.0.1"
-                        ):
+                        if not _udp_client_matches(peer_ip, client_ip):
                             continue
                         decoded = _socks5_unpack_udp(packet)
                         if not decoded:
@@ -1090,9 +1128,7 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                         host, port, payload = decoded
                         if _rotate_if_needed():
                             pass
-                        destinations = _udp_destinations_ready(host, port)
-                        destinations.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
-                        destinations = [item for item in destinations if item[0] == socket.AF_INET]
+                        destinations = _udp_destinations_for_send(host, port)
                         if not destinations:
                             continue
                         client_udp_addr = (peer_ip, int(peer[1]))
@@ -1121,6 +1157,11 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                                 try:
                                     sock = socket.socket(af, socket.SOCK_DGRAM)
                                     _set_udp_socket_options(sock)
+                                    if af == socket.AF_INET6:
+                                        try:
+                                            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                                        except OSError:
+                                            pass
                                     bind_addr = ("0.0.0.0", 0) if af == socket.AF_INET else ("::", 0)
                                     sock.bind(bind_addr)
                                     sock.setblocking(False)
@@ -1329,7 +1370,12 @@ def ensure_kernel_socks_outbounds() -> None:
 
 
 def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
-    """Open a new SOCKS5 UDP association and ask 8.8.8.8:53 for example.com."""
+    """Open a new SOCKS5 UDP association and ask for example.com.
+
+    IPv4 8.8.8.8:53 is the primary check. A tunnel that only carries UDP
+    on its global IPv6 address is not an UDP failure: try that path before
+    the card is stamped UDP异常.
+    """
     port = int(os.environ.get("LOCAL_PROXY_PORT", "8500"))
     user, password = get_proxy_credentials()
     control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1355,17 +1401,29 @@ def probe_socks_udp_dns(timeout: float = 2.0) -> dict[str, Any]:
         if len(reply) < 10 or reply[1] != 0:
             return {"ok": False, "error": "SOCKS5 UDP ASSOCIATE 失败"}
         relay_port = int.from_bytes(reply[8:10], "big")
-        tx_id = secrets.token_bytes(2)
-        dns = _build_dns_query("example.com", 1, tx_id)
-        if not dns:
-            return {"ok": False, "error": "DNS 查询构造失败"}
-        header = b"\x00\x00\x00\x01" + socket.inet_aton("8.8.8.8") + (53).to_bytes(2, "big")
+        targets: list[tuple[str, int]] = [("8.8.8.8", 1)]
+        if _iface_has_global_ipv6(get_forward_interface() or ""):
+            targets.append(("2001:4860:4860::8888", 28))
+        errors: list[str] = []
         query.settimeout(timeout)
-        query.sendto(header + dns, ("127.0.0.1", relay_port))
-        packet, _peer = query.recvfrom(2048)
-        if len(packet) < 10 or packet[:3] != b"\x00\x00\x00":
-            return {"ok": False, "error": "SOCKS5 UDP 回包无效"}
-        return {"ok": True}
+        for dns_ip, qtype in targets:
+            family = "IPv6" if ":" in dns_ip else "IPv4"
+            tx_id = secrets.token_bytes(2)
+            dns = _build_dns_query("example.com", qtype, tx_id)
+            if not dns:
+                errors.append(f"{family} DNS 查询构造失败")
+                continue
+            try:
+                query.sendto(_socks5_pack_udp((dns_ip, 53), dns), ("127.0.0.1", relay_port))
+                packet, _peer = query.recvfrom(2048)
+            except OSError as exc:
+                errors.append(f"{family} UDP {dns_ip}:53 无回包 ({exc})")
+                continue
+            if len(packet) < 10 or packet[:3] != b"\x00\x00\x00":
+                errors.append(f"{family} UDP 回包无效")
+                continue
+            return {"ok": True, "family": family}
+        return {"ok": False, "error": "；".join(errors) or "UDP 异常"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
     finally:

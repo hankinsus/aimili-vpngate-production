@@ -218,35 +218,94 @@ class ResourceShareManager:
         return result[:32]
 
     @staticmethod
-    def client_ip(headers: Any, client_address: Any) -> str:
-        values: list[str] = []
+    def unwrap_ip(value: Any):
+        """Manual IPv4 stays IPv4. ::ffff:67.10.84.82 is that same address."""
+        text = str(value or "").strip()
+        if not text:
+            return None
         try:
-            values.append(str(headers.get("X-Real-IP") or "").strip())
-            forwarded = str(headers.get("X-Forwarded-For") or "").strip()
-            if forwarded:
-                values.extend(x.strip() for x in forwarded.split(","))
-        except Exception:
-            pass
+            addr = ipaddress.ip_address(text)
+        except ValueError:
+            return None
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return addr.ipv4_mapped
+        return addr
+
+    @staticmethod
+    def client_ips(headers: Any, client_address: Any) -> list[str]:
+        """TCP peer first. Forwarded headers only when that peer is local nginx.
+
+        A manually allowed address must be compared against the real peer.
+        An X-Forwarded-For value must not hide it, and must not be trusted
+        from a connection that did not come through the local proxy.
+        """
+        socket_raw = ""
         try:
-            values.append(str(client_address[0] if client_address else "").strip())
+            socket_raw = str(client_address[0] if client_address else "").strip()
         except Exception:
-            pass
-        for value in values:
+            socket_raw = ""
+        socket_addr = ResourceShareManager.unwrap_ip(socket_raw)
+        raw_values: list[str] = []
+        if socket_raw:
+            raw_values.append(socket_raw)
+        if socket_addr is not None and socket_addr.is_loopback:
             try:
-                return str(ipaddress.ip_address(value))
-            except ValueError:
+                real_ip = str(headers.get("X-Real-IP") or "").strip()
+                if real_ip:
+                    raw_values.append(real_ip)
+                forwarded = str(headers.get("X-Forwarded-For") or "").strip()
+                if forwarded:
+                    raw_values.extend(part.strip() for part in forwarded.split(","))
+            except Exception:
+                pass
+        found: list[str] = []
+        for raw in raw_values:
+            addr = ResourceShareManager.unwrap_ip(raw)
+            if addr is None:
                 continue
-        return ""
+            text = str(addr)
+            if text not in found:
+                found.append(text)
+        return found
+
+    @staticmethod
+    def client_ip(headers: Any, client_address: Any) -> str:
+        ips = ResourceShareManager.client_ips(headers, client_address)
+        return ips[0] if ips else ""
 
     @staticmethod
     def _cidr_allowed(source_ip: str, cidrs: list[str]) -> bool:
-        if not source_ip or not cidrs:
+        addr = ResourceShareManager.unwrap_ip(source_ip)
+        if addr is None or not cidrs:
             return False
-        try:
-            addr = ipaddress.ip_address(source_ip)
-        except ValueError:
-            return False
-        return any(addr in ipaddress.ip_network(raw, strict=False) for raw in cidrs)
+        # A typed /32 or /128 is the operator's explicit choice. Check it
+        # before a different-family network, and never let a family mismatch
+        # abort the rest of the list.
+        ordered = sorted(
+            cidrs,
+            key=lambda raw: 0 if str(raw).endswith("/32") or str(raw).endswith("/128") else 1,
+        )
+        for raw in ordered:
+            try:
+                network = ipaddress.ip_network(str(raw), strict=False)
+            except ValueError:
+                continue
+            if network.version != addr.version:
+                continue
+            if addr in network:
+                return True
+        return False
+
+    @classmethod
+    def _sources_allowed(cls, source_ips: Any, cidrs: list[str]) -> str:
+        if isinstance(source_ips, str):
+            ips = [source_ips]
+        else:
+            ips = [str(item or "") for item in (source_ips or [])]
+        for source_ip in ips:
+            if cls._cidr_allowed(source_ip, cidrs):
+                return str(cls.unwrap_ip(source_ip) or source_ip)
+        return ""
     def create_invite(self, peer_name: str = "", allowed_cidrs: Any = None) -> dict[str, Any]:
         peer_name = self._safe_name(peer_name, "共享服务器")
         cidrs = self.normalize_cidrs(allowed_cidrs)
@@ -389,9 +448,12 @@ class ResourceShareManager:
                 if not stored_hash or not hmac.compare_digest(stored_hash, target):
                     continue
                 cidrs = list(invite.get("allowed_cidrs") or [])
-                if not self._cidr_allowed(source_ip, cidrs):
+                matched_ip = self._sources_allowed(source_ip, cidrs)
+                if not matched_ip:
                     continue
-                return str(invite_id), dict(invite)
+                invite = dict(invite)
+                invite["_matched_source_ip"] = matched_ip
+                return str(invite_id), invite
         return None
 
     def _find_peer_by_token(self, token: str, source_ip: str) -> tuple[str, dict[str, Any]] | None:
@@ -403,27 +465,38 @@ class ResourceShareManager:
                     continue
                 if not hmac.compare_digest(str(peer.get("inbound_token_hash") or ""), target):
                     continue
-                if not self._cidr_allowed(source_ip, list(peer.get("allowed_cidrs") or [])):
+                matched_ip = self._sources_allowed(source_ip, list(peer.get("allowed_cidrs") or []))
+                if not matched_ip:
                     continue
-                return str(peer_id), dict(peer)
+                peer = dict(peer)
+                peer["_matched_source_ip"] = matched_ip
+                return str(peer_id), peer
         return None
 
     def authorize(self, headers: Any, client_address: Any) -> tuple[str, dict[str, Any]]:
         token = str(headers.get("X-Aimili-Resource-Token") or "").strip()
         if len(token) < 20:
             raise PermissionError("资源共享访问令牌无效")
-        source_ip = self.client_ip(headers, client_address)
-        matched = self._find_peer_by_token(token, source_ip)
+        source_ips = self.client_ips(headers, client_address)
+        matched = self._find_peer_by_token(token, source_ips)
         if not matched:
-            raise PermissionError("资源共享身份验证失败或来源 IP 未获允许")
+            shown = ", ".join(source_ips) or "未知"
+            raise PermissionError(f"资源共享身份验证失败，或来源 IP 未获允许（实际来源 {shown}）")
         return matched
-    def enroll(self, payload: dict[str, Any], source_ip: str) -> dict[str, Any]:
+    def enroll(self, payload: dict[str, Any], source_ip: Any) -> dict[str, Any]:
         code = str(payload.get("invite_code") or "").strip()
         if not code:
             raise PermissionError("邀请码不能为空")
         found = self._find_invite(code, source_ip)
         if not found:
-            raise PermissionError("邀请码无效、已撤销，或来源 IP 不在授权范围内")
+            if isinstance(source_ip, str):
+                shown = source_ip or "未知"
+            else:
+                shown = ", ".join(str(item) for item in (source_ip or [])) or "未知"
+            raise PermissionError(
+                "邀请码无效、已撤销，或来源 IP 不在人工允许范围内"
+                f"（实际来源 {shown}）。手工填写的 IPv4 同样认可它的 ::ffff: 形式。"
+            )
         invite_id, invite = found
         remote_instance_id = self._safe_name(payload.get("peer_id"), "Peer")[:128]
         remote_name = self._safe_name(invite.get("peer_name"), "共享服务器")
@@ -471,7 +544,7 @@ class ResourceShareManager:
                 "last_sync_ok": None,
                 "last_sync_error": "",
                 "last_sync_count": 0,
-                "source_ip": source_ip,
+                "source_ip": str(invite.get("_matched_source_ip") or (source_ip if isinstance(source_ip, str) else "")),
                 "invite_id": invite_id,
                 "inbound_token_hash": self._hash_secret(inbound_token),
                 "outbound_token": "",

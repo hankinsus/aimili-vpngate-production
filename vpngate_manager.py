@@ -20498,12 +20498,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if effective_path == "/resource-share/enroll":
                 payload = self.read_json_body(max_bytes=32768)
-                source_ip = resource_share.client_ip(self.headers, self.client_address)
-                if not source_ip:
+                source_ips = resource_share.client_ips(self.headers, self.client_address)
+                if not source_ips:
                     raise ValueError("无法识别对端 IP")
-                result = resource_share.enroll(payload, source_ip)
+                result = resource_share.enroll(payload, source_ips)
                 result["resource_url"] = self.resource_share_local_url() + "/resources"
-                log_to_json("INFO", "Share", f"资源共享新 Peer 已加入: {result.get('peer_id')}，来源 {source_ip}")
+                log_to_json("INFO", "Share", f"资源共享新 Peer 已加入: {result.get('peer_id')}，来源 {', '.join(source_ips)}")
                 self.send_json(result)
                 return True
             self.send_json({"ok": False, "error": "resource share endpoint not found"}, HTTPStatus.NOT_FOUND)
