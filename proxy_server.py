@@ -135,12 +135,11 @@ def _iptables_mss(action: str, iface: str) -> None:
     )
 
 def tune_forwarding_interface(iface: str) -> None:
-    """Keep a short fair queue on the tunnel NIC and clamp TCP MSS.
+    """Keep a short fair queue on the tunnel NIC and a 1280-byte MTU.
 
+    TCP is already clamped, but QUIC is not. A larger MTU lets those UDP
+    packets disappear inside L2TP, and the page waits until QUIC gives up.
     One video flow must not fill a 1000-packet FIFO and block web requests.
-    Do not overwrite a negotiated MTU that is already at or below 1400.
-    Only an oversized device, such as an SSTP PPP that came up at 1500, is
-    lowered. OpenVPN, SoftEther and L2TP keep the MTU they negotiated.
     """
     global _last_tuned_iface
     iface = str(iface or "").strip()
@@ -169,9 +168,9 @@ def tune_forwarding_interface(iface: str) -> None:
         parts = (shown.stdout or "").split()
         if "mtu" in parts:
             mtu = parse_int(parts[parts.index("mtu") + 1])
-        if mtu > 1400:
+        if mtu != 1280:
             subprocess.run(
-                ["ip", "link", "set", "dev", iface, "mtu", "1400"],
+                ["ip", "link", "set", "dev", iface, "mtu", "1280"],
                 capture_output=True, text=True, timeout=3,
             )
     except Exception:

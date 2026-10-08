@@ -18234,6 +18234,10 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
     for dev in (inner, ns_dev):
         try:
             subprocess.run(
+                ["ip", "netns", "exec", namespace, "ip", "link", "set", "dev", dev, "mtu", "1280"],
+                capture_output=True, text=True, timeout=3,
+            )
+            subprocess.run(
                 ["ip", "netns", "exec", namespace, "tc", "qdisc", "replace", "dev", dev, "root", "fq_codel", "limit", "256", "target", "20ms", "interval", "100ms"],
                 capture_output=True, text=True, timeout=3,
             )

@@ -936,8 +936,8 @@ for _ in $(seq 1 60); do
       iptables -t mangle -A FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
     iptables -t mangle -C INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
       iptables -t mangle -A INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
-    ip link set dev "$IFACE" txqueuelen 32 2>/dev/null || true
-    ip link set dev "{ns_veth}" txqueuelen 32 2>/dev/null || true
+    ip link set dev "$IFACE" mtu 1280 2>/dev/null || true
+    ip link set dev "{ns_veth}" mtu 1280 2>/dev/null || true
     tc qdisc replace dev "$IFACE" root fq_codel limit 256 target 20ms interval 100ms 2>/dev/null || true
     tc qdisc replace dev "{ns_veth}" root fq_codel limit 256 target 20ms interval 100ms 2>/dev/null || true
     echo "$IFACE" > "{work_dir / 'ppp-iface'}"
