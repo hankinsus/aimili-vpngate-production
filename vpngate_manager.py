@@ -19540,7 +19540,7 @@ def preflight_proxy_egress() -> tuple[bool, str]:
     return True, iface
 
 
-def check_proxy_health(fast: bool = False, urls: tuple[str, ...] | None = None) -> dict[str, Any]:
+def check_proxy_health(fast: bool = False, urls: tuple[str, ...] | None = None, budget: float | None = None) -> dict[str, Any]:
     # 1. 检测代理服务端口是否在监听
     is_ipv6 = ":" in LOCAL_PROXY_HOST
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
@@ -19654,7 +19654,7 @@ def check_proxy_health(fast: bool = False, urls: tuple[str, ...] | None = None) 
         # the tunnel and used to hold 「切换中」 for ~20s, then revert a path
         # that could already open web pages.
         result = None
-        page_budget = 2 if fast else 4
+        page_budget = float(budget) if budget is not None else (2 if fast else 4)
         targets = urls or ("https://example.com/", "https://www.google.com/generate_204")
         for url in targets:
             result = _curl_via_proxy(url, page_budget, False)
@@ -19753,14 +19753,23 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
         if not owned():
             return
         health = check_proxy_health(fast=True)
-        if health.get("ok") and owned() and proxy_server.get_egress_mode() == mode:
-            for url in ("https://ilovestudyip.com/", "https://www.google.com/generate_204"):
+        if health.get("ok") and owned() and proxy_server.get_egress_mode() == mode and mode == "proxy":
+            # The first check already proved the tunnel can open a page.
+            # One slow site must not roll a working proxy switch back to direct.
+            confirmed = False
+            failed_url = ""
+            for url in ("https://www.google.com/generate_204", "https://example.com/", "https://ilovestudyip.com/"):
                 if not owned() or proxy_server.get_egress_mode() != mode:
                     return
-                hit = check_proxy_health(fast=True, urls=(url,))
-                if not hit.get("ok"):
-                    health = {"ok": False, "error": "8500 切换后验收失败：" + url}
+                hit = check_proxy_health(fast=True, urls=(url,), budget=6)
+                if hit.get("ok"):
+                    confirmed = True
+                    if hit.get("ip"):
+                        health["ip"] = hit["ip"]
                     break
+                failed_url = url
+            if not confirmed:
+                health = {"ok": False, "error": "8500 切换后验收失败：" + failed_url}
         if not owned() or proxy_server.get_egress_mode() != mode:
             return
         if health.get("ok"):
