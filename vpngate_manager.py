@@ -10563,26 +10563,33 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
       font-weight: 500;
     }
-    .library-server-meta {
-      flex: 1 0 100%;
-      width: 100%;
+    .active-server-corner {
+      position: absolute;
+      top: 22px;
+      right: 24px;
+      left: 340px;
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
       min-width: 0;
-      max-width: 100%;
-      margin-left: 0;
-      display: block;
+      overflow: hidden;
+      z-index: 2;
+      pointer-events: none;
+    }
+    .active-server-corner-line {
+      flex: 0 0 auto;
       color: #d5dee8;
+      font-size: 13px;
       font-weight: 500;
       line-height: 22px;
       white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }
-    .library-server-meta > span,
-    .library-server-meta .meta-dot {
+    .active-server-corner-line > span,
+    .active-server-corner .meta-dot {
       display: inline;
       white-space: nowrap;
     }
-    .library-server-meta .active-location-with-flag {
+    .active-server-corner .active-location-with-flag {
       display: inline-flex !important;
       width: auto !important;
       max-width: none !important;
@@ -10590,7 +10597,7 @@ INDEX_HTML = r"""<!doctype html>
       vertical-align: middle;
       flex: none;
     }
-    .library-server-meta .active-location-with-flag > span:last-child {
+    .active-server-corner .active-location-with-flag > span:last-child {
       display: inline;
       width: auto;
       max-width: none;
@@ -10599,7 +10606,7 @@ INDEX_HTML = r"""<!doctype html>
       color: inherit;
       font-weight: 500;
     }
-    .library-server-meta .mono {
+    .active-server-corner .mono {
       display: inline;
       overflow: visible;
       text-overflow: clip;
@@ -11805,7 +11812,12 @@ INDEX_HTML = r"""<!doctype html>
       .node-actions-cell::before { display: none; }
       .active-card {
         align-items: flex-start;
-        padding: 16px;
+        padding: 40px 16px 16px;
+      }
+      .active-server-corner {
+        top: 10px;
+        right: 16px;
+        left: 16px;
       }
       .active-card-info {
         flex-wrap: wrap;
@@ -15573,8 +15585,26 @@ function paintPriorityStatus() {
   const badge = running
     ? `<span class="badge not_checked"><span class="badge-pulse"></span>全球库</span>`
     : `<span class="badge available">全球库</span>`;
-  const serverMeta = currentServerMetaHtml();
-  priorityStatusEl.innerHTML = badge + `<span class="library-status-main">${esc(libraryStatusLine())}</span>` + (serverMeta ? `<span class="library-server-meta">${serverMeta}</span>` : "");
+  priorityStatusEl.innerHTML = badge + `<span class="library-status-main">${esc(libraryStatusLine())}</span>`;
+  paintServerCorner();
+}
+
+function paintServerCorner() {
+  const card = document.querySelector("#active_node_card .active-card");
+  if (!card) return;
+  const html = currentServerMetaHtml();
+  let corner = card.querySelector(".active-server-corner");
+  if (!html) {
+    if (corner) corner.remove();
+    return;
+  }
+  if (!corner) {
+    corner = document.createElement("div");
+    corner.className = "active-server-corner";
+    card.appendChild(corner);
+  }
+  const wrapped = '<span class="active-server-corner-line">' + html + '</span>';
+  if (corner.innerHTML !== wrapped) corner.innerHTML = wrapped;
 }
 
 async function prioritizeCountry(country){
