@@ -6474,7 +6474,15 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
     active_ip = _active_exit_ip()
     home = routing_target_country(ui_cfg)
     proto = _current_route_protocol(ui_cfg)
-    cache_key = f"{home}|{proto}|{normalize_routing_blocklist(ui_cfg.get('routing_blocklist') or '')}"
+    cache_key = "|".join([
+        home,
+        proto,
+        normalize_routing_blocklist(ui_cfg.get("routing_blocklist") or ""),
+        str(ui_cfg.get("routing_mode") or ""),
+        str(ui_cfg.get("routing_ip_type") or ""),
+        str(ui_cfg.get("routing_min_speed_bps") or 0),
+        str(ui_cfg.get("routing_latency") or ""),
+    ])
     cached = getattr(_cold_candidates, "cache", None)
     now_rank = time.time()
     if isinstance(cached, dict) and cached.get("key") == cache_key and (now_rank - float(cached.get("at") or 0) < 3600 or ui_query_active()):
@@ -6585,6 +6593,8 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         )
 
     qualified.sort(key=_sort_key)
+    if _explicit_scheme_configured(ui_cfg):
+        qualified = [ep for ep in qualified if endpoint_matches_explicit_routing(ep, ui_cfg)]
     found: dict[str, dict[str, Any]] = {}
     for endpoint in qualified:
         endpoint["_precold_tier"] = _tier(endpoint)
@@ -7006,6 +7016,16 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
                 for extra in _select_precold_ids(candidates, eid):
                     if extra and extra != exclude and extra not in order:
                         order.append(extra)
+        if _explicit_scheme_configured(ui_cfg) and candidates:
+            matching = [
+                eid for eid, endpoint in candidates.items()
+                if eid and eid != exclude and endpoint_matches_explicit_routing(endpoint, ui_cfg)
+            ]
+            if matching:
+                order = [eid for eid in order if eid in matching]
+                for eid in matching:
+                    if eid not in order:
+                        order.append(eid)
         order = order[: 1 + PRECOLD_TARGET]
         if not order:
             return "skip"
@@ -7014,6 +7034,13 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
                 break
             endpoint = _lookup_cold_endpoint(eid, candidates)
             if not endpoint:
+                continue
+            if _explicit_scheme_configured(ui_cfg) and not endpoint_matches_explicit_routing(endpoint, ui_cfg):
+                log_to_json(
+                    "INFO",
+                    "Standby",
+                    f"冷备不符合当前筛选，跳过 {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}",
+                )
                 continue
             probed = _cold_port_open(endpoint)
             if probed is False:
@@ -7082,6 +7109,18 @@ def cold_standby_pass() -> None:
             promote_cold_standby_to_main()
         return
     current = current_active_routing_endpoint()
+    if (
+        active_tunnel_running()
+        and current
+        and _explicit_scheme_configured(ui_cfg)
+        and not endpoint_matches_explicit_routing(current, ui_cfg)
+        and not endpoint_is_unstable(current)
+    ):
+        now_scheme = time.time()
+        if now_scheme - float(getattr(cold_standby_pass, "scheme_at", 0) or 0) > 60:
+            cold_standby_pass.scheme_at = now_scheme
+            if enter_explicit_scheme(immediate=True):
+                return
     if current and endpoint_is_blocked(current, ui_cfg):
         blocked_eid = str(current.get("endpoint_id") or "")
         log_to_json("INFO", "Routing", f"屏蔽节点退出主连接 {_endpoint_ip(current)}")
@@ -11599,7 +11638,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
     }
     .node-domain {
-      font-size: 15px;
+      font-size: 13px;
       font-weight: 600;
       color: #b7c3cb;
       display: block;
