@@ -69,8 +69,8 @@ def test_singleflight_and_scope():
     assert sum(1 for server, _iface in calls if server == "8.8.8.8") == 1
 
     system = []
-    ps._system_dns_ipv4 = lambda host, timeout: system.append(host) or "34.4.110.244"
-    assert ps.resolve_dns_over_active_tunnel("google.com", iface="") == "34.4.110.244"
+    ps._system_dns_ipv4 = lambda host, timeout: system.append(host) or "203.0.113.10"
+    assert ps.resolve_dns_over_active_tunnel("google.com", iface="") == "203.0.113.10"
     assert system == ["google.com"]
 
 
