@@ -1139,32 +1139,33 @@ class NodePool:
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
             with closing(self._connect(4000, readonly=True)) as db:
-                grouped = db.execute(
-                    "SELECT s.country AS country, "
-                    "COUNT(DISTINCT s.current_ip) AS ip_count, "
-                    "COUNT(DISTINCT s.server_key) AS server_count"
-                    + scope + " GROUP BY s.country",
+                rows = db.execute(
+                    "SELECT s.country AS country, s.current_ip AS current_ip, s.server_key AS server_key"
+                    + scope + " GROUP BY s.country, s.current_ip, s.server_key",
                     params,
                 ).fetchall()
-                total_ip = int(db.execute(
-                    "SELECT COUNT(DISTINCT s.current_ip) AS n" + scope,
-                    params,
-                ).fetchone()["n"] or 0)
 
             countries: dict[str, dict[str, int]] = {}
-            country_ip_count = 0
-            for row in grouped:
-                ip_count = int(row["ip_count"] or 0)
-                server_count = int(row["server_count"] or 0)
-                if ip_count <= 0:
+            country_servers: dict[str, set[str]] = {}
+            country_ips: dict[str, set[str]] = {}
+            all_ips: set[str] = set()
+            for row in rows:
+                ip = str(row["current_ip"] or "").strip()
+                if not ip:
                     continue
                 country = canonical_country_name(row["country"])
                 if not country:
                     continue
-                slot = countries.setdefault(country, {"ip_count": 0, "server_count": 0})
-                slot["ip_count"] += ip_count
-                slot["server_count"] += server_count
-                country_ip_count += ip_count
+                all_ips.add(ip)
+                country_ips.setdefault(country, set()).add(ip)
+                country_servers.setdefault(country, set()).add(str(row["server_key"] or ""))
+            for country, ips in country_ips.items():
+                countries[country] = {
+                    "ip_count": len(ips),
+                    "server_count": len(country_servers.get(country) or ()),
+                }
+            country_ip_count = sum(item["ip_count"] for item in countries.values())
+            total_ip = len(all_ips)
 
             result = {
                 "total_ip_count": total_ip,
@@ -1803,38 +1804,41 @@ class NodePool:
                 speed_min_bps=speed_min_bps,
                 latency=latency,
             )
-            select_sql = []
-            select_params: list[Any] = []
-            for name, statuses in _UI_STATUS_GROUPS.items():
-                select_sql.append(
-                    "COUNT(DISTINCT CASE WHEN UPPER(e.status) IN ("
-                    + ",".join("?" for _ in statuses)
-                    + ") THEN " + _UI_ROW_KEY_SQL + " END) AS " + name
-                )
-                select_params.extend(statuses)
-            select_sql.append("COUNT(DISTINCT " + _UI_ROW_KEY_SQL + ") AS all_rows")
-            sql = (
-                "SELECT " + ", ".join(select_sql)
-                + " FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
+            select_sql = (
+                "SELECT _sr, COUNT(*) AS n FROM ("
+                "SELECT CASE UPPER(e.status) "
+                "WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
+                "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 "
+                "WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END AS _sr, "
+                "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY "
+                "CASE UPPER(e.status) "
+                "WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
+                "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 "
+                "WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, e.endpoint_id) AS _rn "
+                "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
                 + " AND ".join(where)
+                + ") WHERE _rn=1 GROUP BY _sr"
             )
             empty = {"usable": 0, "available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
             try:
                 with closing(self._connect(4000, readonly=True)) as db:
-                    row = db.execute(sql, select_params + params).fetchone()
+                    grouped = db.execute(select_sql, params).fetchall()
             except sqlite3.OperationalError:
                 if cached:
                     return dict(cached[1])
                 return dict(empty)
+            buckets = {int(row["_sr"]): int(row["n"] or 0) for row in grouped}
+            def _take(*ranks: int) -> int:
+                return sum(buckets.get(rank, 0) for rank in ranks)
             result = {
-                "usable": int(row["usable"] or 0),
-                "available": int(row["available"] or 0),
-                "testing": int(row["testing"] or 0),
-                "not_checked": int(row["not_checked"] or 0),
-                "unavailable": int(row["unavailable"] or 0),
-                "all": int(row["all_rows"] or 0),
+                "usable": _take(0, 1, 2, 3),
+                "available": _take(0, 1),
+                "testing": _take(2),
+                "not_checked": _take(3),
+                "unavailable": _take(4, 5, 6, 7, 8, 9),
+                "all": sum(buckets.values()),
             }
-            self._status_counts_cache[cache_key] = (time.monotonic() + 15.0, result)
+            self._status_counts_cache[cache_key] = (time.monotonic() + 60.0, result)
             return dict(result)
 
     def stats(self) -> dict[str, Any]:
