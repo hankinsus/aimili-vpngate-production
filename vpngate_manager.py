@@ -11462,7 +11462,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     table.node-table td {
-      font-weight: 600;
+      font-size: 15px;
+      font-weight: 700;
+      color: #d7e1e8;
     }
 
     th, td {
@@ -11576,9 +11578,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .node-address-cell .mono {
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 700;
-      color: #7f96a3;
+      color: #c5d3db;
       letter-spacing: 0;
       display: block;
       white-space: nowrap;
@@ -11597,9 +11599,9 @@ INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
     }
     .node-domain {
-      font-size: 13px;
-      font-weight: 600;
-      color: #8ea3af;
+      font-size: 15px;
+      font-weight: 700;
+      color: #e2eaee;
       display: block;
       white-space: nowrap;
       overflow: hidden;
@@ -11615,8 +11617,8 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       white-space: nowrap;
       font-weight: 700;
-      font-size: 13px;
-      color: #8b9eaa;
+      font-size: 15px;
+      color: #d7e1e8;
       font-variant-numeric: tabular-nums;
     }
     @media (min-width: 1101px) {
@@ -11630,7 +11632,7 @@ INDEX_HTML = r"""<!doctype html>
 
     .node-table td:nth-child(5),
     .node-table td:nth-child(6) {
-      font-size: 13px;
+      font-size: 15px;
     }
 
     th {
@@ -11861,9 +11863,9 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid rgba(99, 102, 241, 0.4);
       border-radius: 6px;
       padding: 0 10px;
-      height: 28px;
-      font-size: 12px;
-      font-weight: 500;
+      height: 30px;
+      font-size: 13px;
+      font-weight: 600;
       transition: all 0.2s ease;
       cursor: pointer;
     }
@@ -11887,8 +11889,8 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 6px;
       padding: 0 12px;
       height: 30px;
-      font-size: 12px;
-      font-weight: 600;
+      font-size: 13px;
+      font-weight: 700;
       cursor: pointer;
       transition: all 0.2s ease;
     }
@@ -11943,7 +11945,7 @@ INDEX_HTML = r"""<!doctype html>
       padding: 0;
       border-radius: 0;
       background: transparent;
-      font-size: 13px;
+      font-size: 15px;
       font-variant-numeric: tabular-nums;
       line-height: 1.2;
     }
