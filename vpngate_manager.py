@@ -10294,6 +10294,15 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 18px;
       flex: 0 0 18px;
     }
+    .proxy-account-row {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.15fr) minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+      align-items: end;
+    }
+    .proxy-account-row > .form-group { margin-bottom: 0 !important; min-width: 0; }
+    .proxy-account-row .form-label { white-space: nowrap; }
     .net-filter-grid {
       display: grid;
       grid-template-columns: minmax(0, 1.85fr) minmax(0, 0.82fr) minmax(0, 0.9fr) minmax(0, 0.92fr);
@@ -12748,17 +12757,19 @@ INDEX_HTML = r"""<!doctype html>
 
       <form id="network_form" onsubmit="saveNetwork(event)">
         <div class="net-modal-scroll">
-        <div class="form-group" style="margin-bottom: 16px;">
+        <div class="proxy-account-row">
+        <div class="form-group">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理端口</label>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" value="8500" disabled title="代理端口固定为 8500">
         </div>
-        <div class="form-group" style="margin-bottom: 16px;">
+        <div class="form-group">
           <label class="form-label" for="net_proxy_user">SOCKS5 用户名</label>
           <input type="text" id="net_proxy_user" class="input-field" autocomplete="off" value="socks5" maxlength="64">
         </div>
-        <div class="form-group" style="margin-bottom: 16px;">
+        <div class="form-group">
           <label class="form-label" for="net_proxy_pass">SOCKS5 密码</label>
           <input type="text" id="net_proxy_pass" class="input-field" autocomplete="off" value="ilovestudy" maxlength="64">
+        </div>
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
