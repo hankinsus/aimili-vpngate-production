@@ -529,6 +529,9 @@ class ResourceShareManager:
         sync_interval_unit: Any = DEFAULT_SYNC_INTERVAL_UNIT,
         remote_invite_id: str = "",
         remote_invite_code: str = "",
+        auto_sync: Any = True,
+        sync_schedule: str = "loop",
+        sync_hour: Any = None,
     ) -> str:
         normalized = self.normalize_remote_input(remote_url)
         now = time.time()
@@ -576,7 +579,17 @@ class ResourceShareManager:
                 "remote_invite_code": str(remote_invite_code or ""),
                 "sync_interval_value": interval_value,
                 "sync_interval_unit": interval_unit,
+                "auto_sync": old_peer.get("auto_sync", True) is not False,
+                "sync_schedule": str(old_peer.get("sync_schedule") or "loop"),
+                "sync_hour": int(old_peer.get("sync_hour") or interval_value or 6),
+                "syncing": False,
             })
+            self.apply_sync_schedule(
+                old_peer,
+                auto_sync,
+                sync_schedule,
+                sync_hour if sync_hour is not None else interval_value,
+            )
             data["peers"][target_id] = old_peer
             self._write(data)
         return target_id
@@ -618,6 +631,13 @@ class ResourceShareManager:
                 peer["sync_interval_unit"] = unit
             if "enabled" in patch:
                 peer["enabled"] = bool(patch.get("enabled"))
+            if "auto_sync" in patch or "sync_schedule" in patch or "sync_hour" in patch:
+                self.apply_sync_schedule(
+                    peer,
+                    patch.get("auto_sync", peer.get("auto_sync", True)),
+                    patch.get("sync_schedule", peer.get("sync_schedule") or "loop"),
+                    patch.get("sync_hour", peer.get("sync_hour") or peer.get("sync_interval_value") or 6),
+                )
             if "allowed_cidrs" in patch:
                 peer["allowed_cidrs"] = self.normalize_cidrs(patch.get("allowed_cidrs"))
             peer["updated_at"] = time.time()
@@ -718,7 +738,14 @@ class ResourceShareManager:
             local_invite_code = self._invite_code(str((inbound or {}).get("invite_id") or ""))
             remote_invite_code = str((outbound or {}).get("remote_invite_code") or "")
             if outbound:
-                sync_status = "已同步" if outbound.get("last_sync_ok") is True else ("同步失败" if outbound.get("last_sync_ok") is False else "待同步")
+                if outbound.get("syncing"):
+                    sync_status = "同步中"
+                elif outbound.get("last_sync_ok") is True:
+                    sync_status = "同步完成"
+                elif outbound.get("last_sync_ok") is False:
+                    sync_status = "同步失败"
+                else:
+                    sync_status = "待同步"
                 next_sync = float(outbound.get("next_sync_at") or 0)
                 if not next_sync:
                     last = float(outbound.get("last_sync_at") or 0)
@@ -744,6 +771,11 @@ class ResourceShareManager:
                 "sync_interval_value": interval_value,
                 "sync_interval_unit": interval_unit,
                 "sync_interval_seconds": interval_seconds if outbound else 0,
+                "auto_sync": (outbound or primary).get("auto_sync", True) is not False,
+                "sync_schedule": str((outbound or primary).get("sync_schedule") or "loop"),
+                "sync_hour": int((outbound or primary).get("sync_hour") or interval_value or 6),
+                "syncing": bool((outbound or {}).get("syncing")),
+                "last_sync_count": int((outbound or {}).get("last_sync_count") or 0),
                 "next_sync_at": next_sync,
                 "sync_status": sync_status,
                 "enabled": any(bool(p.get("enabled", True)) for p in items),
@@ -856,12 +888,12 @@ class ResourceShareManager:
 
         now = time.time()
         next_sync_at = (last_sync_at + interval_seconds) if last_sync_at else now
-        if not force and last_sync_at and now < next_sync_at:
+        if not force and not self.peer_sync_due(peer, now):
             return {
                 "ok": True,
                 "skipped": True,
                 "peer_id": str(peer_id),
-                "next_sync_at": next_sync_at,
+                "next_sync_at": now + 60,
                 "sync_interval_value": interval_value,
                 "sync_interval_unit": interval_unit,
             }
@@ -916,7 +948,71 @@ class ResourceShareManager:
             peer["last_sync_ok"] = bool(result.get("ok"))
             peer["last_sync_error"] = str(error or "")
             peer["last_sync_count"] = int(result.get("imported") or result.get("received") or 0)
+            peer["syncing"] = False
             self._write(data)
+
+    def mark_syncing(self, peer_id: str, syncing: bool = True) -> None:
+        with self.lock:
+            data = self._read()
+            peer = data["peers"].get(str(peer_id))
+            if not isinstance(peer, dict):
+                return
+            peer["syncing"] = bool(syncing)
+            self._write(data)
+
+    @staticmethod
+    def apply_sync_schedule(peer: dict[str, Any], auto_sync: Any, schedule: Any, hour: Any) -> None:
+        allowed = {"loop", "daily", "mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        mode = str(schedule or "loop").strip().lower()
+        if mode not in allowed:
+            mode = "loop"
+        try:
+            amount = int(hour)
+        except (TypeError, ValueError):
+            amount = 6
+        amount = max(1, min(24, amount))
+        peer["auto_sync"] = bool(auto_sync)
+        peer["sync_schedule"] = mode
+        peer["sync_hour"] = amount
+        if mode == "loop":
+            peer["sync_interval_value"] = amount
+            peer["sync_interval_unit"] = "hours"
+        elif mode == "daily":
+            peer["sync_interval_value"] = 1
+            peer["sync_interval_unit"] = "days"
+        else:
+            peer["sync_interval_value"] = 1
+            peer["sync_interval_unit"] = "weeks"
+
+    def peer_sync_due(self, peer: dict[str, Any], now: float | None = None) -> bool:
+        now = time.time() if now is None else float(now)
+        if peer.get("auto_sync") is False:
+            return False
+        last = float(peer.get("last_sync_at") or 0)
+        schedule = str(peer.get("sync_schedule") or "")
+        if not schedule:
+            _, _, seconds = self.sync_interval_from_peer(peer)
+            return (not last) or now >= last + seconds
+        try:
+            hour = int(peer.get("sync_hour") or 6)
+        except (TypeError, ValueError):
+            hour = 6
+        hour = max(1, min(24, hour))
+        if schedule == "loop":
+            return (not last) or now >= last + hour * 3600
+        weekdays = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+        if schedule != "daily" and schedule not in weekdays:
+            return (not last) or now >= last + 6 * 3600
+        current = time.localtime(now)
+        if schedule in weekdays and current.tm_wday != weekdays[schedule]:
+            return False
+        clock = 0 if hour >= 24 else hour
+        if current.tm_hour < clock:
+            return False
+        if not last:
+            return True
+        previous = time.localtime(last)
+        return not (previous.tm_year == current.tm_year and previous.tm_yday == current.tm_yday)
 
     def sync_all(self, force: bool = False) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
@@ -974,6 +1070,9 @@ class ResourceShareManager:
         sync_interval_value: Any = DEFAULT_SYNC_INTERVAL_VALUE,
         sync_interval_unit: Any = DEFAULT_SYNC_INTERVAL_UNIT,
         existing_peer_id: str = "",
+        auto_sync: Any = True,
+        sync_schedule: str = "loop",
+        sync_hour: Any = None,
     ) -> dict[str, Any]:
         remote_url = self.normalize_remote_input(remote_url)
         invite_code = str(invite_code or "").strip()
@@ -1004,6 +1103,9 @@ class ResourceShareManager:
             sync_interval_unit=interval_unit,
             remote_invite_id=str(result.get("invite_id") or ""),
             remote_invite_code=invite_code,
+            auto_sync=auto_sync,
+            sync_schedule=sync_schedule,
+            sync_hour=sync_hour if sync_hour is not None else interval_value,
         )
         return {
             "ok": True,
@@ -1027,6 +1129,9 @@ class ResourceShareManager:
         name: str = "",
         sync_interval_value: Any = DEFAULT_SYNC_INTERVAL_VALUE,
         sync_interval_unit: Any = DEFAULT_SYNC_INTERVAL_UNIT,
+        auto_sync: Any = None,
+        sync_schedule: str = "",
+        sync_hour: Any = None,
     ) -> dict[str, Any]:
         peer = self.get_peer(peer_id)
         if not peer:
@@ -1037,6 +1142,9 @@ class ResourceShareManager:
                 "name": name,
                 "sync_interval_value": sync_interval_value,
                 "sync_interval_unit": sync_interval_unit,
+                "auto_sync": peer.get("auto_sync", True) if auto_sync is None else auto_sync,
+                "sync_schedule": sync_schedule or peer.get("sync_schedule") or "loop",
+                "sync_hour": peer.get("sync_hour") or sync_interval_value if sync_hour is None else sync_hour,
             })
         normalized = self.normalize_remote_input(remote_url)
         invite_code = str(invite_code or "").strip()
@@ -1070,6 +1178,12 @@ class ResourceShareManager:
                 "sync_interval_unit": unit,
                 "updated_at": time.time(),
             })
+            self.apply_sync_schedule(
+                local,
+                local.get("auto_sync", True) if auto_sync is None else auto_sync,
+                sync_schedule or local.get("sync_schedule") or "loop",
+                local.get("sync_hour") or value if sync_hour is None else sync_hour,
+            )
             self._write(data)
         return {"ok": True, "peer": self.get_peer(peer_id)}
 

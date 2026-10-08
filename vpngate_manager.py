@@ -3494,6 +3494,31 @@ def protocol_catalog_loop() -> None:
         time.sleep(1800)
 
 
+def _background_share_sync(peer_id: str) -> None:
+    try:
+        result = resource_share.sync_peer(peer_id, timeout=60, force=True)
+        imported = result.get("imported") or result.get("received") or 0
+        if result.get("ok") is False:
+            log_to_json("WARNING", "Share", f"资源共享同步失败: {peer_id} {result.get('error') or ''}")
+        else:
+            log_to_json("INFO", "Share", f"资源共享同步完成: {peer_id} 导入 {imported}")
+    except Exception as exc:
+        log_to_json("WARNING", "Share", f"资源共享同步失败: {peer_id} {exc}")
+    finally:
+        try:
+            resource_share.mark_syncing(peer_id, False)
+        except Exception:
+            pass
+
+
+def _start_share_sync(peer_id: str) -> None:
+    peer_id = str(peer_id or "").strip()
+    if not peer_id:
+        return
+    resource_share.mark_syncing(peer_id, True)
+    threading.Thread(target=_background_share_sync, args=(peer_id,), name=f"share-sync-{peer_id}", daemon=True).start()
+
+
 def resource_share_loop() -> None:
     # The loop is only a lightweight scheduler sweep. Each Peer decides when
     # its next real sync is due according to its configured hour/day/week interval.
@@ -11991,6 +12016,26 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       gap: 9px;
     }
+    .rs-auto-row { display: flex; flex-direction: column; gap: 8px; }
+    .rs-auto-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .rs-auto-selects { display: flex; gap: 10px; }
+    #resource_share_modal .rs-scan-select,
+    #resource_share_edit_modal .rs-scan-select {
+      flex: 1 1 0;
+      width: auto;
+      min-width: 0;
+      height: 40px;
+    }
+    #resource_share_modal .rs-scan-select .toolbar-custom-select-menu,
+    #resource_share_edit_modal .rs-scan-select .toolbar-custom-select-menu { width: auto; }
     .rs-sync-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -13220,23 +13265,41 @@ INDEX_HTML = r"""<!doctype html>
             <input id="rs_invite_link_input" class="input-field" placeholder="粘贴邀请链接，例如 https://example.com:8443/resource-share/RS-XXXX-XXXX-XXXX-XXXX">
             <input id="rs_remote_url" type="hidden" value="">
             <input id="rs_invite_input" type="hidden" value="">
-            <input id="rs_sync_interval_value" type="hidden" value="6">
-            <select id="rs_sync_interval_unit" aria-hidden="true" tabindex="-1" style="display:none;">
-              <option value="hours">小时</option>
-              <option value="days">天</option>
-              <option value="weeks">周</option>
-            </select>
-            <div class="rs-sync-row">
-              <input id="rs_sync_interval_value_display" class="input-field" type="number" min="1" max="84" value="6" placeholder="同步周期">
-              <div id="rs_sync_interval_unit_widget" class="toolbar-custom-select unified-select unified-select-sync" data-unified-select-id="rs_sync_interval_unit" aria-label="同步周期">
-                <button id="rs_sync_interval_unit_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-                  <span id="rs_sync_interval_unit_label" class="toolbar-custom-select-label">小时</span>
-                  <span class="toolbar-custom-select-arrow">⌄</span>
-                </button>
-                <div id="rs_sync_interval_unit_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+            <div class="rs-auto-row">
+              <label class="rs-auto-check"><input type="checkbox" id="rs_sync_auto" checked> 开启自动同步</label>
+              <div class="rs-auto-selects">
+                <select id="rs_sync_schedule" aria-hidden="true" tabindex="-1" style="display:none;">
+                  <option value="loop">循环</option>
+                  <option value="daily">每天</option>
+                  <option value="mon">周一</option><option value="tue">周二</option><option value="wed">周三</option>
+                  <option value="thu">周四</option><option value="fri">周五</option><option value="sat">周六</option><option value="sun">周日</option>
+                </select>
+                <div id="rs_sync_schedule_widget" class="toolbar-custom-select unified-select rs-scan-select" data-unified-select-id="rs_sync_schedule" aria-label="同步周期">
+                  <button id="rs_sync_schedule_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                    <span id="rs_sync_schedule_label" class="toolbar-custom-select-label">循环</span>
+                    <span class="toolbar-custom-select-arrow">⌄</span>
+                  </button>
+                  <div id="rs_sync_schedule_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+                </div>
+                <select id="rs_sync_hour" aria-hidden="true" tabindex="-1" style="display:none;">
+                  <option value="1">1小时</option><option value="2">2小时</option><option value="3">3小时</option><option value="4">4小时</option>
+                  <option value="5">5小时</option><option value="6" selected>6小时</option><option value="7">7小时</option><option value="8">8小时</option>
+                  <option value="9">9小时</option><option value="10">10小时</option><option value="11">11小时</option><option value="12">12小时</option>
+                  <option value="13">13小时</option><option value="14">14小时</option><option value="15">15小时</option><option value="16">16小时</option>
+                  <option value="17">17小时</option><option value="18">18小时</option><option value="19">19小时</option><option value="20">20小时</option>
+                  <option value="21">21小时</option><option value="22">22小时</option><option value="23">23小时</option><option value="24">24小时</option>
+                </select>
+                <div id="rs_sync_hour_widget" class="toolbar-custom-select unified-select rs-scan-select" data-unified-select-id="rs_sync_hour" aria-label="同步间隔">
+                  <button id="rs_sync_hour_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                    <span id="rs_sync_hour_label" class="toolbar-custom-select-label">6小时</span>
+                    <span class="toolbar-custom-select-arrow">⌄</span>
+                  </button>
+                  <div id="rs_sync_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+                </div>
               </div>
             </div>
-            <div class="rs-help">自动同步周期：可选择小时、天、周。</div>
+            <div class="rs-help">勾选后自动同步。循环按右边的小时间隔重复；每天或星期几按右边的钟点开始。</div>
+            <div id="rs_join_status" class="rs-help" style="display:none;font-weight:600;"></div>
             <button id="rs_join_btn" type="button" class="btn-primary rs-full-btn" onclick="joinResourcePeer()">添加并立即同步</button>
           </div>
         </section>
@@ -13309,22 +13372,40 @@ INDEX_HTML = r"""<!doctype html>
 
         <div id="rs_edit_sync_row" class="rs-edit-field">
           <label>自动同步周期</label>
-          <div class="rs-sync-row rs-edit-sync-row">
-            <input id="rs_edit_sync_value" class="input-field" type="number" min="1" max="84" value="6" placeholder="周期">
-            <select id="rs_edit_sync_unit" aria-hidden="true" tabindex="-1" style="display:none;">
-              <option value="hours">小时</option>
-              <option value="days">天</option>
-              <option value="weeks">周</option>
-            </select>
-            <div id="rs_edit_sync_unit_widget" class="toolbar-custom-select unified-select unified-select-sync" data-unified-select-id="rs_edit_sync_unit" aria-label="同步周期单位">
-              <button id="rs_edit_sync_unit_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-                <span id="rs_edit_sync_unit_label" class="toolbar-custom-select-label">小时</span>
-                <span class="toolbar-custom-select-arrow">⌄</span>
-              </button>
-              <div id="rs_edit_sync_unit_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+          <div class="rs-auto-row">
+            <label class="rs-auto-check"><input type="checkbox" id="rs_edit_sync_auto" checked> 开启自动同步</label>
+            <div class="rs-auto-selects">
+              <select id="rs_edit_sync_schedule" aria-hidden="true" tabindex="-1" style="display:none;">
+                <option value="loop">循环</option>
+                <option value="daily">每天</option>
+                <option value="mon">周一</option><option value="tue">周二</option><option value="wed">周三</option>
+                <option value="thu">周四</option><option value="fri">周五</option><option value="sat">周六</option><option value="sun">周日</option>
+              </select>
+              <div id="rs_edit_sync_schedule_widget" class="toolbar-custom-select unified-select rs-scan-select" data-unified-select-id="rs_edit_sync_schedule" aria-label="同步周期">
+                <button id="rs_edit_sync_schedule_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                  <span id="rs_edit_sync_schedule_label" class="toolbar-custom-select-label">循环</span>
+                  <span class="toolbar-custom-select-arrow">⌄</span>
+                </button>
+                <div id="rs_edit_sync_schedule_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+              </div>
+              <select id="rs_edit_sync_hour" aria-hidden="true" tabindex="-1" style="display:none;">
+                <option value="1">1小时</option><option value="2">2小时</option><option value="3">3小时</option><option value="4">4小时</option>
+                <option value="5">5小时</option><option value="6" selected>6小时</option><option value="7">7小时</option><option value="8">8小时</option>
+                <option value="9">9小时</option><option value="10">10小时</option><option value="11">11小时</option><option value="12">12小时</option>
+                <option value="13">13小时</option><option value="14">14小时</option><option value="15">15小时</option><option value="16">16小时</option>
+                <option value="17">17小时</option><option value="18">18小时</option><option value="19">19小时</option><option value="20">20小时</option>
+                <option value="21">21小时</option><option value="22">22小时</option><option value="23">23小时</option><option value="24">24小时</option>
+              </select>
+              <div id="rs_edit_sync_hour_widget" class="toolbar-custom-select unified-select rs-scan-select" data-unified-select-id="rs_edit_sync_hour" aria-label="同步间隔">
+                <button id="rs_edit_sync_hour_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
+                  <span id="rs_edit_sync_hour_label" class="toolbar-custom-select-label">6小时</span>
+                  <span class="toolbar-custom-select-arrow">⌄</span>
+                </button>
+                <div id="rs_edit_sync_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
+              </div>
             </div>
           </div>
-          <div class="rs-edit-field-help">修改后下一个周期按新配置重新计算；也可以随时手动同步。</div>
+          <div class="rs-edit-field-help">勾选后按周期自动同步。循环按小时间隔重复；每天或星期几按钟点开始。也可以随时手动同步。</div>
         </div>
 
         <div id="rs_edit_error" class="rs-edit-error" style="display:none;"></div>
@@ -13766,8 +13847,10 @@ const UNIFIED_SELECT_CONFIG = {
   net_routing_protocol: {widget:"net_routing_protocol_widget", button:"net_routing_protocol_button", label:"net_routing_protocol_label", menu:"net_routing_protocol_menu"},
   net_routing_latency: {widget:"net_routing_latency_widget", button:"net_routing_latency_button", label:"net_routing_latency_label", menu:"net_routing_latency_menu"},
   net_routing_min_speed: {widget:"net_routing_min_speed_widget", button:"net_routing_min_speed_button", label:"net_routing_min_speed_label", menu:"net_routing_min_speed_menu"},
-  rs_sync_interval_unit: {widget:"rs_sync_interval_unit_widget", button:"rs_sync_interval_unit_button", label:"rs_sync_interval_unit_label", menu:"rs_sync_interval_unit_menu"},
-  rs_edit_sync_unit: {widget:"rs_edit_sync_unit_widget", button:"rs_edit_sync_unit_button", label:"rs_edit_sync_unit_label", menu:"rs_edit_sync_unit_menu"},
+  rs_sync_schedule: {widget:"rs_sync_schedule_widget", button:"rs_sync_schedule_button", label:"rs_sync_schedule_label", menu:"rs_sync_schedule_menu"},
+  rs_sync_hour: {widget:"rs_sync_hour_widget", button:"rs_sync_hour_button", label:"rs_sync_hour_label", menu:"rs_sync_hour_menu"},
+  rs_edit_sync_schedule: {widget:"rs_edit_sync_schedule_widget", button:"rs_edit_sync_schedule_button", label:"rs_edit_sync_schedule_label", menu:"rs_edit_sync_schedule_menu"},
+  rs_edit_sync_hour: {widget:"rs_edit_sync_hour_widget", button:"rs_edit_sync_hour_button", label:"rs_edit_sync_hour_label", menu:"rs_edit_sync_hour_menu"},
   log_filter_select: {widget:"log_filter_select_widget", button:"log_filter_select_button", label:"log_filter_select_label", menu:"log_filter_select_menu"},
   library_scan_mode: {widget:"library_scan_mode_widget", button:"library_scan_mode_button", label:"library_scan_mode_label", menu:"library_scan_mode_menu"},
   library_scan_hour: {widget:"library_scan_hour_widget", button:"library_scan_hour_button", label:"library_scan_hour_label", menu:"library_scan_hour_menu"}
@@ -17617,14 +17700,14 @@ function renderGatewayServices(services) {
   container.innerHTML = html;
 }
 
-async function resourceShareAdminPost(action, payload={}) {
+async function resourceShareAdminPost(action, payload={}, timeoutMs=15000) {
   return fetchJsonWithTimeout("./api/resource_share/" + action, {
     method: "POST",
     credentials: "same-origin",
     cache: "no-store",
     headers: {"Content-Type":"application/json"},
     body: JSON.stringify(payload)
-  }, 15000);
+  }, timeoutMs);
 }
 
 function resourceShareTime(ts) {
@@ -17652,7 +17735,8 @@ function openResourceShareModal() {
   if (dropdown) dropdown.style.display = "none";
   const modal = $("resource_share_modal");
   if (modal) modal.style.display = "flex";
-  syncUnifiedSelect("rs_sync_interval_unit");
+  syncUnifiedSelect("rs_sync_schedule");
+  syncUnifiedSelect("rs_sync_hour");
   loadResourceShareStatus();
 }
 
@@ -17732,11 +17816,17 @@ function renderResourceShareRelationships(relations) {
   }
   box.innerHTML = relations.map(function(relation) {
     const bidir = relation.direction === "双向共享";
-    const status = relation.sync_status || "未建立主动拉取";
-    const statusColor = relation.last_sync_error ? "var(--danger)" : (relation.last_sync_at ? "var(--success)" : "var(--warning)");
-    const intervalText = relation.sync_interval_seconds
-      ? ((relation.sync_interval_value || 6) + " " + (relation.sync_interval_unit === "days" ? "天" : relation.sync_interval_unit === "weeks" ? "周" : "小时"))
-      : "—";
+    const scheduleNames = {loop:"循环", daily:"每天", mon:"周一", tue:"周二", wed:"周三", thu:"周四", fri:"周五", sat:"周六", sun:"周日"};
+    const schedule = relation.sync_schedule || "loop";
+    const hour = relation.sync_hour || relation.sync_interval_value || 6;
+    const intervalText = relation.auto_sync === false
+      ? "自动同步已关闭"
+      : (schedule === "loop"
+        ? ("每 " + hour + " 小时")
+        : ((scheduleNames[schedule] || "每天") + " " + (hour >= 24 ? "0" : hour) + " 点"));
+    const statusColor = relation.sync_status === "同步失败"
+      ? "var(--danger)"
+      : (relation.sync_status === "同步完成" ? "var(--success)" : "var(--warning)");
     const allowed = Array.isArray(relation.allowed_cidrs) && relation.allowed_cidrs.length ? relation.allowed_cidrs.join(", ") : "本机未开放白名单";
     const nextText = relation.next_sync_at ? resourceShareTime(relation.next_sync_at) : (relation.outbound_peer_id ? "待同步" : "无本机主动拉取");
     const syncBtn = relation.outbound_peer_id
@@ -17748,7 +17838,7 @@ function renderResourceShareRelationships(relations) {
           '<div class="rs-item-name">' +
             esc(relation.name || "共享服务器") +
             '<span class="rs-direction ' + (bidir ? 'bidir' : '') + '">' + esc(relation.direction || "单向共享") + '</span>' +
-            '<span style="font-size:11px;color:' + statusColor + ';">' + esc(status) + '</span>' +
+            '<span class="rs-direction" style="color:' + statusColor + ';border-color:' + statusColor + ';background:transparent;">' + esc(relation.sync_status || "待同步") + '</span>' +
           '</div>' +
           '<div class="rs-item-meta">服务器 IP：<strong>' + esc(relation.remote_ip || "—") + '</strong>' +
             (relation.remote_url ? ' · 地址：' + esc(relation.remote_url) : '') +
@@ -17860,9 +17950,13 @@ async function openResourceShareEditModal(type, id) {
     $("rs_edit_remote_link").value = (editRemoteUrl && editRemoteCode)
       ? editRemoteUrl.replace(/\/$/, "") + "/" + editRemoteCode
       : "";
-    $("rs_edit_sync_value").value = Number(payload.sync_interval_value || 6);
-    $("rs_edit_sync_unit").value = payload.sync_interval_unit || "hours";
-    syncUnifiedSelect("rs_edit_sync_unit");
+    const schedule = payload.sync_schedule || (payload.sync_interval_unit === "days" ? "daily" : payload.sync_interval_unit === "weeks" ? "mon" : "loop");
+    const hour = payload.sync_hour || payload.sync_interval_value || 6;
+    if ($("rs_edit_sync_auto")) $("rs_edit_sync_auto").checked = payload.auto_sync !== false;
+    if ($("rs_edit_sync_schedule")) $("rs_edit_sync_schedule").value = schedule;
+    if ($("rs_edit_sync_hour")) $("rs_edit_sync_hour").value = String(hour);
+    syncUnifiedSelect("rs_edit_sync_schedule");
+    syncUnifiedSelect("rs_edit_sync_hour");
 
     const isInvite = type === "invite";
     const hasOutbound = !isInvite && !!payload.outbound_peer_id;
@@ -17871,8 +17965,6 @@ async function openResourceShareEditModal(type, id) {
     $("rs_edit_sync_row").style.display = hasOutbound ? "grid" : "none";
     $("rs_edit_local_scope").disabled = false;
     $("rs_edit_remote_link").disabled = false;
-    $("rs_edit_sync_value").disabled = false;
-    $("rs_edit_sync_unit").disabled = false;
 
     $("rs_edit_error").style.display = "none";
     $("rs_edit_error").textContent = "";
@@ -17901,8 +17993,9 @@ async function submitResourceShareEdit(event) {
   const remoteParsed = parseResourceShareInviteLink($("rs_edit_remote_link").value || "");
   const remoteUrl = remoteParsed.remoteUrl;
   const remoteInvite = remoteParsed.inviteCode;
-  const syncValue = Math.max(1, Number($("rs_edit_sync_value").value || 6));
-  const syncUnit = $("rs_edit_sync_unit").value || "hours";
+  const autoSync = !!($("rs_edit_sync_auto") && $("rs_edit_sync_auto").checked);
+  const syncSchedule = ($("rs_edit_sync_schedule") && $("rs_edit_sync_schedule").value) || "loop";
+  const syncHour = Math.max(1, Math.min(24, Number(($("rs_edit_sync_hour") && $("rs_edit_sync_hour").value) || 6)));
 
   errorBox.style.display = "none";
   submit.disabled = true;
@@ -17926,8 +18019,11 @@ async function submitResourceShareEdit(event) {
           remote_url: remoteUrl,
           invite_code: remoteInvite,
           name: name,
-          sync_interval_value: syncValue,
-          sync_interval_unit: syncUnit
+          auto_sync: autoSync,
+          sync_schedule: syncSchedule,
+          sync_hour: syncHour,
+          sync_interval_value: syncHour,
+          sync_interval_unit: syncSchedule === "loop" ? "hours" : (syncSchedule === "daily" ? "days" : "weeks")
         });
       }
       if (relation.local_invite_id) {
@@ -18009,41 +18105,6 @@ function normalizeResourceRemoteInput(value) {
     return parsed.toString().replace(/\/$/, "");
   } catch (_) {
     return raw;
-  }
-}
-
-async function joinResourcePeer() {
-  const btn = $("rs_join_btn");
-  const remoteUrl = normalizeResourceRemoteInput($("rs_remote_url")?.value);
-  const invite = ($("rs_invite_input")?.value || "").trim();
-  const intervalValue = Math.max(1, Number($("rs_sync_interval_value")?.value || 6));
-  const intervalUnit = $("rs_sync_interval_unit")?.value || "hours";
-  if (!remoteUrl || !invite) {
-    alert("请填写对方服务器 IP/域名和邀请码。");
-    return;
-  }
-  try {
-    if (btn) { btn.disabled = true; btn.textContent = "正在添加..."; }
-    const data = await resourceShareAdminPost("join", {
-      remote_url: remoteUrl,
-      invite_code: invite,
-      sync_interval_value: intervalValue,
-      sync_interval_unit: intervalUnit
-    });
-    const first = data.first_sync || {};
-    if ($("rs_remote_url")) $("rs_remote_url").value = "";
-    if ($("rs_invite_input")) $("rs_invite_input").value = "";
-    await loadResourceShareStatus();
-    await load();
-    if (first.ok) {
-      alert("共享服务器已添加，首次同步成功，导入 " + Number(first.imported || first.received || 0) + " 条资源。");
-    } else {
-      alert("共享服务器已建立，但首次同步失败：\n" + (first.error || "远端暂不可用") + "\n稍后可在“已建立共享服务器”中重新同步。");
-    }
-  } catch (err) {
-    alert("添加共享服务器失败：\n" + (err.message || err));
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "添加并立即同步"; }
   }
 }
 
@@ -18145,60 +18206,140 @@ function parseResourceShareInviteLink(value) {
   return {remoteUrl, inviteCode};
 }
 
-async function joinResourcePeer() {
+function readShareSchedule(prefix) {
+  const auto = $(prefix + "_auto");
+  const schedule = $(prefix + "_schedule");
+  const hour = $(prefix + "_hour");
+  return {
+    auto_sync: !auto || !!auto.checked,
+    sync_schedule: (schedule && schedule.value) || "loop",
+    sync_hour: Math.max(1, Math.min(24, Number((hour && hour.value) || 6)))
+  };
+}
+
+function setJoinShareStatus(text, isError) {
+  const box = $("rs_join_status");
+  if (!box) return;
+  if (!text) { box.style.display = "none"; box.textContent = ""; return; }
+  box.style.display = "block";
+  box.style.color = isError ? "var(--danger)" : (text === "同步完成" ? "var(--success)" : "var(--warning)");
+  box.textContent = text;
+}
+
+function setJoinButtonBusy(busy) {
   const btn = $("rs_join_btn");
+  if (!btn) return;
+  btn.disabled = !!busy;
+  btn.textContent = busy ? "同步中" : "添加并立即同步";
+}
+
+function relationMatchesPeer(item, peerId) {
+  if (!peerId) return true;
+  if (!item) return false;
+  if (item.outbound_peer_id === peerId) return true;
+  return Array.isArray(item.peer_ids) && item.peer_ids.indexOf(peerId) >= 0;
+}
+
+let shareWatchTimer = null;
+function watchResourceShareUntilSettled(peerId) {
+  if (shareWatchTimer) clearInterval(shareWatchTimer);
+  const started = Date.now();
+  const target = String(peerId || "");
+  shareWatchTimer = setInterval(async function() {
+    try {
+      const data = await fetchJsonWithTimeout("./api/resource_share/status", {}, 10000);
+      const relations = data.relationships || [];
+      if (typeof renderResourceShareRelationships === "function") renderResourceShareRelationships(relations);
+      const watched = target ? relations.filter(function(item) { return relationMatchesPeer(item, target); }) : relations;
+      if (target && !watched.length) {
+        if (Date.now() - started > 30000) {
+          clearInterval(shareWatchTimer);
+          shareWatchTimer = null;
+          setJoinButtonBusy(false);
+          setJoinShareStatus("已加入，列表尚未刷新，请重新打开资源共享", true);
+        }
+        return;
+      }
+      const syncing = watched.some(function(item) { return item && (item.syncing || item.sync_status === "同步中"); });
+      if (syncing) {
+        setJoinShareStatus("同步中");
+        if (Date.now() - started > 180000) {
+          clearInterval(shareWatchTimer);
+          shareWatchTimer = null;
+          setJoinButtonBusy(false);
+          setJoinShareStatus("仍在同步，可稍后在已建立列表查看", true);
+        }
+        return;
+      }
+      clearInterval(shareWatchTimer);
+      shareWatchTimer = null;
+      setJoinButtonBusy(false);
+      const failed = watched.find(function(item) { return item && item.sync_status === "同步失败"; });
+      if (failed) {
+        setJoinShareStatus("同步失败", true);
+        showResourceShareNotice("同步失败：" + (failed.last_sync_error || "远端暂不可用"), true);
+      } else {
+        const done = watched.find(function(item) { return item && item.sync_status === "同步完成"; }) || watched[0];
+        const imported = done ? (done.last_sync_count || 0) : 0;
+        setJoinShareStatus("同步完成");
+        showResourceShareNotice("同步完成" + (imported ? "，共导入 " + imported + " 条资源。" : "。"));
+      }
+      try { await load(); } catch (_) {}
+    } catch (_) {}
+  }, 2000);
+}
+
+async function joinResourcePeer() {
   const parsed = parseResourceShareInviteLink($("rs_invite_link_input")?.value || "");
   if (!parsed.remoteUrl || !parsed.inviteCode) {
     showResourceShareNotice("请粘贴完整的邀请链接，例如 https://example.com:8443/resource-share/邀请标识", true);
     return;
   }
+  const schedule = readShareSchedule("rs_sync");
   try {
-    if (btn) { btn.disabled = true; btn.textContent = "正在加入并同步..."; }
-    const intervalValue = Math.max(1, Number($("rs_sync_interval_value_display")?.value || 6));
-    const intervalUnit = String($("rs_sync_interval_unit")?.value || "hours");
-    if ($("rs_sync_interval_value")) $("rs_sync_interval_value").value = String(intervalValue);
-    const data = await resourceShareAdminPost("join", {
+    setJoinButtonBusy(true);
+    setJoinShareStatus("同步中");
+    showResourceShareNotice("正在加入，同步中…");
+    const data = await resourceShareAdminPost("join", Object.assign({
       remote_url: parsed.remoteUrl,
-      invite_code: parsed.inviteCode,
-      sync_interval_value: intervalValue,
-      sync_interval_unit: intervalUnit
-    });
-    const first = data.first_sync || {};
-    showResourceShareNotice(first.ok
-      ? "资源共享已建立，首次同步成功，共导入 " + (first.imported || first.received || 0) + " 条资源。"
-      : "资源共享已建立，但首次同步失败：\n" + (first.error || "远端暂不可用") + "\n可以点击“同步”重新尝试。", !first.ok);
+      invite_code: parsed.inviteCode
+    }, schedule), 45000);
+    if (!data || data.ok === false) throw new Error((data && data.error) || "加入失败");
     if ($("rs_invite_link_input")) $("rs_invite_link_input").value = "";
     await loadResourceShareStatus();
-    await load();
+    setJoinShareStatus("同步中");
+    showResourceShareNotice("已加入，同步中…");
+    watchResourceShareUntilSettled(data.peer_id || "");
   } catch (err) {
-    showResourceShareNotice("加入共享失败：\n" + (err.message || err), true);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "添加并立即同步"; }
+    setJoinButtonBusy(false);
+    setJoinShareStatus("加入失败", true);
+    showResourceShareNotice("加入共享失败：" + (err.message || err), true);
   }
 }
 
 async function syncResourcePeer(peerId) {
   try {
-    const data = await resourceShareAdminPost("sync", {peer_id: peerId});
-    const result = data.result || {};
-    alert(result.ok === false ? "同步失败：\n" + (result.error || "未知错误") : "同步完成，导入 " + (result.imported || result.received || 0) + " 条资源。");
+    setJoinShareStatus("同步中");
+    showResourceShareNotice("同步中…");
+    await resourceShareAdminPost("sync", {peer_id: peerId}, 20000);
     await loadResourceShareStatus();
-    await load();
+    watchResourceShareUntilSettled(peerId);
   } catch (err) {
-    alert("同步失败：\n" + (err.message || err));
+    setJoinShareStatus("同步失败", true);
+    showResourceShareNotice("同步失败：" + (err.message || err), true);
   }
 }
 
 async function syncAllResourcePeers() {
   try {
-    const data = await resourceShareAdminPost("sync", {});
-    const results = Array.isArray(data.result) ? data.result : [];
-    const ok = results.filter(function(item) { return item && item.ok; }).length;
-    alert("同步完成：成功 " + ok + " / " + results.length + " 个 Peer。");
+    setJoinShareStatus("同步中");
+    showResourceShareNotice("同步中…");
+    await resourceShareAdminPost("sync", {}, 20000);
     await loadResourceShareStatus();
-    await load();
+    watchResourceShareUntilSettled("");
   } catch (err) {
-    alert("同步失败：\n" + (err.message || err));
+    setJoinShareStatus("同步失败", true);
+    showResourceShareNotice("同步失败：" + (err.message || err), true);
   }
 }
 
@@ -20564,18 +20705,18 @@ class Handler(BaseHTTPRequestHandler):
                     remote_url=str(payload.get("remote_url") or "").strip(),
                     invite_code=str(payload.get("invite_code") or "").strip(),
                     name=str(payload.get("name") or "").strip(),
-                    sync_interval_value=payload.get("sync_interval_value", resource_share.DEFAULT_SYNC_INTERVAL_VALUE),
+                    sync_interval_value=payload.get("sync_hour", payload.get("sync_interval_value", resource_share.DEFAULT_SYNC_INTERVAL_VALUE)),
                     sync_interval_unit=str(payload.get("sync_interval_unit") or resource_share.DEFAULT_SYNC_INTERVAL_UNIT),
                     existing_peer_id=str(payload.get("peer_id") or ""),
+                    auto_sync=payload.get("auto_sync", True),
+                    sync_schedule=str(payload.get("sync_schedule") or "loop"),
+                    sync_hour=payload.get("sync_hour", payload.get("sync_interval_value", 6)),
                 )
-                sync_result = None
-                try:
-                    sync_result = resource_share.sync_peer(str(result.get("peer_id") or ""), force=True)
-                except Exception as sync_exc:
-                    sync_result = {"ok": False, "error": str(sync_exc)}
-                    log_to_json("WARNING", "Share", f"新共享服务器首次同步失败: {result.get('peer_id')}")
-                result["first_sync"] = sync_result
-                log_to_json("INFO", "Share", f"已建立资源共享关系: {result.get('peer_id')}")
+                peer_id = str(result.get("peer_id") or "")
+                _start_share_sync(peer_id)
+                result["syncing"] = True
+                result["sync_status"] = "同步中"
+                log_to_json("INFO", "Share", f"已建立资源共享关系: {peer_id}，开始同步")
                 self.send_json(result)
             except (ValueError, RuntimeError) as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -20588,9 +20729,16 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body(max_bytes=8192)
                 peer_id = str(payload.get("peer_id") or "").strip()
                 if peer_id:
-                    result = resource_share.sync_peer(peer_id, force=True)
+                    _start_share_sync(peer_id)
+                    result = {"ok": True, "syncing": True, "sync_status": "同步中", "peer_id": peer_id}
                 else:
-                    result = resource_share.sync_all(force=True)
+                    started = 0
+                    for peer in resource_share.list_peers():
+                        if str(peer.get("direction") or "") != "outbound":
+                            continue
+                        _start_share_sync(str(peer.get("peer_id") or ""))
+                        started += 1
+                    result = {"ok": True, "syncing": started > 0, "sync_status": "同步中" if started else "同步完成", "started": started}
                 self.send_json({"ok": True, "result": result})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_GATEWAY)
@@ -20604,7 +20752,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("peer_id 不能为空")
                 patch = {
                     key: payload[key]
-                    for key in ("name", "allowed_cidrs", "enabled", "sync_interval_value", "sync_interval_unit")
+                    for key in ("name", "allowed_cidrs", "enabled", "sync_interval_value", "sync_interval_unit", "auto_sync", "sync_schedule", "sync_hour")
                     if key in payload
                 }
                 if "allowed_cidrs" in patch:
@@ -20628,8 +20776,11 @@ class Handler(BaseHTTPRequestHandler):
                     remote_url=str(payload.get("remote_url") or "").strip(),
                     invite_code=str(payload.get("invite_code") or "").strip(),
                     name=str(payload.get("name") or "").strip(),
-                    sync_interval_value=payload.get("sync_interval_value", resource_share.DEFAULT_SYNC_INTERVAL_VALUE),
+                    sync_interval_value=payload.get("sync_hour", payload.get("sync_interval_value", resource_share.DEFAULT_SYNC_INTERVAL_VALUE)),
                     sync_interval_unit=str(payload.get("sync_interval_unit") or resource_share.DEFAULT_SYNC_INTERVAL_UNIT),
+                    auto_sync=payload.get("auto_sync"),
+                    sync_schedule=str(payload.get("sync_schedule") or ""),
+                    sync_hour=payload.get("sync_hour"),
                 )
                 self.send_json(result)
             except KeyError as exc:
