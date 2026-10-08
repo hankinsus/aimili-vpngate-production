@@ -1990,6 +1990,40 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def persist_openvpn_candidates(candidates: list[dict[str, Any]]) -> int:
+    """Keep the official OpenVPN configs. The pool row alone cannot open a tunnel."""
+    usable = [
+        dict(node) for node in (candidates or [])
+        if str(node.get("id") or "").strip() and str(node.get("config_text") or "").strip()
+    ]
+    if not usable:
+        return 0
+    with lock:
+        current = read_nodes()
+        by_id = {str(node.get("id")): node for node in current if node.get("id")}
+        for cand in usable:
+            nid = str(cand.get("id"))
+            previous = by_id.get(nid)
+            if previous:
+                for key in ("probe_status", "probe_message", "latency_ms", "probed_at", "active"):
+                    if previous.get(key) not in (None, "", False):
+                        cand[key] = previous.get(key)
+            text = str(cand.get("config_text") or "")
+            path = Path(str(cand.get("config_file") or ""))
+            if text and path.name:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(text, encoding="utf-8")
+                except Exception:
+                    pass
+            by_id[nid] = cand
+        merged = list(by_id.values())
+        if len(merged) > 1000:
+            merged = merged[:1000]
+        write_json(NODES_FILE, merged)
+    return len(usable)
+
+
 def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
@@ -2076,6 +2110,12 @@ def fetch_candidates() -> list[dict[str, Any]]:
         log_to_json("WARNING", "Main", f"NodePool 快照写入失败: {pool_exc}")
 
     log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    try:
+        saved = persist_openvpn_candidates(candidates)
+        if saved:
+            log_to_json("INFO", "Main", f"已写入 {saved} 份 OpenVPN 配置")
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"OpenVPN 配置写入失败: {exc}")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:
