@@ -6280,7 +6280,7 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
     active_ip = _active_exit_ip()
     home = routing_target_country(ui_cfg)
     proto = _current_route_protocol(ui_cfg)
-    cache_key = f"{home}|{proto}"
+    cache_key = f"{home}|{proto}|{normalize_routing_blocklist(ui_cfg.get('routing_blocklist') or '')}"
     cached = getattr(_cold_candidates, "cache", None)
     now_rank = time.time()
     if isinstance(cached, dict) and cached.get("key") == cache_key and (now_rank - float(cached.get("at") or 0) < 3600 or ui_query_active()):
@@ -6300,6 +6300,7 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         "excluded_occupied": 0,
         "excluded_duplicate": 0,
         "excluded_unstable": 0,
+        "excluded_blocked": 0,
     }
     try:
         rows = node_pool.list_routing_endpoints(limit=800)
@@ -6316,6 +6317,9 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         if not eid or protocol not in ("openvpn", "softether", "sstp", "l2tp-ipsec"):
             continue
         if str(endpoint.get("status") or "").upper() not in ("HOT", "AVAILABLE"):
+            continue
+        if endpoint_is_blocked(endpoint, ui_cfg):
+            stats["excluded_blocked"] += 1
             continue
         ip = _endpoint_ip(endpoint)
         if not ip:
@@ -6535,6 +6539,9 @@ def _publish_cold_standby(endpoint: dict[str, Any] | None) -> None:
             _save_cold_state()
         return
     eid = str(endpoint.get("endpoint_id") or "")
+    if endpoint_is_blocked(endpoint, load_ui_config()):
+        _publish_cold_standby(None)
+        return
     wanted_id = ("pool:" + eid) if eid else ""
     try:
         raw_state = read_json(STATE_FILE, {})
@@ -6577,6 +6584,18 @@ def _cold_port_open(endpoint: dict[str, Any]) -> bool | None:
     return _tcp_port_open(host, port, timeout=1.5)
 
 
+def _refill_unblocked_primary(ui_cfg: dict[str, Any]) -> None:
+    if active_tunnel_running() or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+        return
+    if is_connecting or manual_connection_active:
+        return
+    if time.time() - float(getattr(_refill_unblocked_primary, "at", 0) or 0) <= 180:
+        return
+    _refill_unblocked_primary.at = time.time()
+    log_to_json("INFO", "Routing", "主连接空缺，改用未屏蔽节点")
+    auto_switch_node()
+
+
 def cold_standby_pass() -> None:
     ui_cfg = load_ui_config()
     if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
@@ -6585,6 +6604,13 @@ def cold_standby_pass() -> None:
         _remember_precold({}, "")
         return
     if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
+        return
+    current = current_active_routing_endpoint()
+    if current and endpoint_is_blocked(current, ui_cfg):
+        blocked_eid = str(current.get("endpoint_id") or "")
+        log_to_json("INFO", "Routing", f"屏蔽节点退出主连接 {_endpoint_ip(current)}")
+        if not try_unified_failover(exclude_endpoint_id=blocked_eid, attempts=4):
+            auto_switch_node()
         return
     candidates = _cold_candidates(ui_cfg)
     if candidates is None:
@@ -6609,6 +6635,7 @@ def cold_standby_pass() -> None:
     _publish_cold_standby(chosen)
     _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
     if not chosen:
+        _refill_unblocked_primary(ui_cfg)
         return
     cold = _cold_state()
     now = time.time()
@@ -6632,6 +6659,7 @@ def cold_standby_pass() -> None:
         else:
             _publish_cold_standby(None)
             _remember_precold(candidates, "")
+        _refill_unblocked_primary(ui_cfg)
 
 
 def cold_standby_loop() -> None:
@@ -14696,9 +14724,9 @@ function render(){
 
       const canRetest = !isCurrentlyActive && !isTesting && !isWaiting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
       const standbyShown = !!(state?.standby_ready || state?.standby_prepared);
-      const hotStandby = !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
+      const hotStandby = !blocked && !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
       const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
-      const statusCell = isCurrentlyActive
+      const statusCell = isCurrentlyActive && !blocked
         ? `<span class="badge ${n.probe_status === "unavailable" ? "unavailable" : "available"}" title="${esc(n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>${n.probe_status === "unavailable" ? "主连接 · 代理不通" : "主连接"}</span>`
         : isWaiting
           ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
