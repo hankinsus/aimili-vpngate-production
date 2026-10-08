@@ -4677,7 +4677,7 @@ def _scheme_filter_label(ui_cfg: dict[str, Any]) -> str:
     elif speed > 0:
         parts.append(f"≥{speed / 1_000_000:.0f} Mbps")
     else:
-        parts.append("不限速度")
+        parts.append("≥50 Mbps")
     if str(ui_cfg.get("routing_mode") or "") == "favorites":
         parts.append("仅收藏")
     rules = routing_block_rules(ui_cfg)
@@ -4886,19 +4886,50 @@ def apply_user_routing_preferences() -> None:
         log_to_json("WARNING", "Routing", f"应用用户路由偏好失败: {exc}")
 
 
-def _refresh_cold_standby_now() -> None:
-    try:
-        cold_standby_pass()
-    except Exception as exc:
-        log_to_json("WARNING", "Standby", f"新代理设置冷备刷新失败: {exc}")
+def _scheme_candidates(ui_cfg: dict[str, Any], limit: int = 30) -> list[dict[str, Any]]:
+    return [
+        ep for ep in _stable_candidates(unified_hot_pool_candidates(ui_cfg, limit=limit))
+        if endpoint_matches_explicit_routing(ep, ui_cfg) and not endpoint_is_unstable(ep)
+    ]
+
+
+def _smart_floor_configs(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Default guarantee when the saved scheme has nothing to connect.
+
+    智能模式, keep 移动/住宅/机房 and latency, bandwidth at least 50 Mbps.
+    Does not start a country sweep.
+    """
+    floor = dict(ui_cfg)
+    floor["routing_mode"] = "auto"
+    floor["force_country"] = ""
+    floor["routing_min_speed_bps"] = ROUTING_MIN_LINE_SPEED_BPS
+    configs = [floor]
+    if str(floor.get("routing_ip_type") or "all").lower() not in ("", "all"):
+        wider = dict(floor)
+        wider["routing_ip_type"] = "all"
+        configs.append(wider)
+    if str(floor.get("routing_protocol") or "").strip() or str(floor.get("routing_latency") or "").strip():
+        widest = dict(floor)
+        widest["routing_ip_type"] = "all"
+        widest["routing_protocol"] = ""
+        widest["routing_latency"] = ""
+        configs.append(widest)
+    return configs
+
+
+_scheme_apply_lock = threading.Lock()
 
 
 def apply_saved_scheme_now() -> None:
     """Put the saved proxy settings on the live exit and the cold standby now.
 
-    Library detection stays paused. Nothing here starts a country sweep or
-    changes the saved country. No matching node means the current tunnel stays.
+    Saving always tries to connect. There is no disconnect button, so an empty
+    tunnel is not a valid result. A strict scheme with no candidate falls back
+    to 智能模式 at ≥50 Mbps without a batch sweep and without rewriting the
+    saved settings. A higher saved speed is kept while any such node exists.
     """
+    if not _scheme_apply_lock.acquire(blocking=False):
+        return
     try:
         invalidate_scheme_snapshot()
         ui_cfg = load_ui_config()
@@ -4907,45 +4938,81 @@ def apply_saved_scheme_now() -> None:
         if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
             return
         current = current_active_routing_endpoint()
-        if current and endpoint_matches_explicit_routing(current, ui_cfg) and not endpoint_is_unstable(current):
+        if (
+            current
+            and active_tunnel_running()
+            and endpoint_matches_explicit_routing(current, ui_cfg)
+            and not endpoint_is_unstable(current)
+        ):
             set_state(routing_degraded=False, last_check_message="当前出口符合代理设置")
             _refresh_cold_standby_now()
             return
-        matching = [
-            ep for ep in _stable_candidates(unified_hot_pool_candidates(ui_cfg, limit=30))
-            if endpoint_matches_explicit_routing(ep, ui_cfg) and not endpoint_is_unstable(ep)
-        ]
-        if not matching:
-            set_state(routing_degraded=True, last_check_message="新代理设置暂无稳定节点，保持当前出口")
-            log_to_json("INFO", "Routing", "新代理设置暂无稳定节点，保持当前出口")
-            _refresh_cold_standby_now()
-            return
-        best = matching[0]
-        if current and str(best.get("endpoint_id") or "") == str(current.get("endpoint_id") or ""):
-            set_state(routing_degraded=False, last_check_message="当前出口符合代理设置")
-            _refresh_cold_standby_now()
-            return
-        # manual=True keeps the old tunnel until the new one is verified.
-        connect_ranked_endpoint(best, manual=True)
-        clear_manual_route_pin()
+        strict = _scheme_candidates(ui_cfg)
+        if strict:
+            plans: list[tuple[list[dict[str, Any]], str, bool]] = [(strict, "已按代理设置连接", False)]
+        else:
+            plans = [
+                (_scheme_candidates(cfg), "当前方案没有可连节点，已按智能模式保底连接（≥50 Mbps）", True)
+                for cfg in _smart_floor_configs(ui_cfg)
+            ]
+        last_error = ""
+        for matching, message, degraded in plans:
+            if not matching:
+                continue
+            replacing = active_tunnel_running()
+            connected = False
+            for endpoint in matching[:3]:
+                try:
+                    connect_ranked_endpoint(endpoint, manual=replacing)
+                except Exception as exc:
+                    last_error = str(exc)
+                    log_to_json(
+                        "WARNING",
+                        "Routing",
+                        f"按代理设置连接失败 {endpoint.get('protocol')} {endpoint.get('endpoint_id')}: {exc}",
+                    )
+                    continue
+                if not active_tunnel_running():
+                    last_error = "连接后隧道未起来"
+                    continue
+                clear_manual_route_pin()
+                set_state(
+                    routing_degraded=degraded,
+                    last_check_message=message,
+                    manual_switch_active=False,
+                    manual_switch_message=message,
+                    is_connecting=False,
+                    manual_connection_active=False,
+                    pending_connection_id="",
+                    pending_connection_pool_endpoint_id="",
+                    pending_connection_protocol="",
+                    pending_connection_country="",
+                    pending_connection_address="",
+                )
+                log_to_json(
+                    "INFO",
+                    "Routing",
+                    f"{message} {endpoint.get('protocol')} {endpoint.get('country')} {endpoint.get('endpoint_id')}",
+                )
+                if _auto_direct_fallback_active():
+                    _engage_proxy_egress(message)
+                _refresh_cold_standby_now()
+                connected = True
+                break
+            if connected:
+                return
+            if not degraded:
+                break
         set_state(
-            routing_degraded=False,
-            last_check_message="已按新代理设置切换出口",
+            routing_degraded=True,
+            last_check_message="代理设置暂无可用节点，主连接继续等待",
             manual_switch_active=False,
-            manual_switch_message="已按新代理设置切换出口",
             is_connecting=False,
             manual_connection_active=False,
             pending_connection_id="",
             pending_connection_pool_endpoint_id="",
-            pending_connection_protocol="",
-            pending_connection_country="",
-            pending_connection_address="",
         )
-        log_to_json(
-            "INFO",
-            "Routing",
-            f"已按新代理设置切换 {best.get('protocol')} {best.get('country')} {best.get('endpoint_id')}",
-        )
+        log_to_json("INFO", "Routing", "代理设置暂无可用节点，主连接继续等待" + (f": {last_error}" if last_error else ""))
         _refresh_cold_standby_now()
     except Exception as exc:
         log_to_json("WARNING", "Routing", f"应用新代理设置失败，保持当前出口: {exc}")
@@ -4957,12 +5024,42 @@ def apply_saved_scheme_now() -> None:
                 manual_switch_active=False,
                 is_connecting=False,
                 manual_connection_active=False,
-                pending_connection_id="",
-                pending_connection_pool_endpoint_id="",
             )
             _refresh_cold_standby_now()
         except Exception:
             pass
+    finally:
+        _scheme_apply_lock.release()
+
+
+def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool = False) -> None:
+    """Health and the proxy switch use this. A missing main must be connected."""
+    if active_tunnel_running():
+        if engage_proxy and proxy_server.get_egress_mode() != "proxy":
+            _engage_proxy_egress(reason)
+        elif _auto_direct_fallback_active() and proxy_server.get_egress_mode() != "proxy":
+            _engage_proxy_egress(reason)
+        return
+    now = time.time()
+    if not force and now - float(getattr(ensure_main_connection, "at", 0) or 0) < 45:
+        return
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+        return
+    ensure_main_connection.at = now
+    log_to_json("INFO", "Proxy", f"主连接未启动，开始连接: {reason}")
+    apply_saved_scheme_now()
+    if not active_tunnel_running():
+        return
+    if engage_proxy or _auto_direct_fallback_active():
+        if proxy_server.get_egress_mode() != "proxy":
+            _engage_proxy_egress(reason)
+
+
+def _refresh_cold_standby_now() -> None:
+    try:
+        cold_standby_pass()
+    except Exception as exc:
+        log_to_json("WARNING", "Standby", f"新代理设置冷备刷新失败: {exc}")
 
 
 def apply_routing_filters(
@@ -6978,8 +7075,6 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
         return "skip"
     mode = proxy_server.get_egress_mode()
     auto_direct = _auto_direct_fallback_active()
-    if mode == "direct" and not auto_direct:
-        return "skip"
     if mode not in ("proxy", "direct"):
         return "skip"
     now = time.time()
@@ -6994,7 +7089,7 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
             _cold_promote_cooldown_until = 0.0
             pool = candidates if isinstance(candidates, dict) else (_cold_candidates(ui_cfg) or {})
             _promote_next_cold(str(exclude_endpoint_id or ""), pool)
-            if auto_direct or proxy_server.get_egress_mode() == "direct":
+            if auto_direct:
                 _engage_proxy_egress("热备已接管，切回代理模式")
             log_to_json("INFO", "Standby", "主连接未启动，已由就绪热备接管")
             return "up"
@@ -7066,7 +7161,7 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
                 continue
             _cold_promote_cooldown_until = 0.0
             _promote_next_cold(eid, candidates)
-            if auto_direct or proxy_server.get_egress_mode() == "direct":
+            if auto_direct:
                 _engage_proxy_egress("冷备已接上，切回代理模式")
             return "up"
         _cold_promote_cooldown_until = time.time() + 180
@@ -7107,7 +7202,6 @@ def cold_standby_pass() -> None:
         if (
             not active_tunnel_running()
             and not proxy_server.proxy_forwarding_busy()
-            and (proxy_server.get_egress_mode() == "proxy" or _auto_direct_fallback_active())
         ):
             promote_cold_standby_to_main()
         return
@@ -7159,15 +7253,12 @@ def cold_standby_pass() -> None:
         return
     if is_connecting or manual_connection_active or ui_command_plane.is_busy():
         return
-    mode = proxy_server.get_egress_mode()
-    if mode == "direct" and not _auto_direct_fallback_active():
-        return
     if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
         return
     outcome = promote_cold_standby_to_main(candidates=candidates)
     if outcome in ("up", "direct", "busy", "cooldown"):
         return
-    if mode == "proxy":
+    if proxy_server.get_egress_mode() == "proxy":
         _refill_unblocked_primary(ui_cfg)
 
 
@@ -13455,7 +13546,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label" for="net_routing_min_speed">速度</label>
             <select id="net_routing_min_speed" aria-hidden="true" tabindex="-1" style="display:none;">
-              <option value="0">不限速度</option>
+              <option value="0">默认 ≥50 Mbps</option>
               <option value="50000000">≥50 Mbps</option>
               <option value="100000000">≥100 Mbps</option>
               <option value="300000000">≥300 Mbps</option>
@@ -13465,7 +13556,7 @@ INDEX_HTML = r"""<!doctype html>
             </select>
             <div id="net_routing_min_speed_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_min_speed" aria-label="速度">
               <button id="net_routing_min_speed_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">不限速度</span>
+                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">默认 ≥50 Mbps</span>
                 <span class="toolbar-custom-select-arrow">⌄</span>
               </button>
               <div id="net_routing_min_speed_menu" class="toolbar-custom-select-menu" role="listbox"></div>
@@ -15611,7 +15702,7 @@ function proxySettingsLine() {
     const where = country || "";
     status = where + (state.background_paused ? "检测已暂停" : (detecting ? "检测中" : "检测待命"));
   }
-  const settingBody = [configured ? (country || "不限国家") : "不限国家", label || "所有协议 · 不限类型 · 不限延迟 · 不限速度"].filter(Boolean).join(" · ");
+  const settingBody = [configured ? (country || "不限国家") : "智能模式", label || "所有协议 · 不限类型 · 不限延迟 · ≥50 Mbps"].filter(Boolean).join(" · ");
   return status + " 代理设置 · " + settingBody + " · 符合 " + available + " · 已验证 " + inventory + " IP";
 }
 
@@ -20069,6 +20160,13 @@ def background_proxy_checker() -> None:
                 if res.get("ok"):
                     proxy_health_failures = 0
                     log_to_json("INFO", "Proxy", f"直连可用，延迟 {res.get('latency_ms')} ms")
+                    if not active_tunnel_running():
+                        threading.Thread(
+                            target=ensure_main_connection,
+                            args=("健康检测发现主连接未启动",),
+                            daemon=True,
+                            name="health-main",
+                        ).start()
                 else:
                     proxy_health_failures += 1
                     log_to_json("WARNING", "Proxy", f"直连出口失败，不更换 VPN 节点: {res.get('error')}")
@@ -20085,6 +20183,13 @@ def background_proxy_checker() -> None:
                         proxy_latency_ms=0,
                         proxy_error="当前实例没有活动 VPN 隧道",
                     )
+                    threading.Thread(
+                        target=ensure_main_connection,
+                        args=("健康检测发现主连接未启动",),
+                        kwargs={"engage_proxy": True},
+                        daemon=True,
+                        name="health-main",
+                    ).start()
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
                 res = {"ok": False, "error": "活动 VPN 隧道进程或网卡已消失"}
@@ -21837,7 +21942,19 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "mode 只能是 direct 或 proxy"}, HTTPStatus.BAD_REQUEST)
                     return
                 if mode == "proxy" and not active_tunnel_running():
-                    self.send_json({"ok": False, "error": "当前没有代理隧道，请先连接节点再切回代理模式"}, HTTPStatus.CONFLICT)
+                    threading.Thread(
+                        target=ensure_main_connection,
+                        args=("切换代理模式时主连接未启动",),
+                        kwargs={"engage_proxy": True, "force": True},
+                        daemon=True,
+                        name="proxy-mode-main",
+                    ).start()
+                    self.send_json({
+                        "ok": True,
+                        "switching": True,
+                        "mode": "direct",
+                        "message": "主连接未启动，正在按代理设置连接，连上后自动切回代理模式",
+                    })
                     return
                 previous = proxy_server.get_egress_mode()
                 if previous == mode:
