@@ -852,10 +852,9 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
             pass
     if sock.family == socket.AF_INET:
         try:
-            # 10 is IP_MTU_DISCOVER. 0 is IP_PMTUDISC_DONT. Some Python builds
-            # do not expose the names, and a missing name must not kill UDP.
+            # 10 is IP_MTU_DISCOVER. 2 is IP_PMTUDISC_DO: refuse to fragment.
             mtu_discover = getattr(socket, "IP_MTU_DISCOVER", 10)
-            sock.setsockopt(socket.IPPROTO_IP, mtu_discover, 0)
+            sock.setsockopt(socket.IPPROTO_IP, mtu_discover, 2)
         except (OSError, AttributeError):
             pass
     if not bind_device:
@@ -870,6 +869,7 @@ def _set_udp_socket_options(sock: socket.socket, bind_device: bool = True) -> No
 
 _UDP_DEST_CACHE: dict[tuple[str, str, str, int], tuple[float, list[tuple[int, tuple[Any, ...]]]]] = {}
 _UDP_DEST_LOCK = threading.Lock()
+_UDP_DEST_FLIGHTS: set[tuple[str, str, str, int]] = set()
 
 
 def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
@@ -885,6 +885,8 @@ def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any
     literal = _host_is_ip(host)
     ip = literal or resolve_dns_over_active_tunnel(host, iface=get_forward_interface())
     if not ip:
+        with _UDP_DEST_LOCK:
+            _UDP_DEST_CACHE[key] = (now - 55.0, [])
         return []
     try:
         found = [
@@ -901,6 +903,34 @@ def _resolve_udp_destinations(host: str, port: int) -> list[tuple[int, tuple[Any
             _UDP_DEST_CACHE.clear()
         _UDP_DEST_CACHE[key] = (now, found)
     return found
+
+
+def _udp_destinations_ready(host: str, port: int) -> list[tuple[int, tuple[Any, ...]]]:
+    """Never block the relay. A new name resolves on the side; the datagram waits for the retry."""
+    host = str(host or "").strip()
+    if _host_is_ip(host):
+        return _resolve_udp_destinations(host, port)
+    iface = get_forward_interface() or ""
+    generation = _current_egress_generation()
+    key = (str(generation), iface, host, int(port))
+    now = time.monotonic()
+    start = False
+    with _UDP_DEST_LOCK:
+        cached = _UDP_DEST_CACHE.get(key)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+        if key not in _UDP_DEST_FLIGHTS:
+            _UDP_DEST_FLIGHTS.add(key)
+            start = True
+    if start:
+        def run() -> None:
+            try:
+                _resolve_udp_destinations(host, port)
+            finally:
+                with _UDP_DEST_LOCK:
+                    _UDP_DEST_FLIGHTS.discard(key)
+        threading.Thread(target=run, daemon=True, name="udp-dns").start()
+    return []
 
 
 def _socks5_reply_ipv4(client: socket.socket) -> str:
@@ -1003,77 +1033,86 @@ def socks5_udp_associate(client: socket.socket, control_address: tuple[str, int]
                     continue
 
                 if source is relay:
-                    try:
-                        packet, peer = relay.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
-                    except BlockingIOError:
-                        continue
-                    peer_ip = str(peer[0] or "")
-                    if peer_ip != client_ip and not (
-                        client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
-                        and peer_ip == "127.0.0.1"
-                    ):
-                        continue
-                    decoded = _socks5_unpack_udp(packet)
-                    if not decoded:
-                        continue
-                    host, port, payload = decoded
-                    if _rotate_if_needed():
-                        pass
-                    destinations = _resolve_udp_destinations(host, port)
-                    destinations.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
-                    destinations = [item for item in destinations if item[0] == socket.AF_INET]
-                    if not destinations:
-                        continue
-                    client_udp_addr = (peer_ip, int(peer[1]))
-                    if port in (500, 4500):
-                        now_mono = time.monotonic()
-                        if now_mono - float(getattr(socks5_udp_associate, "ike_log_at", 0.0)) > 2:
-                            socks5_udp_associate.ike_log_at = now_mono
-                            print(f"[WiFi Calling] UDP {host}:{port} {len(payload)} bytes", flush=True)
-                    kind = "wifi" if port in (500, 4500) else ("quic" if port == 443 else "other")
-                    sent = False
-                    for af, sa in destinations:
-                        sock = upstreams.get((kind, af))
-                        if sock is None:
-                            try:
-                                sock = socket.socket(af, socket.SOCK_DGRAM)
-                                _set_udp_socket_options(sock)
-                                bind_addr = ("0.0.0.0", 0) if af == socket.AF_INET else ("::", 0)
-                                sock.bind(bind_addr)
-                                sock.setblocking(False)
-                                upstreams[(kind, af)] = sock
-                            except OSError:
-                                if sock is not None:
-                                    sock.close()
-                                continue
+                    while True:
                         try:
-                            sock.sendto(payload, sa)
-                            sent = True
-                            if kind == "quic":
-                                _note_quic_packet(host, association_generation, association_iface)
+                            packet, peer = relay.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
+                        except BlockingIOError:
                             break
-                        except OSError:
-                            try:
-                                sock.close()
-                            except OSError:
-                                pass
-                            upstreams.pop((kind, af), None)
+                        peer_ip = str(peer[0] or "")
+                        if peer_ip != client_ip and not (
+                            client_ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+                            and peer_ip == "127.0.0.1"
+                        ):
                             continue
-                    if sent:
-                        last_activity = time.monotonic()
+                        decoded = _socks5_unpack_udp(packet)
+                        if not decoded:
+                            continue
+                        host, port, payload = decoded
+                        if _rotate_if_needed():
+                            pass
+                        destinations = _udp_destinations_ready(host, port)
+                        destinations.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+                        destinations = [item for item in destinations if item[0] == socket.AF_INET]
+                        if not destinations:
+                            continue
+                        client_udp_addr = (peer_ip, int(peer[1]))
+                        if port in (500, 4500):
+                            now_mono = time.monotonic()
+                            if now_mono - float(getattr(socks5_udp_associate, "ike_log_at", 0.0)) > 2:
+                                socks5_udp_associate.ike_log_at = now_mono
+                                print(f"[WiFi Calling] UDP {host}:{port} {len(payload)} bytes", flush=True)
+                        kind = "wifi" if port in (500, 4500) else ("quic" if port == 443 else "other")
+                        sent = False
+                        for af, sa in destinations:
+                            sock = upstreams.get((kind, af))
+                            if sock is None:
+                                try:
+                                    sock = socket.socket(af, socket.SOCK_DGRAM)
+                                    _set_udp_socket_options(sock)
+                                    bind_addr = ("0.0.0.0", 0) if af == socket.AF_INET else ("::", 0)
+                                    sock.bind(bind_addr)
+                                    sock.setblocking(False)
+                                    upstreams[(kind, af)] = sock
+                                except OSError:
+                                    if sock is not None:
+                                        sock.close()
+                                    continue
+                            try:
+                                sock.sendto(payload, sa)
+                                sent = True
+                                if kind == "quic":
+                                    _note_quic_packet(host, association_generation, association_iface)
+                                break
+                            except OSError as exc:
+                                # One destination refused or the datagram is too big.
+                                # The socket is shared by every flow of this kind.
+                                if exc.errno in (11, 90, 101, 113):
+                                    continue
+                                try:
+                                    sock.close()
+                                except OSError:
+                                    pass
+                                upstreams.pop((kind, af), None)
+                                continue
+                        if sent:
+                            last_activity = time.monotonic()
                     continue
 
                 # Upstream UDP response -> SOCKS5 client UDP socket.
-                try:
-                    response, source_addr = source.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
-                except BlockingIOError:
-                    continue
-                if client_udp_addr is not None:
-                    relay.sendto(
-                        _socks5_pack_udp((str(source_addr[0]), int(source_addr[1])), response),
-                        client_udp_addr,
-                    )
-                    last_activity = time.monotonic()
+                while True:
+                    try:
+                        response, source_addr = source.recvfrom(PROXY_UDP_MAX_PACKET_BYTES)
+                    except BlockingIOError:
+                        break
+                    if client_udp_addr is not None:
+                        try:
+                            relay.sendto(
+                                _socks5_pack_udp((str(source_addr[0]), int(source_addr[1])), response),
+                                client_udp_addr,
+                            )
+                        except OSError:
+                            break
+                        last_activity = time.monotonic()
     except Exception as exc:
         print(f"[SOCKS5 UDP] UDP ASSOCIATE 失败: {exc}", flush=True)
     finally:
