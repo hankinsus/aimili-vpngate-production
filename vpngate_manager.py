@@ -18227,16 +18227,18 @@ def ensure_l2tp_namespace_forward(result: Any) -> None:
     rules = [
         ["filter", "FORWARD", "-i", ns_dev, "-o", inner, "-j", "ACCEPT"],
         ["filter", "FORWARD", "-i", inner, "-o", ns_dev, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
-        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
-        ["mangle", "FORWARD", "-i", inner, "-o", ns_dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
-        ["mangle", "INPUT", "-i", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
+        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "FORWARD", "-i", inner, "-o", ns_dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "INPUT", "-i", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
     ]
     stale = [
         ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
         ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"],
-        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
-        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1100"],
+        ["mangle", "OUTPUT", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
+        ["mangle", "FORWARD", "-o", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
+        ["mangle", "FORWARD", "-i", inner, "-o", ns_dev, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
+        ["mangle", "INPUT", "-i", inner, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200"],
     ]
     for table, *rule in stale:
         try:

@@ -924,18 +924,20 @@ for _ in $(seq 1 60); do
       iptables -A FORWARD -i "{ns_veth}" -o "$IFACE" -j ACCEPT
     iptables -C FORWARD -i "$IFACE" -o "{ns_veth}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
       iptables -A FORWARD -i "$IFACE" -o "{ns_veth}" -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -t mangle -D OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || true
-    iptables -t mangle -D FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || true
+    iptables -t mangle -D FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || true
+    iptables -t mangle -D FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || true
+    iptables -t mangle -D INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || true
     iptables -t mangle -D OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
     iptables -t mangle -D FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-    iptables -t mangle -C OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
-    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
-      iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
-    iptables -t mangle -C FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
-      iptables -t mangle -A FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
-    iptables -t mangle -C INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 2>/dev/null || \
-      iptables -t mangle -A INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200
+    iptables -t mangle -C OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
+    iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
+      iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
+    iptables -t mangle -C FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
+      iptables -t mangle -A FORWARD -i "$IFACE" -o "{ns_veth}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
+    iptables -t mangle -C INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100 2>/dev/null || \
+      iptables -t mangle -A INPUT -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1100
     ip link set dev "$IFACE" mtu 1280 2>/dev/null || true
     ip link set dev "{ns_veth}" mtu 1280 2>/dev/null || true
     tc qdisc replace dev "$IFACE" root fq_codel limit 256 target 20ms interval 100ms 2>/dev/null || true
