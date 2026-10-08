@@ -54,55 +54,29 @@ if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -f /opt/aimilivpn/vpngate_data/sta
 fi
 
 INSTALL_JIUHEYI="${INSTALL_JIUHEYI:-}"
-JIUHEYI_CORE_CHOICE="${JIUHEYI_CORE:-}"
+JIUHEYI_CORE_CHOICE="${JIUHEYI_CORE:-1}"
 JIUHEYI_CAMOUFLAGE="${JIUHEYI_REALITY_DOMAIN:-}"
 jiuheyi_already_installed() {
     [ -f /etc/v2ray-agent/xray/xray ] || [ -f /etc/v2ray-agent/sing-box/sing-box ]
 }
+# 联合安装先问域名。没有九合一时再问 1 是 / 2 否。伪装域名直接回车用微软。
 if [ "${AIMILI_FROM_JIUHEYI:-}" != "1" ] && [ -t 0 ]; then
+    if [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
+        read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
+    fi
     if jiuheyi_already_installed; then
         echo -e "${YELLOW}检测到九合一已安装，跳过。${PLAIN}"
         INSTALL_JIUHEYI=n
-        if [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
-            read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
-        fi
-    else
-        read -r -p "是否安装九合一？[y/N]: " INSTALL_JIUHEYI
-        if [ "${INSTALL_JIUHEYI}" = "y" ] || [ "${INSTALL_JIUHEYI}" = "Y" ]; then
-            echo -e "${YELLOW}1.Xray-core，6 个协议（直接回车）${PLAIN}"
-            echo -e "${YELLOW}2.sing-box，11 个协议${PLAIN}"
-            read -r -p "请选择内核: " JIUHEYI_CORE_CHOICE
-            case "${JIUHEYI_CORE_CHOICE}" in
-                2|singbox|sing-box) JIUHEYI_CORE_CHOICE=2 ;;
-                *) JIUHEYI_CORE_CHOICE=1 ;;
-            esac
-            if [ -z "${AIMILIVPN_DOMAIN+x}" ] || [ -z "${AIMILIVPN_DOMAIN}" ]; then
-                read -r -p "请输入域名（九合一全部协议需要域名，直接回车则只装 AimiliVPN）: " AIMILIVPN_DOMAIN
-            fi
-            if [ -z "${AIMILIVPN_DOMAIN}" ]; then
-                echo -e "${YELLOW}没有域名，跳过九合一，AimiliVPN 使用服务器 IP 继续安装。${PLAIN}"
-                INSTALL_JIUHEYI=n
-            else
-                echo -e "${YELLOW}1.www.microsoft.com（直接回车）${PLAIN}"
-                echo -e "${YELLOW}2.www.apple.com${PLAIN}"
-                echo -e "${YELLOW}3.dl.google.com${PLAIN}"
-                echo -e "${YELLOW}4.addons.mozilla.org${PLAIN}"
-                echo -e "${YELLOW}5.自己输入${PLAIN}"
-                read -r -p "请选择伪装域名: " JIUHEYI_CAMOUFLAGE_CHOICE
-                case "${JIUHEYI_CAMOUFLAGE_CHOICE}" in
-                    2) JIUHEYI_CAMOUFLAGE="www.apple.com" ;;
-                    3) JIUHEYI_CAMOUFLAGE="dl.google.com" ;;
-                    4) JIUHEYI_CAMOUFLAGE="addons.mozilla.org" ;;
-                    5)
-                        read -r -p "请输入伪装域名: " JIUHEYI_CAMOUFLAGE
-                        JIUHEYI_CAMOUFLAGE=$(printf '%s' "${JIUHEYI_CAMOUFLAGE}" | tr -d '[:space:]')
-                        [ -n "${JIUHEYI_CAMOUFLAGE}" ] || JIUHEYI_CAMOUFLAGE="www.microsoft.com"
-                        ;;
-                    *) JIUHEYI_CAMOUFLAGE="www.microsoft.com" ;;
-                esac
-            fi
-        elif [ -z "${AIMILIVPN_DOMAIN+x}" ]; then
-            read -r -p "请输入域名，直接回车表示使用服务器 IP: " AIMILIVPN_DOMAIN
+    elif [ -z "${INSTALL_JIUHEYI}" ]; then
+        read -r -p "是否安装九合一？1 是，2 否（直接回车为否）: " INSTALL_JIUHEYI
+        case "${INSTALL_JIUHEYI}" in
+            1|y|Y) INSTALL_JIUHEYI=y ;;
+            *) INSTALL_JIUHEYI=n ;;
+        esac
+        if [ "${INSTALL_JIUHEYI}" = "y" ] && [ -z "${JIUHEYI_CAMOUFLAGE}" ]; then
+            read -r -p "请输入伪装域名，直接回车使用 www.microsoft.com: " JIUHEYI_CAMOUFLAGE
+            JIUHEYI_CAMOUFLAGE=$(printf '%s' "${JIUHEYI_CAMOUFLAGE}" | tr -d '[:space:]')
+            [ -n "${JIUHEYI_CAMOUFLAGE}" ] || JIUHEYI_CAMOUFLAGE="www.microsoft.com"
         fi
     fi
 fi
@@ -124,6 +98,19 @@ GITHUB_REPO="${2:-${DEFAULT_REPO}}"
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
+# 一键安装补 4G 虚拟内存，并打开 BBR。已经有足够交换分区时不重复添加。
+swap_bytes=0
+if swapon --show=SIZE --bytes --noheadings >/dev/null 2>&1; then
+    swap_bytes=$(swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk '{s+=$1} END {print s+0}')
+fi
+if [ "${swap_bytes}" -lt 4294967296 ] && [ ! -f /swapfile ]; then
+    echo -e "${YELLOW}  -> 添加 4G 虚拟内存...${PLAIN}"
+    fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile || true
+    grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
 if [ "$PKG_MGR" = "apt-get" ]; then
     echo -e "  -> 正在运行 apt-get update 更新软件源清单..."
     apt-get update -q || true
@@ -1247,9 +1234,17 @@ echo "2" > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || sysctl -w net.ip
 echo "2" > /proc/sys/net/ipv4/conf/default/rp_filter 2>/dev/null || sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
 # Optional BBR: use only when the kernel exposes the module.
 if command -v modprobe >/dev/null 2>&1; then modprobe tcp_bbr >/dev/null 2>&1 || true; fi
+if [ -d /etc/sysctl.d ]; then
+    cat > /etc/sysctl.d/99-aimilivpn-bbr.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+fi
 if sysctl net.ipv4.tcp_available_congestion_control >/dev/null 2>&1; then
     if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
         sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+        sysctl -p /etc/sysctl.d/99-aimilivpn-bbr.conf >/dev/null 2>&1 || true
     fi
 fi
 # Keep NAT-T/UDP mappings alive for Wi-Fi Calling and other long-lived UDP flows when conntrack exposes these knobs.
@@ -1304,9 +1299,9 @@ if [ -n "${AIMILIVPN_DOMAIN:-}" ]; then
         fi
     fi
     if [ "$EXISTING_OK" = "1" ]; then
-        echo -e "\n${GREEN}已有 ${AIMILIVPN_DOMAIN} 的正式证书，直接使用，不再重新申请。${PLAIN}"
+        echo -e "\n${GREEN}本地已有 ${AIMILIVPN_DOMAIN} 的证书，直接使用，不再重新申请。${PLAIN}"
     else
-    echo -e "\n${YELLOW}正在为 ${AIMILIVPN_DOMAIN} 申请 Let's Encrypt 证书（约 90 天，自动续期）...${PLAIN}"
+    echo -e "\n${YELLOW}本地没有 ${AIMILIVPN_DOMAIN} 的证书，正在申请。失败则继续使用 IP 证书。${PLAIN}"
     if ! python3 - "${INSTALL_DIR}" "${AIMILIVPN_DOMAIN}" <<'PY'
 import sys
 from pathlib import Path
@@ -1317,7 +1312,7 @@ WebCertificateManager(Path(root) / "vpngate_data" / "web_certificate.json")._wor
 print("域名证书已安装")
 PY
     then
-        echo -e "${YELLOW}域名证书申请失败，面板继续使用自签证书。请把域名解析到本机并放开 80 端口后，在网页里重试。${PLAIN}"
+        echo -e "${YELLOW}域名证书申请失败，继续使用已安装的 IP 证书。域名解析到本机并放开 80 端口后，可在网页里重试。${PLAIN}"
     fi
     fi
 fi
@@ -1405,10 +1400,8 @@ echo
 if [ "${INSTALL_JIUHEYI:-}" = "y" ] || [ "${INSTALL_JIUHEYI:-}" = "Y" ]; then
     if [ -f /etc/v2ray-agent/xray/xray ] || [ -f /etc/v2ray-agent/sing-box/sing-box ]; then
         echo -e "${YELLOW}九合一已安装，跳过。${PLAIN}"
-    elif [ -z "${AIMILIVPN_DOMAIN}" ]; then
-        echo -e "${YELLOW}没有域名，跳过九合一。${PLAIN}"
     else
-        echo -e "${YELLOW}开始安装九合一...${PLAIN}"
+        echo -e "${YELLOW}开始安装九合一... 管理入口 8443，代理 8500。${PLAIN}"
         if ! curl -fsSL "https://raw.githubusercontent.com/hankinsus/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh \
             || ! grep -q "九合一 V1.0.1" /tmp/jiuheyi-install.sh; then
             curl -fsSL "https://raw.githubusercontent.com/ilovestudyus-sketch/ilovestudy-node-9/main/install.sh" -o /tmp/jiuheyi-install.sh
