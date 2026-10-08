@@ -7466,13 +7466,14 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
     try:
         log_to_json("INFO", "VPN", f"开始连接节点: {node_id}")
 
-        node = None
-        with _nodes_index_lock:
-            if _nodes_index is not None:
-                node = _nodes_index.get(node_id)
+        nodes = read_nodes()
+        node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
-            nodes = read_nodes()
-            node = next((item for item in nodes if item.get("id") == node_id), None)
+            with _nodes_index_lock:
+                if _nodes_index is not None:
+                    node = _nodes_index.get(node_id)
+            if node:
+                nodes.append(dict(node))
         if not node:
             raise ValueError(f"Node not found: {node_id}")
 
