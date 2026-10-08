@@ -999,42 +999,58 @@ class NodePool:
             )
 
             base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
+            status_rank = (
+                "CASE UPPER(e.status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
+                "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END"
+            )
+            lat_rank = "CASE WHEN (" + _UI_LATENCY_SQL + ") BETWEEN 1 AND 1500 THEN (" + _UI_LATENCY_SQL + ") ELSE 999999 END"
             stale = self._scoped_page_stale.get(cache_key)
             try:
                 with closing(self._connect(4000, readonly=True)) as db:
-                    total=int(db.execute(
-                        "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
-                        params,
-                    ).fetchone()[0] or 0)
+                    # One pass: dedupe, count, and pick this page. Pulling every
+                    # metadata blob before LIMIT made the same scan take twice as long.
                     rows=db.execute(
-                        "SELECT * FROM ("
-                        "SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state, "
-                        "s.metadata_json AS server_metadata_json, "
+                        "SELECT endpoint_id, _ui_total FROM ("
+                        "SELECT endpoint_id, current_ip, protocol, port, _sr, _lat, COUNT(*) OVER () AS _ui_total FROM ("
+                        "SELECT e.endpoint_id AS endpoint_id, s.current_ip AS current_ip, "
+                        "LOWER(e.protocol) AS protocol, e.port AS port, "
+                        + status_rank + " AS _sr, " + lat_rank + " AS _lat, "
                         "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY "
-                        "CASE UPPER(e.status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
-                        "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
-                        "CASE WHEN (" + _UI_LATENCY_SQL + ") BETWEEN 1 AND 1500 THEN (" + _UI_LATENCY_SQL + ") ELSE 999999 END, "
-                        "e.endpoint_id) AS _ui_rn "
+                        + status_rank + ", " + lat_rank + ", e.endpoint_id) AS _ui_rn "
                         + base +
-                        ") WHERE _ui_rn=1 "
-                        "ORDER BY CASE "
+                        ") WHERE _ui_rn=1"
+                        ") ORDER BY CASE "
                         "WHEN ?<>'' AND endpoint_id=? THEN 0 "
-                        "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 0 "
+                        "WHEN ?<>'' AND current_ip=? AND protocol=? AND port=? THEN 0 "
                         "WHEN ?<>'' AND endpoint_id=? THEN 1 "
-                        "WHEN ?<>'' AND current_ip=? AND LOWER(protocol)=? AND port=? THEN 1 "
-                        "ELSE 2 END, "
-                        "CASE UPPER(status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
-                        "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, "
-                        "CASE WHEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") BETWEEN 1 AND 1500 "
-                        "THEN (" + _UI_LATENCY_SQL.replace("e.metadata_json", "metadata_json").replace("e.latency_ewma", "latency_ewma") + ") ELSE 999999 END, "
-                        "endpoint_id "
+                        "WHEN ?<>'' AND current_ip=? AND protocol=? AND port=? THEN 1 "
+                        "ELSE 2 END, _sr, _lat, endpoint_id "
                         "LIMIT ? OFFSET ?",
                         params+[
                             active_endpoint_id, active_endpoint_id, active_ip, active_ip, active_protocol, active_port,
                             standby_endpoint_id, standby_endpoint_id, standby_ip, standby_ip, standby_protocol, standby_port,
                             limit, offset,
                         ]).fetchall()
-                    page_rows = [dict(row) for row in rows]
+                    total = int(rows[0]["_ui_total"]) if rows else None
+                    if total is None and offset == 0:
+                        total = 0
+                    if total is None:
+                        total=int(db.execute(
+                            "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
+                            params,
+                        ).fetchone()[0] or 0)
+                    ids = [str(row["endpoint_id"]) for row in rows]
+                    page_rows = []
+                    if ids:
+                        found = db.execute(
+                            "SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state, "
+                            "s.metadata_json AS server_metadata_json "
+                            "FROM endpoints e JOIN servers s ON s.server_key=e.server_key "
+                            "WHERE e.endpoint_id IN (" + ",".join("?" for _ in ids) + ")",
+                            ids,
+                        ).fetchall()
+                        by_id = {str(row["endpoint_id"]): dict(row) for row in found}
+                        page_rows = [by_id[item_id] for item_id in ids if item_id in by_id]
                     _attach_latest_observations(db, page_rows)
             except sqlite3.OperationalError as exc:
                 if stale and "lock" in str(exc).lower():
