@@ -17325,6 +17325,7 @@ async function refreshFilterCounts(signal = null) {
 
 let filterReloadTimer = null;
 function scheduleScopedReload(country, prioritize = false) {
+  nodes = nodes.filter(n => matchesNodeFilters(n));
   nodeListLoading = true;
   nodeListError = "";
   setRowsPending(true);
