@@ -1078,7 +1078,13 @@ class NodePool:
         if not self._ui_order_lock.acquire(blocking=False):
             if cached:
                 return cached[1]
-            self._ui_order_lock.acquire()
+            # Another filter is already scanning. Do not pin this request
+            # until that scan finishes: on a swapped host that was 15–80s
+            # and every timed-out retry stacked behind it.
+            if not self._ui_order_lock.acquire(timeout=2.0):
+                if cached:
+                    return cached[1]
+                raise sqlite3.OperationalError("ui order busy")
         try:
             cached = self._ui_order_cache.get(key)
             if cached and cached[0] > time.monotonic():
@@ -1199,7 +1205,12 @@ class NodePool:
             if stale:
                 cached_rows, cached_total = stale
                 return [dict(x) for x in cached_rows], int(cached_total)
-            gate.acquire()
+            if not gate.acquire(timeout=2.0):
+                stale = self._scoped_page_stale.get(cache_key)
+                if stale:
+                    cached_rows, cached_total = stale
+                    return [dict(x) for x in cached_rows], int(cached_total)
+                raise sqlite3.OperationalError("ui page busy")
         try:
             cached = self._scoped_page_cache.get(cache_key)
             if cached and cached[0] > time.monotonic():
@@ -1331,7 +1342,10 @@ class NodePool:
         if not self._country_catalog_gate.acquire(blocking=False):
             if cached:
                 return dict(cached[1])
-            self._country_catalog_gate.acquire()
+            if not self._country_catalog_gate.acquire(timeout=2.0):
+                if cached:
+                    return dict(cached[1])
+                raise sqlite3.OperationalError("country catalog busy")
         try:
             cached = self._country_catalog_cache.get(key)
             if cached and cached[0] > time.monotonic():
@@ -2048,7 +2062,10 @@ class NodePool:
         if not self._status_counts_gate.acquire(blocking=False):
             if cached:
                 return dict(cached[1])
-            self._status_counts_gate.acquire()
+            if not self._status_counts_gate.acquire(timeout=2.0):
+                if cached:
+                    return dict(cached[1])
+                raise sqlite3.OperationalError("status counts busy")
         try:
             cached = self._status_counts_cache.get(cache_key)
             if cached and cached[0] > time.monotonic():
@@ -2065,7 +2082,7 @@ class NodePool:
             except sqlite3.OperationalError:
                 if cached:
                     return dict(cached[1])
-                return dict(empty)
+                raise
             buckets: dict[int, int] = {}
             for item in ranked:
                 rank = int(item["rank"])

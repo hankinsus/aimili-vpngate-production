@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.85"
+APP_VERSION = "V1.0.86"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -5701,6 +5701,17 @@ def country_full_sweep(country: str) -> dict[str, Any]:
                     priority_message="后台检测已暂停，转发优先",
                 )
                 return {"ok": True, "paused": True, "country": target, "tested": cursor, "total": len(refs)}
+            pause_reason = _nano_library_pause_reason()
+            if pause_reason:
+                country_full_sweep_running = False
+                probe_engine_running = False
+                set_state(
+                    priority_running=False,
+                    priority_full_sweep_running=False,
+                    priority_message=pause_reason,
+                )
+                log_to_json("INFO", "Probe", f"{target} 全量检测让路：{pause_reason}")
+                return {"ok": True, "paused": True, "country": target, "tested": cursor, "total": len(refs)}
             # A live tunnel, an open page, or a catalog refresh owns the small
             # VM. Wait here instead of opening another tunnel on top of them.
             while (
@@ -10048,7 +10059,8 @@ def resource_collect_loop() -> None:
             time.sleep(5)
             continue
         total_kb, _avail_kb = _meminfo_kb()
-        if 0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024:
+        pause_reason = _nano_library_pause_reason()
+        if (0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024) or pause_reason:
             time.sleep(60)
             continue
         try:
@@ -23479,6 +23491,27 @@ def _self_swap_kb() -> int:
     return _self_status_kb("VmSwap:")
 
 
+def _nano_library_pause_reason() -> str:
+    """Small hosts must not start a catalog write while the data plane is up.
+
+    Empty means a background collect or country sweep may run. This never
+    touches the proxy, the live tunnel, or the list cache.
+    """
+    total_kb, avail_kb = _meminfo_kb()
+    if not (0 < total_kb < 700 * 1024):
+        return ""
+    if _self_swap_kb() > 64 * 1024:
+        return "小机器正在换页，资源库让路"
+    if 0 < avail_kb < 90 * 1024:
+        return "小机器空闲内存不够，资源库让路"
+    try:
+        if active_tunnel_running():
+            return "小机器隧道在用，资源库让路"
+    except Exception:
+        pass
+    return ""
+
+
 def _self_status_kb(prefix: str) -> int:
     try:
         for line in Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines():
@@ -23921,6 +23954,8 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
             log_to_json("INFO", "UI", f"ui_nodes_ms={total_ms} sqlite_ms={sqlite_ms} serialize_ms={max(0, total_ms - sqlite_ms)} country={country or '-'} protocol={protocol or '-'}")
         return ordered, endpoint_total, building
     except Exception as exc:
+        if "busy" in str(exc).lower():
+            raise
         log_to_json("WARNING", "Main", f"按范围读取 Master Pool UI 页面失败，回退 UI 快照: {exc}")
 
     # Emergency compatibility fallback for an unavailable/locked Master Pool.
@@ -24625,17 +24660,23 @@ def _resource_next_interval(history: list[dict[str, Any]] | None = None) -> int:
     rows = list(history if history is not None else _load_resource_history())
     recent = [int(item.get("inserted_endpoints") or 0) for item in rows[-5:]]
     if recent and recent[-1] >= 50:
-        return RESOURCE_COLLECTION_INTERVAL_SECONDS
-    if len(recent) < 5:
-        return RESOURCE_COLLECTION_INTERVAL_SECONDS
-    total = sum(recent)
-    if total <= 0:
-        return RESOURCE_COLLECTION_INTERVAL_MAX
-    if total <= 5:
-        return 1800
-    if total <= 25:
-        return 1200
-    return RESOURCE_COLLECTION_INTERVAL_SECONDS
+        interval = RESOURCE_COLLECTION_INTERVAL_SECONDS
+    elif len(recent) < 5:
+        interval = RESOURCE_COLLECTION_INTERVAL_SECONDS
+    else:
+        total = sum(recent)
+        if total <= 0:
+            interval = RESOURCE_COLLECTION_INTERVAL_MAX
+        elif total <= 5:
+            interval = 1800
+        elif total <= 25:
+            interval = 1200
+        else:
+            interval = RESOURCE_COLLECTION_INTERVAL_SECONDS
+    total_kb, _avail_kb = _meminfo_kb()
+    if 0 < total_kb < 700 * 1024:
+        interval = max(interval, 6 * 3600)
+    return interval
 
 
 def _remember_resource_run(entry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -24673,6 +24714,12 @@ def _probe_new_resource_ids(ids: list[str]) -> None:
 def resource_collect_once(force=False, reason: str = "background", wait: bool = False):
     global resource_engine_running, resource_engine_message, resource_engine_last_at, _resource_last_result
     reason = str(reason or "background")
+    if not force and reason == "background":
+        pause_reason = _nano_library_pause_reason()
+        if pause_reason:
+            return {"ok": True, "skipped": True, "reason": pause_reason}
+        if ui_query_active():
+            return {"ok": True, "skipped": True, "busy": True, "reason": "页面正在读库，资源更新让路"}
     if not force:
         history = _load_resource_history()
         interval = _resource_next_interval(history)
