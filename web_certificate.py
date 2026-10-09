@@ -353,6 +353,9 @@ server {{
     ssl_protocols TLSv1.2 TLSv1.3;
 
     client_max_body_size 100m;
+    keepalive_timeout 15s;
+    client_header_timeout 15s;
+    client_body_timeout 30s;
 
     # Manual node switching is make-before-break and may take several checks
     # when a candidate needs a fallback. Keep the reverse proxy connection alive

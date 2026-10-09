@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.80"
+APP_VERSION = "V1.0.81"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -21030,8 +21030,11 @@ def _run_manual_add_job(value: str) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     # Keep-alive between Nginx and the local manager avoids a fresh backend TCP
-    # connection for every UI state/catalog request.
+    # connection for every UI state/catalog request. An idle UI connection is
+    # closed after 25s. The open page polls inside 10s, so it stays. A tab left
+    # in the background does not hold a thread for the 900s nginx timeout.
     protocol_version = "HTTP/1.1"
+    timeout = 25
 
     def get_secret_path(self) -> str:
         ui_cfg = load_ui_config()
@@ -22943,6 +22946,7 @@ ui_nodes_cache_lock = threading.Lock()
 ui_nodes_cache = []
 ui_nodes_cache_at = 0.0
 ui_nodes_cache_building = False
+_memory_pressure = False
 UI_NODES_CACHE_TTL_SECONDS = 3.0
 bootstrap_connection_lock = threading.Lock()
 resource_engine_running = False
@@ -23335,8 +23339,86 @@ def _first_install_bootstrap_needed():
     except Exception:
         return not BOOTSTRAP_STATE_FILE.exists()
 
+def _meminfo_kb() -> tuple[int, int]:
+    total = 0
+    avail = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("MemTotal:"):
+                total = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                avail = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0, 0
+    return total, avail
+
+
+def _data_plane_reserve_kb(total_kb: int) -> int:
+    """Free RAM kept for the proxy, tunnel and kernel. The UI cache is not part of this."""
+    if total_kb < 700 * 1024:
+        return 80 * 1024
+    return 160 * 1024
+
+
+def _reclaim_manager_caches() -> None:
+    """Drop UI snapshots only. Does not touch 8500, the tunnel, or client sockets."""
+    global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
+    import gc
+    with ui_nodes_cache_lock:
+        ui_nodes_cache = []
+        ui_nodes_cache_at = 0.0
+        ui_nodes_cache_building = False
+    with _first_page_snapshot_lock:
+        _first_page_snapshot.clear()
+    try:
+        with _scheme_snap_lock:
+            _scheme_snap["at"] = 0.0
+            _scheme_snap["value"] = None
+    except Exception:
+        pass
+    try:
+        node_pool.invalidate_ui_lists()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def memory_guard_loop() -> None:
+    """When free RAM falls under the exit reserve, release the management caches."""
+    global _memory_pressure
+    time.sleep(20)
+    last_log = 0.0
+    while True:
+        try:
+            total, avail = _meminfo_kb()
+            reserve = _data_plane_reserve_kb(total)
+            if avail and avail < reserve:
+                _memory_pressure = True
+                _reclaim_manager_caches()
+                now = time.time()
+                if now - last_log > 60:
+                    last_log = now
+                    log_to_json(
+                        "INFO",
+                        "Memory",
+                        f"可用内存 {avail // 1024}MB 低于出口预留 {reserve // 1024}MB，已释放管理缓存，转发未动",
+                    )
+            elif _memory_pressure and avail > reserve + 40 * 1024:
+                _memory_pressure = False
+        except Exception as exc:
+            log_to_json("ERROR", "Memory", f"内存回收异常: {exc}")
+        time.sleep(15)
+
+
 def _refresh_ui_nodes_cache_async(force=False):
     global ui_nodes_cache_building
+    if _memory_pressure:
+        return
     with ui_nodes_cache_lock:
         fresh = bool(ui_nodes_cache) and (time.time() - ui_nodes_cache_at) < UI_NODES_CACHE_TTL_SECONDS
         if ui_nodes_cache_building or (not force and fresh):
@@ -24882,6 +24964,7 @@ def main() -> None:
     env["VPNGATE_DATA_DIR"] = str(DATA_DIR)
     env["LOCAL_PROXY_HOST"] = LOCAL_PROXY_HOST
     env["LOCAL_PROXY_PORT"] = str(LOCAL_PROXY_PORT)
+    env.setdefault("MALLOC_ARENA_MAX", "2")
     proc = subprocess.Popen(
         [sys.executable, str(ROOT_DIR / "proxy_server.py")],
         cwd=str(ROOT_DIR),
@@ -24960,6 +25043,7 @@ def main() -> None:
     if ENABLE_PROTOCOL_PROBE_LOOP:
         threading.Thread(target=protocol_probe_loop, daemon=True).start()
         enabled_loops.append("protocol-probe")
+    threading.Thread(target=memory_guard_loop, daemon=True, name="memory-guard").start()
     threading.Thread(target=warm_first_page_loop, daemon=True, name="warm-first-page").start()
     threading.Thread(target=warm_standby_loop, daemon=True, name="warm-standby").start()
     threading.Thread(target=cold_standby_loop, daemon=True, name="cold-standby").start()

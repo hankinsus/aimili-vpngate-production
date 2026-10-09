@@ -2059,7 +2059,7 @@ class _SpliceLeg:
 
 def _pipe_cap(read_fd: int) -> int:
     try:
-        fcntl.fcntl(read_fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 1024 * 1024)
+        fcntl.fcntl(read_fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 256 * 1024)
     except (OSError, AttributeError):
         pass
     try:
@@ -2137,6 +2137,8 @@ def _relay_splice(left: socket.socket, right: socket.socket) -> None:
             os.set_blocking(pipe_w, False)
             legs.append(_SpliceLeg(src, dst, pipe_r, pipe_w, _pipe_cap(pipe_r)))
         moved = False
+        stalls = 0
+        idle_polls = 0
         while True:
             progressed = False
             for leg in legs:
@@ -2172,17 +2174,32 @@ def _relay_splice(left: socket.socket, right: socket.socket) -> None:
             if all(leg.dst_shut for leg in legs):
                 return
             if progressed:
+                stalls = 0
+                idle_polls = 0
                 continue
             rlist = [leg.src for leg in legs if not leg.src_eof and leg.pending < leg.cap]
             wlist = [leg.dst for leg in legs if leg.pending and not leg.dst_shut]
             if not rlist and not wlist:
                 return
             try:
-                _readable, _writable, errored = _poll_ready(rlist, wlist, 60)
+                readable, writable, errored = _poll_ready(rlist, wlist, 30)
             except (OSError, ValueError):
                 return
             if errored:
                 return
+            # No bytes and no socket event: an idle browser/xray connection.
+            # A live page or video keeps moving bytes, so it is not closed.
+            if not readable and not writable:
+                stalls = 0
+                idle_polls += 1
+                if idle_polls >= 4:
+                    return
+                continue
+            # Readable or writable but nothing moved: a wedged or corrupt packet.
+            stalls += 1
+            if stalls >= 20:
+                return
+            time.sleep(0.02)
     except _SpliceUnsupported:
         raise
     except OSError:
@@ -2210,6 +2227,8 @@ def _relay_copy(left: socket.socket, right: socket.socket) -> None:
     bufs: dict[socket.socket, bytearray] = {left: bytearray(), right: bytearray()}
     offs = {left: 0, right: 0}
     closed = {left: False, right: False}
+    idle_polls = 0
+    stalls = 0
     while True:
         if all(closed[sock] and offs[sock] >= len(bufs[sock]) for sock in peers):
             return
@@ -2218,18 +2237,25 @@ def _relay_copy(left: socket.socket, right: socket.socket) -> None:
         for sock in peers:
             other = right if sock is left else left
             pending_other = len(bufs[other]) - offs[other]
-            if not closed[sock] and pending_other < 1024 * 1024:
+            if not closed[sock] and pending_other < 256 * 1024:
                 rlist.append(sock)
             if offs[sock] < len(bufs[sock]):
                 wlist.append(sock)
         if not rlist and not wlist:
             return
         try:
-            readable, writable, errored = _poll_ready(rlist, wlist, 60)
+            readable, writable, errored = _poll_ready(rlist, wlist, 30)
         except (OSError, ValueError):
             return
         if errored:
             return
+        if not readable and not writable:
+            stalls = 0
+            idle_polls += 1
+            if idle_polls >= 4:
+                return
+            continue
+        moved = False
         for sock in writable:
             start = offs[sock]
             if start >= len(bufs[sock]):
@@ -2248,6 +2274,7 @@ def _relay_copy(left: socket.socket, right: socket.socket) -> None:
                 return
             offs[sock] = start + sent
             note_proxy_forwarded(sent)
+            moved = True
             if offs[sock] >= 256 * 1024 or offs[sock] >= len(bufs[sock]):
                 if offs[sock] >= len(bufs[sock]):
                     bufs[sock].clear()
@@ -2266,10 +2293,19 @@ def _relay_copy(left: socket.socket, right: socket.socket) -> None:
             if not data:
                 closed[sock] = True
                 continue
+            moved = True
             if offs[other] and offs[other] >= len(bufs[other]):
                 bufs[other].clear()
                 offs[other] = 0
             bufs[other].extend(data)
+        if moved:
+            stalls = 0
+            idle_polls = 0
+        else:
+            stalls += 1
+            if stalls >= 20:
+                return
+            time.sleep(0.02)
 
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
