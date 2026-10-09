@@ -20805,7 +20805,7 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                 proxy_error="",
                 last_check_message=note,
             )
-            log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip} · udp={'ok' if udp.get('ok') else udp.get('error')} · quic={'ok' if quic_ok else quic.get('error')}")
+            log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip}")
             report = proxy_server.egress_switch_report()
             summary = (
                 f"generation={report.get('generation')} mode={mode} "
@@ -20815,8 +20815,7 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                 f"udp_live={report.get('udp_live')} "
                 f"old_iface={report.get('old_iface') or '-'} "
                 f"new_iface={report.get('new_iface') or '-'} "
-                f"tcp_health=ok udp_health={'ok' if udp.get('ok') else 'fail'} "
-                f"quic_health={'ok' if quic_ok else 'fail'}"
+                f"tcp_health=ok"
             )
             print(f"[网关] {summary}", flush=True)
             log_to_json("INFO", "Proxy", summary)
