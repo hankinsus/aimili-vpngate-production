@@ -1242,12 +1242,36 @@ def _nodes_index_get() -> dict[str, dict[str, Any]]:
     loaded: dict[str, dict[str, Any]] = {}
     for node in read_nodes():
         nid = str(node.get("id") or "")
-        if nid:
-            loaded[nid] = node
+        if not nid:
+            continue
+        # OpenVPN bodies are about 10KB each and already live in configs/.
+        # Keeping all of them in this process is what pushed the 512MB host
+        # into swap. The file is read only when a tunnel is actually started.
+        item = dict(node)
+        config_path = str(item.get("config_file") or "").strip()
+        if config_path and Path(config_path).is_file():
+            item.pop("config_text", None)
+        loaded[nid] = item
     with _nodes_index_lock:
         if _nodes_index is None:
             _nodes_index = loaded
         return _nodes_index
+
+
+def node_config_text(node: dict[str, Any] | None) -> str:
+    """OpenVPN profile. Prefer the copy already in memory, otherwise the file."""
+    if not isinstance(node, dict):
+        return ""
+    text = str(node.get("config_text") or "")
+    if text.strip():
+        return text
+    path = str(node.get("config_file") or "").strip()
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _remember_openvpn_node(node: dict[str, Any]) -> None:
@@ -2394,12 +2418,12 @@ def _openvpn_udp_has_tls_auth(endpoint: dict[str, Any]) -> bool:
         metadata.get("config_file"),
     ]
     node_id = str(metadata.get("node_id") or endpoint.get("id") or "").strip()
-    if node_id:
+    if node_id and not any(str(p or "").strip() for p in paths):
         try:
             cached = _nodes_index_get().get(node_id) or {}
         except Exception:
             cached = {}
-        if _config_has_tls_auth(str(cached.get("config_text") or "")):
+        if _config_has_tls_auth(node_config_text(cached)):
             return True
         if cached.get("config_file"):
             paths.append(cached.get("config_file"))
@@ -6082,7 +6106,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "port": p,
             "current_ip": n_info.get("ip") or h,
             "hostname": h,
-            "config_text": n_info.get("config_text") or "",
+            "config_text": node_config_text(n_info),
             "config_file": n_info.get("config_file") or "",
             "id": node_id,
         })
@@ -6673,12 +6697,13 @@ def warm_first_page_loop() -> None:
                     if country_key in seen:
                         continue
                     seen.add(country_key)
-                    nodes, total, building = _get_ui_nodes_page(0, 60, country, "usable")
+                    page_limit = ui_list_page_size()
+                    nodes, total, building = _get_ui_nodes_page(0, page_limit, country, "usable")
                     body = {
                         "ok": True,
                         "nodes": nodes,
                         "offset": 0,
-                        "limit": 60,
+                        "limit": page_limit,
                         "total": total,
                         "has_more": len(nodes) < int(total or 0),
                         "cache_building": bool(building),
@@ -14844,7 +14869,7 @@ let nodes=[], state={}, testingNodeIds = new Set(), waitingNodeIds = new Set();
 const manualTestQueue = [];
 const BOOT_SERVER_COUNTRY = __BOOT_SERVER_COUNTRY_JSON__;
 let currentPage = 1;
-const pageSize = 50;
+const pageSize = __UI_PAGE_SIZE__;
 let currentPageNodes = [];
 
 const translateProtocol = p => {
@@ -20294,6 +20319,7 @@ def cached_index_page(boot_country: str) -> tuple[str, bytes, bytes]:
     page = (
         INDEX_HTML
         .replace("__BOOT_SERVER_COUNTRY_JSON__", json.dumps(boot_country, ensure_ascii=False))
+        .replace("__UI_PAGE_SIZE__", str(ui_list_page_size()))
         .replace("__APP_VERSION__", APP_VERSION)
         .encode("utf-8")
     )
@@ -21983,8 +22009,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "state": _get_fast_nodes_state(), "ui_command": ui_command_plane.ui_state()})
         elif effective_path == "/api/ui/nodes":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            page_cap = ui_list_page_size()
             offset = bounded_int((query.get("offset") or ["0"])[0], 0, 0, 200000)
-            limit = bounded_int((query.get("limit") or ["100"])[0], 100, 1, 200)
+            limit = bounded_int((query.get("limit") or [str(page_cap)])[0], page_cap, 1, page_cap)
             country = str((query.get("country") or [""])[0]).strip()
             status = str((query.get("status") or [""])[0]).strip().lower()
             protocol = str((query.get("protocol") or [""])[0]).strip().lower()
@@ -22171,13 +22198,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(b"0" * requested, "application/octet-stream")
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
-            with lock:
-                nodes = read_nodes()
-                node = next((n for n in nodes if Path(n.get("config_file", "")).name == filename), None)
-            if node and node.get("config_text"):
-                self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
-            else:
-                self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            safe_name = Path(filename).name
+            config_path = CONFIG_DIR / safe_name
+            if safe_name and safe_name == filename and config_path.is_file():
+                try:
+                    self.send_bytes(config_path.read_bytes(), "application/x-openvpn-profile")
+                    return
+                except OSError:
+                    pass
+            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         elif effective_path == "/api/gateway_status":
             web_ui_status = {
                 "name": "Web 管理服务",
@@ -23967,6 +23996,14 @@ def _meminfo_kb() -> tuple[int, int]:
     return total, avail
 
 
+def ui_list_page_size() -> int:
+    """512MB class serves 30 rows. 1GB and above serves 50."""
+    total, _avail = _meminfo_kb()
+    if 0 < total < 800 * 1024:
+        return 30
+    return 50
+
+
 def _self_rss_kb() -> int:
     return _self_status_kb("VmRSS:")
 
@@ -24020,9 +24057,30 @@ def memory_guard_loop() -> None:
             total, _avail = _meminfo_kb()
             rss = _self_rss_kb()
             swap = _self_swap_kb()
+            global _nodes_index
             # Free arenas only. Do not drop the list index: the previous guard
             # did that whenever free RAM was under 80MB, which is the normal
             # state of this 512MB host, and every filter then scanned cold.
+            if swap > 48 * 1024 and total < 800 * 1024:
+                # The OpenVPN index is the large long-lived object on this box.
+                # Dropping it does not touch the SQLite list index or the proxy.
+                dropped = False
+                with _nodes_index_lock:
+                    if _nodes_index is not None:
+                        _nodes_index = None
+                        dropped = True
+                if dropped:
+                    try:
+                        import gc
+                        gc.collect()
+                    except Exception:
+                        pass
+                    try:
+                        import ctypes
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:
+                        pass
+                    log_to_json("INFO", "Memory", f"管理进程换页 {swap // 1024}MB，已释放 OpenVPN 配置索引")
             if swap > 64 * 1024:
                 try:
                     import gc

@@ -1167,6 +1167,13 @@ class NodePool:
                     best[identity] = item
             ordered = sorted(best.values(), key=lambda item: (item["rank"], item["lat_sort"], item["endpoint_id"]))
             self._ui_order_cache[key] = (time.monotonic() + 60.0, ordered)
+            if len(self._ui_order_cache) > 4:
+                for stale in list(self._ui_order_cache):
+                    if stale == key:
+                        continue
+                    if len(self._ui_order_cache) <= 4:
+                        break
+                    self._ui_order_cache.pop(stale, None)
             return ordered
         finally:
             self._ui_order_lock.release()
