@@ -1,0 +1,34 @@
+name: japan-external-client
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-client:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - name: Connect to Japan from a GitHub Windows runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $target = "jpai.netsecai.com"
+          foreach ($port in 443, 8443) {
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            try {
+              $wait = $tcp.BeginConnect($target, $port, $null, $null)
+              $ok = $wait.AsyncWaitHandle.WaitOne(8000, $false)
+              if ($ok) { $tcp.EndConnect($wait) }
+              $sw.Stop()
+              if ($ok) { Write-Output "tcp $port ok $($sw.ElapsedMilliseconds)ms" }
+              else { Write-Output "tcp $port timeout $($sw.ElapsedMilliseconds)ms" }
+            } catch {
+              $sw.Stop()
+              Write-Output "tcp $port fail $($sw.ElapsedMilliseconds)ms"
+            } finally {
+              $tcp.Close()
+            }
+          }
+          curl.exe -sk -o NUL -w "https8443 %{http_code} %{time_connect} %{time_starttransfer} %{time_total}`n" --max-time 20 "https://${target}:8443/"
+          curl.exe -sk -o NUL -w "https443 %{http_code} %{time_connect} %{time_starttransfer} %{time_total}`n" --max-time 20 "https://${target}:443/"

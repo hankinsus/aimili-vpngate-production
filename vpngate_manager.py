@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.84"
+APP_VERSION = "V1.0.85"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -9063,6 +9063,11 @@ def _library_wait_until_slot(generation: int) -> str:
             _library_set_wait("页面正在筛选，检测让路，等待不算失败")
             time.sleep(0.3)
             continue
+        total_kb, _avail_kb = _meminfo_kb()
+        if 0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024:
+            _library_set_wait("内存正在换页，检测让路，等待不算失败")
+            time.sleep(2.0)
+            continue
         _library_set_wait("")
         return "go"
 
@@ -9313,6 +9318,9 @@ def maybe_start_scheduled_library_check() -> None:
         return
     if not global_scan_due():
         return
+    total_kb, _avail_kb = _meminfo_kb()
+    if 0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024:
+        return
     if (
         proxy_server.proxy_forwarding_busy()
         or is_connecting
@@ -9521,6 +9529,14 @@ def _library_check_worker(generation: int) -> None:
             if any(outcomes.get(endpoint_id, ("", 0, ""))[0] == "stop" for endpoint_id in futures.values()):
                 break
             index += len(batch)
+            if 0 < total_kb < 700 * 1024:
+                if probe_started and time.time() - probe_started >= LIBRARY_IDLE_FAST_LIMIT:
+                    log_to_json("INFO", "Probe", "小机器本轮全球库检测已满 15 分钟，剩下的留到下次，避免把出口卡死")
+                    with library_check_lock:
+                        if library_check_generation == generation:
+                            library_check_message = "本轮检测暂停：小机器已检测 15 分钟，剩余留到下次"
+                    break
+                time.sleep(1.0)
     except Exception as exc:
         log_to_json("ERROR", "Probe", f"全球库检测异常: {exc}")
         with library_check_lock:
@@ -10030,6 +10046,10 @@ def resource_collect_loop() -> None:
     while True:
         if background_paused():
             time.sleep(5)
+            continue
+        total_kb, _avail_kb = _meminfo_kb()
+        if 0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024:
+            time.sleep(60)
             continue
         try:
             if (not ISOLATED_INSTANCE and not initial_bootstrap_active
@@ -20625,7 +20645,11 @@ def _promote_live_standby() -> bool:
     if validated_at and age_ms <= 2000:
         log_to_json("INFO", "Standby", f"热备 {dev} 健康 {age_ms} ms，直接接管")
     else:
-        log_to_json("INFO", "Standby", f"热备 {dev} 健康记录 {age_ms} ms，不再等待探测，直接接管")
+        confirmed, detail = _probe_iface_tcp(dev, 1.5)
+        if not confirmed:
+            log_to_json("INFO", "Standby", f"热备 {dev} 健康记录已过期 {age_ms} ms，复测未通过，不接管: {detail}")
+            return False
+        log_to_json("INFO", "Standby", f"热备 {dev} 健康记录 {age_ms} ms，复测通过后接管")
     adopted = take_standby(node_id)
     if not adopted or (adopted.get("process") is None and adopted.get("tunnel") is None):
         return False
@@ -23483,6 +23507,11 @@ def memory_guard_loop() -> None:
             # did that whenever free RAM was under 80MB, which is the normal
             # state of this 512MB host, and every filter then scanned cold.
             if swap > 64 * 1024:
+                try:
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
                 try:
                     import ctypes
                     ctypes.CDLL("libc.so.6").malloc_trim(0)
