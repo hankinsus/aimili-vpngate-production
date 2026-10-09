@@ -24044,32 +24044,49 @@ def _self_status_kb(prefix: str) -> int:
 
 
 def memory_guard_loop() -> None:
-    """Shrink only this process, and only when it is actually oversized.
+    """Shrink only this process. Never signal the proxy, xray, or the tunnel.
 
-    A 512MB machine sits at 40–70MB free while healthy. The previous guard
-    treated that as pressure, wiped the list cache every 15 seconds and ran
-    gc.collect(). Filters then scanned the whole pool and the page timed out.
-    The proxy and the tunnel are other processes; this loop never signals them.
+    On a 512MB host the manager's cold pages belong in swap. gc.collect()
+    walks them back into RAM and the kernel then swaps the proxy. Release the
+    OpenVPN config index if it is still held, and drop the page cache only
+    when almost no memory is reclaimable. 1GB hosts keep the old behavior.
     """
     time.sleep(60)
+    global _nodes_index, ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
     while True:
         try:
-            total, _avail = _meminfo_kb()
+            total, avail = _meminfo_kb()
             rss = _self_rss_kb()
             swap = _self_swap_kb()
-            global _nodes_index
-            # Free arenas only. Do not drop the list index: the previous guard
-            # did that whenever free RAM was under 80MB, which is the normal
-            # state of this 512MB host, and every filter then scanned cold.
-            if swap > 48 * 1024 and total < 800 * 1024:
-                # The OpenVPN index is the large long-lived object on this box.
-                # Dropping it does not touch the SQLite list index or the proxy.
-                dropped = False
-                with _nodes_index_lock:
-                    if _nodes_index is not None:
-                        _nodes_index = None
-                        dropped = True
-                if dropped:
+            small = 0 < total < 800 * 1024
+            if small:
+                if swap > 32 * 1024:
+                    with _nodes_index_lock:
+                        if _nodes_index is not None:
+                            _nodes_index = None
+                            try:
+                                import ctypes
+                                ctypes.CDLL("libc.so.6").malloc_trim(0)
+                            except Exception:
+                                pass
+                            log_to_json(
+                                "INFO",
+                                "Memory",
+                                f"管理进程换页 {swap // 1024}MB，已释放 OpenVPN 配置索引，未把换出的页拉回内存",
+                            )
+                if 0 < avail < 40 * 1024:
+                    try:
+                        Path("/proc/sys/vm/drop_caches").write_text("1")
+                        log_to_json(
+                            "INFO",
+                            "Memory",
+                            f"可用内存 {avail // 1024}MB，已丢掉页缓存，转发进程未动",
+                        )
+                    except OSError:
+                        pass
+                cap = 80 * 1024
+            else:
+                if swap > 64 * 1024:
                     try:
                         import gc
                         gc.collect()
@@ -24080,21 +24097,8 @@ def memory_guard_loop() -> None:
                         ctypes.CDLL("libc.so.6").malloc_trim(0)
                     except Exception:
                         pass
-                    log_to_json("INFO", "Memory", f"管理进程换页 {swap // 1024}MB，已释放 OpenVPN 配置索引")
-            if swap > 64 * 1024:
-                try:
-                    import gc
-                    gc.collect()
-                except Exception:
-                    pass
-                try:
-                    import ctypes
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
-            cap = 140 * 1024 if total < 700 * 1024 else 320 * 1024
+                cap = 320 * 1024
             if rss > cap:
-                global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
                 with ui_nodes_cache_lock:
                     ui_nodes_cache = []
                     ui_nodes_cache_at = 0.0
