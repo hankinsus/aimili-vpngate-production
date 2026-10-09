@@ -1166,9 +1166,9 @@ class NodePool:
             ip_type=ip_type,
         )
         sql = (
-            "SELECT endpoint_id, protocol, server_key, status FROM ("
+            "SELECT endpoint_id, protocol, server_key, status, country FROM ("
             "SELECT e.endpoint_id AS endpoint_id, e.protocol AS protocol, "
-            "e.server_key AS server_key, e.status AS status, "
+            "e.server_key AS server_key, e.status AS status, s.country AS country, "
             "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY e.endpoint_id) AS _rn "
             "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
             + " AND ".join(where)

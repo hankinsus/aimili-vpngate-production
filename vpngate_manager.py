@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.77"
+APP_VERSION = "V1.0.78"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -6736,7 +6736,13 @@ def warm_standby_loop() -> None:
         time.sleep(8)
 
 COLD_PORT_SECONDS = 60
-COLD_CONNECT_SECONDS = 600
+COLD_REAL_SECONDS = 10 * 60
+PRECOLD_REAL_SECONDS = 20 * 60
+SUBSTITUTE_REAL_SECONDS = 40 * 60
+STANDBY_REAL_GAP_SECONDS = 3 * 60
+LIBRARY_IDLE_FAST_SECONDS = 3 * 3600
+LIBRARY_IDLE_SLOW_SECONDS = 6 * 3600
+LIBRARY_IDLE_FAST_LIMIT = 15 * 60
 PRECOLD_TARGET = 5
 _cold_guard = threading.Lock()
 _cold_mem: dict[str, Any] | None = None
@@ -6754,6 +6760,7 @@ def _load_cold_state() -> dict[str, Any]:
         "precold_detail": raw.get("precold_detail") if isinstance(raw.get("precold_detail"), dict) else {},
         "published": str(raw.get("published") or ""),
         "last_connect": float(raw.get("last_connect") or 0),
+        "last_real_any": float(raw.get("last_real_any") or 0),
         "real_at": _cold_real_at(raw.get("real_at")),
     }
 
@@ -6776,16 +6783,6 @@ def _save_cold_state() -> None:
         write_json(DATA_DIR / "cold_standby.json", snapshot)
     except Exception:
         pass
-
-
-def _cold_skips_port(endpoint: dict[str, Any]) -> bool:
-    protocol = str(endpoint.get("protocol") or "").lower()
-    transport = str(endpoint.get("transport") or "").lower()
-    if protocol == "l2tp-ipsec" or transport == "udp":
-        return True
-    if protocol == "openvpn" and transport != "tcp":
-        return True
-    return False
 
 
 def _endpoint_speed_bps(endpoint: dict[str, Any]) -> int:
@@ -7157,16 +7154,11 @@ def _publish_cold_standby(endpoint: dict[str, Any] | None) -> None:
 
 
 def _cold_port_open(endpoint: dict[str, Any]) -> bool | None:
-    if _cold_skips_port(endpoint):
+    """One-minute spare check. TCP is a port connect, UDP is one protocol packet. Never a tunnel."""
+    result = light_probe_endpoint(endpoint)
+    if result.get("inconclusive"):
         return None
-    host = _endpoint_ip(endpoint) or str(endpoint.get("hostname") or "").strip()
-    try:
-        port = int(endpoint.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    if not host or port <= 0:
-        return None
-    return _tcp_port_open(host, port, timeout=1.5)
+    return bool(result.get("ok"))
 
 
 _cold_promote_lock = threading.Lock()
@@ -7521,8 +7513,58 @@ def _standby_is_live(eid: str, endpoint: dict[str, Any] | None) -> bool:
     return bool(node_id and node_id == str(active_openvpn_node_id or ""))
 
 
+def _standby_role_interval(eid: str, cold: dict[str, Any]) -> tuple[str, int]:
+    """Cold is the only one on a 10 minute real check. The bench behind it waits longer."""
+    published = _cold_eid(str(cold.get("published") or ""))
+    if eid and eid == published:
+        return "冷备", COLD_REAL_SECONDS
+    precold_ids = {_cold_eid(item) for item in (cold.get("precold") or [])}
+    if eid in precold_ids:
+        return "预冷备", PRECOLD_REAL_SECONDS
+    return "替补预冷备", SUBSTITUTE_REAL_SECONDS
+
+
+def _light_check_spare_bench(candidates: dict[str, dict[str, Any]]) -> None:
+    """One light probe each for precold and substitutes. Rotate a single dead spare."""
+    if library_check_phase in ("running", "paused"):
+        return
+    if is_connecting or manual_connection_active or ui_query_active():
+        return
+    try:
+        if proxy_server.proxy_forwarding_busy():
+            return
+    except Exception:
+        return
+    cold = _cold_state()
+    published = _cold_eid(str(cold.get("published") or ""))
+    bench = [eid for eid in _standby_real_ids(candidates) if eid and eid != published]
+    for eid in bench:
+        endpoint = candidates.get(eid) or {}
+        if not endpoint or _standby_is_live(eid, endpoint):
+            continue
+        if _cold_port_open(endpoint) is not False:
+            continue
+        role, _interval = _standby_role_interval(eid, cold)
+        log_to_json(
+            "INFO",
+            "Standby",
+            f"{role}端口不可用，排到队尾 {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}",
+        )
+        _rotate_cold(eid, candidates)
+        cold = _cold_state()
+        cold["precold"] = [item for item in (cold.get("precold") or []) if _cold_eid(item) != eid]
+        _save_cold_state()
+        chosen = _pick_cold(candidates)
+        _publish_cold_standby(chosen)
+        _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
+        return
+
+
 def _verify_one_standby_real(candidates: dict[str, dict[str, Any]]) -> None:
-    """One real tunnel per cold pass. Everyone else stays on the light probe."""
+    """At most one real tunnel plus a webpage. Cold every 10 minutes and it goes first.
+    Precold every 20 minutes, substitutes every 40. Anyone except cold waits 3 minutes
+    after the previous real tunnel, so the bench is not a scan.
+    """
     if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
         return
     if library_check_phase in ("running", "paused"):
@@ -7538,59 +7580,77 @@ def _verify_one_standby_real(candidates: dict[str, dict[str, Any]]) -> None:
     now = time.time()
     cold = _cold_state()
     real_at = dict(cold.get("real_at") or {})
+    last_any = float(cold.get("last_real_any") or 0)
+    gap_ok = (now - last_any) >= STANDBY_REAL_GAP_SECONDS
+    chosen_eid = ""
     for eid in bench:
         endpoint = candidates.get(eid) or {}
         if _standby_is_live(eid, endpoint):
             continue
-        if now - float(real_at.get(eid) or 0) < COLD_CONNECT_SECONDS:
+        role, interval = _standby_role_interval(eid, cold)
+        if now - float(real_at.get(eid) or 0) < interval:
             continue
-        protocol = str(endpoint.get("protocol") or "").lower()
-        ok = False
-        skipped = False
-        message = ""
-        try:
-            if protocol == "openvpn":
-                node_id = ensure_openvpn_node_from_pool(endpoint)
-                node = test_node_by_id(node_id)
-                message = str(node.get("probe_message") or "")
-                if "让路" in message:
-                    skipped = True
-                else:
-                    ok = str(node.get("probe_status") or "") == "available"
+        if role != "冷备" and not gap_ok:
+            continue
+        chosen_eid = eid
+        break
+    if not chosen_eid:
+        return
+    eid = chosen_eid
+    endpoint = candidates.get(eid) or {}
+    protocol = str(endpoint.get("protocol") or "").lower()
+    ok = False
+    skipped = False
+    message = ""
+    try:
+        if protocol == "openvpn":
+            node_id = ensure_openvpn_node_from_pool(endpoint)
+            node = test_node_by_id(node_id)
+            message = str(node.get("probe_message") or "")
+            if "让路" in message:
+                skipped = True
             else:
-                result = probe_pool_endpoint(eid)
-                if result.get("skipped"):
-                    skipped = True
-                    message = str(result.get("error") or "真实连接让路")
-                else:
-                    ok = bool(result.get("ok"))
-                    message = str(result.get("message") or result.get("error") or "")
-        except Exception as exc:
-            ok = False
-            message = str(exc)
-        if skipped:
-            continue
-        label = f"{protocol} {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}"
+                ok = str(node.get("probe_status") or "") == "available"
+        else:
+            result = probe_pool_endpoint(eid)
+            if result.get("skipped"):
+                skipped = True
+                message = str(result.get("error") or "真实连接让路")
+            else:
+                ok = bool(result.get("ok"))
+                message = str(result.get("message") or result.get("error") or "")
+    except Exception as exc:
+        ok = False
+        message = str(exc)
+    if skipped:
         cold = _cold_state()
+        role, interval = _standby_role_interval(eid, cold)
+        now_skip = time.time()
+        cold["last_real_any"] = now_skip
         stamped = dict(cold.get("real_at") or {})
-        stamped[eid] = time.time()
+        stamped[eid] = now_skip - interval + STANDBY_REAL_GAP_SECONDS
         cold["real_at"] = stamped
         _save_cold_state()
-        published = _cold_eid(str(cold.get("published") or ""))
-        precold_ids = {_cold_eid(item) for item in (cold.get("precold") or [])}
-        role = "冷备" if eid == published else ("预冷备" if eid in precold_ids else "替补预冷备")
-        if ok:
-            log_to_json("INFO", "Standby", f"{role}真实连接通过 {label} {message}")
-            return
-        log_to_json("INFO", "Standby", f"{role}真实连接未通过，换下一个 {label}: {message}")
-        _rotate_cold(eid, candidates)
-        cold = _cold_state()
-        cold["precold"] = [item for item in (cold.get("precold") or []) if _cold_eid(item) != eid]
-        _save_cold_state()
-        chosen = _pick_cold(candidates)
-        _publish_cold_standby(chosen)
-        _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
         return
+    label = f"{protocol} {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}"
+    cold = _cold_state()
+    stamped = dict(cold.get("real_at") or {})
+    stamped[eid] = time.time()
+    cold["real_at"] = stamped
+    cold["last_real_any"] = stamped[eid]
+    _save_cold_state()
+    role, _interval = _standby_role_interval(eid, cold)
+    if ok:
+        log_to_json("INFO", "Standby", f"{role}真实连接通过 {label} {message}")
+        return
+    log_to_json("INFO", "Standby", f"{role}真实连接未通过，换下一个 {label}: {message}")
+    _rotate_cold(eid, candidates)
+    cold = _cold_state()
+    cold["precold"] = [item for item in (cold.get("precold") or []) if _cold_eid(item) != eid]
+    _save_cold_state()
+    chosen = _pick_cold(candidates)
+    _publish_cold_standby(chosen)
+    _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
 
 
 def cold_standby_pass() -> None:
@@ -7654,6 +7714,7 @@ def cold_standby_pass() -> None:
     _publish_cold_standby(chosen)
     _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
     if active_tunnel_running() and not proxy_server.proxy_forwarding_busy():
+        _light_check_spare_bench(candidates)
         _verify_one_standby_real(candidates)
     if active_tunnel_running() or proxy_server.proxy_forwarding_busy():
         if active_tunnel_running() and proxy_server.get_egress_mode() == "direct" and _auto_direct_fallback_active():
@@ -9057,7 +9118,23 @@ def global_scan_settings() -> dict[str, Any]:
         "hour": hour,
         "interval": interval,
         "last": last,
+        "last_duration": _scan_last_duration(cfg),
     }
+
+
+def _scan_last_duration(cfg: dict[str, Any] | None = None) -> float:
+    raw = cfg if isinstance(cfg, dict) else load_ui_config()
+    try:
+        return max(0.0, float(raw.get("last_global_scan_seconds") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _library_idle_interval_seconds(last_duration: float) -> int:
+    """3 hours when the last idle sweep finished within 15 minutes, otherwise 6."""
+    if last_duration > LIBRARY_IDLE_FAST_LIMIT:
+        return LIBRARY_IDLE_SLOW_SECONDS
+    return LIBRARY_IDLE_FAST_SECONDS
 
 
 def global_scan_public_state() -> dict[str, Any]:
@@ -9110,7 +9187,7 @@ def save_global_scan_settings(changes: dict[str, Any]) -> dict[str, Any]:
     return global_scan_public_state()
 
 
-def remember_global_scan(when: float | None = None) -> None:
+def remember_global_scan(when: float | None = None, duration: float | None = None) -> None:
     with lock:
         path = DATA_DIR / "ui_auth.json"
         stored: dict[str, Any] = {}
@@ -9121,7 +9198,10 @@ def remember_global_scan(when: float | None = None) -> None:
                     stored = loaded
             except Exception:
                 stored = {}
-        stored["last_global_scan_at"] = float(when if when is not None else time.time())
+        if when is not None or duration is None:
+            stored["last_global_scan_at"] = float(when if when is not None else time.time())
+        if duration is not None:
+            stored["last_global_scan_seconds"] = max(0.0, float(duration))
         write_json(path, stored)
     invalidate_ui_config_cache()
 
@@ -9135,7 +9215,7 @@ def global_scan_due(now: float | None = None) -> bool:
         if last <= 0:
             remember_global_scan(now)
             return False
-        return (now - last) >= 6 * 3600
+        return (now - last) >= _library_idle_interval_seconds(float(settings.get("last_duration") or 0))
     if settings["mode"] == "loop":
         last = settings["last"]
         if last <= 0:
@@ -9168,7 +9248,12 @@ def maybe_start_scheduled_library_check() -> None:
         return
     library_check_control("start", {"reason": "scheduled_global_scan"})
     remember_global_scan()
-    mode = "每 6 小时" if not global_scan_settings()["auto"] else global_scan_settings()["mode"]
+    settings = global_scan_settings()
+    if not settings["auto"]:
+        hours = _library_idle_interval_seconds(float(settings.get("last_duration") or 0)) // 3600
+        mode = f"每 {hours} 小时"
+    else:
+        mode = settings["mode"]
     log_to_json("INFO", "Probe", f"空闲，按计划开始全球库检测（{mode}）")
 
 
@@ -9244,6 +9329,7 @@ def _library_check_worker(generation: int) -> None:
     global library_check_rate_seconds, library_check_rate_samples
     global library_check_message, library_check_wait_reason
     global library_check_stop, library_check_paused
+    probe_started = 0.0
     try:
         reason = str(library_check_fetch_reason or "manual_global_scan")
         with library_check_lock:
@@ -9273,7 +9359,21 @@ def _library_check_worker(generation: int) -> None:
                 skipped += 1
                 continue
             ready_rows.append(row)
-        ready_rows.sort(key=lambda item: (_library_status_rank(str(item.get("status") or "")), str(item.get("endpoint_id") or "")))
+        home = ""
+        try:
+            ui_cfg = load_ui_config()
+            home = normalized_country_name(
+                str(ui_cfg.get("force_country") or "").strip() or server_home_country()
+            )
+        except Exception:
+            home = ""
+
+        def _library_row_key(item: dict[str, Any]) -> tuple[int, int, str]:
+            country = normalized_country_name(str(item.get("country") or ""))
+            same = 0 if home and country == home else 1
+            return (same, _library_status_rank(str(item.get("status") or "")), str(item.get("endpoint_id") or ""))
+
+        ready_rows.sort(key=_library_row_key)
         ids = [str(item.get("endpoint_id") or "") for item in ready_rows if str(item.get("endpoint_id") or "")]
         with library_check_lock:
             if library_check_generation != generation:
@@ -9286,9 +9386,16 @@ def _library_check_worker(generation: int) -> None:
             stop_now = library_check_stop
         if stop_now:
             return
-        log_to_json("INFO", "Probe", f"全球库检测开始：轻量检测 {len(ids)}，跳过 {skipped}")
+        log_to_json(
+            "INFO",
+            "Probe",
+            f"全球库检测开始：轻量检测 {len(ids)}，"
+            + (f"同国家 {home} 优先，" if home else "未识别本机国家，按状态检测，")
+            + f"跳过 {skipped}",
+        )
         index = 0
         batch_size = 8
+        probe_started = time.time()
         while index < len(ids):
             if _library_wait_until_slot(generation) == "stop":
                 break
@@ -9369,6 +9476,11 @@ def _library_check_worker(generation: int) -> None:
                     library_check_wait_reason = ""
                     library_check_paused = False
                     library_check_stop = False
+        if finished and probe_started and library_check_phase == "done" and library_check_tested > 0:
+            try:
+                remember_global_scan(duration=time.time() - probe_started)
+            except Exception:
+                pass
         if finished:
             try:
                 _drop_ui_page_snapshots()
@@ -13761,7 +13873,7 @@ INDEX_HTML = r"""<!doctype html>
             <div id="library_scan_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
           </div>
         </div>
-        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">不勾选时，每 6 小时在空闲时检测一次。勾选循环后按右边的间隔重复；每天或星期几按右边的钟点开始。系统忙就等到空闲。</div>
+        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">不勾选时，空闲才检测。上一轮在 15 分钟内完成就每 3 小时一次，超过 15 分钟就改回每 6 小时。勾选循环后按右边的间隔重复；每天或星期几按右边的钟点开始。系统忙就等到空闲。同国家的节点先测。</div>
       </div>
       <div style="display:flex; gap:12px; margin-top:18px;">
         <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">手动检测</button>
