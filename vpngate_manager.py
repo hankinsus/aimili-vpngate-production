@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.93"
+APP_VERSION = "V1.0.94"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -21177,9 +21177,8 @@ def fast_tunnel_liveness_loop() -> None:
             _soft_fail_streak = 0
             if active_tunnel_running() and iface and Path("/sys/class/net", iface).exists():
                 set_state(
-                    tunnel_role="SUSPECT",
-                    proxy_error=reason[:300],
-                    last_check_message="出口探测超时，隧道仍在，不拆转发",
+                    tunnel_role="ACTIVE",
+                    last_check_message="出口探测超时，隧道仍在",
                 )
                 log_to_json("WARNING", "Proxy", reason + "；隧道进程仍在，保持 8500")
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
@@ -21325,7 +21324,8 @@ def background_proxy_checker() -> None:
                 log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
             else:
                 first_error = str(res.get("error") or "未知错误")
-                if health_epoch == _tunnel_health_epoch:
+                tunnel_alive = active_openvpn_running() or active_external_tunnel_running()
+                if health_epoch == _tunnel_health_epoch and not tunnel_alive:
                     _invalidate_tunnel_health(first_error)
                 proxy_health_failures += 1
                 if proxy_health_failures < 3:
@@ -21373,6 +21373,10 @@ def background_proxy_checker() -> None:
                 if active_openvpn_node_id:
                     print(f"[警告] {LOCAL_PROXY_PORT} 端口本地代理连续检测失败！原因: {error_msg}", flush=True)
                     log_to_json("WARNING", "Proxy", f"代理连续检测失败: {error_msg}")
+                if active_openvpn_running() or active_external_tunnel_running():
+                    log_to_json("WARNING", "Proxy", f"8500 出口检查失败，隧道还在，不更换节点: {error_msg}")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 set_state(
                     client_proxy_ok=False,
                     proxy_ok=False,
@@ -21382,10 +21386,6 @@ def background_proxy_checker() -> None:
                     proxy_error=error_msg
                 )
 
-                if active_openvpn_running() or active_external_tunnel_running():
-                    log_to_json("WARNING", "Proxy", f"8500 出口检查失败，隧道还在，不更换节点: {error_msg}")
-                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
-                    continue
                 # Only confirmed failures can trigger production failover.
                 handle_confirmed_tunnel_failure(error_msg, expected_target=check_target)
         except Exception as e:
