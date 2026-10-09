@@ -4049,7 +4049,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
         if old_openvpn:
             stop_active_openvpn(keep_policy=True)
 
-        if not in_direct:
+        if not in_direct or _user_wants_proxy():
             _reject_if_slower_than_floor(endpoint_id, str(result.interface or ""))
 
         active_external_tunnel = result
@@ -5210,6 +5210,11 @@ def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     qualified: list[dict[str, Any]] = []
     identities: set[str] = set()
     country_latency: dict[str, int] = {}
+    floor = _active_speed_floor_bps()
+    slow_ips = {
+        ip for endpoint in rows
+        if (ip := _endpoint_ip(endpoint)) and 0 < _endpoint_speed_bps(endpoint) < floor
+    }
     for endpoint in rows:
         protocol = str(endpoint.get("protocol") or "").lower()
         if protocol not in ("openvpn", "softether", "sstp", "l2tp-ipsec"):
@@ -5224,6 +5229,8 @@ def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         ip = _endpoint_ip(endpoint)
         if not ip:
+            continue
+        if ip in slow_ips or _exit_demoted(ip):
             continue
         identity = f"{protocol}|{ip}|{int(endpoint.get('port') or 0)}"
         if identity in identities:
@@ -5411,7 +5418,13 @@ def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool 
     """Health and the proxy switch use this. A missing main must be connected."""
     if active_tunnel_running():
         if proxy_server.get_egress_mode() != "proxy" and (engage_proxy or _auto_direct_fallback_active() or _user_wants_proxy()):
-            _engage_proxy_egress(reason)
+            engaged = _engage_proxy_egress(reason)
+            if not engaged and not active_tunnel_running() and int(getattr(ensure_main_connection, "depth", 0) or 0) < 2:
+                ensure_main_connection.depth = int(getattr(ensure_main_connection, "depth", 0) or 0) + 1
+                try:
+                    ensure_main_connection(reason, engage_proxy=True, force=True)
+                finally:
+                    ensure_main_connection.depth = int(getattr(ensure_main_connection, "depth", 0) or 0) - 1
         return
     now = time.time()
     if not force and now - float(getattr(ensure_main_connection, "at", 0) or 0) < 45:
@@ -5424,7 +5437,13 @@ def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool 
     if not active_tunnel_running():
         return
     if proxy_server.get_egress_mode() != "proxy" and (engage_proxy or _auto_direct_fallback_active() or _user_wants_proxy()):
-        _engage_proxy_egress(reason)
+        engaged = _engage_proxy_egress(reason)
+        if not engaged and not active_tunnel_running() and int(getattr(ensure_main_connection, "depth", 0) or 0) < 2:
+            ensure_main_connection.depth = int(getattr(ensure_main_connection, "depth", 0) or 0) + 1
+            try:
+                ensure_main_connection(reason, engage_proxy=True, force=True)
+            finally:
+                ensure_main_connection.depth = int(getattr(ensure_main_connection, "depth", 0) or 0) - 1
 
 
 def _refresh_cold_standby_now() -> None:
@@ -6448,7 +6467,13 @@ def _endpoint_ip(endpoint: dict[str, Any] | None) -> str:
 
 
 def _active_exit_ip() -> str:
-    return _endpoint_ip(current_active_routing_endpoint())
+    ip = _endpoint_ip(current_active_routing_endpoint())
+    if ip:
+        return ip
+    head = str(active_openvpn_node_id or "").split("_", 1)[0]
+    if head.count(".") == 3:
+        return head
+    return ""
 
 
 def _standby_speed_gap(endpoint: dict[str, Any], target: int) -> int:
@@ -6959,10 +6984,38 @@ def _save_cold_state() -> None:
 
 
 def _endpoint_speed_bps(endpoint: dict[str, Any]) -> int:
+    """A real speed sample wins. The catalog value is only a fallback."""
+    meta = endpoint.get("metadata") if isinstance(endpoint.get("metadata"), dict) else {}
+    try:
+        measured = int(meta.get("last_probe_speed_bps") or 0)
+    except (TypeError, ValueError):
+        measured = 0
+    if measured > 0:
+        return measured
     try:
         return int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+_demoted_ip_until: dict[str, float] = {}
+
+
+def _exit_demoted(ip: str) -> bool:
+    return bool(ip) and time.time() < float(_demoted_ip_until.get(ip) or 0)
+
+
+def _demote_exit(ip: str, endpoint_id: str = "") -> None:
+    """Main was unusable. This address stays out of cold and pre-cold for 30 minutes."""
+    ip = str(ip or "").strip()
+    if ip:
+        _demoted_ip_until[ip] = time.time() + 1800
+        _connect_fail_until[ip] = time.time() + 1800
+    if endpoint_id:
+        try:
+            node_pool.mark_slow(endpoint_id)
+        except Exception:
+            pass
 
 
 def _current_route_protocol(ui_cfg: dict[str, Any]) -> str:
@@ -7006,8 +7059,30 @@ def _queue_unmeasured_speed(endpoint_ids: list[str]) -> None:
         _speed_recheck_at[eid] = now
 
 
+def _filter_standby(found: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    active_ip = _active_exit_ip()
+    active = current_active_routing_endpoint() or {}
+    active_eid = str(active_pool_endpoint_id or active.get("endpoint_id") or "")
+    floor = _active_speed_floor_bps()
+    slow_ips = {
+        ip for ep in found.values()
+        if (ip := _endpoint_ip(ep)) and 0 < _endpoint_speed_bps(ep) < floor
+    }
+    kept: dict[str, dict[str, Any]] = {}
+    for eid, ep in found.items():
+        ip = _endpoint_ip(ep)
+        if active_eid and eid == active_eid:
+            continue
+        if active_ip and ip == active_ip:
+            continue
+        if ip in slow_ips or _exit_demoted(ip):
+            continue
+        kept[eid] = ep
+    return kept
+
+
 def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
-    """Verified backups, relaxed by tier. 50 Mbps is the floor that never drops."""
+    """Verified backups. The live speed floor applies, and the current main is never a backup."""
     active_eid = str(active_pool_endpoint_id or "")
     active_ip = _active_exit_ip()
     home = routing_target_country(ui_cfg)
@@ -7025,11 +7100,11 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
     now_rank = time.time()
     if isinstance(cached, dict) and cached.get("key") == cache_key and (now_rank - float(cached.get("at") or 0) < 3600 or ui_query_active()):
         _cold_candidates.stats = dict(cached.get("stats") or {})
-        return dict(cached.get("found") or {})
+        return _filter_standby(dict(cached.get("found") or {}))
     if ui_query_active():
         if isinstance(cached, dict):
             _cold_candidates.stats = dict(cached.get("stats") or {})
-            return dict(cached.get("found") or {})
+            return _filter_standby(dict(cached.get("found") or {}))
         return {}
     stats = {
         "same_protocol": 0,
@@ -7057,6 +7132,11 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
     unmeasured: list[str] = []
     seen_identity: set[str] = set()
     country_latency: dict[str, int] = {}
+    floor = _active_speed_floor_bps()
+    slow_ips = {
+        ip for endpoint in rows
+        if (ip := _endpoint_ip(endpoint)) and 0 < _endpoint_speed_bps(endpoint) < floor
+    }
     for endpoint in rows:
         eid = str(endpoint.get("endpoint_id") or "")
         protocol = str(endpoint.get("protocol") or "").lower()
@@ -7073,8 +7153,8 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         if endpoint_is_unstable(endpoint) or int(endpoint.get("fail_streak") or 0) >= 3:
             stats["excluded_unstable"] += 1
             continue
-        if eid == active_eid or (active_ip and ip == active_ip):
-            stats["excluded_occupied"] += 1
+        if eid == active_eid or (active_ip and ip == active_ip) or _exit_demoted(ip) or ip in slow_ips:
+            stats["excluded_occupied" if not (ip in slow_ips) else "excluded_speed"] += 1
             continue
         speed = _endpoint_speed_bps(endpoint)
         if 0 < speed < _active_speed_floor_bps():
@@ -7145,7 +7225,7 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
     _queue_unmeasured_speed(unmeasured)
     _cold_candidates.stats = stats
     _cold_candidates.cache = {"at": time.time(), "key": cache_key, "found": found, "stats": dict(stats)}
-    return found
+    return _filter_standby(found)
 
 
 def _precold_bucket(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> str:
@@ -7220,7 +7300,7 @@ def _overlay_pool_roles(state: dict[str, Any]) -> None:
         f" · 当前国家同协议 {int(detail.get('same_protocol') or 0)}"
         f" · 当前国家其它协议 {int(detail.get('other_protocol') or 0)}"
         f" · 其它低延迟国家 {int(detail.get('other_country') or 0)}"
-        f" · 速度低于50Mbps排除 {int(detail.get('excluded_speed') or 0)}"
+        f" · 速度低于{_active_speed_floor_bps() // 1_000_000}Mbps排除 {int(detail.get('excluded_speed') or 0)}"
         f" · 未测速待补 {int(detail.get('excluded_unmeasured') or 0)}"
         f" · 主备占用或重复排除 {int(detail.get('excluded_occupied') or 0) + int(detail.get('excluded_duplicate') or 0)}"
     )
@@ -7290,6 +7370,14 @@ def _publish_cold_standby(endpoint: dict[str, Any] | None) -> None:
             _save_cold_state()
         return
     eid = str(endpoint.get("endpoint_id") or "")
+    ip = _endpoint_ip(endpoint)
+    if (
+        (ip and ip == _active_exit_ip())
+        or _exit_demoted(ip)
+        or 0 < _endpoint_speed_bps(endpoint) < _active_speed_floor_bps()
+    ):
+        _publish_cold_standby(None)
+        return
     if endpoint_is_blocked(endpoint, load_ui_config()):
         _publish_cold_standby(None)
         return
@@ -7413,6 +7501,21 @@ def _fallback_direct_egress(reason: str) -> bool:
 def _engage_proxy_egress(reason: str) -> bool:
     """A backup tunnel is up. Leave automatic direct mode and forward 8500 through it."""
     if not active_tunnel_running():
+        return False
+    current = current_active_routing_endpoint() or {}
+    speed = _endpoint_speed_bps(current)
+    floor = _active_speed_floor_bps()
+    if 0 < speed < floor:
+        _demote_exit(_endpoint_ip(current), str(current.get("endpoint_id") or ""))
+        log_to_json(
+            "WARNING",
+            "Proxy",
+            f"当前出口 {speed / 1_000_000:.1f} Mbps，低于 {floor // 1_000_000}Mbps，不切到代理，30 分钟内不做冷备",
+        )
+        try:
+            stop_all_tunnels()
+        except Exception:
+            pass
         return False
     if proxy_server.get_egress_mode() == "proxy" and not _auto_direct_fallback_active():
         return True
@@ -8282,7 +8385,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 active_node_latency=(f"{last_active_latency} ms" if last_active_latency > 0 else "出口已连接"),
                 proxy_error=""
             )
-        if proxy_server.get_egress_mode() != "direct":
+        if proxy_server.get_egress_mode() != "direct" or _user_wants_proxy():
             _reject_if_slower_than_floor(openvpn_pool_endpoint_id(node), "tun0")
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
@@ -8459,7 +8562,7 @@ def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
     if speed <= 0:
         try:
             stored = node_pool.get_endpoint(endpoint_id) or {}
-            speed = int(stored.get("latest_speed") or 0)
+            speed = _endpoint_speed_bps(stored)
         except Exception:
             speed = 0
     if speed <= 0:
@@ -8470,9 +8573,10 @@ def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
         log_to_json("INFO", "VPN", f"切换后测速 {mbps:.1f} Mbps {interface}")
         return
     try:
-        node_pool.mark_slow(endpoint_id)
+        stored = node_pool.get_endpoint(endpoint_id) or {}
+        _demote_exit(_endpoint_ip(stored), endpoint_id)
     except Exception:
-        pass
+        _demote_exit("", endpoint_id)
     log_to_json("WARNING", "VPN", f"切换后测速 {mbps:.1f} Mbps，低于 {floor_label}，标不稳定并换下一个")
     raise RuntimeError(f"速度 {mbps:.1f} Mbps，低于 {floor_label}")
 
@@ -23164,6 +23268,8 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                         def _replace_dead_tunnel() -> None:
+                            current = current_active_routing_endpoint() or {}
+                            _demote_exit(_endpoint_ip(current) or _active_exit_ip(), str(current.get("endpoint_id") or active_pool_endpoint_id or ""))
                             try:
                                 stop_all_tunnels()
                             except Exception as exc:
@@ -23182,13 +23288,8 @@ class Handler(BaseHTTPRequestHandler):
                                     return
                                 current = current_active_routing_endpoint() or {}
                                 eid = str(current.get("endpoint_id") or active_pool_endpoint_id or "")
-                                try:
-                                    if eid:
-                                        node_pool.note_local_forward(eid, False, detail)
-                                        node_pool.mark_slow(eid)
-                                except Exception:
-                                    pass
                                 if current:
+                                    _demote_exit(_endpoint_ip(current), eid)
                                     _note_connect_fail(current)
                                 log_to_json("WARNING", "Proxy", f"新隧道数据面仍不通，换下一个: {detail}")
                                 try:
