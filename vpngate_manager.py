@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.81"
+APP_VERSION = "V1.0.82"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -22946,7 +22946,6 @@ ui_nodes_cache_lock = threading.Lock()
 ui_nodes_cache = []
 ui_nodes_cache_at = 0.0
 ui_nodes_cache_building = False
-_memory_pressure = False
 UI_NODES_CACHE_TTL_SECONDS = 3.0
 bootstrap_connection_lock = threading.Lock()
 resource_engine_running = False
@@ -23353,71 +23352,59 @@ def _meminfo_kb() -> tuple[int, int]:
     return total, avail
 
 
-def _data_plane_reserve_kb(total_kb: int) -> int:
-    """Free RAM kept for the proxy, tunnel and kernel. The UI cache is not part of this."""
-    if total_kb < 700 * 1024:
-        return 80 * 1024
-    return 160 * 1024
-
-
-def _reclaim_manager_caches() -> None:
-    """Drop UI snapshots only. Does not touch 8500, the tunnel, or client sockets."""
-    global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
-    import gc
-    with ui_nodes_cache_lock:
-        ui_nodes_cache = []
-        ui_nodes_cache_at = 0.0
-        ui_nodes_cache_building = False
-    with _first_page_snapshot_lock:
-        _first_page_snapshot.clear()
+def _self_rss_kb() -> int:
     try:
-        with _scheme_snap_lock:
-            _scheme_snap["at"] = 0.0
-            _scheme_snap["value"] = None
-    except Exception:
-        pass
-    try:
-        node_pool.invalidate_ui_lists()
-    except Exception:
-        pass
-    gc.collect()
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
+        for line in Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
 
 
 def memory_guard_loop() -> None:
-    """When free RAM falls under the exit reserve, release the management caches."""
-    global _memory_pressure
-    time.sleep(20)
-    last_log = 0.0
+    """Shrink only this process, and only when it is actually oversized.
+
+    A 512MB machine sits at 40–70MB free while healthy. The previous guard
+    treated that as pressure, wiped the list cache every 15 seconds and ran
+    gc.collect(). Filters then scanned the whole pool and the page timed out.
+    The proxy and the tunnel are other processes; this loop never signals them.
+    """
+    time.sleep(60)
     while True:
         try:
-            total, avail = _meminfo_kb()
-            reserve = _data_plane_reserve_kb(total)
-            if avail and avail < reserve:
-                _memory_pressure = True
-                _reclaim_manager_caches()
-                now = time.time()
-                if now - last_log > 60:
-                    last_log = now
-                    log_to_json(
-                        "INFO",
-                        "Memory",
-                        f"可用内存 {avail // 1024}MB 低于出口预留 {reserve // 1024}MB，已释放管理缓存，转发未动",
-                    )
-            elif _memory_pressure and avail > reserve + 40 * 1024:
-                _memory_pressure = False
+            total, _avail = _meminfo_kb()
+            rss = _self_rss_kb()
+            cap = 140 * 1024 if total < 700 * 1024 else 320 * 1024
+            if rss > cap:
+                global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
+                with ui_nodes_cache_lock:
+                    ui_nodes_cache = []
+                    ui_nodes_cache_at = 0.0
+                    ui_nodes_cache_building = False
+                import gc
+                gc.collect()
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
+                log_to_json(
+                    "INFO",
+                    "Memory",
+                    f"管理进程 {rss // 1024}MB 超过 {cap // 1024}MB，已丢掉节点全量缓存，列表索引和转发未动",
+                )
         except Exception as exc:
             log_to_json("ERROR", "Memory", f"内存回收异常: {exc}")
-        time.sleep(15)
+        time.sleep(300)
 
 
 def _refresh_ui_nodes_cache_async(force=False):
     global ui_nodes_cache_building
-    if _memory_pressure:
+    total, _avail = _meminfo_kb()
+    # The open page reads one SQLite page. Building all 10k nodes here is what
+    # pushed the 512MB box into swap. Skip that copy on a small machine.
+    if not force and 0 < total < 700 * 1024:
         return
     with ui_nodes_cache_lock:
         fresh = bool(ui_nodes_cache) and (time.time() - ui_nodes_cache_at) < UI_NODES_CACHE_TTL_SECONDS
