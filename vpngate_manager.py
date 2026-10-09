@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.90"
+APP_VERSION = "V1.0.91"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -19069,7 +19069,7 @@ function paintBootStatus(extra) {
     if (titleEl) titleEl.textContent = "正在读取节点";
     if (detailEl) detailEl.textContent = "第一次大约需要 15 秒。请不要刷新，刷新会重新排队。";
   } else {
-    if (titleEl) titleEl.textContent = "还在读取，页面没有卡死";
+    if (titleEl) titleEl.textContent = "读取中";
     if (detailEl) detailEl.textContent = "列表还在从本机读出。请继续等待，不要点击刷新。";
   }
 }
