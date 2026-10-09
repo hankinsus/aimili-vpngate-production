@@ -27,6 +27,39 @@ class TunnelResult:
     work_dir: str = ""
     details: dict[str, Any] | None = None
 
+def _proc_tail(proc: subprocess.Popen[str] | None, wait: float = 0.3) -> str:
+    """Read whatever the process has already printed. Never wait for it to exit."""
+    if proc is None or proc.stdout is None:
+        return ""
+    import select
+    chunks: list[str] = []
+    end = time.time() + wait
+    while time.time() < end and sum(len(part) for part in chunks) < 1500:
+        ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+        if not ready:
+            if proc.poll() is not None:
+                break
+            continue
+        piece = proc.stdout.read(800)
+        if not piece:
+            break
+        chunks.append(piece)
+    return "".join(chunks)[-1200:]
+
+
+def _stop_proc(proc: subprocess.Popen[str] | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -404,12 +437,28 @@ class SoftEtherAdapter:
             time.sleep(1)
         return False, last_output
 
-    def connect(self, host: str, port: int = 443, account: str = "aimili", nic: str = "aimili", username: str = "vpn", password: str = "vpn") -> TunnelResult:
+    def connect(self, host: str, port: int = 443, account: str = "aimili", nic: str = "aimili", username: str = "vpn", password: str = "vpn", deadline: float | None = None) -> TunnelResult:
         if not self.available():
             return TunnelResult(False, self.protocol, message="vpnclient/vpncmd not installed")
         before = list_interfaces()
         routes_before = snapshot_main_routes()
         connected_successfully = False
+
+        def too_late(where: str) -> TunnelResult | None:
+            if deadline is None or time.time() <= deadline:
+                return None
+            try:
+                self.disconnect(account, nic=nic, delete=True)
+            except Exception:
+                pass
+            return TunnelResult(False, self.protocol, message=f"12秒内没有连上，已停止：{where}")
+
+        def step_timeout(seconds: int) -> int:
+            if deadline is None:
+                return seconds
+            left = int(deadline - time.time())
+            return max(2, min(seconds, left))
+
         try:
             # Ubuntu/Debian package normally gets /run/softether from systemd's
             # RuntimeDirectory=. When we intentionally keep the global service
@@ -430,7 +479,10 @@ class SoftEtherAdapter:
             self._vpncmd("AccountDisconnect", account, timeout=3)
             self._vpncmd("AccountDelete", account, timeout=5)
             self._vpncmd("NicDelete", nic, timeout=5)
-            nic_created = self._vpncmd("NicCreate", nic, timeout=8)
+            late = too_late("准备网卡")
+            if late:
+                return late
+            nic_created = self._vpncmd("NicCreate", nic, timeout=step_timeout(8))
             if nic_created.returncode != 0:
                 return TunnelResult(False, self.protocol, message=(nic_created.stdout + nic_created.stderr)[-1200:])
             nic_enabled = self._vpncmd("NicEnable", nic, timeout=8)
@@ -438,13 +490,16 @@ class SoftEtherAdapter:
                 self.disconnect(account, nic=nic, delete=True)
                 return TunnelResult(False, self.protocol, message=(nic_enabled.stdout + nic_enabled.stderr)[-1200:])
 
+            late = too_late("创建账号")
+            if late:
+                return late
             created = self._vpncmd(
                 "AccountCreate", account,
                 f"/SERVER:{host}:{int(port)}",
                 "/HUB:VPNGATE",
                 f"/USERNAME:{username}",
                 f"/NICNAME:{nic}",
-                timeout=10,
+                timeout=step_timeout(10),
             )
             if created.returncode != 0:
                 return TunnelResult(False, self.protocol, message=(created.stdout + created.stderr)[-1200:])
@@ -452,11 +507,17 @@ class SoftEtherAdapter:
             if auth.returncode != 0:
                 self.disconnect(account)
                 return TunnelResult(False, self.protocol, message=(auth.stdout + auth.stderr)[-1200:])
-            connected = self._vpncmd("AccountConnect", account, timeout=10)
+            late = too_late("开始连接")
+            if late:
+                return late
+            connected = self._vpncmd("AccountConnect", account, timeout=step_timeout(10))
             if connected.returncode != 0:
                 return TunnelResult(False, self.protocol, message=(connected.stdout + connected.stderr)[-1200:])
 
-            session_ok, session_status = self._wait_account_connected(account, timeout=8)
+            late = too_late("等待会话")
+            if late:
+                return late
+            session_ok, session_status = self._wait_account_connected(account, timeout=step_timeout(8))
             if not session_ok:
                 self.disconnect(account, nic=nic, delete=True)
                 return TunnelResult(
@@ -465,7 +526,10 @@ class SoftEtherAdapter:
                     message=f"SoftEther session did not reach connected state: {session_status[-1800:]}",
                 )
 
-            iface = wait_for_new_interface(before, ("vpn_",), timeout=12)
+            late = too_late("等待地址")
+            if late:
+                return late
+            iface = wait_for_new_interface(before, ("vpn_",), timeout=step_timeout(8))
             if not iface:
                 iface = f"vpn_{nic}"
             try:
@@ -473,7 +537,7 @@ class SoftEtherAdapter:
                 subprocess.run(["ip", "link", "set", iface, "up"], capture_output=True, timeout=3)
             except Exception:
                 pass
-            dhcp_ok, gateway, dhcp_debug = obtain_dhcp_lease(iface)
+            dhcp_ok, gateway, dhcp_debug = obtain_dhcp_lease(iface, timeout=step_timeout(6))
             if not dhcp_ok:
                 self.disconnect(account)
                 return TunnelResult(
@@ -624,13 +688,9 @@ class SSTPAdapter:
                 before, ("ppp",), timeout=float(timeout), allow_reuse=bool(reuse_existing)
             )
             if not iface or proc.poll() is not None:
-                output = ""
-                try:
-                    output = (proc.stdout.read() if proc.stdout else "")[-1200:]
-                except Exception:
-                    pass
                 if proc.poll() is None:
-                    proc.terminate()
+                    _stop_proc(proc)
+                output = _proc_tail(proc)
                 return TunnelResult(False, self.protocol, message=output or "SSTP PPP interface was not created", process=proc)
             ip_deadline = time.time() + max(4.0, min(float(timeout), 15.0))
             while time.time() < ip_deadline:
@@ -645,11 +705,7 @@ class SSTPAdapter:
                         details={"added_host_routes": added_cleanup_host_routes(routes_before)},
                     )
                 if proc.poll() is not None:
-                    output = ""
-                    try:
-                        output = (proc.stdout.read() if proc.stdout else "")[-1800:]
-                    except Exception:
-                        pass
+                    output = _proc_tail(proc)
                     return TunnelResult(
                         False,
                         self.protocol,
@@ -669,6 +725,7 @@ class SSTPAdapter:
             except Exception:
                 pass
             proc.terminate()
+            _stop_proc(proc)
             return TunnelResult(
                 False,
                 self.protocol,

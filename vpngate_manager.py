@@ -3953,6 +3953,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
                 nic=f"a{token}",
                 username="vpn",
                 password="vpn",
+                deadline=(time.time() + 12) if manual else None,
             )
         elif protocol == "sstp":
             result = tunnel_adapters.SSTPAdapter().connect(
@@ -3994,7 +3995,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
             if protocol == "l2tp-ipsec":
                 raise RuntimeError("L2TP/IPsec 未完成：IPsec、L2TP 或 PPP 在时限内没有拿到地址")
             short = " ".join(detail.split())
-            raise RuntimeError(short[:180] or f"{protocol} 连接失败")
+            raise RuntimeError("连不上，已标不可用：" + (short[:120] or f"{protocol} 连接失败"))
 
         if protocol == "l2tp-ipsec":
             ensure_l2tp_namespace_forward(result)
@@ -4061,12 +4062,39 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
             node_pool.record_endpoint_probe(endpoint_id, False, 0, str(health.get("error") or "8500 代理出口检测失败"))
             raise RuntimeError(str(health.get("error") or "8500 代理出口检测失败"))
 
+        speed_note = ""
+        if manual and (not in_direct or _user_wants_proxy()):
+            set_state(
+                client_proxy_ok=True,
+                proxy_ok=True,
+                active_tunnel_ok=True,
+                manual_switch_message="已切换，客户端可用，正在测速",
+                last_check_message="已切换，客户端可用，正在测速",
+                active_tunnel_interface=result.interface,
+                active_tunnel_protocol=protocol,
+            )
+            try:
+                measured = _reject_if_slower_than_floor(endpoint_id, str(result.interface or ""))
+            except RuntimeError as exc:
+                if previous_iface:
+                    proxy_server.set_active_interface(previous_iface)
+                if old_tunnel is not None and old_tunnel.interface:
+                    setup_policy_routing(old_tunnel.interface, gateway=str(getattr(old_tunnel, "gateway", "") or ""))
+                elif previous_iface:
+                    setup_policy_routing(previous_iface)
+                raise RuntimeError(str(exc) + "，已退回原连接")
+            speed_note = (
+                f"切换完成，测速 {measured / 1_000_000:.1f} Mbps"
+                if measured > 0
+                else "切换完成，测速没有结果，先保持这条"
+            )
+
         if old_tunnel is not None:
             _disconnect_external_tunnel(old_tunnel)
         if old_openvpn:
             stop_active_openvpn(keep_policy=True)
 
-        if not in_direct or _user_wants_proxy():
+        if not manual and (not in_direct or _user_wants_proxy()):
             iface = str(result.interface or "")
             if not _iface_forwards(iface):
                 raise RuntimeError("隧道网卡在，但对端不转发")
@@ -4110,7 +4138,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
             active_pool_endpoint=endpoint_summary,
             active_openvpn_node={},
             active_tunnel_protocol=protocol,
-            manual_switch_message=("切换完成，正在确认客户端状态…" if manual else ""),
+            manual_switch_message=(speed_note or ("切换完成" if manual else "")),
             active_tunnel_interface=result.interface,
             tunnel_forward_ok=not bool(local_forward_note),
             proxy_ok=not in_direct,
@@ -7903,7 +7931,12 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
             str(config_path), keep_alive=True, route_nopull=True, timeout=5, dev=candidate_dev
         )
         if not ok or candidate_process is None:
-            raise RuntimeError(message or "候选 OpenVPN 隧道建立失败")
+            reason = " ".join(str(message or "候选 OpenVPN 隧道建立失败").split())[:120]
+            try:
+                node_pool.record_endpoint_probe(openvpn_pool_endpoint_id(node), False, 0, reason, speed_bps=None)
+            except Exception:
+                pass
+            raise RuntimeError("连不上，已标不可用：" + reason)
         if not tunnel_adapters.interface_has_ipv4(candidate_dev):
             stop_process(candidate_process)
             raise RuntimeError("候选 OpenVPN 隧道已启动，但未获得 IPv4 地址")
@@ -7923,6 +7956,29 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
     proxy_server.set_active_interface(candidate_dev)
     setup_policy_routing(candidate_dev)
     final_health = {"ok": True, "ip": "", "latency_ms": 0}
+
+    set_state(
+        client_proxy_ok=True,
+        proxy_ok=True,
+        active_tunnel_ok=True,
+        manual_switch_message="已切换，客户端可用，正在测速",
+        last_check_message="已切换，客户端可用，正在测速",
+        active_tunnel_interface=candidate_dev,
+        active_tunnel_protocol="openvpn",
+    )
+    try:
+        measured = _reject_if_slower_than_floor(openvpn_pool_endpoint_id(node), candidate_dev)
+    except RuntimeError as exc:
+        if old_iface:
+            proxy_server.set_active_interface(old_iface)
+            setup_policy_routing(old_iface)
+        stop_process(candidate_process)
+        raise RuntimeError(str(exc) + "，已退回原连接")
+    speed_note = (
+        f"切换完成，测速 {measured / 1_000_000:.1f} Mbps"
+        if measured > 0
+        else "切换完成，测速没有结果，先保持这条"
+    )
 
     if old_external_tunnel is not None:
         try:
@@ -7998,8 +8054,8 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
         proxy_latency_ms=latency,
         proxy_error="",
         active_node_latency=(f"{latency} ms" if latency else "出口已连接，等待延迟"),
-        last_check_message=f"Connected {node_id}",
-        manual_switch_message="切换完成",
+        last_check_message=speed_note,
+        manual_switch_message=speed_note,
     )
     set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
     align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""), protocol="openvpn")
@@ -8417,12 +8473,12 @@ def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
             speed = 0
     if speed <= 0:
         log_to_json("INFO", "VPN", f"切换后测速没有结果，保留当前隧道 {interface}")
-        return
+        return 0
     mbps = speed / 1_000_000
     if speed >= floor:
         log_to_json("INFO", "VPN", f"切换后测速 {mbps:.1f} Mbps {interface}")
         _note_forward_ok()
-        return
+        return speed
     try:
         stored = node_pool.get_endpoint(endpoint_id) or {}
         _demote_exit(_endpoint_ip(stored), endpoint_id)
@@ -16722,7 +16778,7 @@ function proxySettingsLine() {
   let status = "默认规则";
   if (configured) {
     const where = country || "";
-    status = where + (state.background_paused ? "检测已暂停" : (detecting ? "检测中" : "检测待命"));
+    status = where + (state.background_paused ? "检测已暂停" : (detecting ? "检测中" : "检测待机"));
   }
   const settingBody = [configured ? (country || "不限国家") : "智能模式", label || "所有协议 · 不限类型 · 不限延迟 · ≥10 Mbps"].filter(Boolean).join(" · ");
   return status + " 代理设置 · " + settingBody + " · 符合 " + available + " · 已验证 " + inventory + " IP";
@@ -16750,7 +16806,14 @@ function libraryStatusLine() {
   if (state.availability_engine_running) return String(state.availability_engine_message || "可用性轮询中") + " · " + stock;
   const tested = Number(state.availability_tested_total || 0);
   const queue = Number(state.availability_queue || 0);
-  let head = "全球库轮询待命";
+  const note = String(state.last_check_message || "");
+  if (/已标不可用|已退回原连接|切换完成，测速/.test(note)) {
+    window._switchResult = {text: note, until: Date.now() + 20000};
+  }
+  if (window._switchResult && Date.now() < window._switchResult.until && !state.manual_switch_active) {
+    return window._switchResult.text + " · " + stock;
+  }
+  let head = "全球库轮询待机";
   if (tested || queue) head += " · 已检测 " + tested + " · 待检测 " + queue;
   return head + " · " + stock;
 }
@@ -21711,14 +21774,17 @@ def _run_manual_connection_job(kind: str, target_ids: list[str], ui_token: str, 
         log_to_json("INFO", "VPN", f"后台人工切换完成: {message}")
     except Exception as primary_exc:
         log_to_json("WARNING", "VPN", f"后台人工切换失败: {primary_exc}")
+        reason = " ".join(str(primary_exc).split())[:160]
         restored, restore_msg = restore_manual_previous_connection(
             previous_openvpn_node_id,
             previous_pool_endpoint_id,
         )
-        if restored:
-            message = "人工切换失败，已保留/恢复原连接：" + str(restore_msg)
+        if "已标不可用" in reason or "已退回原连接" in reason:
+            message = reason + "。" + str(restore_msg)
+        elif restored:
+            message = "连不上，已标不可用：" + reason + "。原连接保持：" + str(restore_msg)
         else:
-            message = "人工切换失败，原连接恢复失败：" + str(restore_msg)
+            message = "连不上，已标不可用：" + reason + "。原连接恢复失败：" + str(restore_msg)
         finish(False, message, restored_previous=restored)
 
 manual_add_lock = threading.Lock()
