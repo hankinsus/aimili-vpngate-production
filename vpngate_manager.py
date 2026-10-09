@@ -7031,15 +7031,25 @@ def _precold_bucket(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> str:
 
 
 def _select_precold_ids(candidates: dict[str, dict[str, Any]], cold_eid: str) -> list[str]:
-    """Fill up to five behind the cold standby. Earlier tiers stay put."""
+    """Five behind the current cold standby. A node that already rotated stays eligible."""
+    skip = {str(cold_eid or ""), str(active_pool_endpoint_id or "")}
+    published = str((_cold_state().get("published") or ""))
+    if published:
+        skip.add(published)
+    skip.discard("")
     failed = {str(item) for item in (_cold_state().get("failed") or [])}
-    picked: list[str] = []
+    fresh: list[str] = []
+    rotated: list[str] = []
     for eid in candidates:
-        if not eid or eid == cold_eid or eid in failed:
+        if not eid or eid in skip:
             continue
-        picked.append(eid)
-        if len(picked) >= PRECOLD_TARGET:
-            break
+        if eid in failed:
+            rotated.append(eid)
+        else:
+            fresh.append(eid)
+    picked = fresh[:PRECOLD_TARGET]
+    if len(picked) < PRECOLD_TARGET:
+        picked.extend(rotated[: PRECOLD_TARGET - len(picked)])
     return picked
 
 
@@ -12551,6 +12561,10 @@ INDEX_HTML = r"""<!doctype html>
       border-bottom: 1px solid var(--active-row-border);
       border-top: 1px solid var(--active-row-border);
     }
+    .active-row .node-actions-cell {
+      position: relative;
+      z-index: 6;
+    }
 
     .badge {
       padding: 4px 10px;
@@ -16389,14 +16403,16 @@ function render(){
           : `<button class="connect-btn" ${(isTesting || isWaiting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
 
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
-      const poolFavId = n.pool_endpoint_id ? ("pool:" + n.pool_endpoint_id) : "";
-      const isFav = favoriteIds.includes(n.id) || (poolFavId && favoriteIds.includes(poolFavId)) || (n.pool_endpoint_id && favoriteIds.includes(n.pool_endpoint_id));
-      const favBusy = favoriteBusyIds.has(n.id);
-      const favBtn = favBusy
-        ? `<button class="test-btn" disabled style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px; cursor: wait;">★ 收藏中</button>`
+      const favId = n.pool_endpoint_id ? ("pool:" + n.pool_endpoint_id) : String(n.id || "");
+      const isFav = !!favId && (favoriteIds.includes(favId) || favoriteIds.includes(String(n.id || "")) || favoriteIds.includes(String(n.pool_endpoint_id || "")));
+      const favBusy = favoriteBusyIds.has(favId);
+      const favBtn = !favId
+        ? ""
+        : favBusy
+        ? `<button type="button" class="test-btn" data-favorite-id="${esc(favId)}" disabled style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px; cursor: wait;">★ 收藏中</button>`
         : isFav
-        ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
-        : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 28px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
+        ? `<button type="button" class="test-btn" data-favorite-id="${esc(favId)}" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px;">★ 已收藏</button>`
+        : `<button type="button" class="test-btn" data-favorite-id="${esc(favId)}" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 28px;">☆ 收藏</button>`;
 
       return `<tr ${rowClass}>
         <td class="node-status-cell" data-label="状态">${statusCell}</td>
@@ -16692,10 +16708,24 @@ async function runManualTest(id){
 
 let favoriteBusyIds = new Set();
 
+document.addEventListener("click", (event) => {
+  const btn = event.target && event.target.closest ? event.target.closest("[data-favorite-id]") : null;
+  if (!btn || btn.disabled) return;
+  event.preventDefault();
+  event.stopPropagation();
+  toggleFavorite(btn.getAttribute("data-favorite-id") || "", event);
+});
+
 async function toggleFavorite(id, event) {
-  if (event) event.stopPropagation();
-  if (favoriteBusyIds.has(id)) return;
+  id = String(id || "");
+  if (!id || favoriteBusyIds.has(id)) return;
   favoriteBusyIds.add(id);
+  const previous = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids.slice() : [];
+  const already = previous.includes(id) || previous.includes(id.replace(/^pool:/, ""));
+  state.favorite_node_ids = already
+    ? previous.filter(item => item !== id && item !== ("pool:" + id) && item !== id.replace(/^pool:/, ""))
+    : previous.concat([id]);
+  render();
   const btn = event && event.currentTarget;
   if (btn) {
     btn.disabled = true;
@@ -16718,11 +16748,13 @@ async function toggleFavorite(id, event) {
     let result = {};
     try { result = await response.json(); } catch (e) { result = {}; }
     if (response.ok && result.ok) {
-      state.favorite_node_ids = Array.isArray(result.favorite_node_ids) ? result.favorite_node_ids : [];
+      state.favorite_node_ids = Array.isArray(result.favorite_node_ids) ? result.favorite_node_ids : state.favorite_node_ids;
     } else {
+      state.favorite_node_ids = previous;
       state.last_check_message = (result && result.error) ? result.error : ("收藏失败 HTTP " + response.status);
     }
   } catch (e) {
+    state.favorite_node_ids = previous;
     state.last_check_message = "收藏失败：" + ((e && e.message) ? e.message : "网络错误");
   } finally {
     const wait = 400 - (Date.now() - started);
@@ -17317,7 +17349,9 @@ function adoptBackendState(next, sourceGeneration, startedAt) {
   const keptDirect = state && state.direct_egress_ok;
   const keptClient = state && state.client_proxy_ok;
   const keptMessage = state && state.last_check_message;
+  const keptFavorites = favoriteBusyIds.size && state ? state.favorite_node_ids : null;
   state = next;
+  if (keptFavorites) state.favorite_node_ids = keptFavorites;
   if (keep) {
     state.status_counts = counts;
     if (connected !== undefined) state.connected_count = connected;
