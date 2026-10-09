@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.96"
+APP_VERSION = "V1.0.97"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4168,7 +4168,7 @@ def ip_type_preference_rank(preferred: str, actual: Any) -> int:
 
 
 ROUTING_PROTOCOL_CHOICES = {"", "openvpn", "softether", "sstp", "l2tp-ipsec"}
-ROUTING_SPEED_CHOICES = {0, 50_000_000, 100_000_000, 300_000_000, 500_000_000, 700_000_000, 1_000_000_000}
+ROUTING_SPEED_CHOICES = {0, -1, 10_000_000, 50_000_000, 100_000_000, 300_000_000, 500_000_000, 700_000_000, 1_000_000_000}
 ROUTING_LATENCY_CHOICES = {"", "100", "200", "400", "800", "1000", "gt1000"}
 
 def normalize_routing_protocol(value: Any) -> str:
@@ -4179,7 +4179,19 @@ def normalize_routing_protocol(value: Any) -> str:
         raise ValueError("无效的协议筛选")
     return protocol
 
+def _parse_speed_filter(raw: Any) -> int:
+    text = str(raw or "").strip().lower()
+    if text in ("below10", "lt10", "-1"):
+        return -1
+    try:
+        return max(0, int(text or 0))
+    except (TypeError, ValueError):
+        return 0
+
 def normalize_routing_min_speed(value: Any) -> int:
+    text = str(value or "").strip().lower()
+    if text in ("below10", "lt10", "-1"):
+        return -1
     try:
         speed = int(value or 0)
     except (TypeError, ValueError):
@@ -4324,13 +4336,15 @@ SWITCH_MIN_SPEED_BPS = 10_000_000
 
 
 def _speed_floor_bps(ui_cfg: dict[str, Any]) -> int:
-    """Lowest speed that may be selected. User choice wins when it is at least 50 Mbps."""
+    """Unset means 10 Mbps. An explicit higher choice is kept. -1 is the below-10 filter."""
     try:
         chosen = int((ui_cfg or {}).get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
         chosen = 0
-    if chosen < ROUTING_MIN_LINE_SPEED_BPS:
-        return ROUTING_MIN_LINE_SPEED_BPS
+    if chosen < 0:
+        return 0
+    if chosen < SWITCH_MIN_SPEED_BPS:
+        return SWITCH_MIN_SPEED_BPS
     return chosen
 
 def routing_target_country(ui_cfg: dict[str, Any]) -> str:
@@ -4797,7 +4811,8 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     """True when this exit already satisfies the filters the user just saved.
 
     Country is only required in 优先地区. 住宅 IP accepts residential and mobile.
-    Speed is never optional: unset means ≥50 Mbps, and a saved 300 Mbps keeps only ≥300 Mbps.
+    Speed is never optional: unset means ≥10 Mbps, and a saved 300 Mbps keeps only ≥300 Mbps.
+    ＜10 Mbps keeps measured results under 10 Mbps. Unmeasured speed still passes a ≥ floor.
     """
     if not endpoint:
         return False
@@ -4819,10 +4834,18 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     protocol = str(ui_cfg.get("routing_protocol") or "").strip().lower()
     if protocol and str(endpoint.get("protocol") or "").lower() != protocol:
         return False
-    floor = _speed_floor_bps(ui_cfg)
     speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
-    if speed > 0 and speed < SWITCH_MIN_SPEED_BPS:
-        return False
+    try:
+        chosen_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
+    except (TypeError, ValueError):
+        chosen_speed = 0
+    if chosen_speed < 0:
+        if speed <= 0 or speed >= SWITCH_MIN_SPEED_BPS:
+            return False
+    else:
+        floor = _speed_floor_bps(ui_cfg)
+        if speed > 0 and speed < floor:
+            return False
     if not latency_filter_matches(endpoint_display_latency_ms(endpoint), str(ui_cfg.get("routing_latency") or "")):
         return False
     if mode == "favorites" and routing_favorite_rank(endpoint, ui_cfg) != 0:
@@ -4852,12 +4875,14 @@ def _scheme_filter_label(ui_cfg: dict[str, Any]) -> str:
         speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
         speed = 0
-    if speed >= 1_000_000_000:
+    if speed < 0:
+        parts.append("＜10 Mbps")
+    elif speed >= 1_000_000_000:
         parts.append(f"≥{speed / 1_000_000_000:.0f} Gbps")
     elif speed > 0:
         parts.append(f"≥{speed / 1_000_000:.0f} Mbps")
     else:
-        parts.append("≥50 Mbps")
+        parts.append("≥10 Mbps")
     if str(ui_cfg.get("routing_mode") or "") == "favorites":
         parts.append("仅收藏")
     rules = routing_block_rules(ui_cfg)
@@ -5946,7 +5971,7 @@ def start_country_priority(country: str) -> dict[str, Any]:
     threading.Thread(target=country_priority_worker, args=(target,), daemon=True).start()
     return {"ok": True, "running": True, "available": snapshot.get("available"), "target": COUNTRY_AVAILABLE_TARGET}
 
-def test_node_by_id(node_id: str) -> dict[str, Any]:
+def test_node_by_id(node_id: str, *, record_pool: bool = True) -> dict[str, Any]:
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
@@ -5967,6 +5992,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
 
     # Latency is the real handshake, not a port probe and not a download.
     latency = 0
+    speed = 0
     openvpn_process: subprocess.Popen[str] | None = None
     ok = False
     message = "OpenVPN did not complete initialization."
@@ -5982,13 +6008,21 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
         )
         yielded = "让路" in str(message or "")
         if ok and not yielded:
-            health = check_interface_egress(f"tun{idx}")
-            if not health.get("ok"):
+            dev = f"tun{idx}"
+            speed = _sample_exit_speed(dev)
+            latency = int(latency_box[0]) if latency_box else 0
+            if speed <= 0:
                 ok = False
                 latency = 0
-                message = "OpenVPN 已握手，但隧道出不了网"
+                message = "OpenVPN 已握手，但测速没有结果"
             else:
-                latency = int(health.get("latency_ms") or 0)
+                mbps = speed / 1_000_000
+                message = f"测速 {mbps:.1f} Mbps"
+                if speed < SWITCH_MIN_SPEED_BPS:
+                    ok = False
+                    message = f"测速 {mbps:.1f} Mbps，低于 10Mbps"
+        else:
+            speed = 0
     finally:
         if openvpn_process is not None:
             stop_process(openvpn_process)
@@ -6017,12 +6051,16 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
-            try:
-                node_pool.record_probe(
-                    node, ok=ok, latency_ms=latency, message=message, speed_bps=None
-                )
-            except Exception as pool_exc:
-                log_to_json("WARNING", "Main", f"NodePool 单节点探测结果写入失败: {pool_exc}")
+            if speed > 0:
+                node["speed"] = speed
+                node["speed_bps"] = speed
+            if record_pool:
+                try:
+                    node_pool.record_probe(
+                        node, ok=ok, latency_ms=latency, message=message, speed_bps=speed or None
+                    )
+                except Exception as pool_exc:
+                    log_to_json("WARNING", "Main", f"NodePool 单节点探测结果写入失败: {pool_exc}")
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
             res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
@@ -6136,7 +6174,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     return list(updated_nodes_map.values())
 
 def probe_listed_node(node_id: str) -> dict[str, Any]:
-    """Manual 待检测. Same path as cold standby: dial the node, then webpage HTTP status."""
+    """Manual 待检测. Dial the node and store one speed sample. No webpage check."""
     node_id = str(node_id or "").strip()
     if not node_id:
         return {"ok": False, "error": "节点 ID 不能为空"}
@@ -6148,7 +6186,7 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
         protocol = str(endpoint.get("protocol") or "").lower()
         if protocol == "openvpn":
             real_id = ensure_openvpn_node_from_pool(endpoint)
-            node = test_node_by_id(real_id)
+            node = test_node_by_id(real_id, record_pool=False)
             message = str(node.get("probe_message") or "")
             if "让路" in message:
                 return {
@@ -6157,21 +6195,28 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
                     "error": message,
                     "node": {"id": node_id, "probe_status": "not_checked", "probe_message": message},
                 }
-            ok = str(node.get("probe_status") or "") == "available"
+            speed = int(node.get("speed") or node.get("speed_bps") or 0)
+            latency = int(node.get("latency_ms") or 0)
+            fast = speed >= SWITCH_MIN_SPEED_BPS
             try:
                 node_pool.record_endpoint_probe(
-                    endpoint_id, ok, int(node.get("latency_ms") or 0), message, speed_bps=None
+                    endpoint_id, fast, latency, message, speed_bps=speed or None
                 )
+                node_pool.invalidate_ui_lists()
             except Exception as exc:
                 log_to_json("WARNING", "Probe", f"待检测结果写入失败: {exc}")
             fresh = node_pool.get_endpoint(endpoint_id)
             ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
             if isinstance(ui, dict):
                 ui["id"] = node_id
-                ui["probe_status"] = "available" if ok else "unavailable"
                 ui["probe_message"] = message
-                ui["latency_ms"] = int(node.get("latency_ms") or 0)
-            return {"ok": ok, "node": ui or {"id": node_id, "probe_status": "available" if ok else "unavailable", "probe_message": message}}
+                ui["latency_ms"] = latency
+                if speed > 0:
+                    ui["speed"] = speed
+                    ui["speed_bps"] = speed
+                if not fast:
+                    ui["probe_status"] = "unavailable"
+            return {"ok": fast, "node": ui or {"id": node_id, "probe_status": "available" if fast else "unavailable", "probe_message": message, "speed": speed, "speed_bps": speed}}
         result = probe_pool_endpoint(endpoint_id)
         if result.get("skipped"):
             message = str(result.get("error") or "检测让路")
@@ -6183,6 +6228,7 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
             }
         ok = bool(result.get("ok"))
         message = str(result.get("message") or result.get("error") or "")
+        speed = int(result.get("speed_bps") or 0)
         fresh = node_pool.get_endpoint(endpoint_id)
         ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
         if isinstance(ui, dict):
@@ -6190,6 +6236,13 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
             ui["probe_status"] = "available" if ok else "unavailable"
             ui["probe_message"] = message
             ui["latency_ms"] = int(result.get("latency_ms") or 0)
+            if speed > 0:
+                ui["speed"] = speed
+                ui["speed_bps"] = speed
+        try:
+            node_pool.invalidate_ui_lists()
+        except Exception:
+            pass
         return {"ok": ok, "node": ui, "result": result}
     node = test_node_by_id(node_id)
     message = str(node.get("probe_message") or "")
@@ -8414,10 +8467,7 @@ def _release_probe_route_table(table: int) -> None:
         probe_route_tables_free.add(int(table))
 
 def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
-    """Real tunnel plus a webpage check. Catalog scans must not call this.
-
-    Cold standby, precold, the substitute bench, and a manual 待检测 click do.
-    """
+    """Real tunnel for a non-OpenVPN 待检测 click. Catalog scans must not call this."""
     endpoint_id = str(endpoint_id or "").strip()
     if not endpoint_id:
         return {"ok": False, "error": "endpoint_id 为空"}
@@ -8538,21 +8588,39 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             egress_latency = int(health.get("latency_ms") or 0)
 
         latency_ms = egress_latency if 0 < egress_latency <= 1500 else 0
-        forward_failed = protocol == "l2tp-ipsec" and not forwarded.get("ok")
-        probe_message = (
-            f"{protocol} 隧道可上网，本机转发未通过"
-            if forward_failed
-            else f"{protocol} 隧道可上网 {latency_ms} ms"
-        )
+        speed = 0
+        if protocol != "l2tp-ipsec" and result.interface:
+            speed = _sample_exit_speed(str(result.interface))
+        if speed > 0:
+            mbps = speed / 1_000_000
+            if speed < SWITCH_MIN_SPEED_BPS:
+                probe_message = f"测速 {mbps:.1f} Mbps，低于 10Mbps"
+                node_pool.record_endpoint_probe(endpoint_id, False, latency_ms, probe_message, speed_bps=speed)
+                return {
+                    "ok": False,
+                    "protocol": protocol,
+                    "interface": result.interface,
+                    "latency_ms": latency_ms,
+                    "speed_bps": speed,
+                    "message": probe_message,
+                }
+            probe_message = f"测速 {mbps:.1f} Mbps"
+        else:
+            forward_failed = protocol == "l2tp-ipsec" and not forwarded.get("ok")
+            probe_message = (
+                f"{protocol} 隧道可上网，本机转发未通过"
+                if forward_failed
+                else f"{protocol} 隧道可上网 {latency_ms} ms"
+            )
         node_pool.record_endpoint_probe(
-            endpoint_id, True, latency_ms, probe_message, speed_bps=None
+            endpoint_id, True, latency_ms, probe_message, speed_bps=speed or None
         )
         return {
             "ok": True,
             "protocol": protocol,
             "interface": result.interface,
             "latency_ms": latency_ms,
-            "speed_bps": 0,
+            "speed_bps": speed,
             "message": probe_message,
         }
     except Exception as exc:
@@ -13770,7 +13838,7 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
-    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="打开全球库检测。TCP 看端口，UDP 发一包。tls-auth 的 UDP 无应答不算不可用。冷备、预冷备、替补预冷备，以及点击待检测，才真实连接并检查网页。">
+    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="打开全球库检测。TCP 看端口，UDP 发一包。tls-auth 的 UDP 无应答不算不可用。冷备和预冷备只测端口。点击待检测才连接并测速，结果写入列表。">
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex:0 0 16px;"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       全球库检测
     </button>
@@ -13903,6 +13971,8 @@ INDEX_HTML = r"""<!doctype html>
 
       <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
         <option value="0">不限速度</option>
+        <option value="10000000">≥10 Mbps</option>
+        <option value="-1">＜10 Mbps</option>
         <option value="50000000">≥50 Mbps</option>
         <option value="100000000">≥100 Mbps</option>
         <option value="300000000">≥300 Mbps</option>
@@ -14004,7 +14074,7 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
-      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。冷备、预冷备、替补预冷备，以及点击待检测，才连接节点并检查网页。转发时等待，筛选不再打断检测，等待不算失败。</div>
+      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。点击待检测才连接该节点并测速，速度写入列表；低于 10Mbps 记为不可用。转发时等待，筛选不再打断检测，等待不算失败。</div>
       <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">检测节点数</span>
         <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>
@@ -14248,7 +14318,9 @@ INDEX_HTML = r"""<!doctype html>
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label" for="net_routing_min_speed">速度</label>
             <select id="net_routing_min_speed" aria-hidden="true" tabindex="-1" style="display:none;">
-              <option value="0">默认 ≥50 Mbps</option>
+              <option value="0">默认 ≥10 Mbps</option>
+              <option value="10000000">≥10 Mbps</option>
+              <option value="-1">＜10 Mbps</option>
               <option value="50000000">≥50 Mbps</option>
               <option value="100000000">≥100 Mbps</option>
               <option value="300000000">≥300 Mbps</option>
@@ -14258,7 +14330,7 @@ INDEX_HTML = r"""<!doctype html>
             </select>
             <div id="net_routing_min_speed_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_min_speed" aria-label="速度">
               <button id="net_routing_min_speed_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">默认 ≥50 Mbps</span>
+                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">默认 ≥10 Mbps</span>
                 <span class="toolbar-custom-select-arrow">⌄</span>
               </button>
               <div id="net_routing_min_speed_menu" class="toolbar-custom-select-menu" role="listbox"></div>
@@ -15011,6 +15083,10 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   const selectedProtocol = $("protocol_filter")?.value || "";
   const selectedIpType = $("ip_type_filter")?.value || "";
   const selectedSpeed = Number($("speed_filter")?.value || 0);
+  if (selectedSpeed < 0) {
+    const measured = Number(n.speed_bps || n.speed || 0);
+    if (!(measured > 0 && measured < 10000000)) return false;
+  } else if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) < selectedSpeed) return false;
   const selectedStatus = $("status_filter")?.value || "";
 
   if (!ignoreCountry && selectedCountry && getNodeCountry(n) !== translateCountry(selectedCountry)) return false;
@@ -15021,7 +15097,6 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedIpType === "hosting" && ipType !== "hosting") return false;
   if (selectedIpType === "mobile" && ipType !== "mobile") return false;
 
-  if (selectedSpeed > 0 && Number(n.speed_bps || n.speed || 0) < selectedSpeed) return false;
   const latencyFilter = String($("latency_filter")?.value || "");
   if (latencyFilter) {
     const ms = Number(n.latency_ms || 0);
@@ -15617,7 +15692,8 @@ function readListScope() {
   const status = String($("status_filter")?.value || "").trim();
   const protocol = String($("protocol_filter")?.value || "").trim();
   const ipType = String($("ip_type_filter")?.value || "").trim();
-  const speedMinBps = Math.max(0, Number($("speed_filter")?.value || 0) || 0);
+  const rawSpeed = Number($("speed_filter")?.value || 0);
+  const speedMinBps = rawSpeed < 0 ? -1 : Math.max(0, rawSpeed || 0);
   const latency = String($("latency_filter")?.value || "").trim();
   const countrySelect = $("country_filter");
   const country = countrySelect
@@ -15660,7 +15736,7 @@ async function refreshCountryCatalog(force = false, signal = null) {
   if (status) params.set("status", status);
   if (protocol) params.set("protocol", protocol);
   if (ipType) params.set("ip_type", ipType);
-  if (speedMinBps && Number(speedMinBps) > 0) params.set("speed_min_bps", speedMinBps);
+  if (speedMinBps) params.set("speed_min_bps", speedMinBps < 0 ? "below10" : String(speedMinBps));
   if (latency) params.set("latency", latency);
 
   countryCatalogInflightKey = key;
@@ -16308,7 +16384,7 @@ function render(){
           : hotStandby
           ? `<span class="badge available"><span class="badge-pulse"></span>${standbyLabel}</span>`
           : canRetest
-            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "按冷备方式连接节点，并检查网页")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
+            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "连接该节点并测速，结果写入列表")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
             : `<span class="badge ${badgeClass}" title="${esc(n.probe_message || "")}">${badgeText}</span>`;
 
       // Background detection is allowed to continue while the user manually
@@ -16411,7 +16487,7 @@ function proxySettingsLine() {
     const where = country || "";
     status = where + (state.background_paused ? "检测已暂停" : (detecting ? "检测中" : "检测待命"));
   }
-  const settingBody = [configured ? (country || "不限国家") : "智能模式", label || "所有协议 · 不限类型 · 不限延迟 · ≥50 Mbps"].filter(Boolean).join(" · ");
+  const settingBody = [configured ? (country || "不限国家") : "智能模式", label || "所有协议 · 不限类型 · 不限延迟 · ≥10 Mbps"].filter(Boolean).join(" · ");
   return status + " 代理设置 · " + settingBody + " · 符合 " + available + " · 已验证 " + inventory + " IP";
 }
 
@@ -16804,7 +16880,10 @@ function nodeMatchesLocalScope(node, scope) {
   const ipType = String(scope.ipType || "").toLowerCase();
   if (ipType && String(node.ip_type || "").toLowerCase() !== ipType) return false;
   const speedMin = Number(scope.speedMinBps || 0);
-  if (speedMin > 0 && Number(node.speed_bps || node.speed || 0) < speedMin) return false;
+  const measured = Number(node.speed_bps || node.speed || 0);
+  if (speedMin < 0) {
+    if (!(measured > 0 && measured < 10000000)) return false;
+  } else if (speedMin > 0 && measured < speedMin) return false;
   const latency = String(scope.latency || "").toLowerCase();
   const ms = Number(node.latency_ms || 0);
   if (latency === "gt1000") {
@@ -16891,7 +16970,7 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signa
   if (scope.status) params.set("status", scope.status);
   if (scope.protocol) params.set("protocol", scope.protocol);
   if (scope.ipType) params.set("ip_type", scope.ipType);
-  if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
+  if (scope.speedMinBps) params.set("speed_min_bps", scope.speedMinBps < 0 ? "below10" : String(scope.speedMinBps));
   if (scope.latency) params.set("latency", scope.latency);
   const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), signal ? {signal} : {}, timeoutMs);
   if (bumpSeq && data && typeof data === "object") data._nodeQuerySeq = seq;
@@ -18025,7 +18104,7 @@ async function refreshFilterCounts(signal = null, attempt = 0) {
   if (scope.country) params.set("country", scope.country);
   if (scope.protocol) params.set("protocol", scope.protocol);
   if (scope.ipType) params.set("ip_type", scope.ipType);
-  if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
+  if (scope.speedMinBps) params.set("speed_min_bps", scope.speedMinBps < 0 ? "below10" : String(scope.speedMinBps));
   if (scope.latency) params.set("latency", scope.latency);
   try {
     const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), signal ? {signal} : {}, 8000);
@@ -21913,7 +21992,7 @@ class Handler(BaseHTTPRequestHandler):
             status = str((query.get("status") or [""])[0]).strip().lower()
             protocol = str((query.get("protocol") or [""])[0]).strip().lower()
             ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-            speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
+            speed_min_bps = _parse_speed_filter((query.get("speed_min_bps") or ["0"])[0])
             try:
                 latency = normalize_routing_latency((query.get("latency") or [""])[0])
             except ValueError:
@@ -21996,7 +22075,7 @@ class Handler(BaseHTTPRequestHandler):
                 country = str((query.get("country") or [""])[0]).strip()
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-                speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
+                speed_min_bps = _parse_speed_filter((query.get("speed_min_bps") or ["0"])[0])
                 try:
                     latency = normalize_routing_latency((query.get("latency") or [""])[0])
                 except ValueError:
@@ -22013,7 +22092,7 @@ class Handler(BaseHTTPRequestHandler):
                 status = str((query.get("status") or [""])[0]).strip().lower()
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-                speed_min_bps = max(0, bounded_int((query.get("speed_min_bps") or ["0"])[0], 0, 0, 2_000_000_000))
+                speed_min_bps = _parse_speed_filter((query.get("speed_min_bps") or ["0"])[0])
                 try:
                     latency = normalize_routing_latency((query.get("latency") or [""])[0])
                 except ValueError:
@@ -24079,7 +24158,7 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
-    speed_min_bps = max(0, int(speed_min_bps or 0))
+    speed_min_bps = int(speed_min_bps or 0)
 
     if country and not country_matches(node.get("country"), country):
         # A populated canonical country is authoritative. Only fall back to
@@ -24101,7 +24180,11 @@ def _node_matches_ui_scope(node: dict[str, Any], country: str = "", status: str 
     if ip_type and node_ip_type != ip_type:
         return False
 
-    if speed_min_bps > 0 and int(node.get("speed_bps") or node.get("speed") or 0) < speed_min_bps:
+    if speed_min_bps < 0:
+        measured = int(node.get("speed_bps") or node.get("speed") or 0)
+        if measured <= 0 or measured >= 10_000_000:
+            return False
+    elif speed_min_bps > 0 and int(node.get("speed_bps") or node.get("speed") or 0) < speed_min_bps:
         return False
     if not latency_filter_matches(int(node.get("latency_ms") or 0), latency):
         return False
@@ -24265,7 +24348,7 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
     """
     offset = max(0, int(offset or 0))
     limit = max(1, min(200, int(limit or 100)))
-    speed_min_bps = max(0, int(speed_min_bps or 0))
+    speed_min_bps = int(speed_min_bps or 0)
     started = time.perf_counter()
 
     # Do not start/build the heavyweight global UI snapshot here. The Master
@@ -24385,7 +24468,7 @@ def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0, 
     country = normalized_country_name(country) if country else ""
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
-    speed_min_bps = max(0, int(speed_min_bps or 0))
+    speed_min_bps = int(speed_min_bps or 0)
     try:
         latency = normalize_routing_latency(latency)
     except ValueError:
@@ -24420,7 +24503,7 @@ def _get_ui_country_catalog(status="", protocol="", ip_type="", speed_min_bps=0,
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
-    speed_min_bps = max(0, int(speed_min_bps or 0))
+    speed_min_bps = int(speed_min_bps or 0)
     try:
         latency = normalize_routing_latency(latency)
     except ValueError:

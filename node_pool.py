@@ -72,7 +72,7 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
     status = str(status or "").strip().lower()
     protocol = str(protocol or "").strip().lower()
     ip_type = str(ip_type or "").strip().lower()
-    speed_min_bps = max(0, int(speed_min_bps or 0))
+    speed_min_bps = int(speed_min_bps or 0)
     latency = normalize_latency_filter(latency)
     where = [
         "TRIM(COALESCE(s.current_ip,''))<>''",
@@ -88,7 +88,13 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
     if ip_type and ip_type != "all":
         where.append("LOWER(COALESCE(json_extract(s.metadata_json,'$.ip_type'),''))=?")
         params.append(ip_type)
-    if speed_min_bps > 0:
+    if speed_min_bps < 0:
+        where.append(
+            "CAST(COALESCE((SELECT o.speed FROM observations o "
+            "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) "
+            "BETWEEN 1 AND 9999999"
+        )
+    elif speed_min_bps > 0:
         where.append(
             "CAST(COALESCE((SELECT o.speed FROM observations o "
             "WHERE o.server_key=e.server_key ORDER BY o.seen_at DESC LIMIT 1), 0) AS INTEGER) >= ?"
@@ -1094,7 +1100,7 @@ class NodePool:
         country = canonical_country_name(country) if country else ""
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
-        speed_min_bps = max(0, int(speed_min_bps or 0))
+        speed_min_bps = int(speed_min_bps or 0)
         latency = normalize_latency_filter(latency)
         key = (country, protocol, ip_type, speed_min_bps, latency)
         now = time.monotonic()
@@ -1204,7 +1210,7 @@ class NodePool:
         status = str(status or "").strip().lower()
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
-        speed_min_bps = max(0, int(speed_min_bps or 0))
+        speed_min_bps = int(speed_min_bps or 0)
         active_endpoint_id = str(active_endpoint_id or "").strip()
         active_ip = str(active_ip or "").strip()
         active_protocol = str(active_protocol or "").strip().lower()
@@ -1343,7 +1349,7 @@ class NodePool:
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
         connected_endpoint_id = str(connected_endpoint_id or "").strip()
-        speed_min_bps = max(0, int(speed_min_bps or 0))
+        speed_min_bps = int(speed_min_bps or 0)
         latency = normalize_latency_filter(latency)
         key = (status, protocol, ip_type, connected_endpoint_id, speed_min_bps, latency)
         now = time.monotonic()
@@ -1384,7 +1390,7 @@ class NodePool:
                     not status
                     and not protocol
                     and not ip_type
-                    and speed_min_bps <= 0
+                    and speed_min_bps == 0
                     and not latency
                 )
                 if plain:
@@ -1856,6 +1862,44 @@ class NodePool:
             self._invalidate_read_caches()
         return wrote
 
+    def _write_measured_speed(self, db: sqlite3.Connection, row: sqlite3.Row, speed: int, now: float) -> None:
+        """Store one real download result. The list reads the newest observation."""
+        server_key = str(row["server_key"] or "")
+        if not server_key or speed <= 0:
+            return
+        server_row = db.execute(
+            "SELECT current_ip, metadata_json FROM servers WHERE server_key=?",
+            (server_key,),
+        ).fetchone()
+        ip = ""
+        if server_row is not None:
+            ip = str(server_row["current_ip"] or "").strip()
+            try:
+                server_meta = json.loads(server_row["metadata_json"] or "{}")
+            except Exception:
+                server_meta = {}
+            if not isinstance(server_meta, dict):
+                server_meta = {}
+            server_meta["last_ip_speed_bps"] = int(speed)
+            server_meta["last_ip_speed_at"] = now
+            server_meta["last_ip_speed_ip"] = ip
+            db.execute(
+                "UPDATE servers SET metadata_json=? WHERE server_key=?",
+                (json.dumps(server_meta, ensure_ascii=False), server_key),
+            )
+        prev = db.execute(
+            "SELECT ping, sessions, score, ip FROM observations WHERE server_key=? ORDER BY seen_at DESC, id DESC LIMIT 1",
+            (server_key,),
+        ).fetchone()
+        ping = int(prev["ping"] or 0) if prev else 0
+        sessions = int(prev["sessions"] or 0) if prev else 0
+        score = int(prev["score"] or 0) if prev else 0
+        observed_ip = str((prev["ip"] if prev else "") or ip or "")
+        db.execute(
+            "INSERT INTO observations(server_key, source, seen_at, ip, ping, speed, sessions, score) VALUES(?,?,?,?,?,?,?,?)",
+            (server_key, "speed_test", now, observed_ip, ping, int(speed), sessions, score),
+        )
+
     def _apply_endpoint_probe(self, db: sqlite3.Connection, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = None) -> bool:
         now = time.time()
         latency = max(0, int(latency_ms or 0))
@@ -1864,82 +1908,99 @@ class NodePool:
         row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
         if not row:
             return False
-            prev_latency = float(row["latency_ewma"] or 0)
-            prev_streak = int(row["success_streak"] or 0)
-            prev_fail = int(row["fail_streak"] or 0)
-            try: meta = json.loads(row["metadata_json"] or "{}")
-            except Exception: meta = {}
-            if not isinstance(meta, dict): meta = {}
-            if ok:
-                ewma = float(latency) if latency > 0 else prev_latency
-                if prev_latency > 0 and latency > 0:
-                    ewma = 0.35 * latency + 0.65 * prev_latency
-                jitter = abs(latency - prev_latency) if prev_latency > 0 and latency > 0 else 0
-                new_jitter = 0.35 * jitter + 0.65 * float(row["jitter_ewma"] or 0)
-                meta["last_error"] = ""
-                meta["last_probe_message"] = msg
-                if speed_bps is not None:
-                    meta["last_probe_speed_bps"] = speed
-                    meta["last_probe_speed_at"] = now
-                server_row = db.execute(
-                    "SELECT current_ip, metadata_json FROM servers WHERE server_key=?",
-                    (row["server_key"],),
-                ).fetchone()
-                if server_row is not None and speed_bps is not None:
-                    try: server_meta = json.loads(server_row["metadata_json"] or "{}")
-                    except Exception: server_meta = {}
-                    if not isinstance(server_meta, dict): server_meta = {}
-                    server_meta["last_ip_speed_bps"] = speed
-                    server_meta["last_ip_speed_at"] = now
-                    server_meta["last_ip_speed_ip"] = str(server_row["current_ip"] or "").strip()
-                    db.execute(
-                        "UPDATE servers SET metadata_json=? WHERE server_key=?",
-                        (json.dumps(server_meta, ensure_ascii=False), row["server_key"]),
-                    )
-                session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
-                stability = self._stability_decision(meta, now, session_seconds, 0)
-                meta["stability"] = stability
-                tcp_rtt = int(meta.get("tcp_rtt_ms") or 0)
-                if 1 <= tcp_rtt <= 1500:
-                    shown_latency = tcp_rtt
-                elif 1 <= latency <= 1500:
-                    shown_latency = latency
-                else:
-                    shown_latency = int(row["ui_latency_ms"] or 0) if "ui_latency_ms" in row.keys() else 0
+        prev_latency = float(row["latency_ewma"] or 0)
+        prev_streak = int(row["success_streak"] or 0)
+        prev_fail = int(row["fail_streak"] or 0)
+        try: meta = json.loads(row["metadata_json"] or "{}")
+        except Exception: meta = {}
+        if not isinstance(meta, dict): meta = {}
+        measured = speed_bps is not None and speed > 0
+        slow = measured and speed < 10_000_000
+        if measured:
+            meta["last_probe_speed_bps"] = speed
+            meta["last_probe_speed_at"] = now
+            meta["slow_until"] = (now + 1800) if slow else 0
+            self._write_measured_speed(db, row, speed, now)
+        if slow:
+            meta["last_error"] = msg
+            meta["last_probe_message"] = msg
+            session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
+            stability = self._stability_decision(meta, now, session_seconds, 0)
+            db.execute(
+                """UPDATE endpoints SET status='COOLDOWN', last_failure=?, next_test=?, stability=?, metadata_json=?
+                   WHERE endpoint_id=?""",
+                (now, now + 1800, stability, json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+        elif ok:
+            ewma = float(latency) if latency > 0 else prev_latency
+            if prev_latency > 0 and latency > 0:
+                ewma = 0.35 * latency + 0.65 * prev_latency
+            jitter = abs(latency - prev_latency) if prev_latency > 0 and latency > 0 else 0
+            new_jitter = 0.35 * jitter + 0.65 * float(row["jitter_ewma"] or 0)
+            meta["last_error"] = ""
+            meta["last_probe_message"] = msg
+            if speed_bps is not None:
+                meta["last_probe_speed_bps"] = speed
+                meta["last_probe_speed_at"] = now
+            server_row = db.execute(
+                "SELECT current_ip, metadata_json FROM servers WHERE server_key=?",
+                (row["server_key"],),
+            ).fetchone()
+            if server_row is not None and speed_bps is not None:
+                try: server_meta = json.loads(server_row["metadata_json"] or "{}")
+                except Exception: server_meta = {}
+                if not isinstance(server_meta, dict): server_meta = {}
+                server_meta["last_ip_speed_bps"] = speed
+                server_meta["last_ip_speed_at"] = now
+                server_meta["last_ip_speed_ip"] = str(server_row["current_ip"] or "").strip()
                 db.execute(
-                    """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
-                       fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, stability=?, metadata_json=?, ui_latency_ms=?
-                       WHERE endpoint_id=?""",
-                    (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, stability, json.dumps(meta, ensure_ascii=False), shown_latency, endpoint_id)
+                    "UPDATE servers SET metadata_json=? WHERE server_key=?",
+                    (json.dumps(server_meta, ensure_ascii=False), row["server_key"]),
+                )
+            session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
+            stability = self._stability_decision(meta, now, session_seconds, 0)
+            meta["stability"] = stability
+            tcp_rtt = int(meta.get("tcp_rtt_ms") or 0)
+            if 1 <= tcp_rtt <= 1500:
+                shown_latency = tcp_rtt
+            elif 1 <= latency <= 1500:
+                shown_latency = latency
+            else:
+                shown_latency = int(row["ui_latency_ms"] or 0) if "ui_latency_ms" in row.keys() else 0
+            db.execute(
+                """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
+                   fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, stability=?, metadata_json=?, ui_latency_ms=?
+                   WHERE endpoint_id=?""",
+                (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, stability, json.dumps(meta, ensure_ascii=False), shown_latency, endpoint_id)
+            )
+        else:
+            if not self._probe_failure_should_count(msg):
+                meta["last_probe_message"] = msg
+                db.execute(
+                    "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                    (json.dumps(meta, ensure_ascii=False), endpoint_id),
                 )
             else:
-                if not self._probe_failure_should_count(msg):
+                new_fail = prev_fail + 1
+                meta["last_error"] = msg
+                session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
+                stability = self._touch_stability(meta, now, "fail", new_fail, 0, session_seconds)
+                if new_fail >= 3:
                     meta["last_probe_message"] = msg
                     db.execute(
-                        "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
-                        (json.dumps(meta, ensure_ascii=False), endpoint_id),
+                        """UPDATE endpoints SET status='COOLDOWN', last_failure=?, failure_count=failure_count+1,
+                           fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
+                        (now, new_fail, now + 300, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
                     )
                 else:
-                    new_fail = prev_fail + 1
-                    meta["last_error"] = msg
-                    session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
-                    stability = self._touch_stability(meta, now, "fail", new_fail, 0, session_seconds)
-                    if new_fail >= 3:
-                        meta["last_probe_message"] = msg
-                        db.execute(
-                            """UPDATE endpoints SET status='COOLDOWN', last_failure=?, failure_count=failure_count+1,
-                               fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
-                            (now, new_fail, now + 300, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
-                        )
-                    else:
-                        note = f"第{new_fail}/3次连通失败，暂不标不可用。{msg}"[:1000]
-                        meta["last_error"] = note
-                        meta["last_probe_message"] = note
-                        db.execute(
-                            """UPDATE endpoints SET last_failure=?, failure_count=failure_count+1,
-                               fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
-                            (now, new_fail, now + 1800, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
-                        )
+                    note = f"第{new_fail}/3次连通失败，暂不标不可用。{msg}"[:1000]
+                    meta["last_error"] = note
+                    meta["last_probe_message"] = note
+                    db.execute(
+                        """UPDATE endpoints SET last_failure=?, failure_count=failure_count+1,
+                           fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
+                        (now, new_fail, now + 1800, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
+                    )
         return True
 
     def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = 0) -> bool:
@@ -2082,7 +2143,7 @@ class NodePool:
         country = canonical_country_name(country) if country else ""
         protocol = str(protocol or "").strip().lower()
         ip_type = str(ip_type or "").strip().lower()
-        speed_min_bps = max(0, int(speed_min_bps or 0))
+        speed_min_bps = int(speed_min_bps or 0)
         latency = normalize_latency_filter(latency)
         cache_key = (country, protocol, ip_type, speed_min_bps, latency)
         cached = self._status_counts_cache.get(cache_key)
