@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.87"
+APP_VERSION = "V1.0.88"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -9053,31 +9053,37 @@ def _library_status_rank(status: str) -> int:
 
 
 def _library_wait_until_slot(generation: int) -> str:
+    """Yield briefly for the data plane. On a small host, exit the round instead of waiting forever."""
+    deadline = time.monotonic() + 60.0
     while True:
         with library_check_lock:
             if library_check_generation != generation or library_check_stop:
                 return "stop"
             paused = library_check_paused
+        total_kb, avail_kb = _meminfo_kb()
+        if 0 < total_kb < 700 * 1024 and (
+            _self_swap_kb() > 64 * 1024 or 0 < avail_kb < 90 * 1024
+        ):
+            _library_set_wait("内存不够，本轮检测退出，剩余留到下次")
+            return "stop"
         if paused:
+            if time.monotonic() >= deadline:
+                return "stop"
             _library_set_wait("已暂停")
             time.sleep(0.4)
             continue
-        if manual_connection_active or is_connecting or maintenance_lock.locked():
-            _library_set_wait("人工切换或维护进行中，检测让路")
-            time.sleep(0.5)
-            continue
-        if proxy_server.proxy_forwarding_busy():
-            _library_set_wait("转发占用中，等待空闲后再检测")
-            time.sleep(0.5)
-            continue
-        if ui_query_active():
-            _library_set_wait("页面正在筛选，检测让路，等待不算失败")
-            time.sleep(0.3)
-            continue
-        total_kb, _avail_kb = _meminfo_kb()
-        if 0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024:
-            _library_set_wait("内存正在换页，检测让路，等待不算失败")
-            time.sleep(2.0)
+        if (
+            manual_connection_active
+            or is_connecting
+            or maintenance_lock.locked()
+            or proxy_server.proxy_forwarding_busy()
+            or ui_query_active()
+        ):
+            if time.monotonic() >= deadline:
+                _library_set_wait("让路超过 60 秒，本轮检测退出，剩余留到下次")
+                return "stop"
+            _library_set_wait("页面或转发占用，检测让路，等待不算失败")
+            time.sleep(0.4)
             continue
         _library_set_wait("")
         return "go"
@@ -9329,8 +9335,10 @@ def maybe_start_scheduled_library_check() -> None:
         return
     if not global_scan_due():
         return
-    total_kb, _avail_kb = _meminfo_kb()
-    if 0 < total_kb < 700 * 1024 and _self_swap_kb() > 64 * 1024:
+    total_kb, avail_kb = _meminfo_kb()
+    if 0 < total_kb < 700 * 1024 and (
+        _self_swap_kb() > 64 * 1024 or 0 < avail_kb < 90 * 1024
+    ):
         return
     if (
         proxy_server.proxy_forwarding_busy()
@@ -10398,19 +10406,29 @@ INDEX_HTML = r"""<!doctype html>
     .boot-status {
       position: fixed;
       left: 50%;
-      top: 46%;
-      z-index: 30;
+      top: 54%;
+      z-index: 5000;
       transform: translate(-50%, -50%);
       pointer-events: none;
     }
     .boot-status-card {
-      width: min(420px, calc(100vw - 48px));
+      width: min(440px, calc(100vw - 32px));
       padding: 28px 26px 22px;
       border-radius: 18px;
-      border: 1px solid rgba(20, 184, 166, 0.35);
-      background: rgba(11, 15, 25, 0.94);
-      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(20, 184, 166, 0.45);
+      background: rgba(8, 12, 20, 0.98);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
       text-align: center;
+    }
+    body.ui-locked button,
+    body.ui-locked a,
+    body.ui-locked select,
+    body.ui-locked input,
+    body.ui-locked textarea,
+    body.ui-locked .option-card,
+    body.ui-locked .unified-select,
+    body.ui-locked [onclick] {
+      pointer-events: none !important;
     }
     .boot-ring {
       width: 54px;
@@ -18899,6 +18917,7 @@ function paintBootStatus(extra) {
 function hideBootStatus() {
   const el = $("boot_status");
   bootStatusHold = false;
+  document.body.classList.remove("ui-locked");
   if (bootStatusTimer) {
     clearInterval(bootStatusTimer);
     bootStatusTimer = null;
@@ -18906,16 +18925,46 @@ function hideBootStatus() {
   if (el) el.style.display = "none";
 }
 
+function pageActionBusy() {
+  if (testingNodeIds && testingNodeIds.size) return "test";
+  if (state && (state.manual_switch_active || state.is_connecting)) return "switch";
+  if (state && state.egress_switching) return "egress";
+  return "";
+}
+
 function settleBootStatus() {
   const el = $("boot_status");
   if (!el) return;
-  const ready = !nodeListLoading && ((currentPageNodes && currentPageNodes.length) || !nodeListError);
+  const action = pageActionBusy();
+  const ready = !action && !nodeListLoading && ((currentPageNodes && currentPageNodes.length) || !nodeListError);
   if (ready) {
     hideBootStatus();
     return;
   }
+  document.body.classList.add("ui-locked");
   if (el.style.display === "none") el.style.display = "flex";
   if (!bootStatusTimer) bootStatusTimer = setInterval(() => paintBootStatus(), 1000);
+  if (action === "switch") {
+    paintBootStatus({
+      title: "正在切换节点",
+      detail: "这一次完成前，后面的点击已取消。请不要再点。"
+    });
+    return;
+  }
+  if (action === "egress") {
+    paintBootStatus({
+      title: "正在切换出口",
+      detail: "这一次完成前，后面的点击已取消。请不要再点。"
+    });
+    return;
+  }
+  if (action === "test") {
+    paintBootStatus({
+      title: "正在检测这个节点",
+      detail: "检测结束前，后面的点击已取消。请不要再点。"
+    });
+    return;
+  }
   if (nodeListError && !nodeListLoading) {
     paintBootStatus({
       title: "这一次没读完",
@@ -18956,6 +19005,17 @@ async function readFirstNodePage(country, generation, signal) {
 nodeListLoading = true;
 render();
 load();
+
+document.addEventListener("click", (event) => {
+  if (!document.body.classList.contains("ui-locked")) return;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
+document.addEventListener("change", (event) => {
+  if (!document.body.classList.contains("ui-locked")) return;
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
 
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面。
 // 不占用筛选请求的序号，避免这一轮把「所有IP / 住宅」的结果判成过期后画成空表。
