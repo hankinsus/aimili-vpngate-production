@@ -21171,7 +21171,7 @@ def fast_tunnel_liveness_loop() -> None:
                 fast_tunnel_liveness_loop.plane_at = now_plane
                 iface = str(proxy_server.get_active_interface() or "").strip()
                 if iface and not _iface_forwards(iface):
-                    if time.time() - float(getattr(fast_tunnel_liveness_loop, "forward_ok_at", 0) or 0) < 600:
+                    if time.time() - float(getattr(fast_tunnel_liveness_loop, "forward_ok_at", 0) or 0) < 180:
                         fast_tunnel_liveness_loop.plane_miss = 0
                         time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                         continue
@@ -21904,90 +21904,100 @@ class Handler(BaseHTTPRequestHandler):
         elif effective_path == "/api/ui/state":
             self.send_json({"ok": True, "state": _get_fast_nodes_state(), "ui_command": ui_command_plane.ui_state()})
         elif effective_path == "/api/ui/nodes":
-            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            page_cap = ui_list_page_size()
-            offset = bounded_int((query.get("offset") or ["0"])[0], 0, 0, 200000)
-            limit = bounded_int((query.get("limit") or [str(page_cap)])[0], page_cap, 1, page_cap)
-            country = str((query.get("country") or [""])[0]).strip()
-            status = str((query.get("status") or [""])[0]).strip().lower()
-            protocol = str((query.get("protocol") or [""])[0]).strip().lower()
-            ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
-            speed_min_bps = _parse_speed_filter((query.get("speed_min_bps") or ["0"])[0])
             try:
-                latency = normalize_routing_latency((query.get("latency") or [""])[0])
-            except ValueError:
-                latency = ""
-            if offset == 0 and status == "usable" and not protocol and not ip_type and not speed_min_bps and not latency:
-                active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
-                country_key = normalized_country_name(country) if country else ""
-                with _first_page_snapshot_lock:
-                    snap = _first_page_snapshot.get((country_key, active_now))
-                snap_body = (snap or {}).get("body")
-                snap_at = float((snap or {}).get("at") or 0)
-                if snap_body and time.time() - snap_at < 60:
-                    body = dict(snap_body)
-                    body["nodes"] = _pin_connected_then_standby(list(body.get("nodes") or [])[:limit])
-                    body["limit"] = limit
-                    self.send_json(body)
-                    return
-            ui_query_enter()
-            try:
-                if status == "connected":
-                    # Connected is a runtime connection state, not a Master Pool
-                    # endpoint lifecycle state. Resolve it from the active tunnel
-                    # first so the filter works for both OpenVPN and pooled protocols.
-                    connected_nodes = []
-                    if active_pool_endpoint_id:
-                        ep = node_pool.get_endpoint(active_pool_endpoint_id)
-                        if ep:
-                            node = protocol_endpoint_to_ui_node(ep)
-                            if _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
-                                connected_nodes = [node]
-                    elif active_openvpn_node_id:
-                        try:
-                            raw_active = _nodes_index_get().get(str(active_openvpn_node_id))
-                        except Exception:
-                            raw_active = None
-                        if raw_active:
-                            raw_active = dict(raw_active)
-                            raw_active["active"] = True
-                            if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type, speed_min_bps, latency):
-                                connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
-                    page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
-                elif status == "standby":
-                    standby_state = _ui_standby_fields()
-                    standby_nodes = []
-                    if standby_state.get("standby_ready") or standby_state.get("standby_prepared"):
-                        node = _load_live_standby_ui_node(standby_state)
-                        if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
-                            node["standby_row"] = True
-                            standby_nodes = [node]
-                    page_nodes, total_nodes, cache_building = standby_nodes[offset:offset + limit], len(standby_nodes), False
-                else:
-                    page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
-                        offset, limit, country, status, protocol, ip_type, speed_min_bps, latency
-                    )
-                if offset == 0 and status not in ("connected", "standby"):
-                    page_nodes = _pin_connected_then_standby(page_nodes)
-                body = {
-                    "ok": True,
-                    "nodes": page_nodes,
-                    "offset": offset,
-                    "limit": limit,
-                    "total": total_nodes,
-                    "has_more": offset + len(page_nodes) < total_nodes,
-                    "cache_building": cache_building,
-                    "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps, "latency": latency},
-                    "generated_at": time.time(),
-                }
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                page_cap = ui_list_page_size()
+                offset = bounded_int((query.get("offset") or ["0"])[0], 0, 0, 200000)
+                limit = bounded_int((query.get("limit") or [str(page_cap)])[0], page_cap, 1, page_cap)
+                country = str((query.get("country") or [""])[0]).strip()
+                status = str((query.get("status") or [""])[0]).strip().lower()
+                protocol = str((query.get("protocol") or [""])[0]).strip().lower()
+                ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
+                speed_min_bps = _parse_speed_filter((query.get("speed_min_bps") or ["0"])[0])
+                try:
+                    latency = normalize_routing_latency((query.get("latency") or [""])[0])
+                except ValueError:
+                    latency = ""
                 if offset == 0 and status == "usable" and not protocol and not ip_type and not speed_min_bps and not latency:
-                    country_key = normalized_country_name(country) if country else ""
                     active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+                    country_key = normalized_country_name(country) if country else ""
                     with _first_page_snapshot_lock:
-                        _first_page_snapshot[(country_key, active_now)] = {"at": time.time(), "body": body}
-                self.send_json(body)
-            finally:
-                ui_query_exit()
+                        snap = _first_page_snapshot.get((country_key, active_now))
+                    snap_body = (snap or {}).get("body")
+                    snap_at = float((snap or {}).get("at") or 0)
+                    if snap_body and time.time() - snap_at < 60:
+                        body = dict(snap_body)
+                        body["nodes"] = _pin_connected_then_standby(list(body.get("nodes") or [])[:limit])
+                        body["limit"] = limit
+                        self.send_json(body)
+                        return
+                ui_query_enter()
+                try:
+                    if status == "connected":
+                        # Connected is a runtime connection state, not a Master Pool
+                        # endpoint lifecycle state. Resolve it from the active tunnel
+                        # first so the filter works for both OpenVPN and pooled protocols.
+                        connected_nodes = []
+                        if active_pool_endpoint_id:
+                            ep = node_pool.get_endpoint(active_pool_endpoint_id)
+                            if ep:
+                                node = protocol_endpoint_to_ui_node(ep)
+                                if _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
+                                    connected_nodes = [node]
+                        elif active_openvpn_node_id:
+                            try:
+                                raw_active = _nodes_index_get().get(str(active_openvpn_node_id))
+                            except Exception:
+                                raw_active = None
+                            if raw_active:
+                                raw_active = dict(raw_active)
+                                raw_active["active"] = True
+                                if _node_matches_ui_scope(raw_active, country, "", protocol, ip_type, speed_min_bps, latency):
+                                    connected_nodes = [_sanitize_ui_nodes([raw_active])[0]]
+                        page_nodes, total_nodes, cache_building = connected_nodes[offset:offset + limit], len(connected_nodes), False
+                    elif status == "standby":
+                        standby_state = _ui_standby_fields()
+                        standby_nodes = []
+                        if standby_state.get("standby_ready") or standby_state.get("standby_prepared"):
+                            node = _load_live_standby_ui_node(standby_state)
+                            if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency):
+                                node["standby_row"] = True
+                                standby_nodes = [node]
+                        page_nodes, total_nodes, cache_building = standby_nodes[offset:offset + limit], len(standby_nodes), False
+                    else:
+                        page_nodes, total_nodes, cache_building = _get_ui_nodes_page(
+                            offset, limit, country, status, protocol, ip_type, speed_min_bps, latency
+                        )
+                    if offset == 0 and status not in ("connected", "standby"):
+                        page_nodes = _pin_connected_then_standby(page_nodes)
+                    body = {
+                        "ok": True,
+                        "nodes": page_nodes,
+                        "offset": offset,
+                        "limit": limit,
+                        "total": total_nodes,
+                        "has_more": offset + len(page_nodes) < total_nodes,
+                        "cache_building": cache_building,
+                        "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps, "latency": latency},
+                        "generated_at": time.time(),
+                    }
+                    if offset == 0 and status == "usable" and not protocol and not ip_type and not speed_min_bps and not latency:
+                        country_key = normalized_country_name(country) if country else ""
+                        active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+                        with _first_page_snapshot_lock:
+                            _first_page_snapshot[(country_key, active_now)] = {"at": time.time(), "body": body}
+                    self.send_json(body)
+                finally:
+                    ui_query_exit()
+            except Exception as exc:
+                log_to_json("ERROR", "UI", f"节点列表读取失败: {exc}")
+                try:
+                    self.send_json(
+                        {"ok": False, "nodes": [], "total": 0, "error": "节点列表读取失败"},
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                except Exception:
+                    pass
         elif effective_path == "/api/ui/filter_counts":
             ui_query_enter()
             try:
