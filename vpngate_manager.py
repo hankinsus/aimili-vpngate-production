@@ -712,6 +712,10 @@ def load_ui_config() -> dict[str, Any]:
             "proxy_pass": "ilovestudy",
             "log_auto_cleanup": True,
         }
+        if not auth_file.exists():
+            config["global_scan_auto"] = True
+            config["global_scan_mode"] = "loop"
+            config["global_scan_interval_hours"] = 3
         updated = False
         if auth_file.exists():
             try:
@@ -9713,23 +9717,30 @@ def _library_check_worker(generation: int) -> None:
     probe_started = 0.0
     try:
         reason = str(library_check_fetch_reason or "manual_global_scan")
+        last_fetch = 0.0
+        try:
+            last_fetch = float(read_json(STATE_FILE, {}).get("last_fetch_at") or 0)
+        except (TypeError, ValueError):
+            last_fetch = 0.0
+        just_fetched = reason == "initial_install" and last_fetch > 0 and time.time() - last_fetch < 600
         with library_check_lock:
             if library_check_generation == generation:
-                library_check_message = "正在更新全球资源库"
+                library_check_message = "资源已经拉完，开始全量检测" if just_fetched else "正在更新全球资源库"
                 library_check_wait_reason = ""
-        try:
-            fetched = resource_collect_once(force=True, reason=reason, wait=True)
-            if isinstance(fetched, dict) and fetched.get("ok") is False and not node_pool.stats().get("endpoints"):
-                raise RuntimeError(str(fetched.get("error") or "资源库无法读取"))
-            note = str((fetched or {}).get("message") or "资源更新完成")
-            with library_check_lock:
-                if library_check_generation == generation:
-                    library_check_message = note
-        except Exception as exc:
-            log_to_json("WARNING", "Probe", f"全球库检测前资源更新未完成，继续检测现有库: {exc}")
-            with library_check_lock:
-                if library_check_generation == generation:
-                    library_check_message = f"资源更新未完成，继续检测现有库：{exc}"
+        if not just_fetched:
+            try:
+                fetched = resource_collect_once(force=True, reason=reason, wait=True)
+                if isinstance(fetched, dict) and fetched.get("ok") is False and not node_pool.stats().get("endpoints"):
+                    raise RuntimeError(str(fetched.get("error") or "资源库无法读取"))
+                note = str((fetched or {}).get("message") or "资源更新完成")
+                with library_check_lock:
+                    if library_check_generation == generation:
+                        library_check_message = note
+            except Exception as exc:
+                log_to_json("WARNING", "Probe", f"全球库检测前资源更新未完成，继续检测现有库: {exc}")
+                with library_check_lock:
+                    if library_check_generation == generation:
+                        library_check_message = f"资源更新未完成，继续检测现有库：{exc}"
         rows = node_pool.list_probe_targets()
         ready_rows: list[dict[str, Any]] = []
         skipped = 0
@@ -9946,11 +9957,8 @@ def library_check_control(action: str, payload: dict[str, Any] | None = None) ->
             library_check_rate_samples = 0
             library_check_message = "正在更新全球资源库"
             library_check_wait_reason = ""
-            library_check_fetch_reason = (
-                "scheduled_global_scan"
-                if str((payload or {}).get("reason") or "") == "scheduled_global_scan"
-                else "manual_global_scan"
-            )
+            asked = str((payload or {}).get("reason") or "")
+            library_check_fetch_reason = asked if asked in ("scheduled_global_scan", "initial_install") else "manual_global_scan"
             start_thread = True
     if start_thread:
         remember_global_scan()
@@ -25787,9 +25795,14 @@ def initial_install_bootstrap_loop():
     )
     try:
         try:
-            resource_collect_once(force=True)
+            resource_collect_once(force=True, reason="initial_install")
         except Exception as exc:
             log_to_json("WARNING", "Bootstrap", f"首次安装资源获取启动失败: {exc}")
+        try:
+            library_check_control("start", {"reason": "initial_install"})
+            log_to_json("INFO", "Bootstrap", "首次安装资源已拉完，开始一次全量端口检测")
+        except Exception as exc:
+            log_to_json("WARNING", "Bootstrap", f"首次安装全量检测没有启动: {exc}")
         try:
             if local_country:
                 availability_sweep_once(local_country)
