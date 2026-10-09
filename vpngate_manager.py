@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.94"
+APP_VERSION = "V1.0.95"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -19090,7 +19090,12 @@ function hideBootStatus() {
 function pageActionBusy() {
   if (testingNodeIds && testingNodeIds.size) return "test";
   if (state && state.manual_switch_active) return "switch";
-  if (state && state.egress_switching) return "egress";
+  if (state && state.egress_switching) {
+    const egressReady = state.egress_mode === "direct"
+      ? state.direct_egress_ok === true
+      : state.client_proxy_ok === true;
+    if (!egressReady) return "egress";
+  }
   return "";
 }
 
@@ -20611,6 +20616,8 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
         if not owned():
             return
         health = check_proxy_health(fast=True)
+        if health.get("ok") and owned():
+            set_state(egress_switching=False, egress_mode=mode, last_check_message="出口已切换")
         if health.get("ok") and owned() and proxy_server.get_egress_mode() == mode and mode == "proxy":
             # The first check already proved the tunnel can open a page.
             # One slow site must not roll a working proxy switch back to direct.
@@ -21301,6 +21308,7 @@ def background_proxy_checker() -> None:
                     continue
                 set_state(
                     tunnel_role="ACTIVE",
+                    egress_switching=False,
                     client_proxy_ok=True,
                     client_tcp_ok=True,
                     client_udp_ok=udp_ok,
