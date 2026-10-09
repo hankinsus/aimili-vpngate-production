@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.89"
+APP_VERSION = "V1.0.90"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -15907,9 +15907,13 @@ function render(){
   // The browser only formats those values; it never scans the global pool.
   updateStatusFilterOptions();
 
-  // Render separated Active Node Card
+  // Render separated Active Node Card. Skip the rebuild when the same
+  // connection is still on screen; the 4s poll used to rewrite this HTML
+  // even though the table already had a signature.
   const activeCardContainer = $("active_node_card");
   const switching = !!state.manual_switch_active || (!!state.is_connecting && !!state.pending_connection_id);
+  const cardSig = backendStateRenderSignature(state) + "|" + (activeNode ? [activeNode.id, activeNode.country, activeNode.location, activeNode.owner, activeNode.ip_type, activeNode.speed, activeNode.protocol, activeNode.ip].join("~") : "");
+  if (switching || !activeCardContainer || activeCardContainer.dataset.sig !== cardSig) {
   if (switching) {
     const pendingCountry = translateCountry(state.pending_connection_country || "-");
     const pendingProtocol = translateProtocol(state.pending_connection_protocol || "-");
@@ -16082,6 +16086,8 @@ function render(){
         ${egressSwitchHtml()}
       </div>
     `;
+  }
+  if (activeCardContainer) activeCardContainer.dataset.sig = cardSig;
   }
 
   const bgActivityEl = $("background_activity_status");
@@ -17182,7 +17188,9 @@ function backendStateRenderSignature(s) {
     x.availability_engine_running,
     x.resource_engine_running, x.global_pool_refresh_running,
     x.hot_pool_size, x.hot_pool_target, x.hot_pool_deficit, x.pool_primary, x.pool_cold, x.pool_precold, x.pool_precold_detail, x.dataplane_jitter, x.queued_connections, x.accept_wait_ms, x.standby_ready, x.standby_prepared, x.standby_node_id,
-    x.egress_mode, x.egress_switching,
+    x.egress_mode, x.egress_switching, x.direct_egress_ok, x.client_proxy_ok,
+    x.client_tcp_ok, x.client_udp_ok, x.client_quic_ok, x.proxy_error,
+    x.active_tunnel_ok, x.tunnel_role,
     x.manual_switch_active,
     x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,
     x.standby_ip, x.standby_protocol,
@@ -19169,35 +19177,38 @@ document.addEventListener("change", (event) => {
   event.stopPropagation();
 }, true);
 
-// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面。
-// 不占用筛选请求的序号，避免这一轮把「所有IP / 住宅」的结果判成过期后画成空表。
+// 节点页 60 秒缓存还在就什么都不做。状态只由 4 秒那条轮询负责，
+// 避免同一页开着时两条请求叠在管理进程上，也避免没变化仍重画顶部卡片。
+let nodePagePollBusy = false;
 setInterval(async () => {
-  if (nodeListLoading) return;
-  if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
-    const generationAtFetch = scopeLoadGeneration;
-    const countryAtFetch = String(activeCountryScope || "");
-    try {
-      const pageOffset = Math.max(0, (currentPage - 1) * pageSize);
-      const cacheKey = pageCacheKey(readListScope(), pageOffset, pageSize);
-      const freshNodes = !cachedNodePage(cacheKey);
-      const [d, stateData] = await Promise.all([
-        freshNodes ? fetchScopedNodePage(pageOffset, pageSize, 8000, null, false) : Promise.resolve(null),
-        fetchUiStateOnly(4000)
-      ]);
-      if (generationAtFetch !== scopeLoadGeneration || nodeListLoading) return;
-      if (countryAtFetch !== String(activeCountryScope || "")) return;
-      if (d && Array.isArray(d?.nodes)) {
-        nodes = [];
-        mergeLoadedNodePage(d.nodes);
-        if (d?.total != null) totalNodeCount = Number(d.total || 0);
-        if (d?.cache_building != null) nodeCacheBuilding = !!d.cache_building;
-        nodeListError = "";
-        stableSortNodes();
-        updateCountryFilter();
-      }
-      if (stateData?.state) adoptBackendState(stateData.state);
-      render();
-    } catch(e) {}
+  if (nodePagePollBusy || nodeListLoading) return;
+  if (document.visibilityState !== "visible") return;
+  if (state && (state.is_connecting || state.manual_switch_active)) return;
+  if (testingNodeIds && testingNodeIds.size) return;
+  const pageOffset = Math.max(0, (currentPage - 1) * pageSize);
+  const cacheKey = pageCacheKey(readListScope(), pageOffset, pageSize);
+  if (cachedNodePage(cacheKey)) return;
+  nodePagePollBusy = true;
+  const generationAtFetch = scopeLoadGeneration;
+  const countryAtFetch = String(activeCountryScope || "");
+  try {
+    const d = await fetchScopedNodePage(pageOffset, pageSize, 8000, null, false);
+    if (generationAtFetch !== scopeLoadGeneration || nodeListLoading) return;
+    if (countryAtFetch !== String(activeCountryScope || "")) return;
+    if (!d || !Array.isArray(d.nodes)) return;
+    const pageSig = d.nodes.map(n => n ? [n.id, n.probe_status, n.latency_ms, n.speed_bps || n.speed || 0].join("~") : "").join("|") + "|" + Number(d.total || 0);
+    const haveSig = nodes.map(n => n ? [n.id, n.probe_status, n.latency_ms, n.speed_bps || n.speed || 0].join("~") : "").join("|") + "|" + Number(totalNodeCount || 0);
+    if (pageSig === haveSig) return;
+    nodes = [];
+    mergeLoadedNodePage(d.nodes);
+    if (d.total != null) totalNodeCount = Number(d.total || 0);
+    if (d.cache_building != null) nodeCacheBuilding = !!d.cache_building;
+    nodeListError = "";
+    stableSortNodes();
+    render();
+  } catch (e) {
+  } finally {
+    nodePagePollBusy = false;
   }
 }, 10000);
 let gatewayPollInterval = null;
