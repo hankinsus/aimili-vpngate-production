@@ -4168,7 +4168,7 @@ def ip_type_preference_rank(preferred: str, actual: Any) -> int:
 
 
 ROUTING_PROTOCOL_CHOICES = {"", "openvpn", "softether", "sstp", "l2tp-ipsec"}
-ROUTING_SPEED_CHOICES = {0, -1, 10_000_000, 50_000_000, 100_000_000, 300_000_000, 500_000_000, 700_000_000, 1_000_000_000}
+ROUTING_SPEED_CHOICES = {0, 5_000_000, 10_000_000, 20_000_000, 30_000_000}
 ROUTING_LATENCY_CHOICES = {"", "100", "200", "400", "800", "1000", "gt1000"}
 
 def normalize_routing_protocol(value: Any) -> str:
@@ -4181,21 +4181,27 @@ def normalize_routing_protocol(value: Any) -> str:
 
 def _parse_speed_filter(raw: Any) -> int:
     text = str(raw or "").strip().lower()
-    if text in ("below10", "lt10", "-1"):
-        return -1
+    # ＜10 Mbps was removed. Old bookmarks must not keep filtering that bucket.
+    if text in ("below10", "lt10", "-1", ""):
+        return 0
     try:
-        return max(0, int(text or 0))
+        speed = int(text)
     except (TypeError, ValueError):
         return 0
+    if speed in ROUTING_SPEED_CHOICES:
+        return speed
+    if speed >= 30_000_000:
+        return 30_000_000
+    if speed >= 20_000_000:
+        return 20_000_000
+    if speed >= 10_000_000:
+        return 10_000_000
+    if speed > 0:
+        return 5_000_000
+    return 0
 
 def normalize_routing_min_speed(value: Any) -> int:
-    text = str(value or "").strip().lower()
-    if text in ("below10", "lt10", "-1"):
-        return -1
-    try:
-        speed = int(value or 0)
-    except (TypeError, ValueError):
-        raise ValueError("无效的速度筛选")
+    speed = _parse_speed_filter(value)
     if speed not in ROUTING_SPEED_CHOICES:
         raise ValueError("无效的速度筛选")
     return speed
@@ -4336,16 +4342,14 @@ SWITCH_MIN_SPEED_BPS = 10_000_000
 
 
 def _speed_floor_bps(ui_cfg: dict[str, Any]) -> int:
-    """Unset means 10 Mbps. An explicit higher choice is kept. -1 is the below-10 filter."""
+    """Unset means 10 Mbps. Explicit choices are 5, 10, 20 or 30 Mbps."""
     try:
         chosen = int((ui_cfg or {}).get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
         chosen = 0
-    if chosen < 0:
-        return 0
-    if chosen < SWITCH_MIN_SPEED_BPS:
+    if chosen <= 0:
         return SWITCH_MIN_SPEED_BPS
-    return chosen
+    return _parse_speed_filter(chosen)
 
 def routing_target_country(ui_cfg: dict[str, Any]) -> str:
     """Manual switch country first, then an explicit preference, then the server."""
@@ -4747,8 +4751,10 @@ def scheme_without_country(ui_cfg: dict[str, Any], country: str = "") -> dict[st
         min_speed = int(cfg.get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
         min_speed = 0
-    if min_speed < SWITCH_MIN_SPEED_BPS:
+    if min_speed <= 0:
         cfg["routing_min_speed_bps"] = SWITCH_MIN_SPEED_BPS
+    elif min_speed not in ROUTING_SPEED_CHOICES:
+        cfg["routing_min_speed_bps"] = _parse_speed_filter(min_speed)
     return cfg
 
 
@@ -4811,8 +4817,8 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     """True when this exit already satisfies the filters the user just saved.
 
     Country is only required in 优先地区. 住宅 IP accepts residential and mobile.
-    Speed is never optional: unset means ≥10 Mbps, and a saved 300 Mbps keeps only ≥300 Mbps.
-    ＜10 Mbps keeps measured results under 10 Mbps. Unmeasured speed still passes a ≥ floor.
+    Speed is never optional: unset means ≥10 Mbps. Explicit floors are 5, 10, 20 or 30 Mbps.
+    Unmeasured speed still passes a ≥ floor.
     """
     if not endpoint:
         return False
@@ -4835,17 +4841,9 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
     if protocol and str(endpoint.get("protocol") or "").lower() != protocol:
         return False
     speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
-    try:
-        chosen_speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
-    except (TypeError, ValueError):
-        chosen_speed = 0
-    if chosen_speed < 0:
-        if speed <= 0 or speed >= SWITCH_MIN_SPEED_BPS:
-            return False
-    else:
-        floor = _speed_floor_bps(ui_cfg)
-        if speed > 0 and speed < floor:
-            return False
+    floor = _speed_floor_bps(ui_cfg)
+    if speed > 0 and speed < floor:
+        return False
     if not latency_filter_matches(endpoint_display_latency_ms(endpoint), str(ui_cfg.get("routing_latency") or "")):
         return False
     if mode == "favorites" and routing_favorite_rank(endpoint, ui_cfg) != 0:
@@ -4875,11 +4873,9 @@ def _scheme_filter_label(ui_cfg: dict[str, Any]) -> str:
         speed = int(ui_cfg.get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
         speed = 0
-    if speed < 0:
-        parts.append("＜10 Mbps")
-    elif speed >= 1_000_000_000:
-        parts.append(f"≥{speed / 1_000_000_000:.0f} Gbps")
-    elif speed > 0:
+    if speed <= 0:
+        parts.append("≥10 Mbps")
+    elif speed >= 1_000_000:
         parts.append(f"≥{speed / 1_000_000:.0f} Mbps")
     else:
         parts.append("≥10 Mbps")
@@ -13971,14 +13967,10 @@ INDEX_HTML = r"""<!doctype html>
 
       <select id="speed_filter" aria-hidden="true" tabindex="-1" style="display:none;">
         <option value="0">不限速度</option>
+        <option value="5000000">≥5 Mbps</option>
         <option value="10000000">≥10 Mbps</option>
-        <option value="-1">＜10 Mbps</option>
-        <option value="50000000">≥50 Mbps</option>
-        <option value="100000000">≥100 Mbps</option>
-        <option value="300000000">≥300 Mbps</option>
-        <option value="500000000">≥500 Mbps</option>
-        <option value="700000000">≥700 Mbps</option>
-        <option value="1000000000">≥1 Gbps</option>
+        <option value="20000000">≥20 Mbps</option>
+        <option value="30000000">≥30 Mbps</option>
       </select>
       <div id="speed_filter_widget" class="toolbar-custom-select" data-filter-id="speed_filter" aria-label="速度筛选">
         <button id="speed_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -14318,19 +14310,14 @@ INDEX_HTML = r"""<!doctype html>
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label" for="net_routing_min_speed">速度</label>
             <select id="net_routing_min_speed" aria-hidden="true" tabindex="-1" style="display:none;">
-              <option value="0">默认 ≥10 Mbps</option>
-              <option value="10000000">≥10 Mbps</option>
-              <option value="-1">＜10 Mbps</option>
-              <option value="50000000">≥50 Mbps</option>
-              <option value="100000000">≥100 Mbps</option>
-              <option value="300000000">≥300 Mbps</option>
-              <option value="500000000">≥500 Mbps</option>
-              <option value="700000000">≥700 Mbps</option>
-              <option value="1000000000">≥1 Gbps</option>
+              <option value="5000000">≥5 Mbps</option>
+              <option value="10000000" selected>≥10 Mbps</option>
+              <option value="20000000">≥20 Mbps</option>
+              <option value="30000000">≥30 Mbps</option>
             </select>
             <div id="net_routing_min_speed_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_min_speed" aria-label="速度">
               <button id="net_routing_min_speed_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
-                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">默认 ≥10 Mbps</span>
+                <span id="net_routing_min_speed_label" class="toolbar-custom-select-label">≥10 Mbps</span>
                 <span class="toolbar-custom-select-arrow">⌄</span>
               </button>
               <div id="net_routing_min_speed_menu" class="toolbar-custom-select-menu" role="listbox"></div>
@@ -14857,7 +14844,7 @@ let nodes=[], state={}, testingNodeIds = new Set(), waitingNodeIds = new Set();
 const manualTestQueue = [];
 const BOOT_SERVER_COUNTRY = __BOOT_SERVER_COUNTRY_JSON__;
 let currentPage = 1;
-const pageSize = 60;
+const pageSize = 50;
 let currentPageNodes = [];
 
 const translateProtocol = p => {
@@ -18965,7 +18952,17 @@ function openNetworkModal() {
     const speedSelect = $("net_routing_min_speed");
     const latencySelect = $("net_routing_latency");
     if (protocolSelect) protocolSelect.value = state.routing_protocol || "";
-    if (speedSelect) speedSelect.value = String(state.routing_min_speed_bps || 0);
+    if (speedSelect) {
+      const rawSpeed = Number(state.routing_min_speed_bps || 0);
+      const allowedSpeeds = [5000000, 10000000, 20000000, 30000000];
+      let shownSpeed = 10000000;
+      if (allowedSpeeds.indexOf(rawSpeed) >= 0) shownSpeed = rawSpeed;
+      else if (rawSpeed >= 30000000) shownSpeed = 30000000;
+      else if (rawSpeed >= 20000000) shownSpeed = 20000000;
+      else if (rawSpeed >= 10000000) shownSpeed = 10000000;
+      else if (rawSpeed > 0) shownSpeed = 5000000;
+      speedSelect.value = String(shownSpeed);
+    }
     if (latencySelect) latencySelect.value = state.routing_latency || "";
     const blockList = $("net_routing_blocklist");
     if (blockList) blockList.value = state.routing_blocklist || "";
