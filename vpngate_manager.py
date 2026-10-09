@@ -4192,7 +4192,7 @@ def ip_type_preference_rank(preferred: str, actual: Any) -> int:
 
 
 ROUTING_PROTOCOL_CHOICES = {"", "openvpn", "softether", "sstp", "l2tp-ipsec"}
-ROUTING_SPEED_CHOICES = {0, 5_000_000, 10_000_000, 20_000_000, 30_000_000}
+ROUTING_SPEED_CHOICES = {0, 5_000_000, 10_000_000, 20_000_000, 30_000_000, 50_000_000, 80_000_000, 100_000_000}
 ROUTING_LATENCY_CHOICES = {"", "100", "200", "400", "800", "1000", "gt1000"}
 
 def normalize_routing_protocol(value: Any) -> str:
@@ -4214,6 +4214,12 @@ def _parse_speed_filter(raw: Any) -> int:
         return 0
     if speed in ROUTING_SPEED_CHOICES:
         return speed
+    if speed >= 100_000_000:
+        return 100_000_000
+    if speed >= 80_000_000:
+        return 80_000_000
+    if speed >= 50_000_000:
+        return 50_000_000
     if speed >= 30_000_000:
         return 30_000_000
     if speed >= 20_000_000:
@@ -4366,7 +4372,7 @@ SWITCH_MIN_SPEED_BPS = 10_000_000
 
 
 def _speed_floor_bps(ui_cfg: dict[str, Any]) -> int:
-    """Unset means 10 Mbps. Explicit choices are 5, 10, 20 or 30 Mbps."""
+    """Unset means 10 Mbps. Explicit choices are 5, 10, 20, 30, 50, 80 or 100."""
     try:
         chosen = int((ui_cfg or {}).get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
@@ -4374,6 +4380,13 @@ def _speed_floor_bps(ui_cfg: dict[str, Any]) -> int:
     if chosen <= 0:
         return SWITCH_MIN_SPEED_BPS
     return _parse_speed_filter(chosen)
+
+
+def _active_speed_floor_bps() -> int:
+    try:
+        return _speed_floor_bps(load_ui_config())
+    except Exception:
+        return SWITCH_MIN_SPEED_BPS
 
 def routing_target_country(ui_cfg: dict[str, Any]) -> str:
     """Manual switch country first, then an explicit preference, then the server."""
@@ -5207,7 +5220,7 @@ def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if int(endpoint.get("fail_streak") or 0) >= 3:
             continue
-        if 0 < _endpoint_speed_bps(endpoint) < SWITCH_MIN_SPEED_BPS:
+        if 0 < _endpoint_speed_bps(endpoint) < _active_speed_floor_bps():
             continue
         ip = _endpoint_ip(endpoint)
         if not ip:
@@ -6038,9 +6051,9 @@ def test_node_by_id(node_id: str, *, record_pool: bool = True) -> dict[str, Any]
             else:
                 mbps = speed / 1_000_000
                 message = f"测速 {mbps:.1f} Mbps"
-                if speed < SWITCH_MIN_SPEED_BPS:
+                if speed < _active_speed_floor_bps():
                     ok = False
-                    message = f"测速 {mbps:.1f} Mbps，低于 10Mbps"
+                    message = f"测速 {mbps:.1f} Mbps，低于 {_active_speed_floor_bps() // 1_000_000}Mbps"
         else:
             speed = 0
     finally:
@@ -6217,7 +6230,7 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
                 }
             speed = int(node.get("speed") or node.get("speed_bps") or 0)
             latency = int(node.get("latency_ms") or 0)
-            fast = speed >= SWITCH_MIN_SPEED_BPS
+            fast = speed >= _active_speed_floor_bps()
             try:
                 node_pool.record_endpoint_probe(
                     endpoint_id, fast, latency, message, speed_bps=speed or None
@@ -7059,7 +7072,7 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
             stats["excluded_occupied"] += 1
             continue
         speed = _endpoint_speed_bps(endpoint)
-        if 0 < speed < SWITCH_MIN_SPEED_BPS:
+        if 0 < speed < _active_speed_floor_bps():
             stats["excluded_speed"] += 1
             continue
         identity = f"{protocol}|{ip}|{int(endpoint.get('port') or 0)}"
@@ -8435,20 +8448,28 @@ def _sample_exit_speed(interface: str) -> int:
 
 
 def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
+    floor = _active_speed_floor_bps()
+    floor_label = f"{floor // 1_000_000}Mbps"
     speed = _sample_exit_speed(interface)
+    if speed <= 0:
+        try:
+            stored = node_pool.get_endpoint(endpoint_id) or {}
+            speed = int(stored.get("latest_speed") or 0)
+        except Exception:
+            speed = 0
     if speed <= 0:
         log_to_json("INFO", "VPN", f"切换后测速没有结果，保留当前隧道 {interface}")
         return
     mbps = speed / 1_000_000
-    if speed >= SWITCH_MIN_SPEED_BPS:
+    if speed >= floor:
         log_to_json("INFO", "VPN", f"切换后测速 {mbps:.1f} Mbps {interface}")
         return
     try:
         node_pool.mark_slow(endpoint_id)
     except Exception:
         pass
-    log_to_json("WARNING", "VPN", f"切换后测速 {mbps:.1f} Mbps，低于 10Mbps，标不稳定并换下一个")
-    raise RuntimeError(f"速度 {mbps:.1f} Mbps，低于 10Mbps")
+    log_to_json("WARNING", "VPN", f"切换后测速 {mbps:.1f} Mbps，低于 {floor_label}，标不稳定并换下一个")
+    raise RuntimeError(f"速度 {mbps:.1f} Mbps，低于 {floor_label}")
 
 
 def measure_interface_speed(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
@@ -8614,8 +8635,8 @@ def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
             speed = _sample_exit_speed(str(result.interface))
         if speed > 0:
             mbps = speed / 1_000_000
-            if speed < SWITCH_MIN_SPEED_BPS:
-                probe_message = f"测速 {mbps:.1f} Mbps，低于 10Mbps"
+            if speed < _active_speed_floor_bps():
+                probe_message = f"测速 {mbps:.1f} Mbps，低于 {_active_speed_floor_bps() // 1_000_000}Mbps"
                 node_pool.record_endpoint_probe(endpoint_id, False, latency_ms, probe_message, speed_bps=speed)
                 return {
                     "ok": False,
@@ -13996,6 +14017,9 @@ INDEX_HTML = r"""<!doctype html>
         <option value="10000000">≥10 Mbps</option>
         <option value="20000000">≥20 Mbps</option>
         <option value="30000000">≥30 Mbps</option>
+        <option value="50000000">≥50 Mbps</option>
+        <option value="80000000">≥80 Mbps</option>
+        <option value="100000000">≥100 Mbps</option>
       </select>
       <div id="speed_filter_widget" class="toolbar-custom-select" data-filter-id="speed_filter" aria-label="速度筛选">
         <button id="speed_filter_button" type="button" class="toolbar-custom-select-button" data-filter-toggle aria-expanded="false">
@@ -14091,7 +14115,7 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
-      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。点击待检测才连接该节点并测速，速度写入列表；低于 10Mbps 记为不可用。转发时等待，筛选不再打断检测，等待不算失败。</div>
+      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。点击待检测才连接该节点并测速，速度写入列表；低于所选速度记为不可用，并自动换下一个。转发时等待，筛选不再打断检测，等待不算失败。</div>
       <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">检测节点数</span>
         <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>
@@ -14339,6 +14363,9 @@ INDEX_HTML = r"""<!doctype html>
               <option value="10000000" selected>≥10 Mbps</option>
               <option value="20000000">≥20 Mbps</option>
               <option value="30000000">≥30 Mbps</option>
+              <option value="50000000">≥50 Mbps</option>
+              <option value="80000000">≥80 Mbps</option>
+              <option value="100000000">≥100 Mbps</option>
             </select>
             <div id="net_routing_min_speed_widget" class="toolbar-custom-select unified-select unified-select-full" data-unified-select-id="net_routing_min_speed" aria-label="速度">
               <button id="net_routing_min_speed_button" type="button" class="toolbar-custom-select-button" data-unified-toggle aria-expanded="false">
