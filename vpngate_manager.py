@@ -5400,12 +5400,17 @@ def apply_saved_scheme_now() -> None:
         _scheme_apply_lock.release()
 
 
+def _user_wants_proxy() -> bool:
+    try:
+        return str(read_json(STATE_FILE, {}).get("manual_egress_mode") or "") == "proxy"
+    except Exception:
+        return False
+
+
 def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool = False) -> None:
     """Health and the proxy switch use this. A missing main must be connected."""
     if active_tunnel_running():
-        if engage_proxy and proxy_server.get_egress_mode() != "proxy":
-            _engage_proxy_egress(reason)
-        elif _auto_direct_fallback_active() and proxy_server.get_egress_mode() != "proxy":
+        if proxy_server.get_egress_mode() != "proxy" and (engage_proxy or _auto_direct_fallback_active() or _user_wants_proxy()):
             _engage_proxy_egress(reason)
         return
     now = time.time()
@@ -5418,7 +5423,7 @@ def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool 
     apply_saved_scheme_now()
     if not active_tunnel_running():
         return
-    if (engage_proxy or _auto_direct_fallback_active()) and proxy_server.get_egress_mode() != "proxy":
+    if proxy_server.get_egress_mode() != "proxy" and (engage_proxy or _auto_direct_fallback_active() or _user_wants_proxy()):
         _engage_proxy_egress(reason)
 
 
@@ -23122,6 +23127,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "mode 只能是 direct 或 proxy"}, HTTPStatus.BAD_REQUEST)
                     return
                 if mode == "proxy" and not active_tunnel_running():
+                    set_state(manual_egress_mode="proxy", last_check_message="主连接未启动，正在连接并切回代理")
                     threading.Thread(
                         target=ensure_main_connection,
                         args=("切换代理模式时主连接未启动",),
@@ -23191,7 +23197,7 @@ class Handler(BaseHTTPRequestHandler):
                                     pass
                             set_state(last_check_message="换了节点仍然不通，保持直连", proxy_error="活动隧道数据面不通")
                         threading.Thread(target=_replace_dead_tunnel, daemon=True, name="proxy-replace-dead").start()
-                        set_state(last_check_message="当前隧道不通，正在换节点并切回代理", proxy_error=path_detail)
+                        set_state(manual_egress_mode="proxy", last_check_message="当前隧道不通，正在换节点并切回代理", proxy_error=path_detail)
                         self.send_json({
                             "ok": True,
                             "switching": True,
