@@ -1975,13 +1975,6 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "RETIRED": "unavailable",
         "UNAVAILABLE": "unavailable",
     }.get(status, "not_checked")
-    measured_speed = 0
-    try:
-        measured_speed = int(metadata.get("last_probe_speed_bps") or endpoint.get("latest_speed") or 0)
-    except (TypeError, ValueError):
-        measured_speed = 0
-    if probe_status == "available" and 0 < measured_speed < _active_speed_floor_bps():
-        probe_status = "unavailable"
     ip = str(endpoint.get("current_ip") or metadata.get("ip") or "").strip()
     host = str(metadata.get("hostname") or endpoint.get("hostname") or ip).strip()
     try:
@@ -6079,9 +6072,7 @@ def test_node_by_id(node_id: str, *, record_pool: bool = True) -> dict[str, Any]
             speed = _sample_exit_speed(dev)
             latency = int(latency_box[0]) if latency_box else 0
             if speed <= 0:
-                ok = False
-                latency = 0
-                message = "OpenVPN 已握手，但测速没有结果"
+                message = "已连通，测速没有结果"
             else:
                 mbps = speed / 1_000_000
                 message = f"测速 {mbps:.1f} Mbps"
@@ -6115,7 +6106,10 @@ def test_node_by_id(node_id: str, *, record_pool: bool = True) -> dict[str, Any]
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if node:
             node["latency_ms"] = latency if ok else 0
-            node["probe_status"] = "available" if ok else "unavailable"
+            if ok and speed <= 0:
+                node["probe_status"] = "available" if str(node.get("probe_status") or "") == "available" else "not_checked"
+            else:
+                node["probe_status"] = "available" if ok else "unavailable"
             node["probe_message"] = message
             node["probed_at"] = time.time()
             if speed > 0:
@@ -8144,6 +8138,8 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
             if item["active"]:
                 _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
                 item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
+                item["probe_status"] = "available"
+                item["probed_at"] = time.time()
         write_json(NODES_FILE, nodes)
 
         if quick:
@@ -8324,6 +8320,10 @@ def _iface_forwards(interface: str, timeout: float = 4.0) -> bool:
         return False
 
 
+def _note_forward_ok() -> None:
+    fast_tunnel_liveness_loop.forward_ok_at = time.time()
+
+
 def _sample_exit_speed(interface: str) -> int:
     """One short download on the tunnel just taken over. Zero means the sample failed."""
     interface = str(interface or "").strip()
@@ -8380,6 +8380,7 @@ def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
     mbps = speed / 1_000_000
     if speed >= floor:
         log_to_json("INFO", "VPN", f"切换后测速 {mbps:.1f} Mbps {interface}")
+        _note_forward_ok()
         return
     try:
         stored = node_pool.get_endpoint(endpoint_id) or {}
@@ -9956,6 +9957,15 @@ def maintain_valid_nodes(force: bool = False):
                     except Exception:
                         pass
 
+            fresh = {str(node.get("id") or ""): node for node in read_nodes()}
+            for item in merged:
+                current = fresh.get(str(item.get("id") or ""))
+                if not current:
+                    continue
+                if float(current.get("probed_at") or 0) >= float(item.get("probed_at") or 0):
+                    for key in ("probe_status", "probe_message", "latency_ms", "probed_at", "speed", "speed_bps"):
+                        if current.get(key) not in (None, ""):
+                            item[key] = current.get(key)
             write_json(NODES_FILE, merged)
 
         initial_tested_ids: set[str] = set()
@@ -21114,9 +21124,13 @@ def fast_tunnel_liveness_loop() -> None:
                 fast_tunnel_liveness_loop.plane_at = now_plane
                 iface = str(proxy_server.get_active_interface() or "").strip()
                 if iface and not _iface_forwards(iface):
+                    if time.time() - float(getattr(fast_tunnel_liveness_loop, "forward_ok_at", 0) or 0) < 600:
+                        fast_tunnel_liveness_loop.plane_miss = 0
+                        time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                        continue
                     misses = int(getattr(fast_tunnel_liveness_loop, "plane_miss", 0) or 0) + 1
                     fast_tunnel_liveness_loop.plane_miss = misses
-                    if misses >= 2:
+                    if misses >= 3:
                         fast_tunnel_liveness_loop.plane_miss = 0
                         current = current_active_routing_endpoint() or {}
                         failed = str(current.get("endpoint_id") or active_pool_endpoint_id or "")
@@ -21132,6 +21146,7 @@ def fast_tunnel_liveness_loop() -> None:
                             ensure_main_connection("当前隧道不转发", engage_proxy=True, force=True)
                 else:
                     fast_tunnel_liveness_loop.plane_miss = 0
+                    _note_forward_ok()
             time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
             continue
         except Exception as exc:
