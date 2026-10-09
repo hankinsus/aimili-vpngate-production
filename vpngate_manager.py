@@ -1420,6 +1420,18 @@ def get_state() -> dict[str, Any]:
                 }
         except Exception:
             pass
+    if parse_int(state.get("proxy_latency_ms")) <= 0 and active_openvpn_node_id:
+        parts = str(active_openvpn_node_id).rsplit("_", 2)
+        if len(parts) == 3 and parts[1].isdigit():
+            try:
+                found = node_pool.find_endpoint_id(parts[0], int(parts[1]), "openvpn")
+                endpoint = node_pool.get_endpoint(found) if found else None
+                if endpoint:
+                    shown = int(endpoint.get("ui_latency_ms") or endpoint.get("latency_ewma") or 0)
+                    if 0 < shown <= 1500:
+                        state["proxy_latency_ms"] = shown
+            except Exception:
+                pass
     _attach_local_server_identity(state)
     state["active_tunnel_interface"] = proxy_server.get_active_interface() if active_tunnel_running() else ""
     state["egress_mode"] = proxy_server.get_egress_mode()
@@ -8087,8 +8099,9 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...", manual_switch_message=("正在建立 OpenVPN 安全隧道…" if manual else ""))
+        latency_box: list[int] = []
         ok, message, process = run_openvpn_until_ready(
-            str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=(5 if quick else None)
+            str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=(5 if quick else None), latency_out=latency_box,
         )
         if not ok or process is None:
             try:
@@ -8143,9 +8156,9 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         write_json(NODES_FILE, nodes)
 
         if quick:
-            res = {"ok": True, "ip": "", "latency_ms": 0}
+            res = {"ok": True, "ip": "", "latency_ms": int(latency_box[0]) if latency_box else 0}
         else:
-            res = {"ok": True, "ip": "", "latency_ms": 0}
+            res = {"ok": True, "ip": "", "latency_ms": int(latency_box[0]) if latency_box else 0}
         if res["ok"]:
             last_active_latency = parse_int(res.get("latency_ms")) or 0
             set_state(
@@ -16038,7 +16051,7 @@ function render(){
     `;
   } else if (state.active_pool_endpoint) {
     const ep = state.active_pool_endpoint;
-    const latencyValue = Number(state.proxy_latency_ms || 0);
+    const latencyValue = Number(state.proxy_latency_ms || ep.latency_ms || 0);
     const latencyClass = getLatencyClass(latencyValue);
     const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
     const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
@@ -16080,7 +16093,7 @@ function render(){
       </div>
     `;
   } else if (activeNode) {
-    const activeLatencyValue = Number(state.proxy_latency_ms || 0);
+    const activeLatencyValue = Number(state.proxy_latency_ms || activeNode.latency_ms || 0);
     const latencyClass = getLatencyClass(activeLatencyValue);
     const latencyText = activeLatencyValue ? `<span class="latency-val ${latencyClass}">${activeLatencyValue} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
@@ -23483,6 +23496,8 @@ ui_nodes_cache_lock = threading.Lock()
 ui_nodes_cache = []
 ui_nodes_cache_at = 0.0
 ui_nodes_cache_building = False
+_first_page_snapshot_lock = threading.Lock()
+_first_page_snapshot: dict[tuple[str, str], dict[str, Any]] = {}
 UI_NODES_CACHE_TTL_SECONDS = 3.0
 bootstrap_connection_lock = threading.Lock()
 resource_engine_running = False
