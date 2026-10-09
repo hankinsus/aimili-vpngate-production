@@ -6443,8 +6443,11 @@ def auto_switch_node(attempt: int = 0) -> None:
         log_to_json("INFO", "VPN", "用户正在手动操作，自动切换暂缓")
         return
     if attempt >= 3:
-        print("[自动切换] 连续切换失败已达 3 次，备用节点不可用，切换直连模式。", flush=True)
-        _fallback_direct_egress("连续切换失败已达 3 次")
+        if not _library_meets_requirement():
+            print("[自动切换] 全球没有符合最低要求的节点，切换直连。", flush=True)
+            _fallback_direct_egress("全球没有符合最低要求的节点，已直连")
+        elif not active_tunnel_running():
+            _fallback_direct_egress("正在建立隧道，暂时直连，建好后回到代理", stop_tunnels=False)
         return
     if proxy_server.get_egress_mode() == "direct" and bool(read_json(STATE_FILE, {}).get("auto_direct_fallback")):
         return
@@ -6480,6 +6483,8 @@ def auto_switch_node(attempt: int = 0) -> None:
         )
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
+        if not active_tunnel_running():
+            _fallback_direct_egress("正在建立隧道，暂时直连，建好后回到代理", stop_tunnels=False)
         for endpoint in candidates[:max(1, min(5, len(candidates)))]:
             eid = str(endpoint.get("endpoint_id") or "")
             if eid:
@@ -6488,7 +6493,7 @@ def auto_switch_node(attempt: int = 0) -> None:
                 connect_ranked_endpoint(endpoint)
                 auto_switch_node.failed_ids = set()
                 if bool(read_json(STATE_FILE, {}).get("auto_direct_fallback")):
-                    _engage_proxy_egress("备用节点已接上，切回代理模式")
+                    _engage_proxy_egress("隧道已建立，已回到代理")
                 return
             except Exception as exc:
                 log_to_json("WARNING", "VPN", f"备用节点 {endpoint.get('endpoint_id')} 切换失败: {exc}")
@@ -6496,7 +6501,13 @@ def auto_switch_node(attempt: int = 0) -> None:
         auto_switch_node(attempt + 1)
         return
 
-    msg = "没有经过验证的备用节点，切换直连模式，并在后台继续补齐。"
+    if _library_meets_requirement(ui_cfg):
+        if not active_tunnel_running():
+            _fallback_direct_egress("正在建立隧道，暂时直连，建好后回到代理", stop_tunnels=False)
+        log_to_json("INFO", "VPN", "当前备选没接上，其它国家仍有符合要求的节点，不长期直连")
+        return
+
+    msg = "全球没有符合最低要求的节点，已直连，后台继续补齐。"
     print(f"[自动切换] {msg}", flush=True)
     log_to_json("WARNING", "VPN", msg)
     stop_all_tunnels()
@@ -7317,7 +7328,42 @@ def _auto_direct_fallback_active() -> bool:
         return False
 
 
-def _fallback_direct_egress(reason: str) -> bool:
+def _manual_direct_locked() -> bool:
+    """The user clicked 直连. Automatic recovery must not take that back."""
+    try:
+        return str(read_json(STATE_FILE, {}).get("manual_egress_mode") or "") == "direct"
+    except Exception:
+        return False
+
+
+def _library_meets_requirement(ui_cfg: dict[str, Any] | None = None) -> bool:
+    """True when some country still meets the default floor or the saved proxy settings."""
+    ui_cfg = ui_cfg or load_ui_config()
+    floor = _active_speed_floor_bps()
+    try:
+        rows = node_pool.list_routing_endpoints(limit=800)
+    except Exception:
+        return True
+    explicit = _explicit_scheme_configured(ui_cfg)
+    for endpoint in rows:
+        try:
+            if endpoint_is_blocked(endpoint, ui_cfg):
+                continue
+        except Exception:
+            continue
+        speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
+        if speed >= floor:
+            return True
+        if explicit:
+            try:
+                if endpoint_matches_explicit_routing(endpoint, ui_cfg) and speed <= 0:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _fallback_direct_egress(reason: str, stop_tunnels: bool = True) -> bool:
     """Last resort when every prepared backup failed. Leaves 8500 on the server NIC."""
     ui_cfg = load_ui_config()
     if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
@@ -7326,14 +7372,10 @@ def _fallback_direct_egress(reason: str) -> bool:
         return False
     if manual_connection_active or ui_command_plane.is_busy():
         return False
+    if _manual_direct_locked():
+        return False
     if proxy_server.get_egress_mode() == "direct":
-        if not _auto_direct_fallback_active():
-            try:
-                manual_direct = str(read_json(STATE_FILE, {}).get("manual_egress_mode") or "") == "direct"
-            except Exception:
-                manual_direct = False
-            if not manual_direct:
-                set_state(auto_direct_fallback=True)
+        set_state(auto_direct_fallback=True, last_check_message=str(reason or "")[:300])
         return True
     if active_tunnel_running():
         return False
@@ -7343,11 +7385,13 @@ def _fallback_direct_egress(reason: str) -> bool:
         return False
     try:
         try:
-            stop_all_tunnels()
+            if stop_tunnels:
+                stop_all_tunnels()
         except Exception:
             pass
         try:
-            _detach_dead_forwarding()
+            if stop_tunnels:
+                _detach_dead_forwarding()
         except Exception:
             pass
         proxy_server.set_egress_mode("direct")
@@ -7388,6 +7432,8 @@ def _fallback_direct_egress(reason: str) -> bool:
 
 def _engage_proxy_egress(reason: str) -> bool:
     """A backup tunnel is up. Leave automatic direct mode and forward 8500 through it."""
+    if _manual_direct_locked():
+        return False
     if not active_tunnel_running():
         return False
     current = current_active_routing_endpoint() or {}
@@ -7558,7 +7604,12 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
                         order.append(eid)
         order = order[: 1 + PRECOLD_TARGET]
         if not order:
+            if not _library_meets_requirement(ui_cfg):
+                _fallback_direct_egress("全球没有符合最低要求的节点，已直连")
+                return "direct"
             return "skip"
+        if not active_tunnel_running() and not _manual_direct_locked():
+            _fallback_direct_egress("正在建立隧道，暂时直连，建好后回到代理", stop_tunnels=False)
         for eid in order:
             if active_tunnel_running() or manual_connection_active or is_connecting:
                 break
@@ -7586,12 +7637,14 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
                 continue
             _cold_promote_cooldown_until = 0.0
             _promote_next_cold(eid, candidates)
-            if auto_direct:
-                _engage_proxy_egress("冷备已接上，切回代理模式")
+            if _auto_direct_fallback_active():
+                _engage_proxy_egress("隧道已建立，已回到代理")
             return "up"
         _cold_promote_cooldown_until = time.time() + 180
-        if proxy_server.get_egress_mode() == "proxy":
-            _fallback_direct_egress("冷备与预冷备均不可用或切换失败")
+        if not active_tunnel_running() and not _library_meets_requirement(ui_cfg):
+            _fallback_direct_egress("全球没有符合最低要求的节点，已直连")
+        elif proxy_server.get_egress_mode() == "proxy" and not active_tunnel_running():
+            _fallback_direct_egress("冷备和预冷备都不可用，暂时直连，隧道建立后回到代理", stop_tunnels=False)
         if proxy_server.get_egress_mode() == "direct":
             return "direct"
         return "skip"
