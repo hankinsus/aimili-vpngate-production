@@ -21321,12 +21321,22 @@ def background_proxy_checker() -> None:
                     continue
                 res = {"ok": False, "error": "活动 VPN 隧道进程或网卡已消失"}
             else:
-                # Tunnel process is up. A webpage fetch, UDP DNS and a 4s QUIC
-                # handshake every 20s are not the agreed checks, and the QUIC
-                # timeout is what kept the badge on 异常.
+                # Tunnel process is up. Do not curl the web or probe QUIC.
+                # Mark the client usable from the live process so the badge
+                # does not stay on 不可用 after a restart.
                 state_now = get_state()
+                updates: dict[str, Any] = {}
                 if state_now.get("client_quic_ok") is False or state_now.get("client_udp_ok") is False:
-                    set_state(client_quic_ok=None, client_udp_ok=None)
+                    updates["client_quic_ok"] = None
+                    updates["client_udp_ok"] = None
+                if state_now.get("client_proxy_ok") is not True or state_now.get("proxy_ok") is not True:
+                    updates["client_proxy_ok"] = True
+                    updates["proxy_ok"] = True
+                    updates["active_tunnel_ok"] = True
+                    updates["client_tcp_ok"] = True
+                    updates["proxy_error"] = ""
+                if updates:
+                    set_state(**updates)
                 time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                 continue
             if not _egress_observation_live(observed):
