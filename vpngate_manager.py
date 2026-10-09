@@ -183,10 +183,10 @@ ENABLE_PINGER_LOOP = env_flag("ENABLE_PINGER_LOOP", not DISABLE_BACKGROUND_LOOPS
 ENABLE_PROTOCOL_PROBE_LOOP = env_flag("ENABLE_PROTOCOL_PROBE_LOOP", not DISABLE_BACKGROUND_LOOPS)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
-FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
+FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.82"
+APP_VERSION = "V1.0.83"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -297,6 +297,7 @@ speed_test_lock = threading.BoundedSemaphore(1)
 fast_state_cache_lock = threading.Lock()
 fast_state_cache: dict[str, Any] | None = None
 fast_state_cache_at = 0.0
+_fast_state_refreshing = False
 ui_config_cache_lock = threading.Lock()
 ui_config_cache: dict[str, Any] | None = None
 ui_config_cache_at = 0.0
@@ -8915,24 +8916,39 @@ def global_probe_sweep_once() -> dict[str, Any]:
 
 _library_preview_at = 0.0
 _library_preview_total = 0
+_library_preview_running = False
 
 
-def library_check_preview_total() -> int:
-    """How many endpoints a library check would dial. Shown before Start."""
-    global _library_preview_at, _library_preview_total
-    now = time.time()
-    if _library_preview_total and now - _library_preview_at < 30:
-        return _library_preview_total
+def _refresh_library_preview() -> None:
+    global _library_preview_at, _library_preview_total, _library_preview_running
     total = 0
     try:
         for protocol, count in node_pool.count_by_protocol(exclude_retired=True).items():
             if _library_protocol_ready(protocol):
                 total += int(count)
+        _library_preview_total = total
+        _library_preview_at = time.time()
     except Exception:
-        total = _library_preview_total
-    _library_preview_at = now
-    _library_preview_total = total
-    return total
+        pass
+    finally:
+        _library_preview_running = False
+
+
+def library_check_preview_total() -> int:
+    """How many endpoints a library check would dial. Shown before Start.
+
+    The count is a full table scan. The homepage poll must not do it inline:
+    holding the state lock across that scan is what made every 4s refresh wait
+    behind SQLite while the manager was swapped out.
+    """
+    global _library_preview_running
+    now = time.time()
+    if _library_preview_total and now - _library_preview_at < 120:
+        return _library_preview_total
+    if not _library_preview_running:
+        _library_preview_running = True
+        threading.Thread(target=_refresh_library_preview, daemon=True, name="library-preview").start()
+    return int(_library_preview_total or 0)
 
 
 def _library_check_public_state() -> dict[str, Any]:
@@ -23353,9 +23369,17 @@ def _meminfo_kb() -> tuple[int, int]:
 
 
 def _self_rss_kb() -> int:
+    return _self_status_kb("VmRSS:")
+
+
+def _self_swap_kb() -> int:
+    return _self_status_kb("VmSwap:")
+
+
+def _self_status_kb(prefix: str) -> int:
     try:
         for line in Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("VmRSS:"):
+            if line.startswith(prefix):
                 return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         return 0
@@ -23375,6 +23399,16 @@ def memory_guard_loop() -> None:
         try:
             total, _avail = _meminfo_kb()
             rss = _self_rss_kb()
+            swap = _self_swap_kb()
+            # Free arenas only. Do not drop the list index: the previous guard
+            # did that whenever free RAM was under 80MB, which is the normal
+            # state of this 512MB host, and every filter then scanned cold.
+            if swap > 64 * 1024:
+                try:
+                    import ctypes
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
             cap = 140 * 1024 if total < 700 * 1024 else 320 * 1024
             if rss > cap:
                 global ui_nodes_cache, ui_nodes_cache_at, ui_nodes_cache_building
@@ -23403,8 +23437,9 @@ def _refresh_ui_nodes_cache_async(force=False):
     global ui_nodes_cache_building
     total, _avail = _meminfo_kb()
     # The open page reads one SQLite page. Building all 10k nodes here is what
-    # pushed the 512MB box into swap. Skip that copy on a small machine.
-    if not force and 0 < total < 700 * 1024:
+    # pushed the 512MB box into swap. Never build that copy on a small machine,
+    # including after a manual insert: that path already drops the list index.
+    if 0 < total < 700 * 1024:
         return
     with ui_nodes_cache_lock:
         fresh = bool(ui_nodes_cache) and (time.time() - ui_nodes_cache_at) < UI_NODES_CACHE_TTL_SECONDS
@@ -23437,6 +23472,15 @@ def _sort_ui_nodes_for_page(nodes):
     """
     status_rank = {"available": 0, "testing": 1, "not_checked": 2, "unavailable": 3}
     protocol_rank = {"softether": 0, "sstp": 1, "l2tp-ipsec": 2, "openvpn": 3}
+    # One read for the whole page. get_state() opens SQLite; calling it from
+    # the sort key ran it once per row and stalled the list for a minute.
+    standby = _ui_standby_fields()
+    standby_on = bool(standby.get("standby_ready") or standby.get("standby_prepared"))
+    standby_id = str(standby.get("standby_node_id") or "")
+    standby_ip = str(standby.get("standby_ip") or "")
+    standby_port = parse_int(standby.get("standby_port"))
+    standby_protocol = str(standby.get("standby_protocol") or "").strip().lower()
+    pool_id = standby_id[5:] if standby_id.startswith("pool:") else standby_id
 
     def key(n):
         active = 2
@@ -23444,15 +23488,9 @@ def _sort_ui_nodes_for_page(nodes):
             active = 0
         elif (not active_pool_endpoint_id and n.get("id") == active_openvpn_node_id):
             active = 0
-        else:
-            standby = get_state()
-            standby_id = str(standby.get("standby_node_id") or "")
-            standby_ip = str(standby.get("standby_ip") or "")
-            standby_port = parse_int(standby.get("standby_port"))
-            standby_protocol = str(standby.get("standby_protocol") or "").strip().lower()
+        elif standby_on:
             node_port = parse_int(n.get("remote_port") or n.get("port"))
             node_protocol = str(n.get("protocol") or "").strip().lower()
-            pool_id = standby_id[5:] if standby_id.startswith("pool:") else standby_id
             id_match = bool(standby_id) and (
                 n.get("id") == standby_id or n.get("pool_endpoint_id") == standby_id
                 or n.get("id") == pool_id or n.get("pool_endpoint_id") == pool_id
@@ -23460,7 +23498,7 @@ def _sort_ui_nodes_for_page(nodes):
             ip_match = bool(standby_ip) and str(n.get("ip") or "") == standby_ip and (
                 not standby_port or node_port == standby_port
             ) and (not standby_protocol or node_protocol == standby_protocol)
-            if (standby.get("standby_ready") or standby.get("standby_prepared")) and (id_match or ip_match):
+            if id_match or ip_match:
                 active = 1
         status = str(n.get("probe_status") or "not_checked").lower()
         latency = float(n.get("latency_ms") or 0)
@@ -23809,14 +23847,8 @@ def _get_ui_filter_counts(country="", protocol="", ip_type="", speed_min_bps=0, 
             node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
             connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency) else 0
         elif active_openvpn_node_id:
-            active = next(
-                (n for n in read_nodes() if str(n.get("id") or "") == str(active_openvpn_node_id)),
-                None,
-            )
-            if active:
-                active = dict(active)
-                active["active"] = True
-                connected_count = 1 if _node_matches_ui_scope(active, country, "", protocol, ip_type, speed_min_bps, latency) else 0
+            node = _openvpn_status_node(active_openvpn_node_id)
+            connected_count = 1 if node and _node_matches_ui_scope(node, country, "", protocol, ip_type, speed_min_bps, latency) else 0
     except Exception:
         connected_count = 0
     elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -23933,15 +23965,82 @@ def _openvpn_status_node(node_id: str) -> dict[str, Any]:
     }
 
 
+def _publish_fast_state_overlay(state: dict[str, Any]) -> None:
+    """Live flags only. No SQLite and no `ip addr` on the 4s poll."""
+    state["is_connecting"] = is_connecting
+    state["manual_connection_active"] = manual_connection_active
+    state["connection_generation"] = connection_generation
+    state["active_connection_generation"] = active_connection_generation
+    state["active_openvpn_node_id"] = active_openvpn_node_id
+    state["active_pool_endpoint_id"] = active_pool_endpoint_id
+    state["maintenance_running"] = maintenance_lock.locked()
+    if is_connecting or manual_connection_active or failover_lock.locked():
+        state["connection_status"] = "connecting"
+        state["connection_message"] = "正在建立或切换 VPN 隧道"
+        state["client_status"] = "validating"
+        state["client_usable"] = False
+    try:
+        state.update(_library_check_public_state())
+    except Exception:
+        pass
+    try:
+        _overlay_pool_roles(state)
+    except Exception:
+        pass
+
+
+def _refresh_fast_state_bg() -> None:
+    global _fast_state_refreshing
+    try:
+        _build_fast_nodes_state()
+    except Exception as exc:
+        log_to_json("WARNING", "UI", f"状态缓存刷新失败: {exc}")
+    finally:
+        with fast_state_cache_lock:
+            _fast_state_refreshing = False
+
+
 def _get_fast_nodes_state():
-    global fast_state_cache, fast_state_cache_at
+    """Return the last state immediately. Rebuild off the request thread.
+
+    The 4s poll used to rebuild on the request itself. A rebuild that took
+    longer than the cache TTL started another one, and the browser gave up
+    at 4s with 请求超时. Switching still shows up at once via the in-memory
+    flags overlaid below.
+    """
+    global _fast_state_refreshing
     now_mono = time.monotonic()
     with fast_state_cache_lock:
-        if fast_state_cache is not None and now_mono - fast_state_cache_at < FAST_STATE_CACHE_TTL_SECONDS:
-            cached = dict(fast_state_cache)
-            cached.update(_library_check_public_state())
-            _overlay_pool_roles(cached)
+        cached = dict(fast_state_cache) if isinstance(fast_state_cache, dict) else None
+        age = now_mono - fast_state_cache_at if cached is not None else 1e9
+        stale = cached is None or age >= FAST_STATE_CACHE_TTL_SECONDS
+        launch = stale and not _fast_state_refreshing
+        if launch:
+            _fast_state_refreshing = True
+    if cached is not None:
+        if launch:
+            threading.Thread(target=_refresh_fast_state_bg, daemon=True, name="fast-state").start()
+        _publish_fast_state_overlay(cached)
+        return cached
+    if not launch:
+        for _ in range(40):
+            time.sleep(0.05)
+            with fast_state_cache_lock:
+                if isinstance(fast_state_cache, dict):
+                    cached = dict(fast_state_cache)
+                    break
+        if cached is not None:
+            _publish_fast_state_overlay(cached)
             return cached
+    try:
+        return _build_fast_nodes_state()
+    finally:
+        with fast_state_cache_lock:
+            _fast_state_refreshing = False
+
+
+def _build_fast_nodes_state():
+    global fast_state_cache, fast_state_cache_at
     state = read_json(STATE_FILE, {})
     state.pop("password", None)
     cert_state = web_certificate.snapshot()
@@ -24632,6 +24731,66 @@ def _ensure_active_client_v2() -> bool:
         bootstrap_connection_lock.release()
     return active_tunnel_running()
 
+def orphan_tunnel_reap_loop() -> None:
+    """Catch SoftEther/L2TP sessions that a failed dial did not close.
+
+    Startup already reaps once. This pass waits until nothing is dialing so it
+    cannot delete a tunnel that is about to be promoted.
+    """
+    time.sleep(180)
+    while True:
+        try:
+            probes_idle = getattr(protocol_probe_lock, "_value", None) == getattr(protocol_probe_lock, "_initial_value", None)
+            if probes_idle and not is_connecting and not manual_connection_active and not failover_lock.locked():
+                reap_orphan_protocol_tunnels()
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"残留隧道清理失败: {exc}")
+        time.sleep(600)
+
+
+def reap_orphan_protocol_tunnels() -> None:
+    """Disconnect SoftEther and L2TP sessions that are not the live exit or the hot standby.
+
+    vpnclient and `ip netns` outlive this process. Leaving them up puts extra
+    10.211.0.0/16 routes next to tun0 and burns the 512MB host.
+    """
+    keep_accounts: set[str] = set()
+    keep_nics: set[str] = set()
+    keep_ns: set[str] = set()
+
+    def _keep(tunnel: tunnel_adapters.TunnelResult | None) -> None:
+        if tunnel is None:
+            return
+        details = tunnel.details or {}
+        account = str(details.get("account") or "")
+        nic = str(details.get("nic") or "")
+        namespace = str(tunnel.namespace or "")
+        if account:
+            keep_accounts.add(account)
+        if nic:
+            keep_nics.add(nic)
+        if namespace:
+            keep_ns.add(namespace)
+
+    _keep(active_external_tunnel)
+    try:
+        _keep(standby_slot.get("tunnel"))
+    except Exception:
+        pass
+    try:
+        removed = tunnel_adapters.SoftEtherAdapter().reap_except(keep_accounts, keep_nics)
+        if removed:
+            log_to_json("INFO", "VPN", "已断开未接管的 SoftEther 会话: " + ", ".join(removed))
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"清理 SoftEther 残留失败: {exc}")
+    try:
+        removed_ns = l2tp_adapter.reap_orphan_namespaces(keep_ns)
+        if removed_ns:
+            log_to_json("INFO", "VPN", "已删除未接管的 L2TP 网络命名空间: " + ", ".join(removed_ns))
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"清理 L2TP 残留失败: {exc}")
+
+
 def startup_recovery_loop():
     """One-shot boot recovery; a failed startup must not churn forever.
 
@@ -24641,6 +24800,12 @@ def startup_recovery_loop():
     "正在连接" state. Normal maintenance/failover loops remain responsible
     for later recovery.
     """
+    try:
+        # Previous process is gone, so nothing in memory owns the vpnclient
+        # sessions or netns it left behind. Drop them before dialing again.
+        reap_orphan_protocol_tunnels()
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"启动清理残留隧道失败: {exc}")
     time.sleep(8)
     try:
         if initial_bootstrap_active:
@@ -25031,6 +25196,7 @@ def main() -> None:
         threading.Thread(target=protocol_probe_loop, daemon=True).start()
         enabled_loops.append("protocol-probe")
     threading.Thread(target=memory_guard_loop, daemon=True, name="memory-guard").start()
+    threading.Thread(target=orphan_tunnel_reap_loop, daemon=True, name="orphan-tunnel-reap").start()
     threading.Thread(target=warm_first_page_loop, daemon=True, name="warm-first-page").start()
     threading.Thread(target=warm_standby_loop, daemon=True, name="warm-standby").start()
     threading.Thread(target=cold_standby_loop, daemon=True, name="cold-standby").start()

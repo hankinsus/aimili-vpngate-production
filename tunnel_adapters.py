@@ -540,6 +540,50 @@ class SoftEtherAdapter:
                     pass
         cleanup_route_lines(added_routes)
 
+    def list_accounts(self) -> list[tuple[str, str]]:
+        """(account, nic) pairs. vpnclient keeps these across manager restarts."""
+        try:
+            result = self._vpncmd("AccountList", timeout=8)
+        except Exception:
+            return []
+        if result.returncode != 0:
+            return []
+        accounts: list[tuple[str, str]] = []
+        name = ""
+        nic = ""
+        for line in (result.stdout or "").splitlines():
+            if "|" not in line:
+                continue
+            key, _, value = line.partition("|")
+            key = key.strip().lower()
+            value = value.strip()
+            if key.startswith("vpn connection setting name"):
+                if name:
+                    accounts.append((name, nic))
+                name, nic = value, ""
+            elif key.startswith("virtual network adapter name"):
+                nic = value
+        if name:
+            accounts.append((name, nic))
+        return accounts
+
+    def reap_except(self, keep_accounts: set[str], keep_nics: set[str]) -> list[str]:
+        """Drop SoftEther sessions this process is not using.
+
+        A failed promotion or a manager restart leaves prod* accounts connected
+        inside vpnclient. Their 10.211.0.0/16 addresses collide with the live
+        OpenVPN peer and keep consuming the small host.
+        """
+        removed: list[str] = []
+        for account, nic in self.list_accounts():
+            if account in keep_accounts or (nic and nic in keep_nics):
+                continue
+            if not account.startswith(("prod", "sb", "probe", "aimili")):
+                continue
+            self.disconnect(account, nic=nic or None, delete=True)
+            removed.append(account)
+        return removed
+
 class SSTPAdapter:
     protocol = "sstp"
 
@@ -1174,6 +1218,24 @@ exit 42
                 shutil.rmtree(result.work_dir, ignore_errors=True)
             except Exception:
                 pass
+
+    def reap_orphan_namespaces(self, keep: set[str]) -> list[str]:
+        """Delete aimili-l2tp-* netns left behind after a failed dial or restart."""
+        removed: list[str] = []
+        try:
+            listed = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True, timeout=3)
+        except Exception:
+            return removed
+        for line in (listed.stdout or "").splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            namespace = parts[0]
+            if not namespace.startswith("aimili-l2tp") or namespace in keep:
+                continue
+            self.disconnect(namespace)
+            removed.append(namespace)
+        return removed
 
     @staticmethod
     def environment_report(run_kernel_test: bool = False) -> dict[str, Any]:

@@ -513,9 +513,15 @@ class NodePool:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=NORMAL")
             db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA mmap_size=33554432")
+            # Writers are rare. 8MB of mmap is enough; 32MB on a 512MB box
+            # competed with the proxy for RAM.
+            db.execute("PRAGMA mmap_size=8388608")
         db.execute("PRAGMA temp_store=MEMORY")
-        db.execute("PRAGMA cache_size=-16384")
+        # Negative cache_size is KiB. 16MB per connection is larger than this
+        # database and, on the 512MB Japan host, each open page pushed the
+        # manager into swap. A 0.3s scan then took more than a minute. The
+        # kernel already caches the file.
+        db.execute("PRAGMA cache_size=-256" if readonly else "PRAGMA cache_size=-1024")
         return db
 
     @staticmethod
@@ -1066,9 +1072,16 @@ class NodePool:
         cached = self._ui_order_cache.get(key)
         if cached and cached[0] > now:
             return cached[1]
-        with self._ui_order_lock:
+        # Same filter already has a snapshot and another request is scanning.
+        # Return that snapshot. Waiting here is what stacked the page past
+        # the browser timeout while the manager was swapped.
+        if not self._ui_order_lock.acquire(blocking=False):
+            if cached:
+                return cached[1]
+            self._ui_order_lock.acquire()
+        try:
             cached = self._ui_order_cache.get(key)
-            if cached and cached[0] > now:
+            if cached and cached[0] > time.monotonic():
                 return cached[1]
             where, params = _ui_list_filters(
                 country=country,
@@ -1112,8 +1125,10 @@ class NodePool:
                 if prev is None or (rank, lat_sort, eid) < (prev["rank"], prev["lat_sort"], prev["endpoint_id"]):
                     best[identity] = item
             ordered = sorted(best.values(), key=lambda item: (item["rank"], item["lat_sort"], item["endpoint_id"]))
-            self._ui_order_cache[key] = (now + 60.0, ordered)
+            self._ui_order_cache[key] = (time.monotonic() + 60.0, ordered)
             return ordered
+        finally:
+            self._ui_order_lock.release()
 
     def list_probe_targets(self) -> list[dict[str, Any]]:
         """Slim rows for a catalog probe. No observation lookups and no config blobs."""
@@ -1179,7 +1194,12 @@ class NodePool:
 
         with self._scoped_query_gate_guard:
             gate = self._scoped_query_gates.setdefault(cache_key, threading.Lock())
-        gate.acquire()
+        if not gate.acquire(blocking=False):
+            stale = self._scoped_page_stale.get(cache_key)
+            if stale:
+                cached_rows, cached_total = stale
+                return [dict(x) for x in cached_rows], int(cached_total)
+            gate.acquire()
         try:
             cached = self._scoped_page_cache.get(cache_key)
             if cached and cached[0] > time.monotonic():
@@ -1308,7 +1328,11 @@ class NodePool:
                 where.append("1=0")
 
         scope = " FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
-        with self._country_catalog_gate:
+        if not self._country_catalog_gate.acquire(blocking=False):
+            if cached:
+                return dict(cached[1])
+            self._country_catalog_gate.acquire()
+        try:
             cached = self._country_catalog_cache.get(key)
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
@@ -1367,6 +1391,8 @@ class NodePool:
             catalog_ttl = 5.0 if status == "connected" else 60.0
             self._country_catalog_cache[key] = (time.monotonic() + catalog_ttl, result)
             return dict(result)
+        finally:
+            self._country_catalog_gate.release()
 
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any] | None:
         endpoint_id = str(endpoint_id or "").strip()
@@ -2019,7 +2045,11 @@ class NodePool:
         cached = self._status_counts_cache.get(cache_key)
         if cached and cached[0] > time.monotonic():
             return dict(cached[1])
-        with self._status_counts_gate:
+        if not self._status_counts_gate.acquire(blocking=False):
+            if cached:
+                return dict(cached[1])
+            self._status_counts_gate.acquire()
+        try:
             cached = self._status_counts_cache.get(cache_key)
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
@@ -2052,6 +2082,8 @@ class NodePool:
             }
             self._status_counts_cache[cache_key] = (time.monotonic() + 60.0, result)
             return dict(result)
+        finally:
+            self._status_counts_gate.release()
 
     def stats(self) -> dict[str, Any]:
         now = time.monotonic()
