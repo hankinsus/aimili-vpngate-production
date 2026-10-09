@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.78"
+APP_VERSION = "V1.0.79"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8981,10 +8981,6 @@ def _library_wait_until_slot(generation: int) -> str:
             _library_set_wait("人工切换或维护进行中，检测让路")
             time.sleep(0.5)
             continue
-        if ui_query_active():
-            _library_set_wait("前台筛选中，检测让路")
-            time.sleep(0.4)
-            continue
         if proxy_server.proxy_forwarding_busy():
             _library_set_wait("转发占用中，等待空闲后再检测")
             time.sleep(0.5)
@@ -9297,30 +9293,22 @@ def reconcile_endpoint_address(endpoint: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
-def _library_probe_one(endpoint_id: str) -> str:
+def _library_probe_one(row: dict[str, Any]) -> tuple[str, int, str]:
     if library_check_stop:
-        return "stop"
-    try:
-        endpoint = node_pool.get_endpoint(endpoint_id)
-    except Exception as exc:
-        return "deferred:读取端点失败，稍后重试 " + str(exc)
-    if not endpoint:
-        return "unavailable"
-    endpoint = reconcile_endpoint_address(endpoint)
-    endpoint_id = str(endpoint.get("endpoint_id") or endpoint_id)
-    if _library_is_live_production(endpoint):
-        return "live"
-    result = light_probe_endpoint(endpoint)
+        return ("stop", 0, "")
+    endpoint_id = str(row.get("endpoint_id") or "")
+    if not endpoint_id:
+        return ("unavailable", 0, "端点不存在")
+    if _library_is_live_production(row):
+        return ("live", 0, "")
+    result = light_probe_endpoint(row)
     if result.get("inconclusive"):
-        return "inconclusive"
-    try:
-        node_pool.record_endpoint_probe(
-            endpoint_id, bool(result.get("ok")), int(result.get("latency_ms") or 0),
-            str(result.get("message") or ""), speed_bps=None,
-        )
-    except Exception as exc:
-        log_to_json("WARNING", "Probe", f"全球库检测写入失败: {exc}")
-    return "available" if result.get("ok") else "unavailable"
+        return ("inconclusive", 0, str(result.get("message") or ""))
+    return (
+        "available" if result.get("ok") else "unavailable",
+        int(result.get("latency_ms") or 0),
+        str(result.get("message") or ""),
+    )
 
 
 def _library_check_worker(generation: int) -> None:
@@ -9349,7 +9337,7 @@ def _library_check_worker(generation: int) -> None:
             with library_check_lock:
                 if library_check_generation == generation:
                     library_check_message = f"资源更新未完成，继续检测现有库：{exc}"
-        rows = node_pool.list_endpoint_ids()
+        rows = node_pool.list_probe_targets()
         ready_rows: list[dict[str, Any]] = []
         skipped = 0
         for row in rows:
@@ -9374,11 +9362,11 @@ def _library_check_worker(generation: int) -> None:
             return (same, _library_status_rank(str(item.get("status") or "")), str(item.get("endpoint_id") or ""))
 
         ready_rows.sort(key=_library_row_key)
-        ids = [str(item.get("endpoint_id") or "") for item in ready_rows if str(item.get("endpoint_id") or "")]
+        queue = [item for item in ready_rows if str(item.get("endpoint_id") or "")]
         with library_check_lock:
             if library_check_generation != generation:
                 return
-            library_check_total = len(ids)
+            library_check_total = len(queue)
             note = "TCP 测端口，UDP 发一包协议探测。不建立隧道，不测速。tls-auth 的 UDP 无应答不算不可用"
             if skipped:
                 note += f"；已跳过 {skipped} 个未知协议的端点"
@@ -9389,41 +9377,50 @@ def _library_check_worker(generation: int) -> None:
         log_to_json(
             "INFO",
             "Probe",
-            f"全球库检测开始：轻量检测 {len(ids)}，"
+            f"全球库检测开始：轻量检测 {len(queue)}，"
             + (f"同国家 {home} 优先，" if home else "未识别本机国家，按状态检测，")
             + f"跳过 {skipped}",
         )
         index = 0
-        batch_size = 8
+        batch_size = 24
         probe_started = time.time()
-        while index < len(ids):
+        while index < len(queue):
             if _library_wait_until_slot(generation) == "stop":
                 break
-            batch = ids[index:index + batch_size]
+            batch = queue[index:index + batch_size]
             started = time.perf_counter()
-            outcomes: dict[str, str] = {}
+            outcomes: dict[str, tuple[str, int, str]] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                futures = {executor.submit(_library_probe_one, endpoint_id): endpoint_id for endpoint_id in batch}
+                futures = {
+                    executor.submit(_library_probe_one, row): str(row.get("endpoint_id") or "")
+                    for row in batch
+                }
                 for future in concurrent.futures.as_completed(futures):
                     endpoint_id = futures[future]
                     try:
-                        outcomes[endpoint_id] = str(future.result() or "unavailable")
+                        result = future.result()
+                        if not isinstance(result, tuple) or len(result) != 3:
+                            result = ("unavailable", 0, "")
+                        outcomes[endpoint_id] = (str(result[0] or "unavailable"), int(result[1] or 0), str(result[2] or ""))
                     except Exception as exc:
-                        outcomes[endpoint_id] = "unavailable"
+                        outcomes[endpoint_id] = ("unavailable", 0, str(exc))
                         log_to_json("WARNING", "Probe", f"全球库检测失败 {endpoint_id}: {exc}")
-            deferred = [endpoint_id for endpoint_id in batch if str(outcomes.get(endpoint_id) or "").startswith("deferred")]
             finished = [
-                endpoint_id for endpoint_id in batch
-                if endpoint_id not in deferred and outcomes.get(endpoint_id) != "stop"
+                endpoint_id for endpoint_id in futures.values()
+                if outcomes.get(endpoint_id, ("", 0, ""))[0] != "stop"
             ]
             elapsed = max(0.0, time.perf_counter() - started)
-            probed = [endpoint_id for endpoint_id in finished if outcomes.get(endpoint_id) in ("available", "unavailable")]
+            probed = [
+                endpoint_id for endpoint_id in finished
+                if outcomes.get(endpoint_id, ("", 0, ""))[0] in ("available", "unavailable")
+            ]
             per = (elapsed / len(probed)) if probed else 0.0
+            writes: list[tuple[str, bool, int, str]] = []
             with library_check_lock:
                 if library_check_generation != generation:
                     return
                 for endpoint_id in finished:
-                    outcome = outcomes.get(endpoint_id) or "unavailable"
+                    outcome, latency_ms, message = outcomes.get(endpoint_id) or ("unavailable", 0, "")
                     library_check_tested += 1
                     if outcome == "available":
                         library_check_available += 1
@@ -9432,18 +9429,18 @@ def _library_check_worker(generation: int) -> None:
                     if outcome in ("available", "unavailable"):
                         library_check_rate_seconds += per
                         library_check_rate_samples += 1
+                        writes.append((endpoint_id, outcome == "available", latency_ms, message))
                 tested_now = library_check_tested
                 library_check_wait_reason = ""
-            if tested_now <= batch_size or tested_now % 80 < batch_size:
+            if writes:
+                try:
+                    node_pool.record_light_probe_batch(writes)
+                except Exception as exc:
+                    log_to_json("WARNING", "Probe", f"全球库检测写入失败: {exc}")
+            if tested_now <= batch_size or tested_now % 96 < batch_size:
                 log_to_json("INFO", "Probe", f"全球库检测进度 {tested_now}/{library_check_total}")
-            if any(outcomes.get(endpoint_id) == "stop" for endpoint_id in batch):
+            if any(outcomes.get(endpoint_id, ("", 0, ""))[0] == "stop" for endpoint_id in futures.values()):
                 break
-            if deferred:
-                _library_set_wait("部分端点稍后重试")
-                time.sleep(0.4)
-                ids = deferred + ids[index + len(batch):]
-                index = 0
-                continue
             index += len(batch)
     except Exception as exc:
         log_to_json("ERROR", "Probe", f"全球库检测异常: {exc}")
@@ -13808,7 +13805,7 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
-      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。冷备、预冷备、替补预冷备，以及点击待检测，才连接节点并检查网页。转发或筛选时等待，等待不算失败。</div>
+      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。冷备、预冷备、替补预冷备，以及点击待检测，才连接节点并检查网页。转发时等待，筛选不再打断检测，等待不算失败。</div>
       <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">检测节点数</span>
         <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>

@@ -41,6 +41,17 @@ _UI_LATENCY_SQL = (
     "WHEN CAST(e.latency_ewma AS INTEGER) BETWEEN 1 AND 1500 THEN CAST(e.latency_ewma AS INTEGER) "
     "ELSE 0 END"
 )
+_UI_STATUS_RANK = {
+    "HOT": 0,
+    "AVAILABLE": 1,
+    "TESTING": 2,
+    "NEW": 3,
+    "DEGRADED": 4,
+    "COOLDOWN": 5,
+    "STALE": 6,
+    "RETIRED": 7,
+    "UNAVAILABLE": 8,
+}
 _LATENCY_FILTERS = {"", "100", "200", "400", "800", "1000", "gt1000"}
 
 
@@ -84,9 +95,9 @@ def _ui_list_filters(country="", status="", protocol="", ip_type="", speed_min_b
         )
         params.append(speed_min_bps)
     if latency == "gt1000":
-        where.append("(" + _UI_LATENCY_SQL + ") > 1000")
+        where.append("COALESCE(e.ui_latency_ms,0) > 1000")
     elif latency:
-        where.append("(" + _UI_LATENCY_SQL + ") BETWEEN 1 AND ?")
+        where.append("COALESCE(e.ui_latency_ms,0) BETWEEN 1 AND ?")
         params.append(int(latency))
     if status and status != "all":
         allowed = _UI_STATUS_GROUPS.get(status)
@@ -210,6 +221,8 @@ class NodePool:
         self._country_catalog_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
         self._scoped_query_gate_guard = threading.Lock()
         self._scoped_query_gates: dict[tuple, threading.Lock] = {}
+        self._ui_order_cache: dict[tuple, tuple[float, list[dict[str, Any]]]] = {}
+        self._ui_order_lock = threading.Lock()
         self._country_catalog_gate = threading.Lock()
         self._status_counts_gate = threading.Lock()
         with closing(self._connect()) as db:
@@ -230,6 +243,17 @@ class NodePool:
             db.execute("ALTER TABLE endpoints ADD COLUMN last_session_seconds INTEGER NOT NULL DEFAULT 0")
         if "stability" not in cols:
             db.execute("ALTER TABLE endpoints ADD COLUMN stability TEXT NOT NULL DEFAULT ''")
+        if "ui_latency_ms" not in cols:
+            db.execute("ALTER TABLE endpoints ADD COLUMN ui_latency_ms INTEGER NOT NULL DEFAULT 0")
+            db.execute(
+                """
+                UPDATE endpoints SET ui_latency_ms = CASE
+                    WHEN CAST(COALESCE(json_extract(metadata_json,'$.tcp_rtt_ms'),0) AS INTEGER) BETWEEN 1 AND 1500
+                        THEN CAST(json_extract(metadata_json,'$.tcp_rtt_ms') AS INTEGER)
+                    WHEN CAST(latency_ewma AS INTEGER) BETWEEN 1 AND 1500 THEN CAST(latency_ewma AS INTEGER)
+                    ELSE 0 END
+                """
+            )
 
     @staticmethod
     def _ensure_ui_indexes(db: sqlite3.Connection) -> None:
@@ -464,6 +488,7 @@ class NodePool:
         self.invalidate_scoped_pages()
         self._country_catalog_cache.clear()
         self._status_counts_cache.clear()
+        self._ui_order_cache.clear()
         self._stats_cache = None
 
     def _invalidate_read_caches(self) -> None:
@@ -1024,6 +1049,103 @@ class NodePool:
             result.append(item)
         return result
 
+    def _ui_order_index(self, country: str = "", protocol: str = "", ip_type: str = "", speed_min_bps: int = 0, latency: str = "") -> list[dict[str, Any]]:
+        """One narrow read of the library. Pages and badge counts share it.
+
+        The old query ran a window sort over every metadata blob. That was
+        about a second for ten thousand rows, and the page plus the badges
+        each did it again.
+        """
+        country = canonical_country_name(country) if country else ""
+        protocol = str(protocol or "").strip().lower()
+        ip_type = str(ip_type or "").strip().lower()
+        speed_min_bps = max(0, int(speed_min_bps or 0))
+        latency = normalize_latency_filter(latency)
+        key = (country, protocol, ip_type, speed_min_bps, latency)
+        now = time.monotonic()
+        cached = self._ui_order_cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+        with self._ui_order_lock:
+            cached = self._ui_order_cache.get(key)
+            if cached and cached[0] > now:
+                return cached[1]
+            where, params = _ui_list_filters(
+                country=country,
+                protocol=protocol,
+                ip_type=ip_type,
+                speed_min_bps=speed_min_bps,
+                latency=latency,
+            )
+            sql = (
+                "SELECT e.endpoint_id AS endpoint_id, UPPER(e.status) AS status, "
+                "LOWER(e.protocol) AS protocol, COALESCE(e.port,0) AS port, "
+                "COALESCE(e.ui_latency_ms,0) AS lat, s.current_ip AS current_ip "
+                "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
+                + " AND ".join(where)
+            )
+            with closing(self._connect(4000, readonly=True)) as db:
+                fetched = db.execute(sql, params).fetchall()
+            best: dict[str, dict[str, Any]] = {}
+            for row in fetched:
+                eid = str(row["endpoint_id"] or "")
+                if not eid:
+                    continue
+                port = int(row["port"] or 0)
+                ip = str(row["current_ip"] or "")
+                proto = str(row["protocol"] or "")
+                identity = f"{proto}|{ip}|{port}" if port > 0 else f"id:{eid}"
+                rank = _UI_STATUS_RANK.get(str(row["status"] or ""), 9)
+                lat = int(row["lat"] or 0)
+                lat_sort = lat if 1 <= lat <= 1500 else 999999
+                item = {
+                    "endpoint_id": eid,
+                    "status": str(row["status"] or ""),
+                    "protocol": proto,
+                    "port": port,
+                    "ip": ip,
+                    "rank": rank,
+                    "lat": lat,
+                    "lat_sort": lat_sort,
+                }
+                prev = best.get(identity)
+                if prev is None or (rank, lat_sort, eid) < (prev["rank"], prev["lat_sort"], prev["endpoint_id"]):
+                    best[identity] = item
+            ordered = sorted(best.values(), key=lambda item: (item["rank"], item["lat_sort"], item["endpoint_id"]))
+            self._ui_order_cache[key] = (now + 60.0, ordered)
+            return ordered
+
+    def list_probe_targets(self) -> list[dict[str, Any]]:
+        """Slim rows for a catalog probe. No observation lookups and no config blobs."""
+        sql = (
+            "SELECT e.endpoint_id AS endpoint_id, LOWER(e.protocol) AS protocol, "
+            "LOWER(e.transport) AS transport, e.port AS port, e.status AS status, "
+            "e.config_ref AS config_ref, s.current_ip AS current_ip, s.hostname AS hostname, "
+            "s.country AS country, "
+            "CASE WHEN instr(lower(COALESCE(e.metadata_json,'')), 'tls-auth')>0 "
+            "OR instr(lower(COALESCE(e.metadata_json,'')), 'tls-crypt')>0 THEN 1 ELSE 0 END AS tls_auth "
+            "FROM endpoints e JOIN servers s ON s.server_key=e.server_key "
+            "WHERE UPPER(COALESCE(e.status,''))!='RETIRED'"
+        )
+        with closing(self._connect(4000, readonly=True)) as db:
+            fetched = db.execute(sql).fetchall()
+        rows: list[dict[str, Any]] = []
+        for row in fetched:
+            tls = bool(row["tls_auth"])
+            rows.append({
+                "endpoint_id": str(row["endpoint_id"] or ""),
+                "protocol": str(row["protocol"] or ""),
+                "transport": str(row["transport"] or ""),
+                "port": int(row["port"] or 0),
+                "status": str(row["status"] or ""),
+                "config_ref": str(row["config_ref"] or ""),
+                "current_ip": str(row["current_ip"] or ""),
+                "hostname": str(row["hostname"] or ""),
+                "country": str(row["country"] or ""),
+                "metadata": {"tls_auth": True} if tls else {},
+            })
+        return rows
+
     def list_endpoints_scoped(self, country="", status="", protocol="", ip_type="", offset=0, limit=100,
                              speed_min_bps=0, active_endpoint_id="", active_ip="", active_protocol="", active_port=0,
                              latency="", standby_endpoint_id="", standby_ip="", standby_protocol="", standby_port=0):
@@ -1064,59 +1186,36 @@ class NodePool:
                 cached_rows, cached_total = cached[1]
                 return [dict(x) for x in cached_rows], int(cached_total)
 
-            where, params = _ui_list_filters(
-                country=country,
-                status=status,
-                protocol=protocol,
-                ip_type=ip_type,
-                speed_min_bps=speed_min_bps,
-                latency=latency,
-            )
-
-            base="FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE " + " AND ".join(where)
-            status_rank = (
-                "CASE UPPER(e.status) WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
-                "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END"
-            )
-            lat_rank = "CASE WHEN (" + _UI_LATENCY_SQL + ") BETWEEN 1 AND 1500 THEN (" + _UI_LATENCY_SQL + ") ELSE 999999 END"
             stale = self._scoped_page_stale.get(cache_key)
             try:
-                with closing(self._connect(4000, readonly=True)) as db:
-                    # One pass: dedupe, count, and pick this page. Pulling every
-                    # metadata blob before LIMIT made the same scan take twice as long.
-                    rows=db.execute(
-                        "SELECT endpoint_id, _ui_total FROM ("
-                        "SELECT endpoint_id, current_ip, protocol, port, _sr, _lat, COUNT(*) OVER () AS _ui_total FROM ("
-                        "SELECT e.endpoint_id AS endpoint_id, s.current_ip AS current_ip, "
-                        "LOWER(e.protocol) AS protocol, e.port AS port, "
-                        + status_rank + " AS _sr, " + lat_rank + " AS _lat, "
-                        "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY "
-                        + status_rank + ", " + lat_rank + ", e.endpoint_id) AS _ui_rn "
-                        + base +
-                        ") WHERE _ui_rn=1"
-                        ") ORDER BY CASE "
-                        "WHEN ?<>'' AND endpoint_id=? THEN 0 "
-                        "WHEN ?<>'' AND current_ip=? AND protocol=? AND port=? THEN 0 "
-                        "WHEN ?<>'' AND endpoint_id=? THEN 1 "
-                        "WHEN ?<>'' AND current_ip=? AND protocol=? AND port=? THEN 1 "
-                        "ELSE 2 END, _sr, _lat, endpoint_id "
-                        "LIMIT ? OFFSET ?",
-                        params+[
-                            active_endpoint_id, active_endpoint_id, active_ip, active_ip, active_protocol, active_port,
-                            standby_endpoint_id, standby_endpoint_id, standby_ip, standby_ip, standby_protocol, standby_port,
-                            limit, offset,
-                        ]).fetchall()
-                    total = int(rows[0]["_ui_total"]) if rows else None
-                    if total is None and offset == 0:
-                        total = 0
-                    if total is None:
-                        total=int(db.execute(
-                            "SELECT COUNT(*) FROM (SELECT " + _UI_ROW_KEY_SQL + " AS k " + base + " GROUP BY k)",
-                            params,
-                        ).fetchone()[0] or 0)
-                    ids = [str(row["endpoint_id"]) for row in rows]
-                    page_rows = []
-                    if ids:
+                ordered = list(self._ui_order_index(country, protocol, ip_type, speed_min_bps, latency))
+                if status and status not in ("", "all"):
+                    allowed = set(_UI_STATUS_GROUPS.get(status) or ())
+                    ordered = [item for item in ordered if item["status"] in allowed]
+
+                def _pin(item: dict[str, Any]) -> tuple:
+                    eid = item["endpoint_id"]
+                    ip = item["ip"]
+                    proto = item["protocol"]
+                    port = int(item["port"] or 0)
+                    if active_endpoint_id and eid == active_endpoint_id:
+                        bucket = 0
+                    elif active_ip and ip == active_ip and proto == active_protocol and port == active_port:
+                        bucket = 0
+                    elif standby_endpoint_id and eid == standby_endpoint_id:
+                        bucket = 1
+                    elif standby_ip and ip == standby_ip and proto == standby_protocol and port == standby_port:
+                        bucket = 1
+                    else:
+                        bucket = 2
+                    return (bucket, item["rank"], item["lat_sort"], eid)
+
+                ordered.sort(key=_pin)
+                total = len(ordered)
+                ids = [item["endpoint_id"] for item in ordered[offset:offset + limit]]
+                page_rows = []
+                if ids:
+                    with closing(self._connect(4000, readonly=True)) as db:
                         found = db.execute(
                             "SELECT e.*, s.hostname, s.current_ip, s.country, s.state AS server_state, "
                             "s.metadata_json AS server_metadata_json "
@@ -1126,7 +1225,7 @@ class NodePool:
                         ).fetchall()
                         by_id = {str(row["endpoint_id"]): dict(row) for row in found}
                         page_rows = [by_id[item_id] for item_id in ids if item_id in by_id]
-                    _attach_latest_observations(db, page_rows)
+                        _attach_latest_observations(db, page_rows)
             except sqlite3.OperationalError as exc:
                 if stale and "lock" in str(exc).lower():
                     cached_rows, cached_total = stale
@@ -1214,11 +1313,26 @@ class NodePool:
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
             with closing(self._connect(4000, readonly=True)) as db:
-                rows = db.execute(
-                    "SELECT s.country AS country, s.current_ip AS current_ip, s.server_key AS server_key"
-                    + scope + " GROUP BY s.country, s.current_ip, s.server_key",
-                    params,
-                ).fetchall()
+                plain = (
+                    not status
+                    and not protocol
+                    and not ip_type
+                    and speed_min_bps <= 0
+                    and not latency
+                )
+                if plain:
+                    rows = db.execute(
+                        "SELECT country, current_ip, server_key FROM servers "
+                        "WHERE TRIM(COALESCE(current_ip,''))<>'' "
+                        "AND EXISTS (SELECT 1 FROM endpoints e WHERE e.server_key=servers.server_key "
+                        "AND TRIM(COALESCE(e.protocol,''))<>'')"
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT s.country AS country, s.current_ip AS current_ip, s.server_key AS server_key"
+                        + scope + " GROUP BY s.country, s.current_ip, s.server_key",
+                        params,
+                    ).fetchall()
 
             countries: dict[str, dict[str, int]] = {}
             country_servers: dict[str, set[str]] = {}
@@ -1623,8 +1737,8 @@ class NodePool:
             meta["tcp_rtt_ms"] = latency_ms
             meta["tcp_rtt_at"] = time.time()
             db.execute(
-                "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
-                (json.dumps(meta, ensure_ascii=False), endpoint_id),
+                "UPDATE endpoints SET metadata_json=?, ui_latency_ms=? WHERE endpoint_id=?",
+                (json.dumps(meta, ensure_ascii=False), latency_ms, endpoint_id),
             )
             db.commit()
         self._invalidate_read_caches()
@@ -1645,14 +1759,42 @@ class NodePool:
 
     def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = None) -> bool:
         endpoint_id = str(endpoint_id or "").strip()
-        if not endpoint_id: return False
+        if not endpoint_id:
+            return False
+        with self.lock, closing(self._connect()) as db:
+            wrote = self._apply_endpoint_probe(db, endpoint_id, ok, latency_ms, message, speed_bps)
+            db.commit()
+        if wrote:
+            self._invalidate_read_caches()
+        return wrote
+
+    def record_light_probe_batch(self, items: list[tuple[str, bool, int, str]]) -> int:
+        """Write one catalog batch in a single transaction."""
+        clean: list[tuple[str, bool, int, str]] = []
+        for endpoint_id, ok, latency_ms, message in items or []:
+            endpoint_id = str(endpoint_id or "").strip()
+            if endpoint_id:
+                clean.append((endpoint_id, bool(ok), int(latency_ms or 0), str(message or "")))
+        if not clean:
+            return 0
+        wrote = 0
+        with self.lock, closing(self._connect()) as db:
+            for endpoint_id, ok, latency_ms, message in clean:
+                if self._apply_endpoint_probe(db, endpoint_id, ok, latency_ms, message, None):
+                    wrote += 1
+            db.commit()
+        if wrote:
+            self._invalidate_read_caches()
+        return wrote
+
+    def _apply_endpoint_probe(self, db: sqlite3.Connection, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = None) -> bool:
         now = time.time()
         latency = max(0, int(latency_ms or 0))
         speed = max(0, int(speed_bps or 0)) if speed_bps is not None else 0
         msg = str(message or "")[:1000]
-        with self.lock, closing(self._connect()) as db:
-            row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
-            if not row: return False
+        row = db.execute("SELECT * FROM endpoints WHERE endpoint_id=?", (endpoint_id,)).fetchone()
+        if not row:
+            return False
             prev_latency = float(row["latency_ewma"] or 0)
             prev_streak = int(row["success_streak"] or 0)
             prev_fail = int(row["fail_streak"] or 0)
@@ -1688,11 +1830,18 @@ class NodePool:
                 session_seconds = int(row["last_session_seconds"] or 0) if "last_session_seconds" in row.keys() else 0
                 stability = self._stability_decision(meta, now, session_seconds, 0)
                 meta["stability"] = stability
+                tcp_rtt = int(meta.get("tcp_rtt_ms") or 0)
+                if 1 <= tcp_rtt <= 1500:
+                    shown_latency = tcp_rtt
+                elif 1 <= latency <= 1500:
+                    shown_latency = latency
+                else:
+                    shown_latency = int(row["ui_latency_ms"] or 0) if "ui_latency_ms" in row.keys() else 0
                 db.execute(
                     """UPDATE endpoints SET status='AVAILABLE', last_success=?, success_count=success_count+1,
-                       fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, stability=?, metadata_json=?
+                       fail_streak=0, success_streak=?, next_test=?, latency_ewma=?, jitter_ewma=?, stability=?, metadata_json=?, ui_latency_ms=?
                        WHERE endpoint_id=?""",
-                    (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
+                    (now, prev_streak + 1, now + 4*3600, ewma, new_jitter, stability, json.dumps(meta, ensure_ascii=False), shown_latency, endpoint_id)
                 )
             else:
                 if not self._probe_failure_should_count(msg):
@@ -1722,8 +1871,6 @@ class NodePool:
                                fail_streak=?, success_streak=0, next_test=?, stability=?, metadata_json=? WHERE endpoint_id=?""",
                             (now, new_fail, now + 1800, stability, json.dumps(meta, ensure_ascii=False), endpoint_id)
                         )
-            db.commit()
-        self._invalidate_read_caches()
         return True
 
     def record_probe(self, node: dict[str, Any], ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = 0) -> bool:
@@ -1876,37 +2023,23 @@ class NodePool:
             cached = self._status_counts_cache.get(cache_key)
             if cached and cached[0] > time.monotonic():
                 return dict(cached[1])
-            where, params = _ui_list_filters(
-                country=country,
-                protocol=protocol,
-                ip_type=ip_type,
-                speed_min_bps=speed_min_bps,
-                latency=latency,
-            )
-            select_sql = (
-                "SELECT _sr, COUNT(*) AS n FROM ("
-                "SELECT CASE UPPER(e.status) "
-                "WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
-                "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 "
-                "WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END AS _sr, "
-                "ROW_NUMBER() OVER (PARTITION BY " + _UI_ROW_KEY_SQL + " ORDER BY "
-                "CASE UPPER(e.status) "
-                "WHEN 'HOT' THEN 0 WHEN 'AVAILABLE' THEN 1 WHEN 'TESTING' THEN 2 WHEN 'NEW' THEN 3 "
-                "WHEN 'DEGRADED' THEN 4 WHEN 'COOLDOWN' THEN 5 WHEN 'STALE' THEN 6 "
-                "WHEN 'RETIRED' THEN 7 WHEN 'UNAVAILABLE' THEN 8 ELSE 9 END, e.endpoint_id) AS _rn "
-                "FROM endpoints e JOIN servers s ON s.server_key=e.server_key WHERE "
-                + " AND ".join(where)
-                + ") WHERE _rn=1 GROUP BY _sr"
-            )
             empty = {"usable": 0, "available": 0, "testing": 0, "not_checked": 0, "unavailable": 0, "all": 0}
             try:
-                with closing(self._connect(4000, readonly=True)) as db:
-                    grouped = db.execute(select_sql, params).fetchall()
+                ranked = self._ui_order_index(
+                    country=country,
+                    protocol=protocol,
+                    ip_type=ip_type,
+                    speed_min_bps=speed_min_bps,
+                    latency=latency,
+                )
             except sqlite3.OperationalError:
                 if cached:
                     return dict(cached[1])
                 return dict(empty)
-            buckets = {int(row["_sr"]): int(row["n"] or 0) for row in grouped}
+            buckets: dict[int, int] = {}
+            for item in ranked:
+                rank = int(item["rank"])
+                buckets[rank] = buckets.get(rank, 0) + 1
             def _take(*ranks: int) -> int:
                 return sum(buckets.get(rank, 0) for rank in ranks)
             result = {
