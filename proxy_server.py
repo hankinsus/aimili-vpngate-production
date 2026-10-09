@@ -1239,10 +1239,10 @@ def _write_json_if_changed(path: Path, payload: dict[str, Any]) -> bool:
 
 
 def ensure_kernel_socks_outbounds() -> None:
-    """Send sing-box and Xray out the tunnel with one fwmark.
+    """Point sing-box and Xray at the local 8500 forwarder.
 
-    Table 100 is updated when the tunnel changes. These processes are not
-    reloaded for that. 8500 stays on 127.0.0.1 for health checks only.
+    8500 chooses the tunnel or the server NIC. A second direct outbound with
+    the same tag can skip 8500, so that file is removed.
     """
     user, password = get_proxy_credentials()
     user = str(user or "")
@@ -1255,6 +1255,7 @@ def ensure_kernel_socks_outbounds() -> None:
             password = password or str(outbound.get("password") or "")
         except (OSError, KeyError, IndexError, TypeError, json.JSONDecodeError):
             pass
+    proxy_port = int(os.environ.get("LOCAL_PROXY_PORT", "8500") or "8500")
     sing_dir = Path("/etc/v2ray-agent/sing-box/conf/config")
     sing_root = Path("/etc/v2ray-agent/sing-box/conf")
     sing_bin = Path("/etc/v2ray-agent/sing-box/sing-box")
@@ -1262,12 +1263,28 @@ def ensure_kernel_socks_outbounds() -> None:
     if sing_dir.is_dir():
         changed = _write_json_if_changed(sing_dir / "socks5_outbound.json", {
             "outbounds": [{
-                "type": "direct",
+                "type": "socks",
                 "tag": "socks5_outbound",
-                "routing_mark": 100,
-                "domain_resolver": "tunnel-dns",
+                "server": "127.0.0.1",
+                "server_port": proxy_port,
+                "version": "5",
+                "username": user,
+                "password": password,
             }],
         }) or changed
+        source_inbound = sing_dir / "02_VLESS_TCP_inbounds.json"
+        port_443 = sing_dir / "02b_VLESS_TCP_443.json"
+        if source_inbound.is_file() and not port_443.is_file():
+            try:
+                original = json.loads(source_inbound.read_text(encoding="utf-8"))
+                inbound = (original.get("inbounds") or [None])[0]
+                if isinstance(inbound, dict):
+                    inbound = json.loads(json.dumps(inbound))
+                    inbound["tag"] = "VLESSTCP443"
+                    inbound["listen_port"] = 443
+                    changed = _write_json_if_changed(port_443, {"inbounds": [inbound]}) or changed
+            except (OSError, json.JSONDecodeError, TypeError) as exc:
+                print(f"[内核] 443 入站没有写上：{exc}", flush=True)
         changed = _write_json_if_changed(sing_dir / "00_dns.json", {
             "dns": {
                 "servers": [{
@@ -1313,7 +1330,7 @@ def ensure_kernel_socks_outbounds() -> None:
                 else:
                     restarted = subprocess.run(["systemctl", "restart", "sing-box"], capture_output=True, text=True, timeout=20)
                     if restarted.returncode == 0:
-                        print("[内核] sing-box 已改走标记 100，经路由表进入当前隧道。SOCKS 入站 10808。", flush=True)
+                        print("[内核] sing-box 出站已改为本机 8500。", flush=True)
                     else:
                         print(f"[内核] sing-box 重启失败：{(restarted.stderr or restarted.stdout or '').strip()}", flush=True)
             except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1324,15 +1341,24 @@ def ensure_kernel_socks_outbounds() -> None:
     conf_dir = Path("/etc/v2ray-agent/xray/conf")
     if not conf_dir.is_dir():
         return
-    outbound_doc = {
+    freedom = conf_dir / "00_socks5_outbound.json"
+    if freedom.is_file():
+        try:
+            freedom.unlink()
+            print("[内核] 已去掉会绕过 8500 的直连出站。", flush=True)
+        except OSError as exc:
+            print(f"[内核] 直连出站没有去掉：{exc}", flush=True)
+    _write_json_if_changed(conf_dir / "socks5_outbound.json", {
         "outbounds": [{
-            "protocol": "freedom",
+            "protocol": "socks",
             "tag": "socks5_outbound",
-            "settings": {"domainStrategy": "UseIPv4"},
-            "streamSettings": {"sockopt": {"mark": 100}},
+            "settings": {"servers": [{
+                "address": "127.0.0.1",
+                "port": proxy_port,
+                "users": [{"user": user, "pass": password}],
+            }]},
         }]
-    }
-    _write_json_if_changed(conf_dir / "00_socks5_outbound.json", outbound_doc)
+    })
     route_path = conf_dir / "09_routing.json"
     route_text = ""
     try:
@@ -1352,7 +1378,7 @@ def ensure_kernel_socks_outbounds() -> None:
         })
     binary = Path("/etc/v2ray-agent/xray/xray")
     if not binary.is_file():
-        print("[内核] Xray 程序不在。sing-box 已走标记路由。", flush=True)
+        print("[内核] Xray 程序不在。sing-box 已改走本机 8500。", flush=True)
         return
     try:
         test = subprocess.run(
@@ -1363,7 +1389,15 @@ def ensure_kernel_socks_outbounds() -> None:
         print(f"[内核] Xray 配置测试没有跑起来：{exc}", flush=True)
         return
     if test.returncode == 0:
-        print("[内核] Xray freedom 标记 100 配置测试通过。未启动，避免抢 sing-box 端口。", flush=True)
+        active = subprocess.run(["systemctl", "is-active", "xray"], capture_output=True, text=True, timeout=10)
+        if (active.stdout or "").strip() == "active":
+            restarted = subprocess.run(["systemctl", "restart", "xray"], capture_output=True, text=True, timeout=20)
+            if restarted.returncode == 0:
+                print("[内核] Xray 出站已改为本机 8500。", flush=True)
+            else:
+                print(f"[内核] Xray 重启失败：{(restarted.stderr or restarted.stdout or '').strip()}", flush=True)
+        else:
+            print("[内核] Xray 出站已改为本机 8500。服务未在运行，没有启动。", flush=True)
     else:
         detail = ((test.stderr or test.stdout or "").strip().splitlines() or ["未知错误"])[-1]
         print(f"[内核] Xray 配置测试失败，未启动：{detail}", flush=True)
