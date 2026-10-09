@@ -14066,7 +14066,7 @@ INDEX_HTML = r"""<!doctype html>
 
     <div class="pagination-container" style="padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 10px 16px;">
       <div class="pagination-meta">
-        第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">1</span> 页 · 本页 <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条 · 共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条 <span style="margin-left: 10px; color: var(--primary);">每页 60 条</span>
+        第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">1</span> 页 · 本页 <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条 · 共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条 <span style="margin-left: 10px; color: var(--primary);">每页 __UI_PAGE_SIZE__ 条</span>
         <span id="nodes_load_progress" style="margin-left: 14px; color: var(--text-secondary);">首页优先加载中...</span>
         <span id="pool_summary" class="pool-summary">全球资源库：—</span>
       </div>
@@ -20761,16 +20761,7 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                     exit_ip = str(endpoint.get("current_ip") or "")
             if not owned():
                 return
-            udp = proxy_server.probe_socks_udp_dns(timeout=2)
-            quic = proxy_server.probe_socks_quic(timeout=4) if udp.get("ok") else {"ok": False, "error": "UDP DNS 未过，未测 QUIC"}
-            if not owned():
-                return
-            quic_ok = bool(quic.get("ok"))
             note = label
-            if not udp.get("ok"):
-                note += " · UDP异常"
-            elif not quic_ok:
-                note += " · QUIC异常"
             set_state(
                 egress_mode=mode,
                 egress_switching=False,
@@ -20778,13 +20769,13 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
                 direct_egress_ok=(mode == "direct"),
                 client_proxy_ok=(mode == "proxy"),
                 client_tcp_ok=True,
-                client_udp_ok=bool(udp.get("ok")),
-                client_quic_ok=quic_ok if udp.get("ok") else False,
+                client_udp_ok=None,
+                client_quic_ok=None,
                 proxy_ok=(mode == "proxy"),
                 active_tunnel_ok=active_tunnel_running(),
                 proxy_ip=exit_ip,
                 proxy_latency_ms=parse_int(health.get("latency_ms")),
-                proxy_error="" if udp.get("ok") else str(udp.get("error") or "UDP 异常"),
+                proxy_error="",
                 last_check_message=note,
             )
             log_to_json("INFO", "Proxy", f"{label} · generation={generation} · {exit_ip} · udp={'ok' if udp.get('ok') else udp.get('error')} · quic={'ok' if quic_ok else quic.get('error')}")
@@ -21221,22 +21212,6 @@ def fast_tunnel_liveness_loop() -> None:
                 iface = str(proxy_server.get_active_interface() or "").strip()
                 if iface and not Path("/sys/class/net", iface).exists():
                     set_state(active_tunnel_ok=False, tunnel_role="STALE")
-                    _direct_plane_fails = 0
-                elif iface:
-                    _direct_plane_checks += 1
-                    if _direct_plane_checks >= 5:
-                        _direct_plane_checks = 0
-                        gateway = ""
-                        if active_external_tunnel is not None:
-                            gateway = str(getattr(active_external_tunnel, "gateway", "") or "")
-                        probed = check_root_via_interface(iface, gateway, timeout=1.5)
-                        if probed.get("ok"):
-                            _direct_plane_fails = 0
-                        else:
-                            _direct_plane_fails += 1
-                            if _direct_plane_fails >= 2 and _promote_live_standby():
-                                _direct_plane_fails = 0
-                                log_to_json("WARNING", "Proxy", f"直连期间活动网卡 {iface} 数据面不通，已切到热备")
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             hard = active_tunnel_hard_reason()
@@ -21254,57 +21229,10 @@ def fast_tunnel_liveness_loop() -> None:
                     handle_confirmed_tunnel_failure(hard)
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
-            if proxy_server.proxy_forwarding_busy(3.0):
-                if _soft_fail_streak:
-                    log_to_json("INFO", "Proxy", "最近仍有业务流量，忽略探测超时")
-                _soft_fail_streak = 0
-                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                continue
-            iface = str(proxy_server.get_active_interface() or "").strip()
-            if _soft_round_failures(iface) < 2:
-                if _soft_fail_streak:
-                    set_state(tunnel_role="ACTIVE", last_check_message="数据面复测已恢复")
-                    log_to_json("INFO", "Proxy", "数据面复测已恢复，不切换")
-                _soft_fail_streak = 0
-                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                continue
-            _soft_fail_streak += 1
-            if _soft_fail_streak < 2:
-                set_state(tunnel_role="SUSPECT", last_check_message="数据面一次超时，正在复测")
-                log_to_json("INFO", "Proxy", f"活动网卡 {iface} 探测超时，标为 SUSPECT，不切换")
-                time.sleep(0.25)
-                continue
-            observed = _egress_observation()
-            if not _egress_observation_live(observed) or proxy_server.proxy_forwarding_busy(3.0):
-                _soft_fail_streak = 0
-                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                continue
-            confirmed = _soft_round_failures(iface, timeout=4.0)
-            if (
-                not _egress_observation_live(observed)
-                or proxy_server.proxy_forwarding_busy(3.0)
-                or confirmed < 2
-            ):
-                _soft_fail_streak = 0
-                set_state(tunnel_role="ACTIVE", last_check_message="较长超时复测通过，保持当前隧道")
-                log_to_json("INFO", "Proxy", "快速探测超时，但较长超时复测通过，不切换")
-                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                continue
-            reason = f"活动网卡 {iface} 数据面快速探测及4秒复测均失败"
-            _soft_fail_streak = 0
-            if active_tunnel_running() and iface and Path("/sys/class/net", iface).exists():
-                set_state(
-                    tunnel_role="ACTIVE",
-                    last_check_message="出口探测超时，隧道仍在",
-                )
-                log_to_json("WARNING", "Proxy", reason + "；隧道进程仍在，保持 8500")
-                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
-                continue
-            _invalidate_tunnel_health(reason)
-            log_to_json("WARNING", "Proxy", reason)
-            if not _promote_live_standby():
-                _detach_dead_forwarding()
-                handle_confirmed_tunnel_failure(reason)
+            # The process is still there. Do not open 8.8.8.8:443 every few
+            # seconds. Port checks stay on the cold standby loop.
+            time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+            continue
         except Exception as exc:
             log_to_json("ERROR", "Proxy", f"快速存活守护异常: {exc}")
         time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
@@ -21346,25 +21274,15 @@ def background_proxy_checker() -> None:
                         continue
                 else:
                     proxy_health_failures = 0
-                udp_ok = None
-                if res.get("ok"):
-                    udp_ok = bool(proxy_server.probe_socks_udp_dns(timeout=2).get("ok"))
-                    quic_ok = bool(proxy_server.probe_socks_quic(timeout=4).get("ok")) if udp_ok else False
-                    if not _egress_observation_live(observed):
-                        log_to_json("INFO", "Proxy", "直连 UDP 检测结果已过期，丢弃")
-                        time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
-                        continue
                 direct_state = dict(
                     direct_egress_ok=bool(res.get("ok")),
                     active_tunnel_ok=tunnel_up,
                     proxy_ip=str(res.get("ip") or "") if res.get("ok") else "-",
                     proxy_latency_ms=parse_int(res.get("latency_ms")),
                     proxy_error="" if res.get("ok") else str(res.get("error") or "服务器直连失败"),
+                    client_udp_ok=None,
+                    client_quic_ok=None,
                 )
-                if udp_ok is not None:
-                    direct_state["client_tcp_ok"] = True
-                    direct_state["client_udp_ok"] = udp_ok
-                    direct_state["client_quic_ok"] = quic_ok
                 set_state(**direct_state)
                 if res.get("ok"):
                     proxy_health_failures = 0
@@ -21403,17 +21321,22 @@ def background_proxy_checker() -> None:
                     continue
                 res = {"ok": False, "error": "活动 VPN 隧道进程或网卡已消失"}
             else:
-                res = check_proxy_health()
+                # Tunnel process is up. A webpage fetch, UDP DNS and a 4s QUIC
+                # handshake every 20s are not the agreed checks, and the QUIC
+                # timeout is what kept the badge on 异常.
+                state_now = get_state()
+                if state_now.get("client_quic_ok") is False or state_now.get("client_udp_ok") is False:
+                    set_state(client_quic_ok=None, client_udp_ok=None)
+                time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                continue
             if not _egress_observation_live(observed):
                 log_to_json("INFO", "Proxy", "代理检测结果已过期，丢弃")
                 time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                 continue
             if res["ok"]:
                 proxy_health_failures = 0
-                udp_ok = bool(proxy_server.probe_socks_udp_dns(timeout=2).get("ok"))
-                quic_ok = bool(proxy_server.probe_socks_quic(timeout=4).get("ok")) if udp_ok else False
                 if not _egress_observation_live(observed) or health_epoch != _tunnel_health_epoch:
-                    log_to_json("INFO", "Proxy", "代理 UDP 检测结果已过期，丢弃")
+                    log_to_json("INFO", "Proxy", "代理检测结果已过期，丢弃")
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
                 set_state(
@@ -21421,8 +21344,8 @@ def background_proxy_checker() -> None:
                     egress_switching=False,
                     client_proxy_ok=True,
                     client_tcp_ok=True,
-                    client_udp_ok=udp_ok,
-                    client_quic_ok=quic_ok,
+                    client_udp_ok=None,
+                    client_quic_ok=None,
                     proxy_ok=True,
                     active_tunnel_ok=True,
                     proxy_ip=res["ip"],
