@@ -1512,6 +1512,7 @@ def get_state() -> dict[str, Any]:
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = bool(ui_cfg.get("fav_fail_fallback", True))
     state["background_paused"] = background_paused()
+    state["bench_min_interval_hours"] = _bench_min_hours()
     try:
         scheme = scheme_match_snapshot(ui_cfg)
     except Exception:
@@ -6246,115 +6247,110 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
 
     return list(updated_nodes_map.values())
 
+def _listed_node_is_live(node_id: str, endpoint_id: str) -> bool:
+    if endpoint_id and endpoint_id == str(active_pool_endpoint_id or ""):
+        return True
+    return bool(node_id and node_id == str(active_openvpn_node_id or ""))
+
+
+def _ui_from_light_probe(node_id: str, endpoint_id: str, port_hit: dict[str, Any]) -> dict[str, Any]:
+    inconclusive = bool(port_hit.get("inconclusive"))
+    ok = bool(port_hit.get("ok"))
+    latency = int(port_hit.get("latency_ms") or 0)
+    message = str(port_hit.get("message") or "")
+    if endpoint_id and not inconclusive:
+        try:
+            node_pool.record_endpoint_probe(
+                endpoint_id,
+                ok,
+                latency if ok else 0,
+                message,
+                speed_bps=None,
+            )
+            node_pool.invalidate_ui_lists()
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"端口结果写入失败: {exc}")
+    fresh = node_pool.get_endpoint(endpoint_id) if endpoint_id else None
+    ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+    if not isinstance(ui, dict):
+        ui = {}
+    ui["id"] = node_id
+    if inconclusive:
+        ui["probe_status"] = str(ui.get("probe_status") or "not_checked")
+        ui["probe_message"] = message or "UDP 无回应，不算不可用"
+        return {"ok": False, "skipped": True, "error": ui["probe_message"], "node": ui}
+    ui["probe_status"] = "available" if ok else "unavailable"
+    ui["probe_message"] = message
+    ui["latency_ms"] = latency if ok else 0
+    return {"ok": ok, "node": ui}
+
+
+def _probe_live_tunnel_speed(node_id: str, endpoint_id: str) -> dict[str, Any]:
+    """Speed belongs only to the one tunnel already forwarding. Never dial another."""
+    iface = ""
+    try:
+        iface = str(proxy_server.get_active_interface() or "").strip()
+    except Exception:
+        iface = ""
+    if not iface or not active_tunnel_running():
+        return {"ok": False, "error": "当前没有正在转发的隧道", "node": {"id": node_id, "probe_message": "当前没有正在转发的隧道"}}
+    speed = int(_sample_exit_speed(iface) or 0)
+    if speed <= 0:
+        message = "测速没有结果，状态不变"
+        return {"ok": False, "skipped": True, "error": message, "node": {"id": node_id, "probe_message": message}}
+    message = f"测速 {speed / 1_000_000:.1f} Mbps"
+    fast = speed >= _active_speed_floor_bps()
+    if not fast:
+        message = f"{message}，低于 {_active_speed_floor_bps() // 1_000_000}Mbps"
+    if endpoint_id:
+        try:
+            node_pool.record_endpoint_probe(endpoint_id, fast, 0, message, speed_bps=speed)
+            node_pool.invalidate_ui_lists()
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"当前隧道测速写入失败: {exc}")
+    fresh = node_pool.get_endpoint(endpoint_id) if endpoint_id else None
+    ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+    if not isinstance(ui, dict):
+        ui = {}
+    ui["id"] = node_id
+    ui["probe_message"] = message
+    ui["speed"] = speed
+    ui["speed_bps"] = speed
+    if not fast:
+        ui["probe_status"] = "unavailable"
+    return {"ok": fast, "node": ui}
+
+
 def probe_listed_node(node_id: str) -> dict[str, Any]:
-    """Manual 待检测. Dial the node and store one speed sample. No webpage check."""
+    """Manual list click. Other nodes get a port check only. The live tunnel gets one speed sample."""
     node_id = str(node_id or "").strip()
     if not node_id:
         return {"ok": False, "error": "节点 ID 不能为空"}
-    if node_id.startswith("pool:"):
-        endpoint_id = node_id.removeprefix("pool:")
-        endpoint = node_pool.get_endpoint(endpoint_id)
-        if endpoint is None:
-            return {"ok": False, "error": "端点不存在"}
-        protocol = str(endpoint.get("protocol") or "").lower()
-        if protocol == "openvpn":
-            port_hit = light_probe_endpoint(endpoint)
-            if not port_hit.get("ok") and not port_hit.get("inconclusive"):
-                message = str(port_hit.get("message") or "端口无应答")
-                try:
-                    node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
-                    node_pool.invalidate_ui_lists()
-                except Exception as exc:
-                    log_to_json("WARNING", "Probe", f"端口结果写入失败: {exc}")
-                fresh = node_pool.get_endpoint(endpoint_id)
-                ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
-                if isinstance(ui, dict):
-                    ui["id"] = node_id
-                    ui["probe_status"] = "unavailable"
-                    ui["probe_message"] = message
-                return {"ok": False, "node": ui or {"id": node_id, "probe_status": "unavailable", "probe_message": message}}
-            real_id = ensure_openvpn_node_from_pool(endpoint)
-            node = test_node_by_id(real_id, record_pool=False)
-            message = str(node.get("probe_message") or "")
-            port_note = str(port_hit.get("message") or "")
-            if port_note and port_note not in message:
-                message = f"{port_note} · {message}" if message else port_note
-            if "让路" in message:
-                return {
-                    "ok": False,
-                    "skipped": True,
-                    "error": message,
-                    "node": {"id": node_id, "probe_status": "not_checked", "probe_message": message},
-                }
-            speed = int(node.get("speed") or node.get("speed_bps") or 0)
-            latency = int(node.get("latency_ms") or 0)
-            fast = speed >= _active_speed_floor_bps()
-            try:
-                node_pool.record_endpoint_probe(
-                    endpoint_id, fast, latency, message, speed_bps=speed or None
-                )
-                node_pool.invalidate_ui_lists()
-            except Exception as exc:
-                log_to_json("WARNING", "Probe", f"待检测结果写入失败: {exc}")
-            fresh = node_pool.get_endpoint(endpoint_id)
-            ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
-            if isinstance(ui, dict):
-                ui["id"] = node_id
-                ui["probe_message"] = message
-                ui["latency_ms"] = latency
-                if speed > 0:
-                    ui["speed"] = speed
-                    ui["speed_bps"] = speed
-                if not fast:
-                    ui["probe_status"] = "unavailable"
-            return {"ok": fast, "node": ui or {"id": node_id, "probe_status": "available" if fast else "unavailable", "probe_message": message, "speed": speed, "speed_bps": speed}}
-        port_hit = light_probe_endpoint(endpoint)
-        if not port_hit.get("ok") and not port_hit.get("inconclusive"):
-            message = str(port_hit.get("message") or "端口无应答")
-            try:
-                node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
-                node_pool.invalidate_ui_lists()
-            except Exception as exc:
-                log_to_json("WARNING", "Probe", f"端口结果写入失败: {exc}")
-            fresh = node_pool.get_endpoint(endpoint_id)
-            ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
-            if isinstance(ui, dict):
-                ui["id"] = node_id
-                ui["probe_status"] = "unavailable"
-                ui["probe_message"] = message
-            return {"ok": False, "node": ui or {"id": node_id, "probe_status": "unavailable", "probe_message": message}}
-        result = probe_pool_endpoint(endpoint_id)
-        if result.get("skipped"):
-            message = str(result.get("error") or "检测让路")
-            return {
-                "ok": False,
-                "skipped": True,
-                "error": message,
-                "node": {"id": node_id, "probe_status": "not_checked", "probe_message": message},
-            }
-        ok = bool(result.get("ok"))
-        message = str(result.get("message") or result.get("error") or "")
-        speed = int(result.get("speed_bps") or 0)
-        fresh = node_pool.get_endpoint(endpoint_id)
-        ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
-        if isinstance(ui, dict):
-            ui["id"] = node_id
-            ui["probe_status"] = "available" if ok else "unavailable"
-            ui["probe_message"] = message
-            ui["latency_ms"] = int(result.get("latency_ms") or 0)
-            if speed > 0:
-                ui["speed"] = speed
-                ui["speed_bps"] = speed
-        try:
-            node_pool.invalidate_ui_lists()
-        except Exception:
-            pass
-        return {"ok": ok, "node": ui, "result": result}
-    node = test_node_by_id(node_id)
-    message = str(node.get("probe_message") or "")
-    if "让路" in message:
-        return {"ok": False, "skipped": True, "error": message, "node": node}
-    return {"ok": str(node.get("probe_status") or "") == "available", "node": node}
+    endpoint_id = node_id.removeprefix("pool:") if node_id.startswith("pool:") else ""
+    endpoint = node_pool.get_endpoint(endpoint_id) if endpoint_id else None
+    if node_id.startswith("pool:") and endpoint is None:
+        return {"ok": False, "error": "端点不存在"}
+    if _listed_node_is_live(node_id, endpoint_id):
+        return _probe_live_tunnel_speed(node_id, endpoint_id or str(active_pool_endpoint_id or ""))
+    if endpoint is not None:
+        return _ui_from_light_probe(node_id, endpoint_id, light_probe_endpoint(endpoint))
+    node = _nodes_index_get().get(node_id) or {}
+    host = str(node.get("ip") or node.get("remote_host") or "")
+    port = parse_int(node.get("remote_port") or node.get("port"))
+    if not host or port <= 0:
+        return {"ok": False, "error": "端点不存在"}
+    rtt = tcp_connect_ms(host, port, 1.0)
+    ok = rtt > 0
+    message = f"TCP 端口开放 {rtt} ms" if ok else "TCP 端口未开放"
+    return {
+        "ok": ok,
+        "node": {
+            "id": node_id,
+            "probe_status": "available" if ok else "unavailable",
+            "probe_message": message,
+            "latency_ms": rtt if ok else 0,
+        },
+    }
 
 
 def auto_switch_node(attempt: int = 0) -> None:
@@ -7211,6 +7207,18 @@ def _publish_cold_standby(endpoint: dict[str, Any] | None) -> None:
 def _cold_port_open(endpoint: dict[str, Any]) -> bool | None:
     """One-minute spare check. TCP is a port connect, UDP is one protocol packet. Never a tunnel."""
     result = light_probe_endpoint(endpoint)
+    endpoint_id = str(endpoint.get("endpoint_id") or "")
+    if endpoint_id and not result.get("inconclusive"):
+        try:
+            node_pool.record_endpoint_probe(
+                endpoint_id,
+                bool(result.get("ok")),
+                int(result.get("latency_ms") or 0) if result.get("ok") else 0,
+                str(result.get("message") or ""),
+                speed_bps=None,
+            )
+        except Exception as exc:
+            log_to_json("WARNING", "Standby", f"冷备端口结果写入失败: {exc}")
     if result.get("inconclusive"):
         return None
     return bool(result.get("ok"))
@@ -7754,7 +7762,9 @@ def cold_standby_pass() -> None:
     _publish_cold_standby(chosen)
     _remember_precold(candidates, str((chosen or {}).get("endpoint_id") or ""))
     if active_tunnel_running() and not proxy_server.proxy_forwarding_busy():
-        _light_check_spare_bench(candidates)
+        if time.time() - float(getattr(cold_standby_pass, "precold_at", 0) or 0) >= 180:
+            cold_standby_pass.precold_at = time.time()
+            _light_check_spare_bench(candidates)
         _verify_one_standby_real(candidates)
     if active_tunnel_running() or proxy_server.proxy_forwarding_busy():
         if active_tunnel_running() and proxy_server.get_egress_mode() == "direct" and _auto_direct_fallback_active():
@@ -7784,6 +7794,10 @@ def cold_standby_loop() -> None:
         except Exception as exc:
             log_to_json("WARNING", "Standby", f"冷备维护失败: {exc}")
         time.sleep(COLD_PORT_SECONDS)
+        try:
+            maybe_country_bench()
+        except Exception as exc:
+            log_to_json("WARNING", "Standby", f"国家名额检测失败: {exc}")
 
 
 FAVORITE_PROBE_SECONDS = 3600
@@ -9287,10 +9301,10 @@ def global_scan_settings() -> dict[str, Any]:
         hour = 0
     hour = max(0, min(23, hour))
     try:
-        interval = int(cfg.get("global_scan_interval_hours") if cfg.get("global_scan_interval_hours") is not None else 1)
+        interval = int(cfg.get("global_scan_interval_hours") if cfg.get("global_scan_interval_hours") is not None else 3)
     except (TypeError, ValueError):
-        interval = 1
-    interval = max(1, min(24, interval))
+        interval = 3
+    interval = max(_bench_min_hours(), min(24, interval))
     try:
         last = float(cfg.get("last_global_scan_at") or 0)
     except (TypeError, ValueError):
@@ -9346,7 +9360,7 @@ def save_global_scan_settings(changes: dict[str, Any]) -> dict[str, Any]:
         interval = int(changes.get("global_scan_interval_hours") if "global_scan_interval_hours" in changes else current["interval"])
     except (TypeError, ValueError):
         interval = current["interval"]
-    interval = max(1, min(24, interval))
+    interval = max(_bench_min_hours(), min(24, interval))
     if mode == "loop":
         hour = current["hour"]
     else:
@@ -9417,11 +9431,218 @@ def global_scan_due(now: float | None = None) -> bool:
     return (previous.tm_year, previous.tm_yday) != (local.tm_year, local.tm_yday)
 
 
+COUNTRY_BENCH_TARGET = 6
+COUNTRY_BENCH_FILE = DATA_DIR / "country_bench.json"
+_country_bench_lock = threading.Lock()
+_country_bench_mem: dict[str, Any] = {}
+
+
+def _swap_used_kb() -> int:
+    total = free = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("SwapTotal:"):
+                total = int(line.split()[1])
+            elif line.startswith("SwapFree:"):
+                free = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return max(0, total - free)
+
+
+def _small_host_kb() -> bool:
+    """512MB class. A 1GB machine reports about 1000MB and is not included."""
+    total, _avail = _meminfo_kb()
+    return 0 < total < 800 * 1024
+
+
+def _bench_min_hours() -> int:
+    total, _avail = _meminfo_kb()
+    if total >= 1800 * 1024:
+        return 1
+    return 3
+
+
+def _full_scan_stop_reason() -> str:
+    if not _small_host_kb():
+        return ""
+    total, avail = _meminfo_kb()
+    if total > 0 and avail < int(total * 0.30):
+        return "可用内存低于 30%，全库检测已停止"
+    if _swap_used_kb() > 0:
+        return "已经在用交换分区，全库检测已停止"
+    return ""
+
+
+def _load_country_bench() -> dict[str, Any]:
+    if _country_bench_mem:
+        return _country_bench_mem
+    try:
+        loaded = read_json(COUNTRY_BENCH_FILE, {})
+    except Exception:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        loaded = {}
+    _country_bench_mem.clear()
+    _country_bench_mem.update(loaded)
+    return _country_bench_mem
+
+
+def _save_country_bench() -> None:
+    try:
+        write_json(COUNTRY_BENCH_FILE, _country_bench_mem)
+    except Exception as exc:
+        log_to_json("WARNING", "Probe", f"国家名额写入失败: {exc}")
+
+
+def bench_substitutes_for(country: str) -> list[str]:
+    country = normalized_country_name(country) if country else ""
+    if not country:
+        return []
+    rows = _load_country_bench().get("rows")
+    if not isinstance(rows, dict):
+        return []
+    item = rows.get(country) if isinstance(rows.get(country), dict) else {}
+    return [str(eid) for eid in (item.get("sub") or []) if str(eid)]
+
+
+def _bench_interval_seconds() -> int:
+    settings = global_scan_settings()
+    if not settings.get("auto"):
+        return 0
+    if settings.get("mode") != "loop":
+        return 0
+    hours = max(_bench_min_hours(), int(settings.get("interval") or 3))
+    return hours * 3600
+
+
+def _run_country_bench() -> None:
+    """Port and latency for up to six nodes in every country. Never a tunnel."""
+    grouped = node_pool.country_probe_ids(24)
+    own_hits: dict[str, list[tuple[str, int]]] = {}
+    writes: list[tuple[str, bool, int, str]] = []
+    for country, endpoint_ids in grouped.items():
+        if _full_scan_stop_reason() and _small_host_kb() and _swap_used_kb() > 8 * 1024:
+            log_to_json("WARNING", "Probe", "国家名额检测因内存或交换分区提前停下")
+            break
+        if is_connecting or manual_connection_active or ui_command_plane.is_busy():
+            break
+        hits: list[tuple[str, int]] = []
+        for endpoint_id in endpoint_ids:
+            if len(hits) >= COUNTRY_BENCH_TARGET:
+                break
+            endpoint = node_pool.get_endpoint(endpoint_id)
+            if not endpoint:
+                continue
+            result = light_probe_endpoint(endpoint)
+            if result.get("inconclusive"):
+                continue
+            ok = bool(result.get("ok"))
+            latency = int(result.get("latency_ms") or 0) if ok else 0
+            writes.append((endpoint_id, ok, latency, str(result.get("message") or "")))
+            if ok:
+                hits.append((endpoint_id, latency))
+        own_hits[country] = hits
+        if len(writes) >= 12:
+            try:
+                node_pool.record_light_probe_batch(writes)
+            except Exception as exc:
+                log_to_json("WARNING", "Probe", f"国家名额写入失败: {exc}")
+            writes = []
+    if writes:
+        try:
+            node_pool.record_light_probe_batch(writes)
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"国家名额写入失败: {exc}")
+    home = ""
+    node_country = ""
+    try:
+        home = normalized_country_name(server_home_country())
+    except Exception:
+        home = ""
+    current = current_active_routing_endpoint() or {}
+    node_country = normalized_country_name(str(current.get("country") or ""))
+    donor_order: list[str] = []
+    for name in (node_country, home):
+        if name and name not in donor_order:
+            donor_order.append(name)
+    ranked = sorted(
+        ((name, min((lat for _eid, lat in hits if lat > 0), default=999999)) for name, hits in own_hits.items()),
+        key=lambda item: item[1],
+    )
+    for name, _lat in ranked:
+        if name not in donor_order:
+            donor_order.append(name)
+    rows: dict[str, Any] = {}
+    for country, hits in own_hits.items():
+        own_ids = [eid for eid, _lat in hits[:COUNTRY_BENCH_TARGET]]
+        sub: list[str] = []
+        if len(own_ids) < COUNTRY_BENCH_TARGET:
+            used = set(own_ids)
+            for donor in donor_order:
+                if donor == country:
+                    continue
+                for eid, _lat in own_hits.get(donor) or []:
+                    if eid in used:
+                        continue
+                    sub.append(eid)
+                    used.add(eid)
+                    if len(own_ids) + len(sub) >= COUNTRY_BENCH_TARGET:
+                        break
+                if len(own_ids) + len(sub) >= COUNTRY_BENCH_TARGET:
+                    break
+        rows[country] = {"own": own_ids, "sub": sub}
+    bench = _load_country_bench()
+    bench["checked_at"] = time.time()
+    bench["not_before"] = 0
+    bench["rows"] = rows
+    _save_country_bench()
+    short = sum(1 for item in rows.values() if len(item.get("own") or []) < COUNTRY_BENCH_TARGET)
+    log_to_json("INFO", "Probe", f"国家名额检测完成：{len(rows)} 个国家，其中 {short} 个不足 6 个，已用周边低延迟节点替补")
+
+
+def maybe_country_bench() -> None:
+    interval = _bench_interval_seconds()
+    if interval <= 0:
+        return
+    if library_check_phase in ("running", "paused"):
+        return
+    if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
+        return
+    try:
+        if proxy_server.proxy_forwarding_busy():
+            return
+    except Exception:
+        return
+    bench = _load_country_bench()
+    now = time.time()
+    if not bench.get("checked_at") and not bench.get("not_before"):
+        bench["not_before"] = now + 600
+        _save_country_bench()
+        return
+    if now < float(bench.get("not_before") or 0):
+        return
+    if now - float(bench.get("checked_at") or 0) < interval:
+        return
+    if not _country_bench_lock.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            _run_country_bench()
+        except Exception as exc:
+            log_to_json("WARNING", "Probe", f"国家名额检测失败: {exc}")
+        finally:
+            _country_bench_lock.release()
+
+    threading.Thread(target=_worker, daemon=True, name="country-bench").start()
+
+
 def maybe_start_scheduled_library_check() -> None:
     """No timed full scan. The bench is filled from known rows and port checks."""
     if not getattr(maybe_start_scheduled_library_check, "noted", False):
         maybe_start_scheduled_library_check.noted = True
-        log_to_json("INFO", "Probe", "不定时全量检测。冷备凑不齐时才补端口，凑齐就停。")
+        log_to_json("INFO", "Probe", "不定时全量检测。每个国家 6 个由自动更新勾选后单独跑。")
     return
 
 
@@ -9558,6 +9779,14 @@ def _library_check_worker(generation: int) -> None:
         batch_size = 4 if 0 < total_kb < 700 * 1024 else 24
         probe_started = time.time()
         while index < len(queue):
+            stop_reason = _full_scan_stop_reason()
+            if stop_reason:
+                log_to_json("WARNING", "Probe", stop_reason)
+                with library_check_lock:
+                    if library_check_generation == generation:
+                        library_check_stop = True
+                        library_check_message = stop_reason
+                break
             if _library_wait_until_slot(generation) == "stop":
                 break
             batch = queue[index:index + batch_size]
@@ -14135,7 +14364,7 @@ INDEX_HTML = r"""<!doctype html>
             <div id="library_scan_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
           </div>
         </div>
-        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">不勾选时，空闲才检测。上一轮在 15 分钟内完成就每 3 小时一次，超过 15 分钟就改回每 6 小时。勾选循环后按右边的间隔重复；每天或星期几按右边的钟点开始。系统忙就等到空闲。同国家的节点先测。</div>
+        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">开启自动更新只复测每个国家 6 个节点的端口和延迟，不扫全库，也不建隧道。默认 3 小时。内存低于 2GB 时不能选 1 小时或 2 小时。全库检测只有点「手动检测」才跑。512MB 上如果可用内存低于 30%，或者已经在用交换分区，这一轮全库检测会停下，当前隧道不停。</div>
       </div>
       <div style="display:flex; gap:12px; margin-top:18px;">
         <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">手动检测</button>
@@ -16370,12 +16599,12 @@ function render(){
       const blockedHit = nodeBlockHit(n);
       const blocked = blockedHit.ip || blockedHit.domain;
 
-      const canRetest = !isCurrentlyActive && !isTesting && !isWaiting && ["not_checked", "unavailable"].includes(n.probe_status || "not_checked");
+      const canRetest = !isTesting && !isWaiting && ["not_checked", "unavailable", "available"].includes(n.probe_status || "not_checked");
       const standbyShown = !!(state?.standby_ready || state?.standby_prepared);
       const hotStandby = !blocked && !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
       const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
       const statusCell = isCurrentlyActive && !blocked
-        ? `<span class="badge ${triState(state.client_proxy_ok) === false ? "unavailable" : "available"}" title="${esc((triState(state.client_proxy_ok) === false && state.proxy_error) || n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>主连接</span>`
+        ? `<button type="button" class="badge status-badge-button ${triState(state.client_proxy_ok) === false ? "unavailable" : "available"}" title="只测当前这一条隧道的速度，不新开隧道" onclick="testNode(this, '${esc(n.id)}', event)"><span class="badge-pulse"></span>主连接</button>`
         : isWaiting
           ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
           : hotStandby
@@ -16418,7 +16647,7 @@ function render(){
         : `<button type="button" class="test-btn" data-favorite-id="${esc(favId)}" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 28px;">☆ 收藏</button>`;
 
       return `<tr ${rowClass}>
-        <td class="node-status-cell" data-label="状态">${statusCell}</td>
+        <td class="node-status-cell" data-label="状态">${n.bench_substitute ? '<span class="badge not_checked" title="不是这个国家自己的节点">替补</span>' : ""}${statusCell}</td>
         <td class="node-protocol-cell" data-label="协议">${renderProtocolCell(n)}</td>
         <td class="node-address-cell${blockedHit.domain ? " is-blocked-domain" : ""}${blockedHit.ip ? " is-blocked-ip" : ""}" data-label="IP" title="${esc((domainLine ? domainLine + " " : "") + (listIp || ""))}"><div class="node-address-stack">${domainLine ? `<div class="node-domain">${esc(domainLine)}</div>` : ""}<div class="mono">${esc(ipLine || "-")}</div></div></td>
         <td class="node-latency-cell" data-label="延迟">${latencyText}</td>
@@ -18343,14 +18572,16 @@ function fillLibraryScanHourOptions(mode) {
   const hour = $("library_scan_hour");
   if (!hour) return;
   const loop = String(mode || "loop") === "loop";
-  const kind = loop ? "interval" : "clock";
+  const minHour = loop ? Math.max(1, Number((state && state.bench_min_interval_hours) || 3)) : 1;
+  const kind = loop ? ("interval-" + minHour) : "clock";
   if (hour.dataset.kind === kind) return;
   const previous = Number(hour.value || 0);
   const values = loop
-    ? Array.from({length: 24}, (_, index) => ({value: index + 1, text: (index + 1) + "小时"}))
+    ? Array.from({length: 24 - minHour + 1}, (_, index) => ({value: index + minHour, text: (index + minHour) + "小时"}))
     : Array.from({length: 24}, (_, index) => ({value: index, text: String(index).padStart(2, "0") + ":00"}));
   hour.innerHTML = values.map(item => '<option value="' + item.value + '">' + item.text + '</option>').join("");
-  hour.value = String(loop ? (previous >= 1 && previous <= 24 ? previous : 1) : Math.max(0, Math.min(23, previous)));
+  const fallback = loop ? Math.max(minHour, 3) : 0;
+  hour.value = String(loop ? (previous >= minHour && previous <= 24 ? previous : fallback) : Math.max(0, Math.min(23, previous)));
   hour.dataset.kind = kind;
   const widget = $("library_scan_hour_widget");
   if (widget) widget.setAttribute("aria-label", loop ? "间隔" : "开始时间");
@@ -18369,7 +18600,7 @@ function paintLibraryScanForm(snapshot) {
   const modeValue = (mode && mode.value) || "loop";
   fillLibraryScanHourOptions(modeValue);
   const stored = modeValue === "loop"
-    ? (snapshot && snapshot.global_scan_interval_hours != null ? snapshot.global_scan_interval_hours : 1)
+    ? (snapshot && snapshot.global_scan_interval_hours != null ? snapshot.global_scan_interval_hours : 3)
     : (snapshot && snapshot.global_scan_hour != null ? snapshot.global_scan_hour : 0);
   if (hour && !hourOpen && stored != null && hour.value !== String(stored)) hour.value = String(stored);
   if (!modeOpen) renderUnifiedSelect("library_scan_mode");
@@ -18380,7 +18611,7 @@ function saveLibraryScanForm() {
   const modeValue = ($("library_scan_mode") && $("library_scan_mode").value) || "loop";
   fillLibraryScanHourOptions(modeValue);
   const hour = $("library_scan_hour");
-  const picked = Number(hour && hour.value || (modeValue === "loop" ? 1 : 0));
+  const picked = Number(hour && hour.value || (modeValue === "loop" ? 3 : 0));
   libraryCheckAction("save_schedule", {
     global_scan_auto: !!($("library_scan_auto") && $("library_scan_auto").checked),
     global_scan_mode: modeValue,
@@ -24440,6 +24671,27 @@ def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", 
         # page. The SQL query already applies the same primary status/latency
         # ordering, so we do not materialize thousands of rows in Python.
         ordered = _sort_ui_nodes_for_page(scoped_nodes)
+        if (
+            offset == 0
+            and country
+            and not status
+            and not protocol
+            and not ip_type
+            and not speed_min_bps
+            and not latency
+        ):
+            present = {str(node.get("pool_endpoint_id") or "") for node in ordered}
+            for endpoint_id in bench_substitutes_for(country):
+                if endpoint_id in present:
+                    continue
+                endpoint = node_pool.get_endpoint(endpoint_id)
+                node = protocol_endpoint_to_ui_node(endpoint) if endpoint else None
+                if not node:
+                    continue
+                node["bench_substitute"] = True
+                node["probe_message"] = "替补 · " + str(node.get("probe_message") or "周边低延迟")
+                ordered.append(node)
+                present.add(endpoint_id)
         # The SQL total is already one row per protocol/IP/port. If this page
         # held every matching endpoint, the deduped payload is the number the
         # footer must show — never a larger raw COUNT.
@@ -24857,6 +25109,7 @@ def _build_fast_nodes_state():
     state["routing_latency"] = str(ui_cfg.get("routing_latency") or "")
     state["routing_blocklist"] = str(ui_cfg.get("routing_blocklist") or "")
     state["background_paused"] = background_paused()
+    state["bench_min_interval_hours"] = _bench_min_hours()
     if state["background_paused"]:
         state["priority_running"] = False
         state["priority_full_sweep_running"] = False

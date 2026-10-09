@@ -1839,6 +1839,33 @@ class NodePool:
                 return False
         return True
 
+    def country_probe_ids(self, per_country: int = 24) -> dict[str, list[str]]:
+        """Up to N endpoint ids per country. Available rows come first. No config bodies."""
+        per_country = max(1, min(40, int(per_country or 24)))
+        grouped: dict[str, list[str]] = {}
+        with closing(self._connect(readonly=True)) as db:
+            rows = db.execute(
+                """
+                SELECT s.country AS country, e.endpoint_id AS endpoint_id
+                FROM endpoints e
+                JOIN servers s ON e.server_key = s.server_key
+                WHERE COALESCE(s.country, '') != ''
+                  AND COALESCE(e.status, '') != 'RETIRED'
+                ORDER BY s.country,
+                         CASE WHEN e.status = 'AVAILABLE' THEN 0 ELSE 1 END,
+                         COALESCE(e.ui_latency_ms, 0)
+                """
+            ).fetchall()
+        for row in rows:
+            country = canonical_country_name(str(row["country"] or ""))
+            endpoint_id = str(row["endpoint_id"] or "")
+            if not country or not endpoint_id:
+                continue
+            bucket = grouped.setdefault(country, [])
+            if len(bucket) < per_country:
+                bucket.append(endpoint_id)
+        return grouped
+
     def record_endpoint_probe(self, endpoint_id: str, ok: bool, latency_ms: int = 0, message: str = "", speed_bps: int | None = None) -> bool:
         endpoint_id = str(endpoint_id or "").strip()
         if not endpoint_id:
