@@ -597,12 +597,20 @@ class NodePool:
                 "hostname": host,
                 "ip": str(node.get("ip") or node.get("remote_host") or "").strip(),
                 "country": node.get("country") or "",
+                "catalog_country": node.get("catalog_country") or "",
                 "ping": node.get("ping") or node.get("latency_ms") or 0,
                 "speed": node.get("speed") or 0,
                 "sessions": node.get("sessions") or 0,
                 "score": node.get("score") or 0,
                 "protocols": [protocol],
                 "_sources": [source],
+                "owner": node.get("owner") or "",
+                "asn": node.get("asn") or "",
+                "as_name": node.get("as_name") or "",
+                "location": node.get("location") or "",
+                "ip_type": node.get("ip_type") or "",
+                "quality": node.get("quality") or "",
+                "geo_verified": bool(node.get("geo_verified")),
             })
             if node.get("manual_added_at"):
                 servers[-1]["manual_added_at"] = float(node.get("manual_added_at") or 0)
@@ -661,10 +669,24 @@ class NodePool:
                             metadata = previous_meta
                     except Exception:
                         pass
-                located = country_from_location(metadata.get("location"))
-                metadata["catalog_country"] = country
-                if located:
-                    country = located
+                if ip_changed:
+                    for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                        metadata.pop(field, None)
+                    metadata.pop("geo_verified", None)
+                for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+                    incoming = str(server.get(field) or "").strip()
+                    if incoming:
+                        metadata[field] = incoming
+                catalog = canonical_country_name(server.get("catalog_country") or "")
+                if catalog:
+                    metadata["catalog_country"] = catalog
+                elif not metadata.get("catalog_country"):
+                    metadata["catalog_country"] = country
+                if server.get("geo_verified"):
+                    metadata["geo_verified"] = True
+                    located = country_from_location(metadata.get("location"))
+                    if located:
+                        country = located
                 db.execute(
                     """
                     INSERT INTO servers(server_key, hostname, current_ip, country, first_seen, last_seen, last_source, missing_count, state, metadata_json)

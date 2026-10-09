@@ -2150,6 +2150,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
         blacklisted_nodes=len(blacklist),
     )
     try:
+        apply_verified_geo(candidates)
         node_pool.upsert_openvpn_snapshot(candidates, source="official_csv")
     except Exception as pool_exc:
         print(f"[NodePool] 官方 CSV 快照写入失败: {pool_exc}", flush=True)
@@ -3144,6 +3145,7 @@ def refresh_multi_protocol_catalog(force: bool = False) -> dict[str, Any]:
         return {"ok": True, "running": True, "pool": node_pool.stats()}
     try:
         servers, sources = vpngate_discovery.fetch_multi_source_tables(max_mirrors=None)
+        apply_verified_geo(servers)
         upsert = node_pool.upsert_discovery_snapshot(servers, source="official_html_multi") or {}
         last_protocol_discovery_at = time.time()
         stats = node_pool.stats()
@@ -3383,7 +3385,8 @@ def _promote_manual_endpoint(host: str, ip: str, country: str, result: dict[str,
     except Exception as exc:
         log_to_json("WARNING", "Probe", f"手工节点 IP 信息补全失败: {exc}")
     location = str(enriched.get("location") or "").strip()
-    inferred_country = str(country or "").strip()
+    located = vpn_utils.country_from_location(location)
+    inferred_country = located or str(country or "").strip()
     if not inferred_country and location:
         country_prefixes = [
             "United Arab Emirates", "United Kingdom", "United States",
@@ -3676,6 +3679,52 @@ def add_manual_vpngate_node(value: str) -> dict[str, Any]:
     return result
 
 
+def apply_verified_geo(servers: list[dict[str, Any]]) -> None:
+    """Look up the IP before it is stored. The catalog country is only a claim."""
+    if not servers:
+        return
+    cache = vpn_utils.load_ip_cache()
+    now = time.time()
+    fresh = 7 * 24 * 3600
+    pending: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def stamp(server: dict[str, Any], info: dict[str, Any]) -> None:
+        if "catalog_country" not in server:
+            server["catalog_country"] = server.get("country") or ""
+        for field in ("owner", "asn", "as_name", "location", "ip_type", "quality"):
+            value = str(info.get(field) or "").strip()
+            if value:
+                server[field] = value
+        located = vpn_utils.country_from_location(info.get("location")) or vpn_utils.canonical_country_name(info.get("country") or "")
+        if located:
+            server["country"] = located
+            server["geo_verified"] = True
+
+    for server in servers:
+        ip = str(server.get("ip") or server.get("remote_host") or "").strip()
+        cached = cache.get(ip) if ip and isinstance(cache.get(ip), dict) else None
+        if cached and now - float(cached.get("cached_at") or 0) < fresh and str(cached.get("location") or "").strip():
+            stamp(server, cached)
+            continue
+        if ip and ip not in seen and len(pending) < 100:
+            seen.add(ip)
+            pending.append({"ip": ip, "remote_host": ip})
+    if not pending:
+        return
+    try:
+        vpn_utils.enrich_ip_info(pending)
+    except Exception as exc:
+        log_to_json("WARNING", "Main", f"入库前地址核对失败: {exc}")
+        return
+    looked = {str(item.get("ip") or ""): item for item in pending}
+    for server in servers:
+        ip = str(server.get("ip") or server.get("remote_host") or "").strip()
+        info = looked.get(ip)
+        if info and str(info.get("location") or "").strip():
+            stamp(server, info)
+
+
 def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
     """Fill ISP, ASN, location and IP-type for multi-protocol server records from the shared IP cache/query."""
     endpoints = node_pool.list_endpoints(limit=1000)
@@ -3689,7 +3738,7 @@ def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
         if not ip or ip in seen:
             continue
         meta = endpoint.get("server_metadata") or {}
-        if all(str(meta.get(k) or "").strip() for k in ("owner", "as_name", "ip_type", "location")):
+        if meta.get("geo_verified") and all(str(meta.get(k) or "").strip() for k in ("owner", "as_name", "ip_type", "location")):
             continue
         seen.add(ip)
         probe_nodes.append({"ip": ip, "remote_host": ip})
@@ -3715,6 +3764,7 @@ def refresh_protocol_ip_metadata(max_ips: int = 100) -> int:
             "location": node.get("location") or "",
             "ip_type": node.get("ip_type") or "",
             "quality": node.get("quality") or "",
+            "geo_verified": bool(str(node.get("location") or "").strip()),
         }
     updated = node_pool.update_server_metadata_batch(updates)
     if updated:

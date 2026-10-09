@@ -485,6 +485,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["asn"] = cached.get("asn", "")
             node["as_name"] = cached.get("as_name", "")
             node["location"] = cached.get("location", "")
+            node["country"] = cached.get("country", "")
             node["ip_type"] = cached.get("ip_type", "")
             node["quality"] = cached.get("quality", "")
         else:
@@ -556,6 +557,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                         "asn": item.get("as") or "",
                         "as_name": item.get("asname") or "",
                         "location": loc,
+                        "country": canonical_country_name(item.get("country") or "") or str(item.get("country") or ""),
                         "ip_type": ip_type,
                         "quality": quality,
                         "cached_at": now,
@@ -581,6 +583,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             node["asn"] = cached.get("asn", "")
             node["as_name"] = cached.get("as_name", "")
             node["location"] = cached.get("location", "")
+            node["country"] = cached.get("country", "")
             node["ip_type"] = cached.get("ip_type", "")
             node["quality"] = cached.get("quality", "")
 
