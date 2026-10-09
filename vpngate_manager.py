@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.86"
+APP_VERSION = "V1.0.87"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -10395,6 +10395,52 @@ INDEX_HTML = r"""<!doctype html>
       --active-row-border: rgba(16, 185, 129, 0.25);
     }
 
+    .boot-status {
+      position: fixed;
+      left: 50%;
+      top: 46%;
+      z-index: 30;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+    .boot-status-card {
+      width: min(420px, calc(100vw - 48px));
+      padding: 28px 26px 22px;
+      border-radius: 18px;
+      border: 1px solid rgba(20, 184, 166, 0.35);
+      background: rgba(11, 15, 25, 0.94);
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+      text-align: center;
+    }
+    .boot-ring {
+      width: 54px;
+      height: 54px;
+      margin: 0 auto 14px;
+      border-radius: 50%;
+      background: conic-gradient(from 0deg, transparent 0 40%, #14b8a6 0 100%);
+      -webkit-mask: radial-gradient(farthest-side, transparent 62%, #000 63%);
+      mask: radial-gradient(farthest-side, transparent 62%, #000 63%);
+      animation: boot-spin 0.9s linear infinite;
+    }
+    @keyframes boot-spin { to { transform: rotate(1turn); } }
+    .boot-status-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .boot-status-detail {
+      margin-top: 8px;
+      font-size: 13px;
+      line-height: 1.55;
+      color: var(--text-secondary);
+    }
+    .boot-status-time {
+      margin-top: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--primary);
+    }
+
     body {
       margin: 0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
@@ -13869,6 +13915,15 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <div id="boot_status" class="boot-status" role="status" aria-live="polite">
+    <div class="boot-status-card">
+      <div class="boot-ring" aria-hidden="true"></div>
+      <div class="boot-status-title" id="boot_status_title">正在读取节点</div>
+      <div class="boot-status-detail" id="boot_status_detail">第一次大约需要 15 秒。请不要刷新，刷新会重新排队。</div>
+      <div class="boot-status-time" id="boot_status_time">已等待 0 秒</div>
+    </div>
+  </div>
+
   <div class="table-wrapper">
     <div class="table-container">
       <table class="node-table">
@@ -16133,6 +16188,7 @@ function render(){
   const endIndex = Math.min(startIndex + shown.length, Number(totalNodeCount || 0));
   currentPageNodes = shown;
   setRowsPending(false);
+  settleBootStatus();
 
   const rowsHost = $("rows");
   const rowsSig = [
@@ -16855,7 +16911,7 @@ async function loadScope(country, {preserveState = true, signal = null} = {}) {
         return;
       }
     }
-    await loadScopedNodes(scope, generation, signal);
+    await readFirstNodePage(scope, generation, signal);
   } catch (e) {
     if (generation !== scopeLoadGeneration || (e && e.name === "AbortError")) return;
     nodeListLoading = false;
@@ -16917,7 +16973,7 @@ async function load(){
   const scopeCountry = countryFollowsNode ? connectedListCountry() : String($("country_filter")?.value || activeCountryScope || "").trim();
   if (scopeCountry) pinCountryFilter(scopeCountry);
   try {
-    await loadScopedNodes(scopeCountry, generation);
+    await readFirstNodePage(scopeCountry, generation);
   } catch (e) {
     if (generation !== scopeLoadGeneration) return;
     nodeListLoading = false;
@@ -18812,6 +18868,91 @@ async function logoutAdmin() {
 
 // 先把页面骨架、筛选栏和状态区域立即渲染出来；节点数据随后异步读取，
 // 避免首页被数千条节点数据阻塞在白屏/半屏状态。
+const bootStatusStartedAt = Date.now();
+let bootStatusTimer = null;
+let bootStatusHold = false;
+
+function paintBootStatus(extra) {
+  const el = $("boot_status");
+  if (!el || el.style.display === "none") return;
+  const waited = Math.max(0, Math.floor((Date.now() - bootStatusStartedAt) / 1000));
+  const timeEl = $("boot_status_time");
+  const titleEl = $("boot_status_title");
+  const detailEl = $("boot_status_detail");
+  if (timeEl) timeEl.textContent = "已等待 " + waited + " 秒";
+  if (extra) {
+    bootStatusHold = true;
+    if (titleEl && extra.title) titleEl.textContent = extra.title;
+    if (detailEl && extra.detail) detailEl.textContent = extra.detail;
+    return;
+  }
+  if (bootStatusHold) return;
+  if (waited < 15) {
+    if (titleEl) titleEl.textContent = "正在读取节点";
+    if (detailEl) detailEl.textContent = "第一次大约需要 15 秒。请不要刷新，刷新会重新排队。";
+  } else {
+    if (titleEl) titleEl.textContent = "还在读取，页面没有卡死";
+    if (detailEl) detailEl.textContent = "列表还在从本机读出。请继续等待，不要点击刷新。";
+  }
+}
+
+function hideBootStatus() {
+  const el = $("boot_status");
+  bootStatusHold = false;
+  if (bootStatusTimer) {
+    clearInterval(bootStatusTimer);
+    bootStatusTimer = null;
+  }
+  if (el) el.style.display = "none";
+}
+
+function settleBootStatus() {
+  const el = $("boot_status");
+  if (!el) return;
+  const ready = !nodeListLoading && ((currentPageNodes && currentPageNodes.length) || !nodeListError);
+  if (ready) {
+    hideBootStatus();
+    return;
+  }
+  if (el.style.display === "none") el.style.display = "flex";
+  if (!bootStatusTimer) bootStatusTimer = setInterval(() => paintBootStatus(), 1000);
+  if (nodeListError && !nodeListLoading) {
+    paintBootStatus({
+      title: "这一次没读完",
+      detail: nodeListError + "。请不要刷新，自动再读仍失败后再试。"
+    });
+    return;
+  }
+  paintBootStatus();
+}
+
+async function readFirstNodePage(country, generation, signal) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (generation !== scopeLoadGeneration) return;
+    if (signal && signal.aborted) return;
+    if (attempt > 0) {
+      nodeListLoading = true;
+      paintBootStatus({
+        title: "正在自动再读",
+        detail: "第 " + attempt + " 次重试。请不要刷新，刷新会重新排队。"
+      });
+      await new Promise(resolve => setTimeout(resolve, 800));
+      if (generation !== scopeLoadGeneration) return;
+      if (signal && signal.aborted) return;
+    }
+    try {
+      await loadScopedNodes(country, generation, signal);
+      return;
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      if (generation !== scopeLoadGeneration) return;
+      lastError = e;
+    }
+  }
+  throw lastError || new Error("筛选失败");
+}
+
 nodeListLoading = true;
 render();
 load();
