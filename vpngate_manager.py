@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.92"
+APP_VERSION = "V1.0.93"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4630,7 +4630,7 @@ def maybe_recover_preferred_route(force: bool = False) -> bool:
     if _explicit_scheme_configured(ui_cfg):
         now = time.time()
         last_check = float(get_state().get("last_preference_recovery_at") or 0)
-        if not force and now - last_check < 60:
+        if not force and now - last_check < 600:
             return False
         set_state(last_preference_recovery_at=now)
         try:
@@ -7741,19 +7741,6 @@ def cold_standby_pass() -> None:
         return
     current = current_active_routing_endpoint()
     manual_hold = bool(manual_route_pin) and active_tunnel_running()
-    if (
-        not manual_hold
-        and active_tunnel_running()
-        and current
-        and _explicit_scheme_configured(ui_cfg)
-        and not endpoint_matches_explicit_routing(current, ui_cfg)
-        and not endpoint_is_unstable(current)
-    ):
-        now_scheme = time.time()
-        if now_scheme - float(getattr(cold_standby_pass, "scheme_at", 0) or 0) > 60:
-            cold_standby_pass.scheme_at = now_scheme
-            if enter_explicit_scheme(immediate=True):
-                return
     if current and endpoint_is_blocked(current, ui_cfg) and not manual_hold:
         blocked_eid = str(current.get("endpoint_id") or "")
         log_to_json("INFO", "Routing", f"屏蔽节点退出主连接 {_endpoint_ip(current)}")
@@ -19102,7 +19089,7 @@ function hideBootStatus() {
 
 function pageActionBusy() {
   if (testingNodeIds && testingNodeIds.size) return "test";
-  if (state && (state.manual_switch_active || state.is_connecting)) return "switch";
+  if (state && state.manual_switch_active) return "switch";
   if (state && state.egress_switching) return "egress";
   return "";
 }
@@ -21395,6 +21382,10 @@ def background_proxy_checker() -> None:
                     proxy_error=error_msg
                 )
 
+                if active_openvpn_running() or active_external_tunnel_running():
+                    log_to_json("WARNING", "Proxy", f"8500 出口检查失败，隧道还在，不更换节点: {error_msg}")
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 # Only confirmed failures can trigger production failover.
                 handle_confirmed_tunnel_failure(error_msg, expected_target=check_target)
         except Exception as e:
