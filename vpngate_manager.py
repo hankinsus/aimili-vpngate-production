@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.91"
+APP_VERSION = "V1.0.92"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -17202,6 +17202,18 @@ function backendStateRenderSignature(s) {
 
 function adoptBackendState(next, sourceGeneration, startedAt) {
   if (!next) return;
+  // A slow status response can arrive after the switch already finished and
+  // put the page back into "握手中", which then swallows 检测 and 切换.
+  const started = Number(next.manual_switch_started_at || 0);
+  const stillSwitching = !!(next.manual_switch_active || next.is_connecting);
+  if (!stillSwitching && started > switchSeenIdleAfter) switchSeenIdleAfter = started;
+  if (stillSwitching && started > 0 && started <= switchSeenIdleAfter) {
+    next = Object.assign({}, next, {
+      manual_switch_active: false,
+      is_connecting: false,
+      manual_connection_active: false,
+    });
+  }
   const counts = state && state.status_counts;
   const connected = state ? state.connected_count : undefined;
   const keep = !!(counts && Object.keys(counts).length);
@@ -17386,7 +17398,7 @@ function startConnectionPolling() {
     try {
       // Connection progress is state-only. Avoid re-downloading the full ~1.5MB
       // node list every 500ms; refresh the node list once the switch completes.
-      const data = await fetchJsonWithTimeout("./api/ui/state", {}, 2500);
+      const data = await fetchJsonWithTimeout("./api/ui/state", {}, 8000);
       if (data.state) {
         const prevTable = switchTableSignature(state);
         const prevSig = backendStateRenderSignature(state);
@@ -19049,11 +19061,14 @@ async function logoutAdmin() {
 const bootStatusStartedAt = Date.now();
 let bootStatusTimer = null;
 let bootStatusHold = false;
+let bootWaitFrom = bootStatusStartedAt;
+let bootWaitAction = "";
+let switchSeenIdleAfter = 0;
 
 function paintBootStatus(extra) {
   const el = $("boot_status");
   if (!el || el.style.display === "none") return;
-  const waited = Math.max(0, Math.floor((Date.now() - bootStatusStartedAt) / 1000));
+  const waited = Math.max(0, Math.floor((Date.now() - bootWaitFrom) / 1000));
   const timeEl = $("boot_status_time");
   const titleEl = $("boot_status_title");
   const detailEl = $("boot_status_detail");
@@ -19096,6 +19111,10 @@ function settleBootStatus() {
   const el = $("boot_status");
   if (!el) return;
   const action = pageActionBusy();
+  if (action !== bootWaitAction) {
+    bootWaitAction = action;
+    bootWaitFrom = Date.now();
+  }
   const ready = !action && !nodeListLoading && ((currentPageNodes && currentPageNodes.length) || !nodeListError);
   if (ready) {
     hideBootStatus();
@@ -19105,9 +19124,10 @@ function settleBootStatus() {
   if (el.style.display === "none") el.style.display = "flex";
   if (!bootStatusTimer) bootStatusTimer = setInterval(() => paintBootStatus(), 1000);
   if (action === "switch") {
+    const progress = String((state && (state.manual_switch_message || state.last_check_message)) || "");
     paintBootStatus({
       title: "正在切换节点",
-      detail: "这一次完成前，后面的点击已取消。请不要再点。"
+      detail: progress || "这一次完成前，后面的点击已取消。请不要再点。"
     });
     return;
   }
