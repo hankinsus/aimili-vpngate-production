@@ -24084,7 +24084,7 @@ def memory_guard_loop() -> None:
                         )
                     except OSError:
                         pass
-                cap = 80 * 1024
+                cap = 140 * 1024
             else:
                 if swap > 64 * 1024:
                     try:
