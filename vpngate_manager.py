@@ -10592,7 +10592,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   <title>AimiliVPN - 安全登录</title>
   <style>
     :root {
@@ -10850,7 +10850,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
   <title>Aimili VPN 多协议节点管理系统</title>
   <style>
     /* Self-contained dashboard: no third-party font request on first load. */
@@ -22032,6 +22032,8 @@ class Handler(BaseHTTPRequestHandler):
         # Resource-sharing endpoints use a separate bearer token and an IP/CIDR
         # allow-list, so peers never need the admin secret path.
         if request_path == "/resource-share" or request_path.startswith("/resource-share/"):
+            return request_path
+        if request_path in ("/favicon.svg", "/favicon.ico"):
             return request_path
         self.send_response(HTTPStatus.NOT_FOUND)
         self.send_header("Content-Length", "0")
