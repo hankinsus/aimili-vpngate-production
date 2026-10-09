@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.79"
+APP_VERSION = "V1.0.80"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2667,7 +2667,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     message = "OpenVPN did not complete initialization."
     peer_ms = 0
     while time.time() - started < limit:
-        if dev not in ("tun0", "tun-sb") and not str(dev).startswith("tun-sw") and (manual_connection_active or ui_query_active()):
+        if dev not in ("tun0", "tun-sb", "tun-hot") and not str(dev).startswith("tun-sw") and (manual_connection_active or ui_query_active()):
             startup_done[0] = True
             stop_process(process)
             return False, "检测已让路给前台筛选或人工切换", None
@@ -2695,6 +2695,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
             if latency_out is not None:
                 latency_out[:] = [elapsed_ms]
             message = f"OpenVPN connected in {elapsed_ms} ms."
+            relax_tun_offloads(dev)
             break
         if "auth_failed" in lower or "authentication failed" in lower:
             message = "AUTH_FAILED"
@@ -2727,6 +2728,34 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
+def relax_tun_offloads(dev: str) -> None:
+    """GRO on this tun driver collapses TCP. Small probes still pass, pages do not."""
+    dev = str(dev or "").strip()
+    if not dev or not Path("/sys/class/net", dev).exists():
+        return
+    try:
+        subprocess.run(
+            ["ethtool", "-K", dev, "gro", "off", "gso", "off", "tso", "off"],
+            capture_output=True,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def standby_device() -> str:
+    """Hot standby must not reuse the live tunnel NIC. Promotion keeps that NIC."""
+    active = ""
+    try:
+        active = str(proxy_server.get_active_interface() or "").strip()
+    except Exception:
+        active = ""
+    for name in ("tun-hot", "tun-sb"):
+        if name != active:
+            return name
+    return "tun-hot"
+
+
 def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
     """Install the live oif rule before removing any other one.
 
@@ -2738,6 +2767,7 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
     gateway = str(gateway or "").strip()
     if not interface:
         return
+    relax_tun_offloads(interface)
     table = str(ACTIVE_ROUTE_TABLE)
     success = False
     for attempt in range(1, 4):
@@ -2855,7 +2885,7 @@ def _quiesce_duplicate_tunnel_ifaces(active: str) -> None:
     except OSError:
         return
     for name in names:
-        if name == active or name == STANDBY_DEV:
+        if name == active or name in ("tun-sb", "tun-hot"):
             continue
         if not name.startswith(("vpn", "tun", "tap", "ppp")):
             continue
@@ -6256,7 +6286,7 @@ def take_standby(node_id: str) -> dict[str, Any] | None:
         taken = {
             "node_id": standby_slot.get("node_id") or "",
             "process": standby_slot.get("process"),
-            "dev": standby_slot.get("dev") or STANDBY_DEV,
+            "dev": standby_slot.get("dev") or standby_device(),
             "tunnel": standby_slot.get("tunnel"),
             "gateway": standby_slot.get("gateway") or "",
             "endpoint_id": standby_slot.get("endpoint_id") or "",
@@ -6487,8 +6517,9 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
     config_path = CONFIG_DIR / f"standby-{node_id}.ovpn"
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
     config_path.write_text(_prefer_openvpn_ip(node.get("config_text") or "", node), encoding="utf-8")
+    dev = standby_device()
     ok, message, process = run_openvpn_until_ready(
-        str(config_path), keep_alive=True, route_nopull=True, timeout=12, dev=STANDBY_DEV
+        str(config_path), keep_alive=True, route_nopull=True, timeout=12, dev=dev
     )
     if not ok or process is None:
         failed_until = getattr(_select_standby_openvpn_node, "failed_until", {})
@@ -6500,7 +6531,7 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
         # Tunnel is already up. Count it as the hot standby immediately and
         # confirm the exit on a later pass, instead of leaving the card at 0.
         with standby_guard:
-            standby_slot.update(node_id=node_id, process=process, dev=STANDBY_DEV, ready=True, country=str(node.get("country") or ""), protocol="openvpn", endpoint_id="", gateway="", tunnel=None, validated_at=time.time())
+            standby_slot.update(node_id=node_id, process=process, dev=dev, ready=True, country=str(node.get("country") or ""), protocol="openvpn", endpoint_id="", gateway="", tunnel=None, validated_at=time.time())
         set_state(
             standby_ready=True,
             standby_node_id=node_id,
@@ -6509,7 +6540,7 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
             standby_protocol=str(node.get("protocol") or "openvpn"),
         )
         return True
-    egress = check_interface_egress(STANDBY_DEV, table=101)
+    egress = check_interface_egress(dev, table=101)
     if not egress.get("ok"):
         stop_process(process)
         failed_until = getattr(_select_standby_openvpn_node, "failed_until", {})
@@ -6518,7 +6549,7 @@ def _bring_up_standby(node: dict[str, Any]) -> bool:
         log_to_json("INFO", "Standby", f"热备出口未通过 {node_id}: {egress.get('error') or ''}")
         return False
     with standby_guard:
-        standby_slot.update(node_id=node_id, process=process, dev=STANDBY_DEV, ready=True, country=str(node.get("country") or ""), protocol="openvpn", endpoint_id="", gateway="", tunnel=None)
+        standby_slot.update(node_id=node_id, process=process, dev=dev, ready=True, country=str(node.get("country") or ""), protocol="openvpn", endpoint_id="", gateway="", tunnel=None)
     log_to_json("INFO", "Standby", f"热备隧道已就绪 {node_id} · {egress.get('latency_ms') or 0} ms")
     set_state(
         standby_ready=True,
@@ -6697,7 +6728,7 @@ def warm_standby_loop() -> None:
                     standby_slot["ready"] = True
                 set_state(standby_ready=True, standby_node_id=pending_id)
                 if not proxy_server.proxy_forwarding_busy():
-                    egress = check_interface_egress(STANDBY_DEV, table=101)
+                    egress = check_interface_egress(str(standby_slot.get("dev") or standby_device()), table=101)
                     if egress.get("ok"):
                         set_state(standby_ready=True, standby_node_id=pending_id, standby_latency_ms=parse_int(egress.get("latency_ms")))
                         log_to_json("INFO", "Standby", f"热备隧道已就绪 {pending_id} · {egress.get('latency_ms') or 0} ms")
@@ -7833,7 +7864,7 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
     candidate_egress: dict[str, Any] = {"ok": True, "latency_ms": 0, "ip": ""}
     if adopted and adopted.get("process") is not None:
         candidate_process = adopted["process"]
-        candidate_dev = str(adopted.get("dev") or STANDBY_DEV)
+        candidate_dev = str(adopted.get("dev") or standby_device())
         set_state(
             standby_ready=False,
             standby_node_id="",
