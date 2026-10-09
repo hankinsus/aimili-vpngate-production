@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.88"
+APP_VERSION = "V1.0.89"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -8171,7 +8171,10 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         if manual:
             set_state(manual_switch_message="隧道已建立，正在接管…", last_check_message="未做网页检测，直接接管")
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        setup_policy_routing("tun0")
+        if proxy_server.get_egress_mode() == "direct":
+            suspend_policy_routing()
+        else:
+            setup_policy_routing("tun0")
 
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -16714,6 +16717,135 @@ let lastGoodNodesState = null;
 let totalNodeCount = 0;
 let nodeCacheBuilding = false;
 let nodeQuerySeq = 0;
+const nodePageCache = new Map();
+let residentScope = null;
+let residentNodes = [];
+
+function pageCacheKey(scope, offset, limit) {
+  return [
+    String(scope.country || ""),
+    normListStatus(scope.status),
+    String(scope.protocol || ""),
+    String(scope.ipType || ""),
+    String(scope.speedMinBps || 0),
+    String(scope.latency || ""),
+    String(offset),
+    String(limit)
+  ].join("|");
+}
+
+function normListStatus(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return text === "all" ? "" : text;
+}
+
+function rememberNodePage(key, data) {
+  if (!key || !data) return;
+  const stored = Object.assign({}, data, {
+    nodes: Array.isArray(data.nodes) ? data.nodes.slice() : []
+  });
+  delete stored._nodeQuerySeq;
+  nodePageCache.set(key, {at: Date.now(), data: stored});
+  while (nodePageCache.size > 24) {
+    const oldest = nodePageCache.keys().next().value;
+    nodePageCache.delete(oldest);
+  }
+}
+
+function cachedNodePage(key) {
+  const hit = nodePageCache.get(key);
+  if (!hit || Date.now() - hit.at >= 60000) return null;
+  return Object.assign({}, hit.data, {
+    nodes: Array.isArray(hit.data.nodes) ? hit.data.nodes.slice() : []
+  });
+}
+
+function scopeIsNarrower(parent, child) {
+  if (!parent || !child) return false;
+  if (String(parent.country || "") !== String(child.country || "")) return false;
+  const parentStatus = normListStatus(parent.status);
+  const childStatus = normListStatus(child.status);
+  if (parentStatus && parentStatus !== childStatus) return false;
+  if (childStatus === "connected" || childStatus === "standby") return false;
+  const parentProtocol = String(parent.protocol || "");
+  const childProtocol = String(child.protocol || "");
+  if (parentProtocol && parentProtocol !== childProtocol) return false;
+  const parentIp = String(parent.ipType || "");
+  const childIp = String(child.ipType || "");
+  if (parentIp && parentIp !== childIp) return false;
+  const parentLatency = String(parent.latency || "");
+  const childLatency = String(child.latency || "");
+  if (parentLatency && parentLatency !== childLatency) return false;
+  if (Number(child.speedMinBps || 0) < Number(parent.speedMinBps || 0)) return false;
+  return true;
+}
+
+function nodeMatchesLocalScope(node, scope) {
+  const protocol = String(scope.protocol || "").toLowerCase();
+  if (protocol && String(node.protocol || "openvpn").toLowerCase() !== protocol) return false;
+  const ipType = String(scope.ipType || "").toLowerCase();
+  if (ipType && String(node.ip_type || "").toLowerCase() !== ipType) return false;
+  const speedMin = Number(scope.speedMinBps || 0);
+  if (speedMin > 0 && Number(node.speed_bps || node.speed || 0) < speedMin) return false;
+  const latency = String(scope.latency || "").toLowerCase();
+  const ms = Number(node.latency_ms || 0);
+  if (latency === "gt1000") {
+    if (!(ms > 1000)) return false;
+  } else if (latency && latency !== "all") {
+    const cap = Number(latency);
+    if (!(cap > 0 && ms > 0 && ms <= cap)) return false;
+  }
+  const status = normListStatus(scope.status);
+  const probe = String(node.probe_status || "").toLowerCase();
+  if (status === "usable") return probe === "available" || probe === "testing" || probe === "not_checked" || !!node.active;
+  if (status === "available") return probe === "available" || !!node.active;
+  if (status === "unavailable") return probe === "unavailable" && !node.active;
+  if (status === "testing") return probe === "testing";
+  if (status) return false;
+  return true;
+}
+
+function noteResident(scope, list, total) {
+  if (!scope || !Array.isArray(list)) return;
+  if (!(Number(total) > 0 && list.length >= Number(total) && list.length <= 200)) {
+    residentScope = null;
+    residentNodes = [];
+    return;
+  }
+  residentScope = {
+    country: String(scope.country || ""),
+    status: normListStatus(scope.status),
+    protocol: String(scope.protocol || ""),
+    ipType: String(scope.ipType || ""),
+    speedMinBps: Number(scope.speedMinBps || 0),
+    latency: String(scope.latency || "")
+  };
+  residentNodes = list.slice();
+}
+
+function tryApplyLocalScope(country) {
+  if (!residentScope || residentNodes.length === 0) return false;
+  const next = readListScope();
+  next.country = String(country || "").trim();
+  next.status = normListStatus(next.status);
+  if (!scopeIsNarrower(residentScope, next)) return false;
+  const filtered = residentNodes.filter(node => nodeMatchesLocalScope(node, next));
+  nodes = filtered.slice();
+  totalNodeCount = filtered.length;
+  activeCountryScope = next.country;
+  currentPage = 1;
+  nodeListLoading = false;
+  nodeListError = "";
+  nodeCacheBuilding = false;
+  rememberNodePage(pageCacheKey(next, 0, pageSize), {
+    nodes: nodes,
+    total: nodes.length,
+    cache_building: false
+  });
+  updateNodeLoadProgress(filtered.length, filtered.length, true);
+  render();
+  return true;
+}
 
 function nodePageIsCurrent(data) {
   return !!(data && data._nodeQuerySeq === nodeQuerySeq);
@@ -16723,9 +16855,17 @@ async function fetchUiStateOnly(timeoutMs = 5000) {
   return fetchJsonWithTimeout("./api/ui/state", {}, timeoutMs);
 }
 
-async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signal = null, bumpSeq = true) {
-  const seq = bumpSeq ? ++nodeQuerySeq : nodeQuerySeq;
+async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signal = null, bumpSeq = true, fresh = false) {
   const scope = readListScope();
+  const key = pageCacheKey(scope, offset, limit);
+  if (!fresh) {
+    const cached = cachedNodePage(key);
+    if (cached) {
+      if (bumpSeq) cached._nodeQuerySeq = ++nodeQuerySeq;
+      return cached;
+    }
+  }
+  const seq = bumpSeq ? ++nodeQuerySeq : nodeQuerySeq;
   const params = new URLSearchParams();
   params.set("offset", String(Math.max(0, Number(offset) || 0)));
   params.set("limit", String(Math.max(1, Math.min(200, Number(limit) || 100))));
@@ -16737,6 +16877,7 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signa
   if (scope.latency) params.set("latency", scope.latency);
   const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), signal ? {signal} : {}, timeoutMs);
   if (bumpSeq && data && typeof data === "object") data._nodeQuerySeq = seq;
+  if (data && typeof data === "object") rememberNodePage(key, data);
   return data;
 }
 
@@ -16845,6 +16986,12 @@ async function loadScopedNodes(country, generation, signal = null) {
   const firstNodes = Array.isArray(first?.nodes) ? first.nodes : [];
   nodes = [];
   if (firstNodes.length) mergeLoadedNodePage(firstNodes);
+  if (totalNodeCount > 0 && firstNodes.length >= totalNodeCount) {
+    noteResident(readListScope(), nodes.slice(), totalNodeCount);
+  } else {
+    residentScope = null;
+    residentNodes = [];
+  }
 
   updateCountryFilter();
   if (totalNodeCount > 0 && firstNodes.length === 0) {
@@ -17873,6 +18020,11 @@ async function refreshFilterCounts(signal = null, attempt = 0) {
 
 let filterReloadTimer = null;
 function scheduleScopedReload(country, prioritize = false) {
+  if (tryApplyLocalScope(country)) {
+    refreshCountryCatalog(false).catch(() => {});
+    if (prioritize && country) prioritizeCountry(country);
+    return;
+  }
   nodeListLoading = true;
   nodeListError = "";
   setRowsPending(true);
@@ -19026,13 +19178,15 @@ setInterval(async () => {
     const countryAtFetch = String(activeCountryScope || "");
     try {
       const pageOffset = Math.max(0, (currentPage - 1) * pageSize);
+      const cacheKey = pageCacheKey(readListScope(), pageOffset, pageSize);
+      const freshNodes = !cachedNodePage(cacheKey);
       const [d, stateData] = await Promise.all([
-        fetchScopedNodePage(pageOffset, pageSize, 8000, null, false),
+        freshNodes ? fetchScopedNodePage(pageOffset, pageSize, 8000, null, false) : Promise.resolve(null),
         fetchUiStateOnly(4000)
       ]);
       if (generationAtFetch !== scopeLoadGeneration || nodeListLoading) return;
       if (countryAtFetch !== String(activeCountryScope || "")) return;
-      if (Array.isArray(d?.nodes)) {
+      if (d && Array.isArray(d?.nodes)) {
         nodes = [];
         mergeLoadedNodePage(d.nodes);
         if (d?.total != null) totalNodeCount = Number(d.total || 0);
@@ -20341,7 +20495,7 @@ def check_proxy_health(fast: bool = False, urls: tuple[str, ...] | None = None, 
         # that could already open web pages.
         result = None
         page_budget = float(budget) if budget is not None else (2 if fast else 4)
-        targets = urls or ("https://example.com/", "https://www.google.com/generate_204")
+        targets = urls or ("https://www.google.com/generate_204", "https://example.com/")
         for url in targets:
             result = _curl_via_proxy(url, page_budget, False)
             if result:
@@ -21038,11 +21192,26 @@ def background_proxy_checker() -> None:
             tunnel_up = active_tunnel_running()
             check_target = observed[3]
             if mode == "direct":
-                res = check_proxy_health()
+                # A reconnect while the user is on direct puts the fwmark rule
+                # back. 8500 itself binds the server NIC, but Xray still follows
+                # that rule, so direct must keep table 100 unpublished.
+                try:
+                    suspend_policy_routing()
+                except Exception:
+                    pass
+                res = check_proxy_health(budget=6)
                 if not _egress_observation_live(observed):
                     log_to_json("INFO", "Proxy", "直连检测结果已过期，丢弃")
                     time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
                     continue
+                if not res.get("ok"):
+                    proxy_health_failures += 1
+                    log_to_json("WARNING", "Proxy", f"直连出口失败 {proxy_health_failures}/2，一次超时不改徽章: {res.get('error')}")
+                    if proxy_health_failures < 2:
+                        time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                        continue
+                else:
+                    proxy_health_failures = 0
                 udp_ok = None
                 if res.get("ok"):
                     udp_ok = bool(proxy_server.probe_socks_udp_dns(timeout=2).get("ok"))
