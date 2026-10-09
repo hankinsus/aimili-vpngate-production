@@ -313,7 +313,10 @@ class NodePool:
         watched = max(0.0, now - float(meta.get("watched_since") or now))
         events = meta.get("stability_events") if isinstance(meta.get("stability_events"), list) else []
         flaps = len([item for item in events if isinstance(item, dict) and now - float(item.get("t") or 0) <= 30 * 60])
-        frequent = flaps >= 4 or int(fail_streak or 0) >= 3
+        if float(meta.get("slow_until") or 0) > now:
+            meta["stability"] = "不稳定"
+            return "不稳定"
+        frequent = flaps >= 4
         seconds = int(session_seconds or 0)
         in_watch = (3600 <= watched < 6 * 3600) or (3600 <= seconds < 6 * 3600)
         if seconds >= 3600 and not frequent:
@@ -331,8 +334,34 @@ class NodePool:
         meta["stability"] = label
         return label
 
-    @staticmethod
-    def _purge_duplicate_rows(db: sqlite3.Connection) -> int:
+    def mark_slow(self, endpoint_id: str, seconds: int = 1800) -> None:
+        """Measured under 10 Mbps. The tag drops when slow_until passes."""
+        endpoint_id = str(endpoint_id or "").strip()
+        if not endpoint_id:
+            return
+        now = time.time()
+        with self.lock, closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT metadata_json FROM endpoints WHERE endpoint_id=?",
+                (endpoint_id,),
+            ).fetchone()
+            if not row:
+                return
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["slow_until"] = now + max(60, int(seconds))
+            meta["stability"] = "不稳定"
+            db.execute(
+                "UPDATE endpoints SET stability=?, metadata_json=? WHERE endpoint_id=?",
+                ("不稳定", json.dumps(meta, ensure_ascii=False), endpoint_id),
+            )
+            db.commit()
+
+    def _purge_duplicate_rows(self, db: sqlite3.Connection) -> int:
         """Delete duplicate protocol+IP+port rows and leftover observations."""
         removed = 0
         cur = db.execute(

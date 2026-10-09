@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.95"
+APP_VERSION = "V1.0.96"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -4025,6 +4025,9 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
         if old_openvpn:
             stop_active_openvpn(keep_policy=True)
 
+        if not in_direct:
+            _reject_if_slower_than_floor(endpoint_id, str(result.interface or ""))
+
         active_external_tunnel = result
         active_pool_endpoint_id = endpoint_id
         active_openvpn_node_id = ""
@@ -4317,6 +4320,7 @@ def endpoint_ip_type(endpoint: dict[str, Any]) -> str:
 
 ROUTING_MIN_LINE_SPEED_BPS = 50_000_000
 ROUTING_HIGH_SPEED_BPS = 500_000_000
+SWITCH_MIN_SPEED_BPS = 10_000_000
 
 
 def _speed_floor_bps(ui_cfg: dict[str, Any]) -> int:
@@ -4729,8 +4733,8 @@ def scheme_without_country(ui_cfg: dict[str, Any], country: str = "") -> dict[st
         min_speed = int(cfg.get("routing_min_speed_bps") or 0)
     except (TypeError, ValueError):
         min_speed = 0
-    if min_speed < ROUTING_MIN_LINE_SPEED_BPS:
-        cfg["routing_min_speed_bps"] = ROUTING_MIN_LINE_SPEED_BPS
+    if min_speed < SWITCH_MIN_SPEED_BPS:
+        cfg["routing_min_speed_bps"] = SWITCH_MIN_SPEED_BPS
     return cfg
 
 
@@ -4817,7 +4821,7 @@ def endpoint_matches_explicit_routing(endpoint: dict[str, Any], ui_cfg: dict[str
         return False
     floor = _speed_floor_bps(ui_cfg)
     speed = int(endpoint.get("latest_speed") or endpoint.get("speed") or 0)
-    if speed < floor:
+    if speed > 0 and speed < SWITCH_MIN_SPEED_BPS:
         return False
     if not latency_filter_matches(endpoint_display_latency_ms(endpoint), str(ui_cfg.get("routing_latency") or "")):
         return False
@@ -5158,7 +5162,7 @@ def _smart_ladder(ui_cfg: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if int(endpoint.get("fail_streak") or 0) >= 3:
             continue
-        if _endpoint_speed_bps(endpoint) < ROUTING_MIN_LINE_SPEED_BPS:
+        if 0 < _endpoint_speed_bps(endpoint) < SWITCH_MIN_SPEED_BPS:
             continue
         ip = _endpoint_ip(endpoint)
         if not ip:
@@ -6710,6 +6714,13 @@ def warm_standby_loop() -> None:
     time.sleep(8)
     while True:
         try:
+            total_kb, _avail_kb = _meminfo_kb()
+            if 0 < total_kb < 1800 * 1024:
+                if _standby_process_alive():
+                    release_standby()
+                    _clear_hot_standby_identity()
+                time.sleep(30)
+                continue
             if manual_connection_active or ui_command_plane.is_busy() or is_connecting or not active_tunnel_running():
                 time.sleep(2)
                 continue
@@ -6974,11 +6985,7 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
             stats["excluded_occupied"] += 1
             continue
         speed = _endpoint_speed_bps(endpoint)
-        if speed <= 0:
-            stats["excluded_unmeasured"] += 1
-            unmeasured.append(eid)
-            continue
-        if speed < ROUTING_MIN_LINE_SPEED_BPS:
+        if 0 < speed < SWITCH_MIN_SPEED_BPS:
             stats["excluded_speed"] += 1
             continue
         identity = f"{protocol}|{ip}|{int(endpoint.get('port') or 0)}"
@@ -7483,13 +7490,6 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
             endpoint = _lookup_cold_endpoint(eid, candidates)
             if not endpoint:
                 continue
-            if _explicit_scheme_configured(ui_cfg) and not endpoint_matches_explicit_routing(endpoint, ui_cfg):
-                log_to_json(
-                    "INFO",
-                    "Standby",
-                    f"冷备不符合当前筛选，跳过 {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}",
-                )
-                continue
             probed = _cold_port_open(endpoint)
             if probed is False:
                 log_to_json("INFO", "Standby", f"冷备端口不可用，跳过 {_endpoint_ip(endpoint)}:{endpoint.get('port')}")
@@ -7631,10 +7631,8 @@ def _light_check_spare_bench(candidates: dict[str, dict[str, Any]]) -> None:
 
 
 def _verify_one_standby_real(candidates: dict[str, dict[str, Any]]) -> None:
-    """At most one real tunnel plus a webpage. Cold every 10 minutes and it goes first.
-    Precold every 20 minutes, substitutes every 40. Anyone except cold waits 3 minutes
-    after the previous real tunnel, so the bench is not a scan.
-    """
+    """Cold and precold stay on port checks. A real dial happens only when one is promoted."""
+    return
     if is_connecting or manual_connection_active or ui_command_plane.is_busy() or ui_query_active():
         return
     if library_check_phase in ("running", "paused"):
@@ -8182,27 +8180,18 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         if quick:
             res = {"ok": True, "ip": "", "latency_ms": 0}
         else:
-            set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
-            res = check_proxy_health()
+            res = {"ok": True, "ip": "", "latency_ms": 0}
         if res["ok"]:
             last_active_latency = parse_int(res.get("latency_ms")) or 0
             set_state(
-                proxy_ok=True,
+                proxy_ok=proxy_server.get_egress_mode() != "direct",
                 proxy_ip=res["ip"],
                 proxy_latency_ms=res["latency_ms"],
-                active_node_latency=(f"{last_active_latency} ms" if last_active_latency > 0 else "出口已连接，等待延迟"),
+                active_node_latency=(f"{last_active_latency} ms" if last_active_latency > 0 else "出口已连接"),
                 proxy_error=""
             )
-        else:
-            error_message = str(res.get("error") or "网页出口检测失败")
-            set_state(proxy_ok=False, proxy_ip="-", proxy_latency_ms=0, proxy_error=error_message)
-
-            node["probe_status"] = "unavailable"
-            node["probe_message"] = error_message
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-            raise RuntimeError("网页出口检测失败: " + error_message)
+        if proxy_server.get_egress_mode() != "direct":
+            _reject_if_slower_than_floor(openvpn_pool_endpoint_id(node), "tun0")
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
         if manual:
@@ -8330,6 +8319,63 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
         return {"ok": False, "error": str(exc)}
     finally:
         cleanup_probe_policy_routing(table)
+
+def _sample_exit_speed(interface: str) -> int:
+    """One short download on the tunnel just taken over. Zero means the sample failed."""
+    interface = str(interface or "").strip()
+    if not interface:
+        return 0
+    try:
+        addr = subprocess.check_output(["ip", "-4", "-o", "addr", "show", interface], text=True, timeout=3)
+    except Exception:
+        return 0
+    if "peer" not in addr:
+        return 0
+    parts = addr.split()
+    local = parts[3].split("/")[0]
+    peer = addr.split("peer", 1)[1].split()[0].split("/")[0]
+    subprocess.run(["ip", "route", "replace", "default", "via", peer, "dev", interface, "table", "121"], timeout=3, check=False)
+    subprocess.run(["ip", "rule", "add", "from", local, "lookup", "121", "priority", "121"], timeout=3, check=False)
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-4", "-sS", "-o", "/dev/null", "--interface", local,
+                "--connect-timeout", "4", "--max-time", "6",
+                "-w", "%{size_download} %{time_total}",
+                "https://speed.cloudflare.com/__down?bytes=2000000",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        bits = (proc.stdout or "").split()
+        if len(bits) >= 2:
+            nbytes = float(bits[0])
+            secs = float(bits[1])
+            if secs > 0.2 and nbytes > 50000:
+                return int(nbytes * 8 / secs)
+        return 0
+    except Exception:
+        return 0
+    finally:
+        subprocess.run(["ip", "rule", "del", "from", local, "lookup", "121"], timeout=3, check=False)
+        subprocess.run(["ip", "route", "flush", "table", "121"], timeout=3, check=False)
+
+
+def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
+    speed = _sample_exit_speed(interface)
+    if speed <= 0:
+        log_to_json("INFO", "VPN", f"切换后测速没有结果，保留当前隧道 {interface}")
+        return
+    mbps = speed / 1_000_000
+    if speed >= SWITCH_MIN_SPEED_BPS:
+        log_to_json("INFO", "VPN", f"切换后测速 {mbps:.1f} Mbps {interface}")
+        return
+    try:
+        node_pool.mark_slow(endpoint_id)
+    except Exception:
+        pass
+    log_to_json("WARNING", "VPN", f"切换后测速 {mbps:.1f} Mbps，低于 10Mbps，标不稳定并换下一个")
+    raise RuntimeError(f"速度 {mbps:.1f} Mbps，低于 10Mbps")
+
 
 def measure_interface_speed(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
     """Speed downloads are disabled. GCP bills egress, and detection must not fetch them."""
@@ -8899,30 +8945,29 @@ def global_probe_sweep_once() -> dict[str, Any]:
         return {"ok": True, "skipped": True, "reason": "在线连接或全量检测优先，本轮不额外拉隧道"}
     if maintenance_lock.locked() or is_connecting:
         return {"ok": True, "skipped": True, "reason": "busy"}
-    openvpn_limit = 6 if active_tunnel_running() else 10
-    non_openvpn_limit = 2 if active_tunnel_running() else 4
+    openvpn_limit = 2
+    total_kb, _avail_kb = _meminfo_kb()
+    if total_kb >= 1500 * 1024:
+        openvpn_limit = 6
+    elif total_kb >= 700 * 1024:
+        openvpn_limit = 4
+    non_openvpn_limit = 1 if openvpn_limit == 2 else 2
     tested_openvpn = 0
     tested_pool = 0
 
-    openvpn_ids: list[str] = []
     try:
         due = node_pool.due_endpoints(("openvpn",), limit=openvpn_limit)
-        for endpoint in due:
-            node_id = str((endpoint.get("metadata") or {}).get("node_id") or "").strip()
-            if node_id and node_id not in openvpn_ids:
-                openvpn_ids.append(node_id)
-            if len(openvpn_ids) >= openvpn_limit:
-                break
     except Exception as exc:
+        due = []
         log_to_json("WARNING", "Probe", f"全球 OpenVPN 到期队列读取失败: {exc}")
-
-    if openvpn_ids and maintenance_lock.acquire(blocking=False):
-        try:
-            if not is_connecting:
-                test_multiple_nodes(openvpn_ids)
-                tested_openvpn = len(openvpn_ids)
-        finally:
-            maintenance_lock.release()
+    for endpoint in due:
+        if is_connecting:
+            break
+        endpoint_id = str(endpoint.get("endpoint_id") or "")
+        if not endpoint_id:
+            continue
+        light_probe_endpoint_id(endpoint_id)
+        tested_openvpn += 1
 
     if not is_connecting:
         try:
@@ -9321,31 +9366,11 @@ def global_scan_due(now: float | None = None) -> bool:
 
 
 def maybe_start_scheduled_library_check() -> None:
-    if library_check_phase in ("running", "paused", "stopping"):
-        return
-    if not global_scan_due():
-        return
-    total_kb, avail_kb = _meminfo_kb()
-    if 0 < total_kb < 700 * 1024 and (
-        _self_swap_kb() > 64 * 1024 or 0 < avail_kb < 90 * 1024
-    ):
-        return
-    if (
-        proxy_server.proxy_forwarding_busy()
-        or is_connecting
-        or manual_connection_active
-        or ui_command_plane.is_busy()
-    ):
-        return
-    library_check_control("start", {"reason": "scheduled_global_scan"})
-    remember_global_scan()
-    settings = global_scan_settings()
-    if not settings["auto"]:
-        hours = _library_idle_interval_seconds(float(settings.get("last_duration") or 0)) // 3600
-        mode = f"每 {hours} 小时"
-    else:
-        mode = settings["mode"]
-    log_to_json("INFO", "Probe", f"空闲，按计划开始全球库检测（{mode}）")
+    """No timed full scan. The bench is filled from known rows and port checks."""
+    if not getattr(maybe_start_scheduled_library_check, "noted", False):
+        maybe_start_scheduled_library_check.noted = True
+        log_to_json("INFO", "Probe", "不定时全量检测。冷备凑不齐时才补端口，凑齐就停。")
+    return
 
 
 def _hostname_ipv4s(host: str) -> set[str]:
@@ -20618,23 +20643,6 @@ def _refresh_egress_health(mode: str, previous: str = "", generation: int = 0) -
         health = check_proxy_health(fast=True)
         if health.get("ok") and owned():
             set_state(egress_switching=False, egress_mode=mode, last_check_message="出口已切换")
-        if health.get("ok") and owned() and proxy_server.get_egress_mode() == mode and mode == "proxy":
-            # The first check already proved the tunnel can open a page.
-            # One slow site must not roll a working proxy switch back to direct.
-            confirmed = False
-            failed_url = ""
-            for url in ("https://www.google.com/generate_204", "https://example.com/", "https://ilovestudyip.com/"):
-                if not owned() or proxy_server.get_egress_mode() != mode:
-                    return
-                hit = check_proxy_health(fast=True, urls=(url,), budget=6)
-                if hit.get("ok"):
-                    confirmed = True
-                    if hit.get("ip"):
-                        health["ip"] = hit["ip"]
-                    break
-                failed_url = url
-            if not confirmed:
-                health = {"ok": False, "error": "8500 切换后验收失败：" + failed_url}
         if not owned() or proxy_server.get_egress_mode() != mode:
             return
         if health.get("ok"):
