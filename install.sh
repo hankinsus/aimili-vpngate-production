@@ -98,39 +98,44 @@ GITHUB_REPO="${2:-${DEFAULT_REPO}}"
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
 echo -e "\n${YELLOW}[1/4] 正在安装系统基础依赖...${PLAIN}"
-# 一键安装补 4G 虚拟内存，并打开 BBR。已经有足够交换分区时不重复添加。
+# 第一次安装：没有交换分区才按内存补一块。已有交换分区不动。
 swap_bytes=0
 if swapon --show=SIZE --bytes --noheadings >/dev/null 2>&1; then
     swap_bytes=$(swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk '{s+=$1} END {print s+0}')
 fi
-if [ "${swap_bytes}" -lt 4294967296 ]; then
-    avail_bytes=$(df -B1 --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
-    if [ -z "${avail_bytes}" ]; then
-        avail_bytes=$(df -B1 / | awk 'NR==2{print $4}')
-    fi
-    if [ "${avail_bytes:-0}" -lt 4500000000 ]; then
-        echo -e "${YELLOW}  -> 磁盘剩余不足 4G，跳过虚拟内存，继续安装。${PLAIN}"
+if [ "${swap_bytes}" -eq 0 ]; then
+    mem_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+    mem_kb=${mem_kb:-0}
+    if [ "${mem_kb}" -lt 1048576 ]; then
+        swap_mb=1024
+    elif [ "${mem_kb}" -lt 2097152 ]; then
+        swap_mb=1024
     else
-        echo -e "${YELLOW}  -> 添加 4G 虚拟内存。磁盘较慢时会停几十秒。${PLAIN}"
-        swapoff /swapfile >/dev/null 2>&1 || true
+        swap_mb=2048
+    fi
+    avail_kb=$(df -k --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
+    if [ -z "${avail_kb}" ]; then
+        avail_kb=$(df -k / | awk 'NR==2{print $4}')
+    fi
+    need_kb=$((swap_mb * 1024 + 512 * 1024))
+    if [ "${avail_kb:-0}" -lt "${need_kb}" ]; then
+        echo -e "${YELLOW}  -> 磁盘剩余不够 ${swap_mb}MB 交换分区，跳过，继续安装。${PLAIN}"
+    else
+        echo -e "${YELLOW}  -> 内存约 $((mem_kb / 1024))MB，没有交换分区，添加 ${swap_mb}MB。${PLAIN}"
         rm -f /swapfile
-        if ! fallocate -l 4G /swapfile 2>/dev/null; then
-            dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress || true
+        if ! fallocate -l "${swap_mb}M" /swapfile 2>/dev/null; then
+            dd if=/dev/zero of=/swapfile bs=1M count="${swap_mb}" status=progress || true
         fi
         chmod 600 /swapfile 2>/dev/null || true
-        if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile >/dev/null 2>&1; then
+        if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile >/dev/null 2>&1; then
+            grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            mkdir -p /etc/sysctl.d
+            printf 'vm.swappiness=10\n' > /etc/sysctl.d/99-aimili-swap.conf
+            sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+        else
             swapoff /swapfile >/dev/null 2>&1 || true
             rm -f /swapfile
-            dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress || true
-            chmod 600 /swapfile 2>/dev/null || true
-            mkswap /swapfile >/dev/null 2>&1 || true
-            swapon /swapfile >/dev/null 2>&1 || true
-        fi
-        if swapon --show=NAME --noheadings 2>/dev/null | grep -q '/swapfile'; then
-            grep -q '/swapfile' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        else
-            rm -f /swapfile
-            echo -e "${YELLOW}  -> 虚拟内存未启用，继续安装。${PLAIN}"
+            echo -e "${YELLOW}  -> 交换分区未启用，继续安装。${PLAIN}"
         fi
     fi
 fi

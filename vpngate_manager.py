@@ -18585,11 +18585,17 @@ function fillLibraryScanHourOptions(mode) {
   if (hour.dataset.kind === kind) return;
   const previous = Number(hour.value || 0);
   const values = loop
-    ? Array.from({length: 24 - minHour + 1}, (_, index) => ({value: index + minHour, text: (index + minHour) + "小时"}))
-    : Array.from({length: 24}, (_, index) => ({value: index, text: String(index).padStart(2, "0") + ":00"}));
-  hour.innerHTML = values.map(item => '<option value="' + item.value + '">' + item.text + '</option>').join("");
-  const fallback = loop ? Math.max(minHour, 3) : 0;
-  hour.value = String(loop ? (previous >= minHour && previous <= 24 ? previous : fallback) : Math.max(0, Math.min(23, previous)));
+    ? Array.from({length: 24}, (_, index) => {
+        const value = index + 1;
+        return {value: value, text: value + "小时", disabled: value < minHour};
+      })
+    : Array.from({length: 24}, (_, index) => ({value: index, text: String(index).padStart(2, "0") + ":00", disabled: false}));
+  hour.innerHTML = values.map(item => '<option value="' + item.value + '"' + (item.disabled ? " disabled" : "") + ">" + item.text + "</option>").join("");
+  const fallback = loop ? minHour : 0;
+  const picked = loop
+    ? (previous >= minHour && previous <= 24 ? previous : fallback)
+    : Math.max(0, Math.min(23, previous));
+  hour.value = String(picked);
   hour.dataset.kind = kind;
   const widget = $("library_scan_hour_widget");
   if (widget) widget.setAttribute("aria-label", loop ? "间隔" : "开始时间");
@@ -18607,8 +18613,9 @@ function paintLibraryScanForm(snapshot) {
   }
   const modeValue = (mode && mode.value) || "loop";
   fillLibraryScanHourOptions(modeValue);
+  const minHour = Math.max(1, Number((snapshot && snapshot.bench_min_interval_hours) || (state && state.bench_min_interval_hours) || 3));
   const stored = modeValue === "loop"
-    ? (snapshot && snapshot.global_scan_interval_hours != null ? snapshot.global_scan_interval_hours : 3)
+    ? Math.max(minHour, Number(snapshot && snapshot.global_scan_interval_hours != null ? snapshot.global_scan_interval_hours : 3) || minHour)
     : (snapshot && snapshot.global_scan_hour != null ? snapshot.global_scan_hour : 0);
   if (hour && !hourOpen && stored != null && hour.value !== String(stored)) hour.value = String(stored);
   if (!modeOpen) renderUnifiedSelect("library_scan_mode");
