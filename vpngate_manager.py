@@ -1975,6 +1975,13 @@ def protocol_endpoint_to_ui_node(endpoint: dict[str, Any]) -> dict[str, Any]:
         "RETIRED": "unavailable",
         "UNAVAILABLE": "unavailable",
     }.get(status, "not_checked")
+    measured_speed = 0
+    try:
+        measured_speed = int(metadata.get("last_probe_speed_bps") or endpoint.get("latest_speed") or 0)
+    except (TypeError, ValueError):
+        measured_speed = 0
+    if probe_status == "available" and 0 < measured_speed < _active_speed_floor_bps():
+        probe_status = "unavailable"
     ip = str(endpoint.get("current_ip") or metadata.get("ip") or "").strip()
     host = str(metadata.get("hostname") or endpoint.get("hostname") or ip).strip()
     try:
@@ -4050,7 +4057,10 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
             stop_active_openvpn(keep_policy=True)
 
         if not in_direct or _user_wants_proxy():
-            _reject_if_slower_than_floor(endpoint_id, str(result.interface or ""))
+            iface = str(result.interface or "")
+            if not _iface_forwards(iface):
+                raise RuntimeError("隧道网卡在，但对端不转发")
+            _reject_if_slower_than_floor(endpoint_id, iface)
 
         active_external_tunnel = result
         active_pool_endpoint_id = endpoint_id
@@ -6827,111 +6837,15 @@ def _refresh_standby_validation() -> None:
 
 
 def warm_standby_loop() -> None:
-    """Keep one dialed standby. Catalog pause must not stop this."""
-    time.sleep(8)
+    """No dialed hot standby. Only cold and precold, and those are port checks."""
+    try:
+        if _standby_process_alive():
+            release_standby()
+            _clear_hot_standby_identity()
+    except Exception:
+        pass
     while True:
-        try:
-            total_kb, _avail_kb = _meminfo_kb()
-            if 0 < total_kb < 1800 * 1024:
-                if _standby_process_alive():
-                    release_standby()
-                    _clear_hot_standby_identity()
-                time.sleep(30)
-                continue
-            if manual_connection_active or ui_command_plane.is_busy() or is_connecting or not active_tunnel_running():
-                time.sleep(2)
-                continue
-            with standby_guard:
-                ready = bool(standby_slot.get("ready")) and _standby_process_alive()
-                pending = standby_slot.get("process") is not None and not standby_slot.get("ready")
-                pending_id = str(standby_slot.get("node_id") or "")
-            if ready:
-                sid = str(standby_slot.get("node_id") or "")
-                standby_ip = str(get_state().get("standby_ip") or "")
-                active_ip = _active_exit_ip()
-                if active_ip and standby_ip == active_ip:
-                    release_standby()
-                    set_state(standby_ready=False, standby_node_id="", standby_ip="", standby_port=0, standby_protocol="")
-                    log_to_json("INFO", "Standby", "备连接与当前出口同一 IP，已放开并改选其他 IP")
-                    continue
-                chosen = _select_standby_endpoint()
-                chosen_protocol = str((chosen or {}).get("protocol") or "").lower()
-                chosen_ip = _endpoint_ip(chosen)
-                slot_protocol = str(standby_slot.get("protocol") or "").lower()
-                if chosen and chosen_ip and chosen_protocol and slot_protocol and chosen_protocol != slot_protocol:
-                    release_standby()
-                    _clear_hot_standby_identity()
-                    _publish_scheme_standby(chosen)
-                    time.sleep(8)
-                    continue
-                pin_country = normalized_country_name((manual_route_pin or {}).get("country") or "")
-                standby_country = normalized_country_name(standby_slot.get("country") or "")
-                if sid and sid == str(active_openvpn_node_id or ""):
-                    release_standby()
-                    _clear_hot_standby_identity()
-                    continue
-                if pin_country and standby_country and standby_country != pin_country:
-                    replacement = _select_standby_openvpn_node()
-                    replacement_country = normalized_country_name((replacement or {}).get("country") or "")
-                    if not replacement or replacement_country != pin_country:
-                        if time.time() - float(getattr(warm_standby_loop, "country_hold_log_at", 0) or 0) > 300:
-                            warm_standby_loop.country_hold_log_at = time.time()
-                            log_to_json("INFO", "Standby", f"热备不在{pin_country}，该国暂无可用 OpenVPN，先保留当前热备")
-                        time.sleep(30)
-                        continue
-                    release_standby()
-                    _clear_hot_standby_identity()
-                    log_to_json("INFO", "Standby", f"热备改到{pin_country}")
-                    _bring_up_standby(replacement)
-                    time.sleep(8)
-                    continue
-                if not read_json(STATE_FILE, {}).get("standby_ready"):
-                    set_state(standby_ready=True, standby_node_id=str(standby_slot.get("node_id") or ""))
-                _refresh_standby_validation()
-                time.sleep(0.5)
-                continue
-            if pending and _standby_process_alive():
-                with standby_guard:
-                    standby_slot["ready"] = True
-                set_state(standby_ready=True, standby_node_id=pending_id)
-                if not proxy_server.proxy_forwarding_busy():
-                    egress = check_interface_egress(str(standby_slot.get("dev") or standby_device()), table=101)
-                    if egress.get("ok"):
-                        set_state(standby_ready=True, standby_node_id=pending_id, standby_latency_ms=parse_int(egress.get("latency_ms")))
-                        log_to_json("INFO", "Standby", f"热备隧道已就绪 {pending_id} · {egress.get('latency_ms') or 0} ms")
-                    else:
-                        failed_until = getattr(_select_standby_openvpn_node, "failed_until", {})
-                        failed_until[pending_id] = time.time() + 600
-                        _select_standby_openvpn_node.failed_until = failed_until
-                        release_standby()
-                        _clear_hot_standby_identity()
-                        log_to_json("INFO", "Standby", f"热备出口未通过 {pending_id}: {egress.get('error') or ''}")
-                time.sleep(8)
-                continue
-            if pending:
-                release_standby()
-            node = _select_standby_openvpn_node()
-            scheme = _select_standby_endpoint()
-            if scheme and str(scheme.get("protocol") or "").lower() != "openvpn":
-                _publish_scheme_standby(scheme)
-                time.sleep(20)
-                continue
-            if scheme and str(scheme.get("protocol") or "").lower() == "openvpn":
-                published = _publish_scheme_standby(scheme)
-                if published:
-                    time.sleep(8)
-                    continue
-            if not node:
-                if time.time() - float(getattr(warm_standby_loop, "empty_log_at", 0) or 0) > 300:
-                    warm_standby_loop.empty_log_at = time.time()
-                    log_to_json("INFO", "Standby", "还没有可预连的 OpenVPN 热备")
-                _clear_hot_standby_identity()
-                time.sleep(30)
-                continue
-            _bring_up_standby(node)
-        except Exception as exc:
-            log_to_json("WARNING", "Standby", f"热备隧道维护失败: {exc}")
-        time.sleep(8)
+        time.sleep(300)
 
 COLD_PORT_SECONDS = 60
 COLD_REAL_SECONDS = 10 * 60
@@ -7636,14 +7550,6 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
         return "busy"
     try:
         if active_tunnel_running():
-            return "up"
-        if _promote_live_standby():
-            _cold_promote_cooldown_until = 0.0
-            pool = candidates if isinstance(candidates, dict) else (_cold_candidates(ui_cfg) or {})
-            _promote_next_cold(str(exclude_endpoint_id or ""), pool)
-            if auto_direct:
-                _engage_proxy_egress("热备已接管，切回代理模式")
-            log_to_json("INFO", "Standby", "主连接未启动，已由就绪热备接管")
             return "up"
         if candidates is None:
             candidates = _cold_candidates(ui_cfg)
@@ -8386,6 +8292,8 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 proxy_error=""
             )
         if proxy_server.get_egress_mode() != "direct" or _user_wants_proxy():
+            if not _iface_forwards("tun0"):
+                raise RuntimeError("隧道网卡在，但对端不转发")
             _reject_if_slower_than_floor(openvpn_pool_endpoint_id(node), "tun0")
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
@@ -8514,6 +8422,29 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
         return {"ok": False, "error": str(exc)}
     finally:
         cleanup_probe_policy_routing(table)
+
+def _iface_forwards(interface: str, timeout: float = 4.0) -> bool:
+    """One request through the tunnel NIC. A live process is not a working exit."""
+    interface = str(interface or "").strip()
+    if not interface or not Path("/sys/class/net", interface).exists():
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-4", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                "--interface", interface,
+                "--connect-timeout", "3",
+                "--max-time", str(max(3, int(timeout))),
+                "https://www.google.com/generate_204",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2,
+        )
+        return (proc.stdout or "").strip() == "204"
+    except Exception:
+        return False
+
 
 def _sample_exit_speed(interface: str) -> int:
     """One short download on the tunnel just taken over. Zero means the sample failed."""
@@ -16253,7 +16184,7 @@ function render(){
               <span>IP 类型: <strong>${esc(translateIpType(ep.ip_type))}</strong></span>
               <span>延时: <strong>${latencyText}</strong></span>
               <span>速度: <strong>${esc(ep.speed_bps ? speed(ep.speed_bps) : "未测")}</strong></span>
-              <span class="active-hot-pool"><span>热备池</span><strong>${hotPoolSummaryHtml()}</strong></span>
+              <span class="active-hot-pool"><span>冷备池</span><strong>${hotPoolSummaryHtml()}</strong></span>
             </div>
           </div>
         </div>
@@ -16295,7 +16226,7 @@ function render(){
               <span>IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
               <span>延时: <strong>${latencyText}</strong></span>
               <span>速度: <strong>${esc(activeNode.speed ? `${(Number(activeNode.speed)/1000000).toFixed(1)} Mbps` : "未测")}</strong></span>
-              <span class="active-hot-pool"><span>热备池</span><strong>${hotPoolSummaryHtml()}</strong></span>
+              <span class="active-hot-pool"><span>冷备池</span><strong>${hotPoolSummaryHtml()}</strong></span>
             </div>
           </div>
         </div>
@@ -16557,7 +16488,8 @@ function render(){
           : `<button class="connect-btn" ${(isTesting || isWaiting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
 
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
-      const isFav = favoriteIds.includes(n.id);
+      const poolFavId = n.pool_endpoint_id ? ("pool:" + n.pool_endpoint_id) : "";
+      const isFav = favoriteIds.includes(n.id) || (poolFavId && favoriteIds.includes(poolFavId)) || (n.pool_endpoint_id && favoriteIds.includes(n.pool_endpoint_id));
       const favBusy = favoriteBusyIds.has(n.id);
       const favBtn = favBusy
         ? `<button class="test-btn" disabled style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 28px; cursor: wait;">★ 收藏中</button>`
@@ -16873,11 +16805,14 @@ async function toggleFavorite(id, event) {
     btn.style.cursor = "wait";
   }
   const started = Date.now();
-  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
     const response = await fetch("./api/toggle_favorite", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id })
+      body: JSON.stringify({ id }),
+      signal: controller.signal
     });
     let result = {};
     try { result = await response.json(); } catch (e) { result = {}; }
@@ -16892,6 +16827,7 @@ async function toggleFavorite(id, event) {
     const wait = 400 - (Date.now() - started);
     if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     favoriteBusyIds.delete(id);
+    clearTimeout(timer);
     render();
   }
 }
@@ -21359,13 +21295,33 @@ def fast_tunnel_liveness_loop() -> None:
                 _soft_fail_streak = 0
                 _invalidate_tunnel_health(hard)
                 log_to_json("WARNING", "Proxy", f"活动隧道硬故障: {hard}")
-                if not _promote_live_standby():
-                    _detach_dead_forwarding()
-                    handle_confirmed_tunnel_failure(hard)
+                _detach_dead_forwarding()
+                handle_confirmed_tunnel_failure(hard)
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
-            # The process is still there. Do not open 8.8.8.8:443 every few
-            # seconds. Port checks stay on the cold standby loop.
+            now_plane = time.time()
+            if now_plane - float(getattr(fast_tunnel_liveness_loop, "plane_at", 0) or 0) >= 60:
+                fast_tunnel_liveness_loop.plane_at = now_plane
+                iface = str(proxy_server.get_active_interface() or "").strip()
+                if iface and not _iface_forwards(iface):
+                    misses = int(getattr(fast_tunnel_liveness_loop, "plane_miss", 0) or 0) + 1
+                    fast_tunnel_liveness_loop.plane_miss = misses
+                    if misses >= 2:
+                        fast_tunnel_liveness_loop.plane_miss = 0
+                        current = current_active_routing_endpoint() or {}
+                        failed = str(current.get("endpoint_id") or active_pool_endpoint_id or "")
+                        _demote_exit(_endpoint_ip(current) or _active_exit_ip(), failed)
+                        log_to_json("WARNING", "Proxy", f"隧道 {iface} 进程还在，对端不转发，拆掉并改走冷备")
+                        try:
+                            stop_all_tunnels()
+                        except Exception as exc:
+                            log_to_json("WARNING", "Proxy", f"拆掉不转发的隧道失败: {exc}")
+                        set_state(last_check_message="当前隧道不转发，正在改用冷备", proxy_error="对端不转发")
+                        outcome = promote_cold_standby_to_main(exclude_endpoint_id=failed)
+                        if outcome not in ("up", "direct"):
+                            ensure_main_connection("当前隧道不转发", engage_proxy=True, force=True)
+                else:
+                    fast_tunnel_liveness_loop.plane_miss = 0
             time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
             continue
         except Exception as exc:
@@ -23094,24 +23050,28 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 auth_file = DATA_DIR / "ui_auth.json"
-                with lock:
-                    try:
-                        current = json.loads(auth_file.read_text(encoding="utf-8")) if auth_file.exists() else {}
-                    except Exception:
-                        current = {}
-                    if not isinstance(current, dict):
-                        current = {}
-                    fav_ids = current.get("favorite_node_ids") or []
-                    if not isinstance(fav_ids, list):
-                        fav_ids = []
-                    fav_ids = [str(item) for item in fav_ids if str(item or "").strip()]
-                    if node_id in fav_ids:
-                        fav_ids.remove(node_id)
-                    else:
-                        fav_ids.append(node_id)
-                    current["favorite_node_ids"] = fav_ids
-                    DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    write_json(auth_file, current)
+                try:
+                    current = json.loads(auth_file.read_text(encoding="utf-8")) if auth_file.exists() else {}
+                except Exception:
+                    current = {}
+                if not isinstance(current, dict):
+                    current = {}
+                fav_ids = current.get("favorite_node_ids") or []
+                if not isinstance(fav_ids, list):
+                    fav_ids = []
+                fav_ids = [str(item) for item in fav_ids if str(item or "").strip()]
+                aliases = {node_id}
+                if node_id.startswith("pool:"):
+                    aliases.add(node_id.split(":", 1)[1])
+                else:
+                    aliases.add("pool:" + node_id)
+                if any(item in aliases for item in fav_ids):
+                    fav_ids = [item for item in fav_ids if item not in aliases]
+                else:
+                    fav_ids.append(node_id)
+                current["favorite_node_ids"] = fav_ids
+                DATA_DIR.mkdir(exist_ok=True, parents=True)
+                write_json(auth_file, current)
                 invalidate_ui_config_cache()
                 invalidate_scheme_snapshot()
 
