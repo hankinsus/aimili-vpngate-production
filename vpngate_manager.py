@@ -6252,9 +6252,27 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
             return {"ok": False, "error": "端点不存在"}
         protocol = str(endpoint.get("protocol") or "").lower()
         if protocol == "openvpn":
+            port_hit = light_probe_endpoint(endpoint)
+            if not port_hit.get("ok") and not port_hit.get("inconclusive"):
+                message = str(port_hit.get("message") or "端口无应答")
+                try:
+                    node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+                    node_pool.invalidate_ui_lists()
+                except Exception as exc:
+                    log_to_json("WARNING", "Probe", f"端口结果写入失败: {exc}")
+                fresh = node_pool.get_endpoint(endpoint_id)
+                ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+                if isinstance(ui, dict):
+                    ui["id"] = node_id
+                    ui["probe_status"] = "unavailable"
+                    ui["probe_message"] = message
+                return {"ok": False, "node": ui or {"id": node_id, "probe_status": "unavailable", "probe_message": message}}
             real_id = ensure_openvpn_node_from_pool(endpoint)
             node = test_node_by_id(real_id, record_pool=False)
             message = str(node.get("probe_message") or "")
+            port_note = str(port_hit.get("message") or "")
+            if port_note and port_note not in message:
+                message = f"{port_note} · {message}" if message else port_note
             if "让路" in message:
                 return {
                     "ok": False,
@@ -6284,6 +6302,21 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
                 if not fast:
                     ui["probe_status"] = "unavailable"
             return {"ok": fast, "node": ui or {"id": node_id, "probe_status": "available" if fast else "unavailable", "probe_message": message, "speed": speed, "speed_bps": speed}}
+        port_hit = light_probe_endpoint(endpoint)
+        if not port_hit.get("ok") and not port_hit.get("inconclusive"):
+            message = str(port_hit.get("message") or "端口无应答")
+            try:
+                node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
+                node_pool.invalidate_ui_lists()
+            except Exception as exc:
+                log_to_json("WARNING", "Probe", f"端口结果写入失败: {exc}")
+            fresh = node_pool.get_endpoint(endpoint_id)
+            ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+            if isinstance(ui, dict):
+                ui["id"] = node_id
+                ui["probe_status"] = "unavailable"
+                ui["probe_message"] = message
+            return {"ok": False, "node": ui or {"id": node_id, "probe_status": "unavailable", "probe_message": message}}
         result = probe_pool_endpoint(endpoint_id)
         if result.get("skipped"):
             message = str(result.get("error") or "检测让路")
@@ -6521,20 +6554,13 @@ def _select_standby_endpoint() -> dict[str, Any] | None:
 
 
 def _publish_scheme_standby(endpoint: dict[str, Any]) -> bool:
-    protocol = str(endpoint.get("protocol") or "").strip().lower()
-    if protocol == "openvpn":
-        try:
-            node_id = ensure_openvpn_node_from_pool(endpoint)
-        except Exception as exc:
-            log_to_json("WARNING", "Standby", f"热备节点准备失败: {exc}")
-            return False
-        node = next((item for item in read_nodes() if str(item.get("id") or "") == node_id), None)
-        if not node or not node.get("config_text"):
-            return False
-        chosen = dict(node)
-        chosen["country"] = normalized_country_name(endpoint.get("country") or "") or chosen.get("country") or ""
-        return _bring_up_standby(chosen)
-    return _bring_up_external_standby(endpoint)
+    """Cold pin only. A second dialed tunnel is not started."""
+    try:
+        _publish_cold_standby(endpoint)
+    except Exception as exc:
+        log_to_json("WARNING", "Standby", f"冷备登记失败: {exc}")
+        return False
+    return True
 
 
 def _select_standby_openvpn_node() -> dict[str, Any] | None:
@@ -6594,144 +6620,14 @@ def _select_standby_openvpn_node() -> dict[str, Any] | None:
     return None
 
 def _bring_up_external_standby(endpoint: dict[str, Any]) -> bool:
-    """Pre-dial SoftEther, SSTP or L2TP without touching the live table 100."""
-    protocol = str(endpoint.get("protocol") or "").strip().lower()
-    endpoint_id = str(endpoint.get("endpoint_id") or "")
-    if protocol not in ("softether", "sstp", "l2tp-ipsec"):
-        return False
-    if (
-        protocol == "softether"
-        and active_external_tunnel is not None
-        and str(active_external_tunnel.protocol or "") == "softether"
-    ):
-        log_to_json("INFO", "Standby", "当前已是 SoftEther，仍尝试用另一张虚拟网卡预拨热备")
-    if standby_slot.get("ready") or standby_slot.get("tunnel") is not None or standby_slot.get("process") is not None:
-        release_standby()
-    metadata = endpoint.get("metadata") or {}
-    host = str(metadata.get("hostname") or endpoint.get("hostname") or endpoint.get("current_ip") or "").strip()
-    if not host:
-        return False
-    port = parse_int(endpoint.get("port"))
-    token = re.sub(r"[^a-z0-9]", "", endpoint_id.lower())[:8] or uuid.uuid4().hex[:8]
-    result: tunnel_adapters.TunnelResult | None = None
-    try:
-        if protocol == "softether":
-            result = tunnel_adapters.SoftEtherAdapter().connect(
-                host=host, port=port or 443, account=f"sb{token}", nic=f"s{token}",
-                username="vpn", password="vpn",
-            )
-        elif protocol == "sstp":
-            result = tunnel_adapters.SSTPAdapter().connect(
-                hostname=host if port in (0, 443) else f"{host}:{port}",
-                username="vpn", password="vpn", timeout=20, reuse_existing=False,
-            )
-        else:
-            result = l2tp_adapter.connect(
-                host=host, username="vpn", password="vpn", psk="vpn",
-                namespace=f"aimili-l2tp-sb{token}"[:31], timeout=25,
-            )
-        if result is None or not result.ok or not result.interface:
-            raise RuntimeError((result.message if result else "隧道未建立")[:180])
-        if protocol == "l2tp-ipsec":
-            ensure_l2tp_namespace_forward(result)
-        probed = check_interface_egress(str(result.interface), str(result.gateway or ""), table=101)
-        if not probed.get("ok"):
-            raise RuntimeError(str(probed.get("error") or "热备数据面未通过")[:180])
-        node_id = f"pool:{endpoint_id}" if endpoint_id else f"pool:{token}"
-        with standby_guard:
-            standby_slot.update(
-                node_id=node_id,
-                process=result.process,
-                dev=str(result.interface),
-                ready=True,
-                country=normalized_country_name(endpoint.get("country") or ""),
-                protocol=protocol,
-                endpoint_id=endpoint_id,
-                gateway=str(result.gateway or ""),
-                tunnel=result,
-                validated_at=time.time(),
-            )
-        set_state(
-            standby_ready=True,
-            standby_prepared=True,
-            standby_node_id=node_id,
-            standby_ip=_endpoint_ip(endpoint),
-            standby_port=port,
-            standby_protocol=protocol,
-            standby_latency_ms=parse_int(probed.get("latency_ms")),
-            standby_validated_at=time.time(),
-            standby_health_age_ms=0,
-        )
-        log_to_json("INFO", "Standby", f"{protocol} 热备已就绪 {result.interface} · {probed.get('latency_ms') or 0} ms")
-        return True
-    except Exception as exc:
-        if result is not None:
-            _disconnect_external_tunnel(result)
-        set_state(
-            standby_prepared=True,
-            standby_ready=False,
-            standby_node_id=f"pool:{endpoint_id}" if endpoint_id else "",
-            standby_ip=_endpoint_ip(endpoint),
-            standby_port=port if host else 0,
-            standby_protocol=protocol,
-        )
-        log_to_json("INFO", "Standby", f"{protocol} 热备未建立 {endpoint_id}: {exc}")
-        return False
+    """Removed. Hot standby no longer dials another tunnel."""
+    return False
 
 
 def _bring_up_standby(node: dict[str, Any]) -> bool:
-    node_id = str(node.get("id") or "")
-    if not node_id:
-        return False
-    config_path = CONFIG_DIR / f"standby-{node_id}.ovpn"
-    CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-    config_path.write_text(_prefer_openvpn_ip(node.get("config_text") or "", node), encoding="utf-8")
-    dev = standby_device()
-    ok, message, process = run_openvpn_until_ready(
-        str(config_path), keep_alive=True, route_nopull=True, timeout=12, dev=dev
-    )
-    if not ok or process is None:
-        failed_until = getattr(_select_standby_openvpn_node, "failed_until", {})
-        failed_until[node_id] = time.time() + 600
-        _select_standby_openvpn_node.failed_until = failed_until
-        log_to_json("INFO", "Standby", f"热备隧道未建立 {node_id}: {message}")
-        return False
-    if proxy_server.proxy_forwarding_busy():
-        # Tunnel is already up. Count it as the hot standby immediately and
-        # confirm the exit on a later pass, instead of leaving the card at 0.
-        with standby_guard:
-            standby_slot.update(node_id=node_id, process=process, dev=dev, ready=True, country=str(node.get("country") or ""), protocol="openvpn", endpoint_id="", gateway="", tunnel=None, validated_at=time.time())
-        set_state(
-            standby_ready=True,
-            standby_node_id=node_id,
-            standby_ip=str(node.get("ip") or node.get("remote_host") or ""),
-            standby_port=parse_int(node.get("remote_port")),
-            standby_protocol=str(node.get("protocol") or "openvpn"),
-        )
-        return True
-    egress = check_interface_egress(dev, table=101)
-    if not egress.get("ok"):
-        stop_process(process)
-        failed_until = getattr(_select_standby_openvpn_node, "failed_until", {})
-        failed_until[node_id] = time.time() + 600
-        _select_standby_openvpn_node.failed_until = failed_until
-        log_to_json("INFO", "Standby", f"热备出口未通过 {node_id}: {egress.get('error') or ''}")
-        return False
-    with standby_guard:
-        standby_slot.update(node_id=node_id, process=process, dev=dev, ready=True, country=str(node.get("country") or ""), protocol="openvpn", endpoint_id="", gateway="", tunnel=None)
-    log_to_json("INFO", "Standby", f"热备隧道已就绪 {node_id} · {egress.get('latency_ms') or 0} ms")
-    set_state(
-        standby_ready=True,
-        standby_node_id=node_id,
-        standby_latency_ms=parse_int(egress.get("latency_ms")),
-        standby_ip=str(node.get("ip") or node.get("remote_host") or ""),
-        standby_port=parse_int(node.get("remote_port")),
-        standby_protocol=str(node.get("protocol") or "openvpn"),
-    )
-    return True
+    """Removed. Hot standby no longer dials another tunnel."""
+    return False
 
-_first_page_snapshot: dict[tuple[str, str], dict[str, Any]] = {}
-_first_page_snapshot_lock = threading.Lock()
 
 def warm_first_page_loop() -> None:
     """Keep the first pages ready so opening the site does not wait on SQLite."""
@@ -6804,36 +6700,8 @@ def _clear_hot_standby_identity() -> None:
 
 
 def _refresh_standby_validation() -> None:
-    """Keep the hot standby's health younger than 2 seconds. One miss does not tear it down."""
-    with standby_guard:
-        if not standby_slot.get("ready"):
-            return
-        dev = str(standby_slot.get("dev") or "")
-        gateway = str(standby_slot.get("gateway") or "")
-    if not dev or not Path("/sys/class/net", dev).exists():
-        return
-    route_ok, _route_error = setup_probe_policy_routing(dev, gateway, table=101)
-    ok = False
-    if route_ok:
-        ok, _detail = _probe_iface_tcp(dev, 1.0)
-        cleanup_probe_policy_routing(101)
-    now = time.time()
-    if ok:
-        with standby_guard:
-            standby_slot["validated_at"] = now
-            standby_slot["misses"] = 0
-        set_state(standby_validated_at=now, standby_health_age_ms=0, standby_ready=True)
-        return
-    with standby_guard:
-        misses = int(standby_slot.get("misses") or 0) + 1
-        standby_slot["misses"] = misses
-        validated_at = float(standby_slot.get("validated_at") or 0)
-    age_ms = int(max(0.0, now - validated_at) * 1000) if validated_at else 0
-    set_state(standby_health_age_ms=age_ms)
-    if misses >= 2:
-        log_to_json("INFO", "Standby", f"热备 {dev} 连续两次复测失败，放弃这条热备")
-        release_standby()
-        set_state(standby_ready=False, standby_health_age_ms=age_ms)
+    """Removed with the dialed hot standby."""
+    return
 
 
 def warm_standby_loop() -> None:
@@ -8304,6 +8172,16 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         remember_live_connection(openvpn_node_id=node_id)
+        try:
+            with lock:
+                saved = read_nodes()
+                for item in saved:
+                    if item.get("id") == node_id:
+                        item["active"] = True
+                        item["probe_status"] = "available"
+                write_json(NODES_FILE, saved)
+        except Exception:
+            pass
         return f"Connected {node_id}"
     except Exception as exc:
         if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):
@@ -16457,13 +16335,13 @@ function render(){
       const hotStandby = !blocked && !isCurrentlyActive && standbyShown && nodeIsStandby(n, state?.standby_node_id);
       const standbyLabel = state?.standby_ready ? "备连接" : "冷备";
       const statusCell = isCurrentlyActive && !blocked
-        ? `<span class="badge ${n.probe_status === "unavailable" || triState(state.client_proxy_ok) === false ? "unavailable" : "available"}" title="${esc((triState(state.client_proxy_ok) === false && state.proxy_error) || n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>主连接</span>`
+        ? `<span class="badge ${triState(state.client_proxy_ok) === false ? "unavailable" : "available"}" title="${esc((triState(state.client_proxy_ok) === false && state.proxy_error) || n.probe_message || "隧道已连接")}"><span class="badge-pulse"></span>主连接</span>`
         : isWaiting
           ? `<span class="badge not_checked" title="已排队，等当前检测结束后自动开始">等待中</span>`
           : hotStandby
           ? `<span class="badge available"><span class="badge-pulse"></span>${standbyLabel}</span>`
           : canRetest
-            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "连接该节点并测速，结果写入列表")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
+            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "先测端口，端口通再测速，结果写入列表")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
             : `<span class="badge ${badgeClass}" title="${esc(n.probe_message || "")}">${badgeText}</span>`;
 
       // Background detection is allowed to continue while the user manually
@@ -21194,76 +21072,8 @@ def _detach_dead_forwarding() -> None:
 
 
 def _promote_live_standby() -> bool:
-    """Take over only a dialed standby whose NIC just passed the same TCP probe."""
-    global active_openvpn_process, active_openvpn_node_id, active_external_tunnel, active_pool_endpoint_id
-    with standby_guard:
-        if not standby_slot.get("ready") or not _standby_process_alive():
-            return False
-        dev = str(standby_slot.get("dev") or "")
-        node_id = str(standby_slot.get("node_id") or "")
-        validated_at = float(standby_slot.get("validated_at") or 0)
-    if not dev or not Path("/sys/class/net", dev).exists():
-        set_state(standby_ready=False, tunnel_role="STALE")
-        return False
-    age_ms = int(max(0.0, time.time() - validated_at) * 1000) if validated_at else 0
-    if validated_at and age_ms <= 2000:
-        log_to_json("INFO", "Standby", f"热备 {dev} 健康 {age_ms} ms，直接接管")
-    else:
-        confirmed, detail = _probe_iface_tcp(dev, 1.5)
-        if not confirmed:
-            log_to_json("INFO", "Standby", f"热备 {dev} 健康记录已过期 {age_ms} ms，复测未通过，不接管: {detail}")
-            return False
-        log_to_json("INFO", "Standby", f"热备 {dev} 健康记录 {age_ms} ms，复测通过后接管")
-    adopted = take_standby(node_id)
-    if not adopted or (adopted.get("process") is None and adopted.get("tunnel") is None):
-        return False
-    old_tunnel = active_external_tunnel
-    old_proc = active_openvpn_process
-    new_tunnel = adopted.get("tunnel")
-    protocol = str(adopted.get("protocol") or getattr(new_tunnel, "protocol", "") or "openvpn")
-    gateway = str(adopted.get("gateway") or getattr(new_tunnel, "gateway", "") or "")
-    endpoint_id = str(adopted.get("endpoint_id") or "")
-    if new_tunnel is not None:
-        active_external_tunnel = new_tunnel
-        active_pool_endpoint_id = endpoint_id
-        active_openvpn_process = None
-        active_openvpn_node_id = ""
-    else:
-        active_external_tunnel = None
-        active_pool_endpoint_id = ""
-        active_openvpn_process = adopted.get("process")
-        active_openvpn_node_id = node_id
-    set_state(tunnel_role="ACTIVE", standby_ready=False, standby_health_age_ms=age_ms, last_check_message=f"热备 {protocol} {dev} 正在接管")
-    try:
-        proxy_server.set_active_interface(dev)
-        setup_policy_routing(dev, gateway=gateway)
-    except Exception as exc:
-        log_to_json("ERROR", "Standby", f"热备接管路由失败: {exc}")
-        return False
-    set_state(
-        tunnel_role="ACTIVE",
-        active_tunnel_interface=dev,
-        active_tunnel_protocol=protocol,
-        active_pool_endpoint_id=endpoint_id,
-        standby_ready=False,
-    )
-
-    def _retire() -> None:
-        set_state(tunnel_role="RETIRING")
-        confirmed, detail = _probe_iface_tcp(dev, 0.8)
-        log_to_json("INFO", "Standby", f"新隧道 {dev} 接管确认 {'OK' if confirmed else detail}")
-        time.sleep(2.5)
-        _disconnect_external_tunnel(old_tunnel)
-        if old_proc is not None and old_proc is not adopted.get("process"):
-            try:
-                stop_process(old_proc)
-            except Exception:
-                pass
-        set_state(tunnel_role="ACTIVE", active_tunnel_interface=dev)
-
-    threading.Thread(target=_retire, daemon=True, name="retire-stale-tunnel").start()
-    log_to_json("INFO", "Standby", f"热备 {protocol} {dev} 已接管，旧隧道后台拆除")
-    return True
+    """Removed. A dead main is replaced from cold standby, not a second live tunnel."""
+    return False
 
 
 def fast_tunnel_liveness_loop() -> None:
@@ -25971,7 +25781,6 @@ def main() -> None:
     threading.Thread(target=memory_guard_loop, daemon=True, name="memory-guard").start()
     threading.Thread(target=orphan_tunnel_reap_loop, daemon=True, name="orphan-tunnel-reap").start()
     threading.Thread(target=warm_first_page_loop, daemon=True, name="warm-first-page").start()
-    threading.Thread(target=warm_standby_loop, daemon=True, name="warm-standby").start()
     threading.Thread(target=cold_standby_loop, daemon=True, name="cold-standby").start()
     enabled_loops.append("warm-standby")
 
