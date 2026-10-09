@@ -2660,6 +2660,70 @@ def _prefer_openvpn_ip(config_text: str, node: dict[str, Any]) -> str:
             out.append(line)
     return "\n".join(out) + ("\n" if text_value.endswith("\n") else "") if changed else text_value
 
+def _openvpn_hard_failure(tail: list[str]) -> bool:
+    text = "\n".join(tail).lower()
+    needles = (
+        "auth_failed",
+        "authentication failed",
+        "cannot resolve host",
+        "connection refused",
+        "tls key negotiation failed",
+        "tls handshake failed",
+        "connection timed out",
+        "ehostunreach",
+        "no route to host",
+        "network is unreachable",
+        "exiting due to fatal error",
+    )
+    return any(item in text for item in needles)
+
+
+def _openvpn_handshake_in_progress(tail: list[str]) -> bool:
+    """TCP/UDP has started and OpenVPN has not reported a hard failure."""
+    if _openvpn_hard_failure(tail):
+        return False
+    text = "\n".join(tail).lower()
+    progress = (
+        "attempting to establish",
+        "tcp connection established",
+        "udpv4 link remote",
+        "udpv6 link remote",
+        "preserving recently used remote",
+        "tls:",
+        "peer connection initiated",
+    )
+    return any(item in text for item in progress)
+
+
+def _dial_still_open(detail: str) -> bool:
+    """Wait expired while the dial was still running. That is not a dead node."""
+    text = str(detail or "")
+    lowered = text.lower()
+    hard = (
+        "auth_failed",
+        "authentication failed",
+        "chap authentication",
+        "pap authentication",
+        "not installed",
+        "未安装",
+        "unable to resolve",
+        "connection refused",
+        "已失败",
+        "requires a valid",
+    )
+    if any(item in lowered or item in text for item in hard):
+        return False
+    soft = (
+        "was not created",
+        "no ipv4",
+        "12秒内没有连上",
+        "timed out",
+        "before ipv4",
+        "仍在建立",
+    )
+    return any(item in lowered or item in text for item in soft)
+
+
 def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0", latency_out: list[int] | None = None, quiet: bool = False) -> tuple[bool, str, subprocess.Popen[str] | None]:
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
@@ -2749,6 +2813,8 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     else:
         message = f"OpenVPN timeout after {limit}s."
 
+    still_connecting = (not ok) and message.startswith("OpenVPN timeout") and _openvpn_handshake_in_progress(tail)
+
     if not quiet:
         for line_str in openvpn_logs:
             level = "INFO"
@@ -2762,8 +2828,11 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
             log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
     if not ok:
-        err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
-        message = f"[错误代码 {err_code}] {diag_msg} (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
+        if still_connecting:
+            message = f"[仍在建立] {limit} 秒内握手还没完成，节点保持可用"
+        else:
+            err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
+            message = f"[错误代码 {err_code}] {diag_msg} (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
     startup_done[0] = True
     if not keep_alive or not ok:
         stop_process(process)
@@ -4010,7 +4079,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
                 hostname=host if port in (0, 443) else f"{host}:{port}",
                 username="vpn",
                 password="vpn",
-                timeout=5 if quick else 20,
+                timeout=12 if quick else 20,
                 reuse_existing=False,
             )
         else:
@@ -4032,19 +4101,25 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
                 password="vpn",
                 psk="vpn",
                 namespace=f"aimili-l2tp-{token}",
-                timeout=5 if quick else 35,
+                timeout=12 if quick else 35,
                 on_progress=_l2tp_progress,
             )
 
         if not result.ok or not result.interface:
             detail = str(result.message or f"{protocol} 连接失败")
-            node_pool.record_endpoint_probe(endpoint_id, False, 0, detail[:500])
-            log_to_json("WARNING", "VPN", f"{protocol} 连接失败 {endpoint_id}: {detail[:800]}")
+            waiting = _dial_still_open(detail)
+            if not waiting:
+                node_pool.record_endpoint_probe(endpoint_id, False, 0, detail[:500])
+            log_to_json("INFO" if waiting else "WARNING", "VPN", f"{protocol} {'握手未完成' if waiting else '连接失败'} {endpoint_id}: {detail[:800]}")
             if protocol == "l2tp-ipsec" and detail.startswith("L2TP/IPsec 已失败"):
                 raise RuntimeError(detail.splitlines()[0][:180])
             if protocol == "l2tp-ipsec":
+                if waiting:
+                    raise RuntimeError("握手未完成，节点保持可用")
                 raise RuntimeError("L2TP/IPsec 未完成：IPsec、L2TP 或 PPP 在时限内没有拿到地址")
             short = " ".join(detail.split())
+            if waiting:
+                raise RuntimeError("握手未完成，节点保持可用：" + (short[:120] or protocol))
             raise RuntimeError("连不上，已标不可用：" + (short[:120] or f"{protocol} 连接失败"))
 
         if protocol == "l2tp-ipsec":
@@ -8031,15 +8106,18 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
         )
     else:
         ok, message, candidate_process = run_openvpn_until_ready(
-            str(config_path), keep_alive=True, route_nopull=True, timeout=5, dev=candidate_dev
+            str(config_path), keep_alive=True, route_nopull=True, timeout=12, dev=candidate_dev
         )
         if not ok or candidate_process is None:
-            reason = " ".join(str(message or "候选 OpenVPN 隧道建立失败").split())[:120]
-            try:
-                node_pool.record_endpoint_probe(openvpn_pool_endpoint_id(node), False, 0, reason, speed_bps=None)
-            except Exception:
-                pass
-            raise RuntimeError("连不上，已标不可用：" + reason)
+            reason = " ".join(str(message or "候选 OpenVPN 隧道建立失败").split())[:160]
+            still = str(message or "").startswith("[仍在建立]")
+            if not still:
+                try:
+                    node_pool.record_endpoint_probe(openvpn_pool_endpoint_id(node), False, 0, reason, speed_bps=None)
+                except Exception:
+                    pass
+                raise RuntimeError("连不上，已标不可用：" + reason)
+            raise RuntimeError(reason)
         if not tunnel_adapters.interface_has_ipv4(candidate_dev):
             stop_process(candidate_process)
             raise RuntimeError("候选 OpenVPN 隧道已启动，但未获得 IPv4 地址")
@@ -8288,22 +8366,29 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...", manual_switch_message=("正在建立 OpenVPN 安全隧道…" if manual else ""))
         latency_box: list[int] = []
         ok, message, process = run_openvpn_until_ready(
-            str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=(5 if quick else None), latency_out=latency_box,
+            str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=(12 if quick else None), latency_out=latency_box,
         )
         if not ok or process is None:
+            still = str(message or "").startswith("[仍在建立]")
             try:
                 if config_path.exists():
                     config_path.unlink()
             except Exception:
                 pass
-            node["probe_status"] = "unavailable"
-            node["probe_message"] = message
+            if not still:
+                node["probe_status"] = "unavailable"
+                node["probe_message"] = message
             for item in nodes:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
-            log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
-            print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
-            set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
+            if still:
+                log_to_json("INFO", "VPN", f"节点 {node_id} 仍在握手，不标不可用: {message}")
+                print(f"[连接仍在建立] {node_id} 握手未完成，保持可用，改接下一个。{message}", flush=True)
+                set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message="握手未完成，节点保持可用，改接下一个")
+            else:
+                log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
+                print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
+                set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
             with lock:
                 active_openvpn_node_id = ""
             raise RuntimeError(message)
