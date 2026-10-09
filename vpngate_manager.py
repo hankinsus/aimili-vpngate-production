@@ -25782,7 +25782,7 @@ def main() -> None:
     threading.Thread(target=orphan_tunnel_reap_loop, daemon=True, name="orphan-tunnel-reap").start()
     threading.Thread(target=warm_first_page_loop, daemon=True, name="warm-first-page").start()
     threading.Thread(target=cold_standby_loop, daemon=True, name="cold-standby").start()
-    enabled_loops.append("warm-standby")
+    enabled_loops.append("cold-standby")
 
     threading.Thread(target=startup_recovery_loop, daemon=True, name="startup-recovery").start()
     enabled_loops.append("startup-recovery")
