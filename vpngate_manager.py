@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 3, 0, 30)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.83"
+APP_VERSION = "V1.0.84"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -406,7 +406,7 @@ def current_github_version() -> dict[str, Any]:
         "ok": bool(local),
         "repository": GITHUB_REPOSITORY,
         "branch": GITHUB_BRANCH,
-        "current_version": _version_label(local) if local else "未知",
+        "current_version": _version_label(local) if local else APP_VERSION,
         "current_commit": local,
         "source": "git",
     }
@@ -2788,12 +2788,7 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
                 )
                 if rule.returncode != 0 and "File exists" not in (rule.stderr or ""):
                     raise RuntimeError((rule.stderr or rule.stdout or "策略规则添加失败").strip())
-            mark = subprocess.run(
-                ["ip", "rule", "add", "fwmark", "100", "lookup", table],
-                capture_output=True, text=True, timeout=2,
-            )
-            if mark.returncode != 0 and "File exists" not in (mark.stderr or ""):
-                raise RuntimeError((mark.stderr or mark.stdout or "标记路由添加失败").strip())
+            _ensure_one_fwmark_rule(int(table))
             _drop_foreign_oif_rules(interface, ACTIVE_ROUTE_TABLE)
             for proc_path in ["all", "default", interface]:
                 try:
@@ -2815,6 +2810,38 @@ def setup_policy_routing(interface: str = "tun0", gateway: str = "") -> None:
     if not success:
         print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
         log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 {ACTIVE_ROUTE_TABLE} 添加默认路由")
+
+
+def _fwmark_rule_prefs(table: int) -> list[str]:
+    try:
+        shown = subprocess.run(["ip", "-4", "rule", "show"], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return []
+    prefs = []
+    for line in (shown.stdout or "").splitlines():
+        if not re.search(rf"\blookup {int(table)}\b", line):
+            continue
+        if not re.search(r"\bfwmark 0x64\b", line):
+            continue
+        pref = line.split(":", 1)[0].strip()
+        if pref.isdigit():
+            prefs.append(pref)
+    return prefs
+
+
+def _ensure_one_fwmark_rule(table: int) -> None:
+    """ip rule add does not always reject a duplicate fwmark rule."""
+    prefs = _fwmark_rule_prefs(table)
+    if not prefs:
+        added = subprocess.run(
+            ["ip", "rule", "add", "fwmark", "100", "lookup", str(int(table))],
+            capture_output=True, text=True, timeout=2,
+        )
+        if added.returncode != 0 and "File exists" not in (added.stderr or ""):
+            raise RuntimeError((added.stderr or added.stdout or "标记路由添加失败").strip())
+        prefs = _fwmark_rule_prefs(table)
+    for pref in prefs[1:]:
+        subprocess.run(["ip", "rule", "del", "pref", pref], capture_output=True, text=True, timeout=2)
 
 
 def _oif_rule_prefs(interface: str, table: int) -> list[str]:
@@ -9032,6 +9059,10 @@ def _library_wait_until_slot(generation: int) -> str:
             _library_set_wait("转发占用中，等待空闲后再检测")
             time.sleep(0.5)
             continue
+        if ui_query_active():
+            _library_set_wait("页面正在筛选，检测让路，等待不算失败")
+            time.sleep(0.3)
+            continue
         _library_set_wait("")
         return "go"
 
@@ -9429,7 +9460,8 @@ def _library_check_worker(generation: int) -> None:
             + f"跳过 {skipped}",
         )
         index = 0
-        batch_size = 24
+        total_kb, _avail_kb = _meminfo_kb()
+        batch_size = 4 if 0 < total_kb < 700 * 1024 else 24
         probe_started = time.time()
         while index < len(queue):
             if _library_wait_until_slot(generation) == "stop":
@@ -13613,7 +13645,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="github-update-panel" id="github_update_panel">
           <div class="github-update-row">
             <span class="github-update-label">当前正式版</span>
-            <code class="github-update-version" id="github_current_version">读取中...</code>
+            <code class="github-update-version" id="github_current_version">__APP_VERSION__</code>
           </div>
           <div class="github-update-message" id="github_update_message">点击“检查更新”获取 GitHub 最新版本。</div>
           <div class="github-update-actions">
@@ -15273,15 +15305,16 @@ function updateStatusFilterOptions() {
     ? Number(counts.usable)
     : (Number(counts.available || 0) + Number(counts.testing || 0) + Number(counts.not_checked || 0));
   const standby = ((state?.standby_ready || state?.standby_prepared) && state?.standby_node_id) ? 1 : 0;
-  const countsReady = counts && Object.keys(counts).length > 0 && !filterCountsLoading;
-  const shownUsable = countsReady ? usable : "加载中";
-  const shownTotal = countsReady ? total : "加载中";
-  const shownAvailable = countsReady ? Number(counts.available || 0) : "加载中";
-  const shownConnected = countsReady ? connected : "加载中";
-  const shownStandby = countsReady ? standby : "加载中";
-  const shownNotChecked = countsReady ? Number(counts.not_checked || 0) : "加载中";
-  const shownTesting = countsReady ? Number(counts.testing || 0) : "加载中";
-  const shownUnavailable = countsReady ? Number(counts.unavailable || 0) : "加载中";
+  const countsReady = counts && Object.keys(counts).length > 0;
+  const pendingLabel = filterCountsLoading ? "加载中" : "—";
+  const shownUsable = countsReady ? usable : pendingLabel;
+  const shownTotal = countsReady ? total : pendingLabel;
+  const shownAvailable = countsReady ? Number(counts.available || 0) : pendingLabel;
+  const shownConnected = countsReady ? connected : pendingLabel;
+  const shownStandby = countsReady ? standby : pendingLabel;
+  const shownNotChecked = countsReady ? Number(counts.not_checked || 0) : pendingLabel;
+  const shownTesting = countsReady ? Number(counts.testing || 0) : pendingLabel;
+  const shownUnavailable = countsReady ? Number(counts.unavailable || 0) : pendingLabel;
   const labels = {
     usable: `可用·检测·待检 · ${shownUsable}`,
     all: `全部节点 · ${shownTotal}`,
@@ -16584,8 +16617,8 @@ async function fetchUiStateOnly(timeoutMs = 5000) {
   return fetchJsonWithTimeout("./api/ui/state", {}, timeoutMs);
 }
 
-async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signal = null) {
-  const seq = ++nodeQuerySeq;
+async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signal = null, bumpSeq = true) {
+  const seq = bumpSeq ? ++nodeQuerySeq : nodeQuerySeq;
   const scope = readListScope();
   const params = new URLSearchParams();
   params.set("offset", String(Math.max(0, Number(offset) || 0)));
@@ -16597,7 +16630,7 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signa
   if (scope.speedMinBps > 0) params.set("speed_min_bps", String(scope.speedMinBps));
   if (scope.latency) params.set("latency", scope.latency);
   const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), signal ? {signal} : {}, timeoutMs);
-  if (data && typeof data === "object") data._nodeQuerySeq = seq;
+  if (bumpSeq && data && typeof data === "object") data._nodeQuerySeq = seq;
   return data;
 }
 
@@ -16697,11 +16730,7 @@ async function loadScopedNodes(country, generation, signal = null) {
   // Keep the previous rows on screen until this page actually arrives.
   const first = await fetchScopedNodePage(0, pageSize, 12000, signal);
   if (myGeneration !== scopeLoadGeneration) return;
-  if (!nodePageIsCurrent(first)) {
-    nodeListLoading = false;
-    render();
-    return;
-  }
+  if (!nodePageIsCurrent(first)) return;
 
   totalNodeCount = Number(first?.total || 0);
   nodeListError = "";
@@ -16785,7 +16814,7 @@ async function loadScope(country, {preserveState = true, signal = null} = {}) {
       });
       const catalogTotal = Number(countryCatalogData.total_ip_count || 0);
       const ipCount = Number(selected?.[1]?.ip_count || 0);
-      if (catalogTotal > 0 && (!selected || ipCount <= 0)) {
+      if (catalogTotal > 0 && selected && ipCount <= 0) {
         nodes = [];
         totalNodeCount = 0;
         nodeListLoading = false;
@@ -16865,7 +16894,6 @@ async function load(){
     updateNodeLoadProgress(nodes.length, totalNodeCount, true);
     render();
   }
-  if (state.library_check_running) openLibraryCheckModal(false);
   if (state.global_pool_refresh_running) {
     startRefreshPolling();
   } else if (state.is_connecting || state.manual_switch_active) {
@@ -17688,7 +17716,6 @@ async function loadLegacy(){
     progressivelyLoadNodes(totalNodeCount, generation);
   }
 
-  if (state.library_check_running) openLibraryCheckModal(false);
   if (state.global_pool_refresh_running) {
     startRefreshPolling();
   } else if (state.is_connecting) {
@@ -17700,11 +17727,14 @@ let filterCountsRequestSeq = 0;
 let filterCountsLoading = true;
 let nodeListLoading = false;
 let nodeListError = "";
-async function refreshFilterCounts(signal = null) {
+async function refreshFilterCounts(signal = null, attempt = 0) {
   const seq = ++filterCountsRequestSeq;
-  filterCountsLoading = true;
-  updateStatusFilterOptions();
-  renderCustomFilter("status_filter");
+  const hadCounts = !!(state?.status_counts && Object.keys(state.status_counts).length);
+  if (!hadCounts) {
+    filterCountsLoading = true;
+    updateStatusFilterOptions();
+    renderCustomFilter("status_filter");
+  }
   const scope = readListScope();
   const params = new URLSearchParams();
   if (scope.country) params.set("country", scope.country);
@@ -17715,23 +17745,28 @@ async function refreshFilterCounts(signal = null) {
   try {
     const data = await fetchJsonWithTimeout("./api/ui/filter_counts?" + params.toString(), signal ? {signal} : {}, 8000);
     if (seq !== filterCountsRequestSeq) return;
-    if (data?.status_counts) state.status_counts = data.status_counts;
+    if (data?.status_counts && Object.keys(data.status_counts).length) state.status_counts = data.status_counts;
     state.connected_count = Number(data?.connected_count || 0);
     filterCountsLoading = false;
     updateStatusFilterOptions();
     renderCustomFilter("status_filter");
-  } catch (_) {
+  } catch (err) {
     if (seq !== filterCountsRequestSeq) return;
     filterCountsLoading = false;
     // Keep the last known counts; node filtering itself remains server-side.
     updateStatusFilterOptions();
     renderCustomFilter("status_filter");
+    if (err && err.name === "AbortError") return;
+    if (!hadCounts && attempt < 2) {
+      setTimeout(() => {
+        if (seq === filterCountsRequestSeq) refreshFilterCounts(null, attempt + 1);
+      }, 1200);
+    }
   }
 }
 
 let filterReloadTimer = null;
 function scheduleScopedReload(country, prioritize = false) {
-  nodes = nodes.filter(n => matchesNodeFilters(n));
   nodeListLoading = true;
   nodeListError = "";
   setRowsPending(true);
@@ -18040,7 +18075,7 @@ async function loadGithubCurrentVersion() {
     if (el) el.textContent = versionLabel;
   } catch (e) {
     const el = $("github_current_version");
-    if (el) el.textContent = "未知";
+    if (el && (!el.textContent || el.textContent === "读取中...")) el.textContent = "未知";
   }
 }
 
@@ -18745,20 +18780,26 @@ async function logoutAdmin() {
 
 // 先把页面骨架、筛选栏和状态区域立即渲染出来；节点数据随后异步读取，
 // 避免首页被数千条节点数据阻塞在白屏/半屏状态。
+nodeListLoading = true;
 render();
 load();
 
-// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
+// 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面。
+// 不占用筛选请求的序号，避免这一轮把「所有IP / 住宅」的结果判成过期后画成空表。
 setInterval(async () => {
   if (nodeListLoading) return;
   if (typeof state !== "undefined" && !state.is_connecting && (!testingNodeIds || !testingNodeIds.size) && document.visibilityState === "visible") {
+    const generationAtFetch = scopeLoadGeneration;
+    const countryAtFetch = String(activeCountryScope || "");
     try {
       const pageOffset = Math.max(0, (currentPage - 1) * pageSize);
       const [d, stateData] = await Promise.all([
-        fetchScopedNodePage(pageOffset, pageSize, 8000),
+        fetchScopedNodePage(pageOffset, pageSize, 8000, null, false),
         fetchUiStateOnly(4000)
       ]);
-      if (nodePageIsCurrent(d) && Array.isArray(d?.nodes)) {
+      if (generationAtFetch !== scopeLoadGeneration || nodeListLoading) return;
+      if (countryAtFetch !== String(activeCountryScope || "")) return;
+      if (Array.isArray(d?.nodes)) {
         nodes = [];
         mergeLoadedNodePage(d.nodes);
         if (d?.total != null) totalNodeCount = Number(d.total || 0);
@@ -19739,7 +19780,12 @@ def cached_index_page(boot_country: str) -> tuple[str, bytes, bytes]:
     cached = _INDEX_PAGE_CACHE.get(boot_country)
     if cached:
         return cached
-    page = INDEX_HTML.replace("__BOOT_SERVER_COUNTRY_JSON__", json.dumps(boot_country, ensure_ascii=False)).encode("utf-8")
+    page = (
+        INDEX_HTML
+        .replace("__BOOT_SERVER_COUNTRY_JSON__", json.dumps(boot_country, ensure_ascii=False))
+        .replace("__APP_VERSION__", APP_VERSION)
+        .encode("utf-8")
+    )
     etag = '"' + hashlib.sha256(page).hexdigest()[:16] + '"'
     packed = (etag, page, gzip.compress(page, compresslevel=6))
     _INDEX_PAGE_CACHE[boot_country] = packed
@@ -20448,6 +20494,27 @@ def _soft_round_failures(iface: str, timeout: float = 1.0) -> int:
     return failed["n"] + sum(1 for worker in workers if worker.is_alive())
 
 
+def _live_openvpn_dev() -> str:
+    """Device of the OpenVPN process this manager started. Empty if it is gone."""
+    proc = active_openvpn_process
+    if proc is None or proc.poll() is not None or not proc.pid:
+        return ""
+    try:
+        raw = Path(f"/proc/{proc.pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return ""
+    args = [part.decode("utf-8", "replace") for part in raw if part]
+    if "--dev" not in args:
+        return ""
+    index = args.index("--dev")
+    if index + 1 >= len(args):
+        return ""
+    dev = args[index + 1].strip()
+    if dev and Path("/sys/class/net", dev).exists():
+        return dev
+    return ""
+
+
 def active_tunnel_hard_reason() -> str:
     """Structural death only. A single slow TCP handshake is not enough."""
     if proxy_server.get_egress_mode() != "proxy":
@@ -20456,10 +20523,13 @@ def active_tunnel_hard_reason() -> str:
         return ""
     iface = str(proxy_server.get_active_interface() or "").strip()
     if not iface:
-        tunnel = active_external_tunnel
-        live = str(getattr(tunnel, "interface", "") or "").strip()
-        if live and Path("/sys/class/net", live).exists() and _tunnel_carrier_alive():
+        live = _live_openvpn_dev()
+        gateway = ""
+        if not live:
+            tunnel = active_external_tunnel
+            live = str(getattr(tunnel, "interface", "") or "").strip()
             gateway = str(getattr(tunnel, "gateway", "") or "")
+        if live and Path("/sys/class/net", live).exists() and _tunnel_carrier_alive():
             try:
                 proxy_server.set_active_interface(live)
                 setup_policy_routing(live, gateway=gateway)
@@ -20696,6 +20766,15 @@ def fast_tunnel_liveness_loop() -> None:
                 continue
             reason = f"活动网卡 {iface} 数据面快速探测及4秒复测均失败"
             _soft_fail_streak = 0
+            if active_tunnel_running() and iface and Path("/sys/class/net", iface).exists():
+                set_state(
+                    tunnel_role="SUSPECT",
+                    proxy_error=reason[:300],
+                    last_check_message="出口探测超时，隧道仍在，不拆转发",
+                )
+                log_to_json("WARNING", "Proxy", reason + "；隧道进程仍在，保持 8500")
+                time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
+                continue
             _invalidate_tunnel_health(reason)
             log_to_json("WARNING", "Proxy", reason)
             if not _promote_live_standby():
