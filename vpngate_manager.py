@@ -16075,7 +16075,7 @@ function render(){
     const clientBadge = clientBadgePair[0];
     const clientBadgeClass = clientBadgePair[1];
     const clientDown = clientBadgeClass === "unavailable";
-    const clientFault = clientDown ? String(state.proxy_error || state.last_check_message || "") : "";
+    const clientFault = clientDown ? String(state.proxy_error || "") : "";
     activeCardContainer.innerHTML = `
       <div class="active-card">
         <div class="active-card-info">
@@ -16116,7 +16116,7 @@ function render(){
     const clientBadge = clientBadgePair[0];
     const clientBadgeClass = clientBadgePair[1];
     const clientDown = clientBadgeClass === "unavailable";
-    const clientFault = clientDown ? String(state.proxy_error || state.last_check_message || "") : "";
+    const clientFault = clientDown ? String(state.proxy_error || "") : "";
     const activeAddress = addressPair(activeNode.host_name || activeNode.remote_host, activeNode.ip, activeNode.remote_port);
     activeCardContainer.innerHTML = `
       <div class="active-card">
@@ -16317,6 +16317,9 @@ function render(){
     state.standby_prepared ? 1 : 0,
     state.standby_ready ? 1 : 0,
     state.standby_node_id || "",
+    triState(state.client_proxy_ok) === false ? 0 : 1,
+    state.proxy_error || "",
+    state.proxy_latency_ms || 0,
     state.standby_ip || "",
     state.standby_port || "",
     state.standby_protocol || "",
@@ -16725,20 +16728,11 @@ async function toggleFavorite(id, event) {
   state.favorite_node_ids = already
     ? previous.filter(item => item !== id && item !== ("pool:" + id) && item !== id.replace(/^pool:/, ""))
     : previous.concat([id]);
-  render();
-  const btn = event && event.currentTarget;
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "★ 收藏中";
-    btn.style.color = "var(--warning)";
-    btn.style.borderColor = "rgba(245, 158, 11, 0.4)";
-    btn.style.opacity = "1";
-    btn.style.cursor = "wait";
-  }
   const started = Date.now();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    try {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    render();
     const response = await fetch("./api/toggle_favorite", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
