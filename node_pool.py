@@ -1637,7 +1637,7 @@ class NodePool:
         for marker in (
             "让路", "跳过", "测速", "速度测试", "未测速",
             "ipify", "cloudflare", "cdn-cgi", "speed test",
-            "出口检测", "网页出口",
+            "出口检测", "网页出口", "不算不可用",
         ):
             if marker in text or marker in lowered:
                 return False

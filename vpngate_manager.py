@@ -186,7 +186,7 @@ ACCESS_LOG_ENABLED = env_flag("ACCESS_LOG_ENABLED", False)
 FAST_STATE_CACHE_TTL_SECONDS = env_int("FAST_STATE_CACHE_TTL_SECONDS", 2, 0, 5)
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-APP_VERSION = "V1.0.76"
+APP_VERSION = "V1.0.77"
 GITHUB_REPOSITORY = "hankinsus/aimili-vpngate-production"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{GITHUB_BRANCH}"
@@ -2366,6 +2366,54 @@ def _endpoint_host_port(endpoint: dict[str, Any]) -> tuple[str, int, str]:
     return host, port, transport
 
 
+def _config_has_tls_auth(text: str) -> bool:
+    for raw in str(text or "").splitlines():
+        line = raw.strip().lower()
+        if line.startswith("#"):
+            continue
+        if line.startswith("tls-auth") or line.startswith("tls-crypt"):
+            return True
+        if line.startswith("<tls-auth") or line.startswith("<tls-crypt"):
+            return True
+    return False
+
+
+def _openvpn_udp_has_tls_auth(endpoint: dict[str, Any]) -> bool:
+    """True when this OpenVPN config uses tls-auth or tls-crypt. No extra probe."""
+    metadata = endpoint.get("metadata") if isinstance(endpoint.get("metadata"), dict) else {}
+    if metadata.get("tls_auth") is True:
+        return True
+    blobs = [endpoint.get("config_text"), metadata.get("config_text")]
+    for blob in blobs:
+        if _config_has_tls_auth(str(blob or "")):
+            return True
+    paths = [
+        endpoint.get("config_ref"),
+        endpoint.get("config_file"),
+        metadata.get("config_file"),
+    ]
+    node_id = str(metadata.get("node_id") or endpoint.get("id") or "").strip()
+    if node_id:
+        try:
+            cached = _nodes_index_get().get(node_id) or {}
+        except Exception:
+            cached = {}
+        if _config_has_tls_auth(str(cached.get("config_text") or "")):
+            return True
+        if cached.get("config_file"):
+            paths.append(cached.get("config_file"))
+    for ref in paths:
+        path = str(ref or "").strip()
+        if not path:
+            continue
+        try:
+            if _config_has_tls_auth(Path(path).read_text(encoding="utf-8", errors="ignore")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def light_probe_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
     """Catalog availability. TCP is a port connect. UDP is one protocol packet. Never a tunnel."""
     protocol = str(endpoint.get("protocol") or "").strip().lower()
@@ -2380,9 +2428,18 @@ def light_probe_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
                 return {"ok": False, "latency_ms": 0, "message": "UDP IKE 无应答"}
             return {"ok": True, "latency_ms": rtt, "message": f"UDP IKE 有应答 {rtt} ms"}
         rtt, data = _udp_reply_ms(host, port, _openvpn_udp_hello(), 0.8)
-        if rtt <= 0 or not _openvpn_udp_reply_ok(data):
-            return {"ok": False, "latency_ms": 0, "message": "UDP OpenVPN 无应答"}
-        return {"ok": True, "latency_ms": rtt, "message": f"UDP OpenVPN 有应答 {rtt} ms"}
+        if rtt > 0 and _openvpn_udp_reply_ok(data):
+            return {"ok": True, "latency_ms": rtt, "message": f"UDP OpenVPN 有应答 {rtt} ms"}
+        # tls-auth drops the bare packet. Do not add another probe, and do not
+        # mark the node unavailable: a missing reply is not proof it is down.
+        if _openvpn_udp_has_tls_auth(endpoint):
+            return {
+                "ok": False,
+                "inconclusive": True,
+                "latency_ms": 0,
+                "message": "UDP tls-auth 不回应裸探测包，不算不可用",
+            }
+        return {"ok": False, "latency_ms": 0, "message": "UDP OpenVPN 无应答"}
     if port <= 0:
         port = 443
     rtt = tcp_connect_ms(host, port, 1.0)
@@ -2397,6 +2454,8 @@ def light_probe_endpoint_id(endpoint_id: str) -> dict[str, Any]:
     if not endpoint:
         return {"ok": False, "latency_ms": 0, "message": "端点不存在"}
     result = light_probe_endpoint(endpoint)
+    if result.get("inconclusive"):
+        return result
     try:
         node_pool.record_endpoint_probe(
             endpoint_id,
@@ -3653,7 +3712,7 @@ def _wait_for_automatic_connection_idle(timeout: float = 2.0) -> None:
             return
         time.sleep(0.25)
 
-def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
+def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = False) -> str:
     global active_external_tunnel, active_pool_endpoint_id, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch, connection_generation, active_connection_generation
     endpoint_id = str(endpoint_id or "").strip()
     endpoint = node_pool.get_endpoint(endpoint_id)
@@ -3661,29 +3720,33 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         raise ValueError("Protocol endpoint not found")
     protocol = str(endpoint.get("protocol") or "").lower()
     metadata = endpoint.get("metadata") or {}
+    quick = bool(fast or manual)
     if protocol not in ("softether", "sstp", "l2tp-ipsec"):
         raise RuntimeError(f"协议 {protocol} 当前尚未开放生产连接")
 
     # Untrusted endpoints get a port or one UDP packet before the production
     # tunnel below. The connect itself is the real tunnel; do not dial twice.
-    if not metadata.get("trusted_observation") and not manual:
+    if not metadata.get("trusted_observation") and not quick:
         probe_result = None
         endpoint_now = endpoint
         for _ in range(2):
             probe_result = light_probe_endpoint(endpoint_now)
-            if probe_result.get("ok"):
+            if probe_result.get("ok") or (probe_result or {}).get("inconclusive"):
                 break
-        try:
-            node_pool.record_endpoint_probe(
-                endpoint_id,
-                bool((probe_result or {}).get("ok")),
-                int((probe_result or {}).get("latency_ms") or 0),
-                str((probe_result or {}).get("message") or ""),
-                speed_bps=None,
-            )
-        except Exception as exc:
-            log_to_json("WARNING", "Probe", f"连接前快速检测写入失败: {exc}")
-        if not probe_result or not probe_result.get("ok"):
+        if not (probe_result or {}).get("inconclusive"):
+            try:
+                node_pool.record_endpoint_probe(
+                    endpoint_id,
+                    bool((probe_result or {}).get("ok")),
+                    int((probe_result or {}).get("latency_ms") or 0),
+                    str((probe_result or {}).get("message") or ""),
+                    speed_bps=None,
+                )
+            except Exception as exc:
+                log_to_json("WARNING", "Probe", f"连接前快速检测写入失败: {exc}")
+        if (probe_result or {}).get("inconclusive"):
+            pass
+        elif not probe_result or not probe_result.get("ok"):
             reason = str((probe_result or {}).get("message") or "端口或协议无应答")
             raise RuntimeError(f"该端点尚未完成多源确认，已先做快速可用性检测，但未通过：{reason}")
         endpoint = node_pool.get_endpoint(endpoint_id) or endpoint
@@ -3797,7 +3860,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 hostname=host if port in (0, 443) else f"{host}:{port}",
                 username="vpn",
                 password="vpn",
-                timeout=20,
+                timeout=5 if quick else 20,
                 reuse_existing=False,
             )
         else:
@@ -3819,7 +3882,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
                 password="vpn",
                 psk="vpn",
                 namespace=f"aimili-l2tp-{token}",
-                timeout=20 if manual else 35,
+                timeout=5 if quick else 35,
                 on_progress=_l2tp_progress,
             )
 
@@ -3834,15 +3897,20 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
             short = " ".join(detail.split())
             raise RuntimeError(short[:180] or f"{protocol} 连接失败")
 
-        if manual:
-            set_state(manual_switch_message="目标隧道已建立，正在验证真实出口与网络质量…", last_check_message="目标节点已建立隧道，正在进行真实出口验证…")
         if protocol == "l2tp-ipsec":
             ensure_l2tp_namespace_forward(result)
-        direct_health = (
-            tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
-            if protocol == "l2tp-ipsec"
-            else check_interface_egress(result.interface, result.gateway)
-        )
+        if quick:
+            direct_health = {"ok": True, "latency_ms": 0, "ip": ""}
+            if manual:
+                set_state(manual_switch_message="隧道已建立，正在接管…", last_check_message="未做网页检测，直接接管")
+        else:
+            if manual:
+                set_state(manual_switch_message="目标隧道已建立，正在验证真实出口与网络质量…", last_check_message="目标节点已建立隧道，正在进行真实出口验证…")
+            direct_health = (
+                tunnel_adapters.L2TPIPsecAdapter.egress_check(result)
+                if protocol == "l2tp-ipsec"
+                else check_interface_egress(result.interface, result.gateway)
+            )
         if not direct_health.get("ok"):
             message = str(direct_health.get("error") or "候选隧道出口检测失败")
             node_pool.record_endpoint_probe(endpoint_id, False, 0, message)
@@ -3867,7 +3935,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         ):
             raise RuntimeError(f"{protocol} 没有建立独立隧道，仍占用当前网卡 {result.interface}")
         if manual:
-            set_state(manual_switch_message="隧道已验证，正在确认 8500 出口…", last_check_message="新隧道已通过出口检测，正在确认客户端转发。")
+            set_state(manual_switch_message="隧道已建立，正在接管 8500…", last_check_message="未做网页检测，直接接管")
         if not manual and (manual_connection_active or time.time() < manual_connection_quiet_until):
             raise RuntimeError("人工切换优先，取消这次自动接管")
 
@@ -3881,7 +3949,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False) -> str:
         in_direct = proxy_server.get_egress_mode() == "direct"
         health = (
             {"ok": True, "ip": str(direct_health.get("ip") or ""), "latency_ms": direct_health.get("latency_ms") or 0}
-            if in_direct
+            if in_direct or quick
             else check_proxy_health(fast=True)
         )
         if not health.get("ok"):
@@ -5143,7 +5211,7 @@ def apply_saved_scheme_now() -> None:
                 if ip:
                     seen_ips.add(ip)
                 try:
-                    connect_ranked_endpoint(endpoint, manual=replacing)
+                    connect_ranked_endpoint(endpoint, manual=replacing, fast=True)
                 except Exception as exc:
                     last_error = str(exc)
                     _note_connect_fail(endpoint)
@@ -5473,10 +5541,19 @@ def _test_pool_reference(ref: dict[str, Any]) -> dict[str, Any]:
         endpoint = node_pool.get_endpoint(endpoint_id)
         node = protocol_endpoint_to_ui_node(endpoint) if endpoint else {}
         if isinstance(node, dict):
-            node["probe_status"] = "available" if result.get("ok") else "unavailable"
+            if result.get("inconclusive"):
+                node["probe_status"] = "not_checked"
+            else:
+                node["probe_status"] = "available" if result.get("ok") else "unavailable"
             node["probe_message"] = str(result.get("message") or "")
             node["latency_ms"] = int(result.get("latency_ms") or 0)
-        return {"ok": bool(result.get("ok")), "kind": kind, "node": node, "result": result}
+        return {
+            "ok": bool(result.get("ok")) and not result.get("inconclusive"),
+            "inconclusive": bool(result.get("inconclusive")),
+            "kind": kind,
+            "node": node,
+            "result": result,
+        }
     return {"ok": False, "error": "未知测试类型"}
 
 def country_full_sweep(country: str) -> dict[str, Any]:
@@ -5898,7 +5975,17 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
             "port": p,
             "current_ip": n_info.get("ip") or h,
             "hostname": h,
+            "config_text": n_info.get("config_text") or "",
+            "config_file": n_info.get("config_file") or "",
+            "id": node_id,
         })
+        if probed.get("inconclusive"):
+            return {
+                "id": node_id,
+                "skipped": True,
+                "probe_status": "not_checked",
+                "probe_message": str(probed.get("message") or ""),
+            }
         ok = bool(probed.get("ok"))
         latency = int(probed.get("latency_ms") or 0)
         message = str(probed.get("message") or "")
@@ -5974,6 +6061,69 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         schedule_nodes_probe_flush(updated_nodes_map)
 
     return list(updated_nodes_map.values())
+
+def probe_listed_node(node_id: str) -> dict[str, Any]:
+    """Manual 待检测. Same path as cold standby: dial the node, then webpage HTTP status."""
+    node_id = str(node_id or "").strip()
+    if not node_id:
+        return {"ok": False, "error": "节点 ID 不能为空"}
+    if node_id.startswith("pool:"):
+        endpoint_id = node_id.removeprefix("pool:")
+        endpoint = node_pool.get_endpoint(endpoint_id)
+        if endpoint is None:
+            return {"ok": False, "error": "端点不存在"}
+        protocol = str(endpoint.get("protocol") or "").lower()
+        if protocol == "openvpn":
+            real_id = ensure_openvpn_node_from_pool(endpoint)
+            node = test_node_by_id(real_id)
+            message = str(node.get("probe_message") or "")
+            if "让路" in message:
+                return {
+                    "ok": False,
+                    "skipped": True,
+                    "error": message,
+                    "node": {"id": node_id, "probe_status": "not_checked", "probe_message": message},
+                }
+            ok = str(node.get("probe_status") or "") == "available"
+            try:
+                node_pool.record_endpoint_probe(
+                    endpoint_id, ok, int(node.get("latency_ms") or 0), message, speed_bps=None
+                )
+            except Exception as exc:
+                log_to_json("WARNING", "Probe", f"待检测结果写入失败: {exc}")
+            fresh = node_pool.get_endpoint(endpoint_id)
+            ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+            if isinstance(ui, dict):
+                ui["id"] = node_id
+                ui["probe_status"] = "available" if ok else "unavailable"
+                ui["probe_message"] = message
+                ui["latency_ms"] = int(node.get("latency_ms") or 0)
+            return {"ok": ok, "node": ui or {"id": node_id, "probe_status": "available" if ok else "unavailable", "probe_message": message}}
+        result = probe_pool_endpoint(endpoint_id)
+        if result.get("skipped"):
+            message = str(result.get("error") or "检测让路")
+            return {
+                "ok": False,
+                "skipped": True,
+                "error": message,
+                "node": {"id": node_id, "probe_status": "not_checked", "probe_message": message},
+            }
+        ok = bool(result.get("ok"))
+        message = str(result.get("message") or result.get("error") or "")
+        fresh = node_pool.get_endpoint(endpoint_id)
+        ui = protocol_endpoint_to_ui_node(fresh) if fresh else {}
+        if isinstance(ui, dict):
+            ui["id"] = node_id
+            ui["probe_status"] = "available" if ok else "unavailable"
+            ui["probe_message"] = message
+            ui["latency_ms"] = int(result.get("latency_ms") or 0)
+        return {"ok": ok, "node": ui, "result": result}
+    node = test_node_by_id(node_id)
+    message = str(node.get("probe_message") or "")
+    if "让路" in message:
+        return {"ok": False, "skipped": True, "error": message, "node": node}
+    return {"ok": str(node.get("probe_status") or "") == "available", "node": node}
+
 
 def auto_switch_node(attempt: int = 0) -> None:
     if ui_command_plane.is_busy():
@@ -7289,7 +7439,7 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
                 f"主连接未启动，冷备接管 {endpoint.get('protocol')} {_endpoint_ip(endpoint)}:{int(endpoint.get('port') or 0)}",
             )
             try:
-                connect_ranked_endpoint(endpoint)
+                connect_ranked_endpoint(endpoint, fast=True)
             except Exception as exc:
                 log_to_json("WARNING", "Standby", f"冷备接管失败 {eid}: {exc}")
                 _rotate_cold(eid, candidates)
@@ -7578,7 +7728,9 @@ def favorite_connectivity_pass() -> None:
         write_json(DATA_DIR / "favorite_probe.json", stamp)
     except Exception:
         pass
-    if result.get("ok"):
+    if result.get("inconclusive"):
+        log_to_json("INFO", "Standby", f"收藏连通检测不算不可用 {endpoint_id}: {result.get('message') or ''}")
+    elif result.get("ok"):
         log_to_json("INFO", "Standby", f"收藏连通检测通过 {endpoint_id}")
     else:
         log_to_json("INFO", "Standby", f"收藏连通检测未通过 {endpoint_id}: {result.get('message') or result.get('error') or ''}")
@@ -7629,58 +7781,29 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
         )
     else:
         ok, message, candidate_process = run_openvpn_until_ready(
-            str(config_path), keep_alive=True, route_nopull=True, dev=candidate_dev
+            str(config_path), keep_alive=True, route_nopull=True, timeout=5, dev=candidate_dev
         )
         if not ok or candidate_process is None:
             raise RuntimeError(message or "候选 OpenVPN 隧道建立失败")
         if not tunnel_adapters.interface_has_ipv4(candidate_dev):
             stop_process(candidate_process)
             raise RuntimeError("候选 OpenVPN 隧道已启动，但未获得 IPv4 地址")
-
-        recently_verified = str(node.get("probe_status") or "") == "available" and parse_int(node.get("latency_ms")) > 0
-        if recently_verified:
-            candidate_egress = {
-                "ok": True,
-                "latency_ms": parse_int(node.get("latency_ms")),
-                "ip": str(node.get("ip") or ""),
-            }
-            set_state(
-                manual_switch_message="节点最近已测通，跳过重复出口测试，正在接管 8500…",
-                last_check_message="候选隧道已建立，直接切换出口",
-            )
-        else:
-            set_state(
-                manual_switch_message="候选 OpenVPN 已建立，正在验证真实出口…",
-                last_check_message="候选 OpenVPN 已建立，正在验证真实出口…",
-            )
-            candidate_egress = check_interface_egress(candidate_dev)
-            if not candidate_egress.get("ok"):
-                stop_process(candidate_process)
-                raise RuntimeError(str(candidate_egress.get("error") or "候选 OpenVPN 真实出口验证失败"))
+        candidate_egress = {"ok": True, "latency_ms": 0, "ip": str(node.get("ip") or "")}
+        set_state(
+            manual_switch_message="隧道已建立，正在接管…",
+            last_check_message="未做网页检测，直接接管",
+        )
 
     set_state(
-        manual_switch_message="候选节点验证通过，正在平滑接管 8500 连接…",
-        last_check_message="候选节点验证通过，正在切换本地出口路由；原连接仍保留到验证完成。",
+        manual_switch_message="隧道已建立，正在接管 8500…",
+        last_check_message="未做网页检测，直接切换出口",
     )
 
     cleanup_policy_routing()
     cleanup_probe_policy_routing(101)
     proxy_server.set_active_interface(candidate_dev)
     setup_policy_routing(candidate_dev)
-    final_health = check_proxy_health()
-    if not final_health.get("ok"):
-        cleanup_policy_routing()
-        try:
-            if old_external_tunnel is not None and old_iface:
-                proxy_server.set_active_interface(old_iface)
-                setup_policy_routing(old_iface, gateway=old_gateway)
-            elif old_openvpn_process is not None and old_iface:
-                proxy_server.set_active_interface(old_iface)
-                setup_policy_routing(old_iface)
-        except Exception as rollback_exc:
-            log_to_json("ERROR", "VPN", f"平滑切换路由回滚失败: {rollback_exc}")
-        stop_process(candidate_process)
-        raise RuntimeError(str(final_health.get("error") or "新 OpenVPN 接管后 8500 出口验证失败"))
+    final_health = {"ok": True, "ip": "", "latency_ms": 0}
 
     if old_external_tunnel is not None:
         try:
@@ -7763,9 +7886,10 @@ def _manual_smooth_openvpn_switch(node: dict[str, Any], ui_cfg: dict[str, Any]) 
     align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""), protocol="openvpn")
     return f"Connected {node_id} (smooth switch)"
 
-def connect_node(node_id: str, enable_connection: bool = False, manual: bool = False) -> str:
+def connect_node(node_id: str, enable_connection: bool = False, manual: bool = False, fast: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch, connection_generation, active_connection_generation
     node_id = str(node_id or "").strip()
+    quick = bool(fast or manual)
     if not node_id:
         raise ValueError("Node id is required")
     stopped_existing = False
@@ -7884,7 +8008,9 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...", manual_switch_message=("正在建立 OpenVPN 安全隧道…" if manual else ""))
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        ok, message, process = run_openvpn_until_ready(
+            str(node["config_file"]), keep_alive=True, route_nopull=True, timeout=(5 if quick else None)
+        )
         if not ok or process is None:
             try:
                 if config_path.exists():
@@ -7912,7 +8038,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         proxy_server.set_active_interface("tun0")
         set_state(active_tunnel_protocol="openvpn", active_tunnel_interface="tun0")
         if manual:
-            set_state(manual_switch_message="候选 OpenVPN 已建立，正在验证真实出口…", last_check_message="候选 OpenVPN 已建立，正在验证真实出口…")
+            set_state(manual_switch_message="隧道已建立，正在接管…", last_check_message="未做网页检测，直接接管")
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
         setup_policy_routing("tun0")
 
@@ -7920,7 +8046,10 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
         last_active_ping_time = time.time()
         last_active_latency = 0
 
-        set_state(active_node_latency="测试出口", last_check_message="正在测试本地代理出站联通性与出口 IP...")
+        set_state(
+            active_node_latency="接管出口",
+            last_check_message=("隧道已建立，未做网页检测" if quick else "正在测试本地代理出站联通性与出口 IP..."),
+        )
 
         for item in nodes:
             item["active"] = item.get("id") == node_id
@@ -7929,8 +8058,11 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
                 item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
         write_json(NODES_FILE, nodes)
 
-        set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
-        res = check_proxy_health()
+        if quick:
+            res = {"ok": True, "ip": "", "latency_ms": 0}
+        else:
+            set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
+            res = check_proxy_health()
         if res["ok"]:
             last_active_latency = parse_int(res.get("latency_ms")) or 0
             set_state(
@@ -7953,7 +8085,7 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
         if manual:
-            set_state(manual_switch_message="目标节点验证完成，正在确认客户端状态…", last_check_message="真实出口验证通过，正在完成平滑切换…")
+            set_state(manual_switch_message="切换完成", last_check_message="隧道已接管，未做网页检测")
             set_manual_route_pin(protocol="openvpn", node_id=node_id, country=str(node.get("country") or ""))
             align_proxy_settings_to_manual(str(node.get("country") or ""), str(node.get("ip_type") or ""), protocol="openvpn")
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
@@ -8115,7 +8247,10 @@ def _release_probe_route_table(table: int) -> None:
         probe_route_tables_free.add(int(table))
 
 def probe_pool_endpoint(endpoint_id: str) -> dict[str, Any]:
-    """Real tunnel. Catalog and row checks must not call this. Cold, precold, and the substitute bench only."""
+    """Real tunnel plus a webpage check. Catalog scans must not call this.
+
+    Cold standby, precold, the substitute bench, and a manual 待检测 click do.
+    """
     endpoint_id = str(endpoint_id or "").strip()
     if not endpoint_id:
         return {"ok": False, "error": "endpoint_id 为空"}
@@ -8386,7 +8521,8 @@ def _endpoint_physical_key(endpoint: dict[str, Any] | None, endpoint_id: str) ->
     return (protocol, host, parse_int(endpoint.get("port")))
 
 
-def connect_pool_endpoint_with_fallback(endpoint_ids: list[str], manual: bool = False) -> str:
+def connect_pool_endpoint_with_fallback(endpoint_ids: list[str], manual: bool = False, fast: bool = False) -> str:
+    quick = bool(fast or manual)
     ids = list(dict.fromkeys(str(x or "").strip() for x in endpoint_ids if str(x or "").strip()))
     if not ids:
         raise ValueError("没有可连接的协议端点")
@@ -8404,27 +8540,32 @@ def connect_pool_endpoint_with_fallback(endpoint_ids: list[str], manual: bool = 
     errors: list[str] = []
     started = time.monotonic()
     for endpoint_id in ids:
+        if quick and time.monotonic() - started > 8:
+            errors.append("5秒内没有连上")
+            break
         if manual and time.monotonic() - started > 50:
             errors.append("已超过人工切换时间预算")
             break
         try:
             endpoint = node_pool.get_endpoint(endpoint_id)
             if endpoint is not None and str(endpoint.get("protocol") or "").lower() == "openvpn":
-                return connect_ranked_endpoint(endpoint, manual=manual)
-            return connect_pool_endpoint(endpoint_id, manual=manual)
+                return connect_ranked_endpoint(endpoint, manual=manual, fast=quick)
+            return connect_pool_endpoint(endpoint_id, manual=manual, fast=quick)
         except Exception as exc:
             errors.append(f"{endpoint_id[:10]}: {exc}")
             continue
     raise RuntimeError("人工切换失败，已停止重试：" + " | ".join(errors[-3:]) if manual else "已尝试该 IP/协议的全部候选端点，均未连接成功：" + " | ".join(errors[-4:]))
 
-def connect_ranked_endpoint(endpoint: dict[str, Any], manual: bool = False) -> str:
+def connect_ranked_endpoint(endpoint: dict[str, Any], manual: bool = False, fast: bool = False) -> str:
+    quick = bool(fast or manual)
     protocol = str(endpoint.get("protocol") or "").lower()
     if protocol == "openvpn":
         node_id = ensure_openvpn_node_from_pool(endpoint)
-        return connect_node(node_id, manual=manual)
+        return connect_node(node_id, manual=manual, fast=quick)
     return connect_pool_endpoint_with_fallback(
         [str(endpoint.get("endpoint_id") or "")],
         manual=manual,
+        fast=quick,
     )
 
 def restore_manual_previous_connection(previous_openvpn_node_id: str = "", previous_pool_endpoint_id: str = "") -> tuple[bool, str]:
@@ -9085,6 +9226,8 @@ def _library_probe_one(endpoint_id: str) -> str:
     if _library_is_live_production(endpoint):
         return "live"
     result = light_probe_endpoint(endpoint)
+    if result.get("inconclusive"):
+        return "inconclusive"
     try:
         node_pool.record_endpoint_probe(
             endpoint_id, bool(result.get("ok")), int(result.get("latency_ms") or 0),
@@ -9136,7 +9279,7 @@ def _library_check_worker(generation: int) -> None:
             if library_check_generation != generation:
                 return
             library_check_total = len(ids)
-            note = "TCP 测端口，UDP 发一包协议探测。不建立隧道，不测速"
+            note = "TCP 测端口，UDP 发一包协议探测。不建立隧道，不测速。tls-auth 的 UDP 无应答不算不可用"
             if skipped:
                 note += f"；已跳过 {skipped} 个未知协议的端点"
             library_check_message = note
@@ -13328,7 +13471,7 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
-    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="打开全球库检测。TCP 看端口，UDP 发一包协议探测。不建立隧道，不测速。只有冷备、预冷备和替补预冷备才真实连接。">
+    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);" title="打开全球库检测。TCP 看端口，UDP 发一包。tls-auth 的 UDP 无应答不算不可用。冷备、预冷备、替补预冷备，以及点击待检测，才真实连接并检查网页。">
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex:0 0 16px;"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
       全球库检测
     </button>
@@ -13553,7 +13696,7 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
-      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。不建立隧道，不测速，不访问 Cloudflare / CDN。只有冷备、预冷备和替补预冷备才做真实连接。转发或筛选时等待，等待不算失败。</div>
+      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。冷备、预冷备、替补预冷备，以及点击待检测，才连接节点并检查网页。转发或筛选时等待，等待不算失败。</div>
       <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">检测节点数</span>
         <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>
@@ -15849,13 +15992,12 @@ function render(){
           : hotStandby
           ? `<span class="badge available"><span class="badge-pulse"></span>${standbyLabel}</span>`
           : canRetest
-            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "点击立即检测此节点")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
+            ? `<button type="button" class="badge status-badge-button ${badgeClass}" title="${esc(n.probe_message || "按冷备方式连接节点，并检查网页")}" onclick="testNode(this, '${esc(n.id)}', event)">${badgeText}</button>`
             : `<span class="badge ${badgeClass}" title="${esc(n.probe_message || "")}">${badgeText}</span>`;
 
       // Background detection is allowed to continue while the user manually
       // switches nodes. Only an actual manual connection operation remains
       // mutually exclusive. A node currently being tested is still unavailable.
-      const isUnavailable = n.probe_status === "unavailable";
       const backgroundDetectionRunning = !!(
         state.maintenance_running ||
         state.priority_running ||
@@ -15872,7 +16014,7 @@ function render(){
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : isPendingSwitch
           ? `<button class="connect-btn switching-btn" disabled><span class="switch-spinner"></span>切换中</button>`
-          : `<button class="connect-btn" ${(isUnavailable || isTesting || isWaiting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+          : `<button class="connect-btn" ${(isTesting || isWaiting || manualConnectBusy || switchRunning) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
 
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
@@ -16129,7 +16271,14 @@ async function runManualTest(id){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id })
     }, 70000);
-    if (result && result.node && result.node.id) {
+    if (result && result.skipped) {
+      const idx = nodes.findIndex(n => n && n.id === id);
+      if (idx !== -1) {
+        nodes[idx] = Object.assign({}, nodes[idx], {
+          probe_message: result.error || (result.node && result.node.probe_message) || "检测让路，稍后再试"
+        });
+      }
+    } else if (result && result.node && result.node.id) {
       if (!result.node.probe_status || result.node.probe_status === "not_checked") {
         result.node.probe_status = result.ok ? "available" : "unavailable";
       }
@@ -22577,28 +22726,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not node_id.strip():
                     self.send_json({"ok": False, "error": "节点 ID 不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
-                if node_id.startswith("pool:"):
-                    endpoint_id = node_id.removeprefix("pool:")
-                    endpoint = node_pool.get_endpoint(endpoint_id)
-                    if endpoint is None:
-                        self.send_json({"ok": False, "error": "端点不存在"}, HTTPStatus.NOT_FOUND)
-                        return
-                    result = light_probe_endpoint_id(endpoint_id)
-                    _drop_ui_page_snapshots()
-                    fresh = node_pool.get_endpoint(endpoint_id)
-                    node = protocol_endpoint_to_ui_node(fresh) if fresh else {}
-                    ok = bool(result.get("ok"))
-                    if node:
-                        node["probe_message"] = str(result.get("message") or "")
-                        node["probe_status"] = "available" if ok else "unavailable"
-                        node["latency_ms"] = int(result.get("latency_ms") or 0)
-                    self.send_json({"ok": ok, "node": node, "result": result})
+                result = probe_listed_node(node_id)
+                _drop_ui_page_snapshots()
+                if result.get("error") == "端点不存在":
+                    self.send_json(result, HTTPStatus.NOT_FOUND)
                     return
-                rows = test_multiple_nodes([node_id])
-                if not rows:
-                    self.send_json({"ok": False, "error": "节点不存在或尚未载入"}, HTTPStatus.NOT_FOUND)
+                if result.get("error") == "节点 ID 不能为空":
+                    self.send_json(result, HTTPStatus.BAD_REQUEST)
                     return
-                self.send_json({"ok": True, "node": rows[0]})
+                self.send_json(result)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_proxy":
