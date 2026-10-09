@@ -23147,23 +23147,65 @@ class Handler(BaseHTTPRequestHandler):
                         "state": _get_fast_nodes_state(),
                     })
                     return
+                if mode == "proxy":
+                    path_ok, path_detail = preflight_proxy_egress()
+                    if not path_ok and _promote_live_standby():
+                        path_ok, path_detail = preflight_proxy_egress()
+                    if not path_ok:
+                        failed_endpoint = str(active_pool_endpoint_id or "")
+                        if failed_endpoint:
+                            try:
+                                node_pool.note_local_forward(failed_endpoint, False, path_detail)
+                            except Exception:
+                                pass
+                        def _replace_dead_tunnel() -> None:
+                            try:
+                                stop_all_tunnels()
+                            except Exception as exc:
+                                log_to_json("WARNING", "Proxy", f"拆掉不通的隧道失败: {exc}")
+                            for _attempt in range(3):
+                                ensure_main_connection("手动切代理时当前隧道不通", engage_proxy=False, force=True)
+                                if not active_tunnel_running():
+                                    set_state(last_check_message="没有可用隧道，保持直连", proxy_error="没有活动隧道")
+                                    return
+                                time.sleep(2)
+                                ok, detail = preflight_proxy_egress()
+                                if ok:
+                                    if _engage_proxy_egress("新隧道已通，切回代理"):
+                                        return
+                                    set_state(last_check_message="隧道已通，但切回代理未确认")
+                                    return
+                                current = current_active_routing_endpoint() or {}
+                                eid = str(current.get("endpoint_id") or active_pool_endpoint_id or "")
+                                try:
+                                    if eid:
+                                        node_pool.note_local_forward(eid, False, detail)
+                                        node_pool.mark_slow(eid)
+                                except Exception:
+                                    pass
+                                if current:
+                                    _note_connect_fail(current)
+                                log_to_json("WARNING", "Proxy", f"新隧道数据面仍不通，换下一个: {detail}")
+                                try:
+                                    stop_all_tunnels()
+                                except Exception:
+                                    pass
+                            set_state(last_check_message="换了节点仍然不通，保持直连", proxy_error="活动隧道数据面不通")
+                        threading.Thread(target=_replace_dead_tunnel, daemon=True, name="proxy-replace-dead").start()
+                        set_state(last_check_message="当前隧道不通，正在换节点并切回代理", proxy_error=path_detail)
+                        self.send_json({
+                            "ok": True,
+                            "switching": True,
+                            "mode": "direct",
+                            "message": "当前隧道不通，正在换节点并切回代理",
+                        })
+                        return
                 generation = _begin_egress_transaction()
                 if generation is None:
                     self.send_json({"ok": False, "error": "切换失败，上一次出口切换尚未结束"}, HTTPStatus.CONFLICT)
                     return
                 handoff = False
                 try:
-                    if mode == "proxy":
-                        failed_endpoint = str(active_pool_endpoint_id or "")
-                        path_ok, path_detail = preflight_proxy_egress()
-                        if not path_ok and _promote_live_standby():
-                            path_ok, path_detail = preflight_proxy_egress()
-                        if not path_ok:
-                            if failed_endpoint:
-                                node_pool.note_local_forward(failed_endpoint, False, path_detail)
-                            set_state(last_check_message="本机代理转发失败：" + path_detail, proxy_error=path_detail)
-                            self.send_json({"ok": False, "error": "本机代理转发失败：" + path_detail}, HTTPStatus.CONFLICT)
-                            return
                     proxy_server.set_egress_mode(mode)
                     if not _wait_egress_applied(mode, timeout=1.2):
                         proxy_server.set_egress_mode(previous)
