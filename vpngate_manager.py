@@ -253,6 +253,21 @@ active_openvpn_node_id = ""
 active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
 startup_exit_restore_pending = True
+startup_standby_frozen_until = 0.0
+_restore_dial_local = threading.local()
+
+
+def startup_restore_holding() -> bool:
+    """Block automatic dials until the saved main has been tried.
+
+    First install has no saved exit, so that path is not held.
+    """
+    return bool(startup_exit_restore_pending) and not initial_bootstrap_active
+
+
+def _in_restore_dial() -> bool:
+    return bool(getattr(_restore_dial_local, "on", False))
+
 protocol_discovery_lock = threading.Lock()
 protocol_probe_lock = threading.BoundedSemaphore(4)
 probe_route_table_lock = threading.Lock()
@@ -3935,6 +3950,8 @@ def _wait_for_automatic_connection_idle(timeout: float = 2.0) -> None:
 def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = False) -> str:
     global active_external_tunnel, active_pool_endpoint_id, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch, connection_generation, active_connection_generation
     endpoint_id = str(endpoint_id or "").strip()
+    if startup_restore_holding() and not manual and not _in_restore_dial():
+        raise RuntimeError("正在接回上次主连接，暂不另选节点")
     endpoint = node_pool.get_endpoint(endpoint_id)
     if endpoint is None:
         raise ValueError("Protocol endpoint not found")
@@ -5093,11 +5110,7 @@ def remember_live_connection(endpoint_id: str = "", openvpn_node_id: str = "") -
     except Exception as exc:
         log_to_json("WARNING", "Routing", f"主连接域名核对失败: {exc}")
     try:
-        write_json(DATA_DIR / "last_exit.json", {
-            "endpoint_id": eid,
-            "openvpn_node_id": str(openvpn_node_id or active_openvpn_node_id or ""),
-            "at": time.time(),
-        })
+        _snapshot_last_exit(eid, str(openvpn_node_id or active_openvpn_node_id or ""))
     except Exception:
         pass
 
@@ -5542,6 +5555,8 @@ def apply_saved_scheme_now() -> None:
     to 智能模式 at ≥50 Mbps without a batch sweep and without rewriting the
     saved settings. A higher saved speed is kept while any such node exists.
     """
+    if startup_restore_holding() and not _in_restore_dial():
+        return
     if not _scheme_apply_lock.acquire(blocking=False):
         return
     try:
@@ -5678,6 +5693,8 @@ def _user_wants_proxy() -> bool:
 
 def ensure_main_connection(reason: str, engage_proxy: bool = False, force: bool = False) -> None:
     """Health and the proxy switch use this. A missing main must be connected."""
+    if startup_restore_holding() and not _in_restore_dial():
+        return
     if active_tunnel_running():
         if proxy_server.get_egress_mode() != "proxy" and (engage_proxy or _auto_direct_fallback_active() or _user_wants_proxy()):
             engaged = _engage_proxy_egress(reason)
@@ -6600,6 +6617,8 @@ def probe_listed_node(node_id: str) -> dict[str, Any]:
 
 
 def auto_switch_node(attempt: int = 0) -> None:
+    if startup_restore_holding() and not _in_restore_dial():
+        return
     if ui_command_plane.is_busy():
         log_to_json("INFO", "VPN", "前端人工指令进行中，自动切换暂缓")
         return
@@ -7767,6 +7786,8 @@ def _promote_next_cold(promoted_eid: str, candidates: dict[str, dict[str, Any]])
 
 def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict[str, dict[str, Any]] | None = None) -> str:
     """Main is down. Promote prepared cold, then one precold. up/direct/busy/cooldown/skip."""
+    if startup_restore_holding() and not _in_restore_dial():
+        return "busy"
     global _cold_promote_cooldown_until
     if active_tunnel_running():
         return "up"
@@ -8067,6 +8088,12 @@ def _verify_one_standby_real(candidates: dict[str, dict[str, Any]]) -> None:
 
 def cold_standby_pass() -> None:
     if startup_exit_restore_pending:
+        return
+    if time.time() < float(startup_standby_frozen_until or 0):
+        try:
+            _republish_saved_cold()
+        except Exception:
+            pass
         return
     ui_cfg = load_ui_config()
     _purge_blocked_standby(ui_cfg)
@@ -8390,6 +8417,8 @@ def connect_node(node_id: str, enable_connection: bool = False, manual: bool = F
     global active_openvpn_process, active_openvpn_node_id, is_connecting, manual_connection_active, manual_connection_epoch, connection_generation, active_connection_generation
     node_id = str(node_id or "").strip()
     quick = bool(fast or manual)
+    if startup_restore_holding() and not manual and not _in_restore_dial():
+        raise RuntimeError("正在接回上次主连接，暂不另选节点")
     if not node_id:
         raise ValueError("Node id is required")
     stopped_existing = False
@@ -8794,6 +8823,9 @@ def _sample_exit_speed(interface: str) -> int:
 
 
 def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
+    if _in_restore_dial():
+        log_to_json("INFO", "VPN", "启动接回上次出口，这次不因测速换 IP")
+        return 0
     floor = _active_speed_floor_bps()
     floor_label = f"{floor // 1_000_000}Mbps"
     speed = _sample_exit_speed(interface)
@@ -9217,6 +9249,8 @@ def endpoint_allowed_by_pool_routing(endpoint: dict[str, Any], ui_cfg: dict[str,
     return ui_cfg.get("routing_mode", "auto") != "fixed_ip"
 
 def try_unified_failover(exclude_endpoint_id: str = "", attempts: int = 4, preferred_only: bool = False, manual: bool = False) -> bool:
+    if startup_restore_holding() and not manual and not _in_restore_dial():
+        return False
     if ui_command_plane.is_busy() and not manual:
         return False
     if not failover_lock.acquire(blocking=False):
@@ -10820,6 +10854,9 @@ def resource_collect_loop() -> None:
 def collector_loop() -> None:
     global last_collector_heartbeat
     while True:
+        if startup_exit_restore_pending:
+            time.sleep(2)
+            continue
         if background_paused():
             time.sleep(5)
             continue
@@ -26464,6 +26501,8 @@ def _switch_candidates_with_favorites_fallback(ui_cfg,exclude_endpoint_id="",lim
 
 
 def _ensure_active_client_v2() -> bool:
+    if startup_restore_holding() and not _in_restore_dial():
+        return False
     if active_tunnel_running() or manual_connection_active or failover_lock.locked() or is_connecting:
         return active_tunnel_running()
     ui_cfg=load_ui_config()
@@ -26542,13 +26581,92 @@ def reap_orphan_protocol_tunnels() -> None:
         log_to_json("WARNING", "VPN", f"清理 L2TP 残留失败: {exc}")
 
 
-def _saved_exit_endpoint() -> dict[str, Any] | None:
-    raw = read_json(DATA_DIR / "last_exit.json", {})
-    if not isinstance(raw, dict):
-        raw = {}
-    eid = str(raw.get("endpoint_id") or "").strip()
+def _exit_record_id(raw: str) -> str:
+    eid = str(raw or "").strip()
     if eid.startswith("pool:"):
         eid = eid.split(":", 1)[1]
+    return eid
+
+
+def _snapshot_last_exit(endpoint_id: str = "", openvpn_node_id: str = "") -> None:
+    """Remember the live main plus the current cold and precold before a restart."""
+    eid = _exit_record_id(endpoint_id)
+    node = str(openvpn_node_id or "").strip()
+    if not eid and not node:
+        return
+    cold_id = ""
+    precold: list[str] = []
+    try:
+        cold = _cold_state()
+        cold_id = _cold_eid(str(cold.get("published") or ""))
+        for item in cold.get("precold") or []:
+            item_id = _cold_eid(item)
+            if item_id and item_id != eid and item_id != cold_id and item_id not in precold:
+                precold.append(item_id)
+    except Exception:
+        try:
+            previous = read_json(DATA_DIR / "last_exit.json", {})
+        except Exception:
+            previous = {}
+        if isinstance(previous, dict):
+            cold_id = _cold_eid(str(previous.get("cold_id") or ""))
+            for item in previous.get("precold") or []:
+                item_id = _cold_eid(item)
+                if item_id and item_id not in precold:
+                    precold.append(item_id)
+    if cold_id == eid:
+        cold_id = ""
+    try:
+        write_json(DATA_DIR / "last_exit.json", {
+            "endpoint_id": eid,
+            "openvpn_node_id": node,
+            "cold_id": cold_id,
+            "precold": precold[:PRECOLD_TARGET],
+            "at": time.time(),
+        })
+    except Exception:
+        pass
+
+
+def _republish_saved_cold() -> None:
+    """Show the recorded cold again after restart. Do not replace it."""
+    cold = _cold_state()
+    published = _cold_eid(str(cold.get("published") or ""))
+    if not published:
+        return
+    try:
+        endpoint = node_pool.get_endpoint(published)
+    except Exception:
+        endpoint = None
+    if not isinstance(endpoint, dict):
+        return
+    if endpoint_is_blocked(endpoint, load_ui_config()):
+        return
+    ip = _endpoint_ip(endpoint)
+    if ip and ip == _active_exit_ip():
+        return
+    set_state(
+        standby_prepared=True,
+        standby_node_id="pool:" + published,
+        standby_ip=ip,
+        standby_port=int(endpoint.get("port") or 0),
+        standby_protocol=str(endpoint.get("protocol") or ""),
+    )
+
+
+def _saved_exit_record() -> dict[str, Any]:
+    raw = read_json(DATA_DIR / "last_exit.json", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def _has_saved_exit() -> bool:
+    raw = _saved_exit_record()
+    return bool(str(raw.get("endpoint_id") or "").strip() or str(raw.get("openvpn_node_id") or "").strip())
+
+
+def _saved_exit_endpoint() -> dict[str, Any] | None:
+    raw = _saved_exit_record()
+    eid = _exit_record_id(str(raw.get("endpoint_id") or ""))
     if not eid:
         eid = _resolve_openvpn_endpoint_id(str(raw.get("openvpn_node_id") or ""))
     if not eid:
@@ -26560,12 +26678,30 @@ def _saved_exit_endpoint() -> dict[str, Any] | None:
     return found if isinstance(found, dict) else None
 
 
+def _saved_main_already_up(record: dict[str, Any]) -> bool:
+    if not active_tunnel_running():
+        return False
+    eid = _exit_record_id(str(record.get("endpoint_id") or ""))
+    node = str(record.get("openvpn_node_id") or "").strip()
+    current = ""
+    try:
+        current = str(get_state().get("active_connected_endpoint") or "")
+    except Exception:
+        current = ""
+    if eid and (active_pool_endpoint_id == eid or current in (eid, "pool:" + eid)):
+        return True
+    if node and active_openvpn_node_id == node:
+        return True
+    return False
+
+
 def _dial_saved_endpoint(endpoint: dict[str, Any] | None, label: str) -> bool:
+    """The connect itself decides availability. A light probe must not skip the saved exit."""
     if not endpoint:
         return False
     ip = _endpoint_ip(endpoint)
-    if _cold_port_open(endpoint) is False:
-        log_to_json("INFO", "VPN", f"{label}端口不可用，不接回 {ip}")
+    if endpoint_is_blocked(endpoint, load_ui_config()):
+        log_to_json("INFO", "VPN", f"{label}在屏蔽列表，不接回 {ip}")
         return False
     try:
         connect_ranked_endpoint(endpoint, manual=False, fast=True)
@@ -26579,18 +26715,30 @@ def _dial_saved_endpoint(endpoint: dict[str, Any] | None, label: str) -> bool:
 
 
 def _restore_previous_exit() -> str:
-    """Reconnect the last main. Cold and precold only if that main is down."""
+    """Priority: last main, then the recorded cold, then the recorded precold."""
+    record = _saved_exit_record()
+    if _saved_main_already_up(record):
+        log_to_json("INFO", "VPN", "上次主连接还在，不换 IP")
+        return "main"
+    if active_tunnel_running():
+        try:
+            stop_all_tunnels()
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"接回前断开其它隧道失败: {exc}")
     previous = _saved_exit_endpoint()
     if _dial_saved_endpoint(previous, "上次主连接"):
         return "main"
     previous_id = str((previous or {}).get("endpoint_id") or "")
     cold = _cold_state()
-    published = _cold_eid(str(cold.get("published") or ""))
+    published = _exit_record_id(str(record.get("cold_id") or "")) or _cold_eid(str(cold.get("published") or ""))
+    precold_ids = [_exit_record_id(item) for item in (record.get("precold") or [])]
+    precold_ids = [item for item in precold_ids if item]
+    if not precold_ids:
+        precold_ids = [_cold_eid(item) for item in (cold.get("precold") or []) if _cold_eid(item)]
     order: list[str] = []
     if published:
         order.append(published)
-    for item in cold.get("precold") or []:
-        eid = _cold_eid(item)
+    for eid in precold_ids:
         if eid and eid not in order:
             order.append(eid)
     for eid in order:
@@ -26606,51 +26754,80 @@ def _restore_previous_exit() -> str:
     return ""
 
 
-def startup_recovery_loop():
-    """One-shot boot recovery. Reuse the last main, then its cold and precold.
+def _dial_default_exit(reason: str) -> bool:
+    """First install, or no saved exit, or every saved exit failed."""
+    log_to_json("INFO", "VPN", reason)
+    _restore_dial_local.on = True
+    try:
+        return bool(_ensure_active_client_v2())
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"默认连接失败: {exc}")
+        return False
+    finally:
+        _restore_dial_local.on = False
 
-    A browser refresh does not restart this task. A new IP is chosen only when
-    the saved main and its saved standbys cannot be dialed.
+
+def startup_recovery_loop():
+    """Reconnect the saved main. Cold and precold are only used if that main fails.
+
+    No record, or a first install, uses the normal default selection.
+    Other automatic dials stay blocked until this attempt finishes.
     """
-    global startup_exit_restore_pending
+    global startup_exit_restore_pending, startup_standby_frozen_until
     try:
         try:
-            # Previous process is gone, so nothing in memory owns the vpnclient
-            # sessions or netns it left behind. Drop them before dialing again.
             reap_orphan_protocol_tunnels()
         except Exception as exc:
             log_to_json("WARNING", "VPN", f"启动清理残留隧道失败: {exc}")
-        time.sleep(8)
+        time.sleep(1)
         try:
-            if initial_bootstrap_active:
+            if initial_bootstrap_active or _first_install_bootstrap_needed():
+                log_to_json("INFO", "VPN", "首次安装，没有上次记录，按默认方式选主连接、冷备和预冷备")
                 return
             ui_cfg = load_ui_config()
             if not bool(ui_cfg.get("connection_enabled", True)):
                 return
-            if global_pool_refresh_running or ui_command_plane.is_busy() or manual_connection_active or is_connecting or active_tunnel_running():
+            if str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
+                _restore_dial_local.on = True
+                try:
+                    reconnect_fixed_node_if_needed(ui_cfg)
+                finally:
+                    _restore_dial_local.on = False
+                return
+            if not _has_saved_exit():
+                set_state(last_check_message="没有上次主连接记录，按默认方式选择")
+                if _dial_default_exit("没有上次主连接记录，按默认方式选主连接、冷备和预冷备"):
+                    set_state(last_check_message="已按默认方式建立主连接")
+                else:
+                    set_state(last_check_message="默认方式暂未连上，后台会继续重试")
                 return
             set_state(last_check_message="启动恢复：正在接回上次主连接")
-            restored = _restore_previous_exit()
+            log_to_json("INFO", "VPN", "启动恢复：先接上次主连接，不可用才用记下的冷备和预冷备")
+            _restore_dial_local.on = True
+            try:
+                restored = _restore_previous_exit()
+            finally:
+                _restore_dial_local.on = False
             if restored == "main":
+                startup_standby_frozen_until = time.time() + 180
+                try:
+                    _republish_saved_cold()
+                except Exception:
+                    pass
                 set_state(last_check_message="启动恢复完成：已接回上次主连接")
                 return
             if restored == "standby":
                 set_state(last_check_message="启动恢复完成：上次主连接不可用，已接上原来的冷备")
                 return
-            set_state(last_check_message="上次主连接和冷备都不可用，正在按代理设置重选")
-            connected = _ensure_active_client_v2()
-            if connected:
-                set_state(last_check_message="启动恢复完成：已建立可用 VPN 出口。")
+            set_state(last_check_message="上次主连接和冷备都不可用，正在按默认方式重选")
+            if _dial_default_exit("上次主连接、冷备和预冷备都不可用，改按默认方式重选"):
+                set_state(last_check_message="启动恢复完成：已按默认方式建立连接")
             else:
-                set_state(
-                    last_check_message="启动恢复未建立连接；不会循环占用检测，后台维护将在下一周期自动重试。"
-                )
+                set_state(last_check_message="启动恢复未建立连接，后台维护将在下一周期重试")
         except Exception as exc:
             log_to_json("WARNING", "VPN", f"启动恢复任务异常: {exc}")
             try:
-                set_state(
-                    last_check_message=f"启动恢复未完成：{exc}；后台维护将在下一周期自动重试。"
-                )
+                set_state(last_check_message=f"启动恢复未完成：{exc}；后台维护将在下一周期自动重试。")
             except Exception:
                 pass
     finally:
@@ -26893,11 +27070,7 @@ def main() -> None:
         saved_node = str(previous_state.get("active_openvpn_node_id") or "").strip()
         if saved_endpoint or saved_node:
             try:
-                write_json(DATA_DIR / "last_exit.json", {
-                    "endpoint_id": saved_endpoint,
-                    "openvpn_node_id": saved_node,
-                    "at": time.time(),
-                })
+                _snapshot_last_exit(saved_endpoint, saved_node)
             except Exception:
                 pass
 
