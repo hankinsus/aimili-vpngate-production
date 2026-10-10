@@ -1435,7 +1435,7 @@ def get_state() -> dict[str, Any]:
                     "speed": endpoint.get("latest_speed", 0),
                     "speed_bps": endpoint.get("latest_speed", 0),
                     "speed_source": "vpngate_observation" if int(endpoint.get("latest_speed") or 0) > 0 else "not_measured",
-                    "latency_ms": endpoint.get("latency_ewma", 0),
+                    "latency_ms": int(float(endpoint.get("latency_ewma") or 0)),
                     "jitter_ms": endpoint.get("jitter_ewma", 0),
                     "selection_score": endpoint.get("selection_score", 0),
                 }
@@ -15940,6 +15940,12 @@ function getLatencyClass(ms) {
   return 'latency-poor';
 }
 
+function latencyShown(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.trunc(n);
+}
+
 function triState(value) {
   if (value === true || value === 1 || value === 'true') return true;
   if (value === false || value === 0 || value === 'false') return false;
@@ -17048,7 +17054,7 @@ function render(){
     `;
   } else if (state.active_pool_endpoint) {
     const ep = state.active_pool_endpoint;
-    const latencyValue = Number(state.proxy_latency_ms || ep.latency_ms || 0);
+    const latencyValue = latencyShown(state.proxy_latency_ms || ep.latency_ms || 0);
     const latencyClass = getLatencyClass(latencyValue);
     const latencyText = latencyValue ? `<span class="latency-val ${latencyClass}">${latencyValue} ms</span>` : "-";
     const protocolName = translateProtocol(ep.protocol || state.active_tunnel_protocol || "openvpn");
@@ -17090,7 +17096,7 @@ function render(){
       </div>
     `;
   } else if (activeNode) {
-    const activeLatencyValue = Number(state.proxy_latency_ms || activeNode.latency_ms || 0);
+    const activeLatencyValue = latencyShown(state.proxy_latency_ms || activeNode.latency_ms || 0);
     const latencyClass = getLatencyClass(activeLatencyValue);
     const latencyText = activeLatencyValue ? `<span class="latency-val ${latencyClass}">${activeLatencyValue} ms</span>` : "-";
     const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
@@ -17232,8 +17238,9 @@ function render(){
         pBadge.className = (udpDown || quicDown) ? "badge unavailable" : "badge available";
         pBadge.textContent = udpDown ? "直连可用 · UDP异常" : (quicDown ? "直连可用 · QUIC异常" : "直连可用");
         pIpVal.textContent = state.proxy_ip || state.server_public_ip || "-";
-        const latencyClass = getLatencyClass(state.proxy_latency_ms);
-        pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms || 0} ms</span>`;
+        const shownLatency = latencyShown(state.proxy_latency_ms);
+        const latencyClass = getLatencyClass(shownLatency);
+        pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${shownLatency} ms</span>`;
       } else if (directOk === false) {
         pBadge.className = "badge unavailable";
         pBadge.textContent = "直连不可用";
@@ -17253,8 +17260,9 @@ function render(){
         pBadge.className = (udpDown || quicDown) ? "badge unavailable" : "badge available";
         pBadge.textContent = udpDown ? "UDP异常" : (quicDown ? "QUIC异常" : "客户端可用");
         pIpVal.textContent = state.proxy_ip || "-";
-        const latencyClass = getLatencyClass(state.proxy_latency_ms);
-        pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${state.proxy_latency_ms} ms</span>`;
+        const shownLatency = latencyShown(state.proxy_latency_ms);
+        const latencyClass = getLatencyClass(shownLatency);
+        pLatVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${shownLatency} ms</span>`;
       } else if (proxyOk === false) {
         pBadge.className = "badge unavailable";
         pBadge.textContent = "客户端不可用";
@@ -17336,8 +17344,8 @@ function render(){
       const badgeClass = isCurrentlyActive ? 'available' : displayProbeStatus;
       const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : translateStatus(displayProbeStatus);
       const rowLatencyValue = isCurrentlyActive
-        ? Number(state.proxy_latency_ms || 0)
-        : (n.probe_status === "available" ? Number(n.latency_ms || 0) : 0);
+        ? latencyShown(state.proxy_latency_ms || 0)
+        : (n.probe_status === "available" ? latencyShown(n.latency_ms || 0) : 0);
       const latencyClass = getLatencyClass(rowLatencyValue);
       const latencyText = rowLatencyValue ? `<span class="latency-val ${latencyClass}" title="网络延迟，不是拨号耗时">${rowLatencyValue} ms</span>` : "-";
       const rowSpeedValue = Number(n.speed_bps || n.speed || 0);
@@ -19440,8 +19448,9 @@ $("btn_test_proxy").onclick = async () => {
       badge.textContent = "可用";
       ipVal.textContent = result.ip || "-";
 
-      const latencyClass = getLatencyClass(result.latency_ms);
-      latVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${result.latency_ms} ms</span>`;
+      const shownLatency = latencyShown(result.latency_ms);
+      const latencyClass = getLatencyClass(shownLatency);
+      latVal.innerHTML = `<span class="latency-val ${latencyClass}" style="margin-left:8px;">${shownLatency} ms</span>`;
     } else {
       badge.className = "badge unavailable";
       badge.textContent = "不可用";
@@ -25901,7 +25910,7 @@ def _build_fast_nodes_state():
                     "speed": endpoint.get("latest_speed", 0),
                     "speed_bps": endpoint.get("latest_speed", 0),
                     "speed_source": "vpngate_observation" if int(endpoint.get("latest_speed") or 0) > 0 else "not_measured",
-                    "latency_ms": endpoint.get("latency_ewma", 0),
+                    "latency_ms": int(float(endpoint.get("latency_ewma") or 0)),
                 }
         except Exception:
             state["active_pool_endpoint"] = None
