@@ -8799,12 +8799,14 @@ def _sample_exit_speed(interface: str) -> int:
     subprocess.run(["ip", "route", "replace", "default", "via", peer, "dev", interface, "table", "121"], timeout=3, check=False)
     subprocess.run(["ip", "rule", "add", "from", local, "lookup", "121", "priority", "121"], timeout=3, check=False)
     try:
+        sample = max(131072, min(SPEED_TEST_BYTES, 1048576))
         proc = subprocess.run(
             [
                 "curl", "-4", "-sS", "-o", "/dev/null", "--interface", local,
                 "--connect-timeout", "4", "--max-time", "6",
+                "-H", f"Range: bytes=0-{sample - 1}",
                 "-w", "%{size_download} %{time_total}",
-                "https://speed.cloudflare.com/__down?bytes=2000000",
+                "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
             ],
             capture_output=True, text=True, timeout=10,
         )
@@ -8853,7 +8855,7 @@ def _reject_if_slower_than_floor(endpoint_id: str, interface: str) -> None:
 
 
 def measure_interface_speed(interface: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
-    """Speed downloads are disabled. GCP bills egress, and detection must not fetch them."""
+    """Speed downloads are disabled. Switching still samples dl.google.com, not Cloudflare."""
     return {"ok": False, "skipped": True, "speed_bps": 0, "error": "测速已关闭，避免访问 Cloudflare 产生云出口流量"}
 
 def measure_or_reuse_ip_speed(interface: str, endpoint_id: str, gateway: str = "", table: int = PROBE_ROUTE_TABLE) -> dict[str, Any]:
