@@ -15571,7 +15571,6 @@ function egressHealthBadge(state) {
     if (ok === false) return ['直连不可用', 'unavailable'];
     return ['直连检测中', 'not_checked'];
   }
-  const proxyOk = triState(state.client_proxy_ok);
   if ((proxyOk === true || state.client_status === 'usable') && udpDown) return ['UDP异常', 'unavailable'];
   if ((proxyOk === true || state.client_status === 'usable') && quicDown) return ['QUIC异常', 'unavailable'];
   if (proxyOk === true || state.client_status === 'usable') return ['客户端可用', 'available'];
