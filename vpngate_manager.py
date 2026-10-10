@@ -10979,6 +10979,16 @@ INDEX_HTML = r"""<!doctype html>
       box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
       text-align: center;
     }
+    body.ui-locked {
+      overflow: hidden !important;
+    }
+    body.ui-locked::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: rgba(8, 12, 20, 0.55);
+      z-index: 4900;
+    }
     body.ui-locked button,
     body.ui-locked a,
     body.ui-locked select,
@@ -12010,7 +12020,7 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: baseline;
       justify-content: flex-end;
-      gap: 14px;
+      gap: 6px;
       white-space: nowrap;
     }
     .active-server-corner .server-self-label {
@@ -12025,6 +12035,7 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .active-server-corner .server-self-v6 {
+      margin-left: 8px;
       font-size: 13px;
       font-weight: 500;
       color: #c5d0dc;
@@ -18266,8 +18277,10 @@ function startConnectionPolling() {
         if (tableChanged) render();
         else if (stateChanged) {
           if (!paintSwitchChrome()) render();
+          else settleBootStatus();
         } else {
           paintSwitchChrome();
+          settleBootStatus();
         }
       } else {
         paintSwitchChrome();
@@ -18308,6 +18321,7 @@ async function connectNode(id){
   state.manual_switch_message = "正在发送连接请求…";
   state.last_check_message = "正在切换，当前连接在目标节点验证通过前保持不变…";
   render();
+  settleBootStatus();
 
   startConnectionPolling();
 
@@ -18436,6 +18450,7 @@ async function setEgressMode(mode) {
   state.last_check_message = mode === "proxy" ? "正在切换至代理" : "正在切换至直连";
   egressHoldUntil = 0;
   paintEgressChrome();
+  settleBootStatus();
   const mine = () => generation === egressSwitchGeneration;
   try {
     const result = await fetchJsonWithTimeout("./api/egress_mode", {
@@ -18455,6 +18470,7 @@ async function setEgressMode(mode) {
       state.last_check_message = (result && (result.error || (result.state && result.state.last_check_message))) || "切换出口失败";
       egressHoldUntil = Date.now() + 3000;
       paintEgressChrome();
+      settleBootStatus();
       return;
     }
     egressSwitchAcked = true;
@@ -18468,6 +18484,7 @@ async function setEgressMode(mode) {
       if (!mine()) return;
       if (snap && snap.state) adoptBackendState(snap.state, generation, startedAt);
       paintEgressChrome();
+      settleBootStatus();
     }
     if (mine() && egressSwitchInFlight) {
       egressSwitchInFlight = false;
@@ -18499,6 +18516,7 @@ async function setEgressMode(mode) {
   }
   if (!mine()) return;
   paintEgressChrome();
+  settleBootStatus();
   if (!egressSwitchInFlight) render();
   if (egressHoldUntil) {
     setTimeout(() => {
@@ -19984,13 +20002,8 @@ function hideBootStatus() {
 
 function pageActionBusy() {
   if (testingNodeIds && testingNodeIds.size) return "test";
-  if (state && state.manual_switch_active) return "switch";
-  if (state && state.egress_switching) {
-    const egressReady = state.egress_mode === "direct"
-      ? state.direct_egress_ok === true
-      : state.client_proxy_ok === true;
-    if (!egressReady) return "egress";
-  }
+  if (manualConnectionUiBusy || (state && state.manual_switch_active)) return "switch";
+  if (egressSwitchInFlight || (state && state.egress_switching)) return "egress";
   return "";
 }
 
@@ -20020,8 +20033,8 @@ function settleBootStatus() {
   }
   if (action === "egress") {
     paintBootStatus({
-      title: "正在切换出口",
-      detail: "这一次完成前，后面的点击已取消。请不要再点。"
+      title: egressPendingLabel() || "正在切换出口",
+      detail: String((state && (state.last_check_message || state.manual_switch_message)) || "切换完成前请不要再点，页面已锁定。")
     });
     return;
   }
