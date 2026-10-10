@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -1509,17 +1510,44 @@ class NodePool:
 
     def replace_hostname_ip(self, hostname: str, new_ip: str) -> int:
         """Point a hostname at its current DNS address. History stays on the same server."""
-        hostname = str(hostname or "").strip().lower()
+        hostname = str(hostname or "").strip().lower().rstrip(".")
         new_ip = str(new_ip or "").strip()
-        if not hostname:
+        if not hostname or not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", new_ip):
             return 0
-        with closing(self._connect()) as db:
+        changed = 0
+        with self.lock, closing(self._connect()) as db:
             cur = db.execute(
                 "UPDATE servers SET current_ip=? WHERE LOWER(hostname)=? AND COALESCE(current_ip,'')<>?",
                 (new_ip, hostname, new_ip),
             )
+            changed = int(cur.rowcount or 0)
+            if changed:
+                rows = db.execute(
+                    """
+                    SELECT e.endpoint_id, e.metadata_json
+                    FROM endpoints e JOIN servers s ON s.server_key=e.server_key
+                    WHERE LOWER(s.hostname)=?
+                    """,
+                    (hostname,),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        meta = json.loads(row["metadata_json"] or "{}")
+                    except Exception:
+                        meta = {}
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    if str(meta.get("ip") or "") == new_ip:
+                        continue
+                    meta["ip"] = new_ip
+                    db.execute(
+                        "UPDATE endpoints SET metadata_json=? WHERE endpoint_id=?",
+                        (json.dumps(meta, ensure_ascii=False), row["endpoint_id"]),
+                    )
             db.commit()
-            return int(cur.rowcount or 0)
+        if changed:
+            self.invalidate_ui_lists()
+        return changed
 
     def find_endpoint_id(self, ip: str, port: int, protocol: str) -> str:
         ip = str(ip or "").strip()

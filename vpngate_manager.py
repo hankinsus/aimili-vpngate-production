@@ -1402,6 +1402,7 @@ def get_state() -> dict[str, Any]:
         try:
             endpoint = node_pool.get_endpoint(active_pool_endpoint_id)
             if endpoint:
+                _schedule_hostname_ip_sync(endpoint)
                 server_meta = endpoint.get("server_metadata") or {}
                 state["active_pool_endpoint"] = {
                     "endpoint_id": endpoint.get("endpoint_id", ""),
@@ -4235,6 +4236,7 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
         latency = parse_int(health.get("latency_ms")) or parse_int(direct_health.get("latency_ms"))
         node_pool.record_endpoint_probe(endpoint_id, True, latency, "production connect ok")
         remember_live_connection(endpoint_id=endpoint_id)
+        fresh_endpoint = node_pool.get_endpoint(endpoint_id) or endpoint
         if manual:
             set_manual_route_pin(protocol=protocol, endpoint_id=endpoint_id, country=str(endpoint.get("country") or ""))
             align_proxy_settings_to_manual(
@@ -4242,15 +4244,15 @@ def connect_pool_endpoint(endpoint_id: str, manual: bool = False, fast: bool = F
                 str(endpoint_ip_type(endpoint) or ""),
                 protocol=protocol,
             )
-        endpoint_meta = endpoint.get("server_metadata") or {}
+        endpoint_meta = fresh_endpoint.get("server_metadata") or {}
         endpoint_summary = {
             "endpoint_id": endpoint_id,
             "protocol": protocol,
             "transport": endpoint.get("transport", ""),
             "port": endpoint.get("port", 0),
-            "hostname": endpoint.get("hostname", ""),
-            "current_ip": endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "",
-            "country": endpoint.get("country", ""),
+            "hostname": fresh_endpoint.get("hostname", ""),
+            "current_ip": fresh_endpoint.get("current_ip") or (fresh_endpoint.get("metadata") or {}).get("ip") or "",
+            "country": fresh_endpoint.get("country", ""),
             "location": endpoint_meta.get("location") or endpoint.get("country", ""),
             "owner": endpoint_meta.get("owner") or endpoint_meta.get("as_name") or "",
             "ip_type": endpoint_meta.get("ip_type") or "",
@@ -5004,6 +5006,78 @@ def _resolve_openvpn_endpoint_id(node_id: str) -> str:
     return ""
 
 
+_hostname_ip_sync_at: dict[str, float] = {}
+
+
+def _lookup_hostname_ipv4(hostname: str) -> str:
+    """One A record. Two seconds, then give up. Does not go through the tunnel."""
+    hostname = str(hostname or "").strip().lower().rstrip(".")
+    if not hostname or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname) or ":" in hostname:
+        return ""
+    box: dict[str, str] = {}
+
+    def _resolve() -> None:
+        try:
+            infos = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        except Exception:
+            return
+        for info in infos:
+            ip = str((info[4] or [""])[0] or "")
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", ip):
+                box["ip"] = ip
+                return
+
+    worker = threading.Thread(target=_resolve, daemon=True, name="hostname-ip")
+    worker.start()
+    worker.join(2)
+    return box.get("ip") or ""
+
+
+def align_connected_hostname_ip(endpoint: dict[str, Any] | None) -> str:
+    """After the main tunnel is up, the domain's current address replaces the stored one."""
+    if not isinstance(endpoint, dict):
+        return ""
+    hostname = str(endpoint.get("hostname") or "").strip().lower().rstrip(".")
+    stored = str(endpoint.get("current_ip") or (endpoint.get("metadata") or {}).get("ip") or "").strip()
+    if not hostname or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname):
+        return stored
+    resolved = _lookup_hostname_ipv4(hostname)
+    if not resolved or resolved == stored:
+        return stored or resolved
+    try:
+        changed = node_pool.replace_hostname_ip(hostname, resolved)
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"主连接域名地址写入失败 {hostname}: {exc}")
+        return stored
+    if changed:
+        endpoint["current_ip"] = resolved
+        meta = endpoint.get("metadata")
+        if isinstance(meta, dict):
+            meta["ip"] = resolved
+        log_to_json("INFO", "Routing", f"主连接 {hostname} 当前地址 {resolved}，库中原为 {stored or '-'}，已更新")
+    return resolved
+
+
+def _schedule_hostname_ip_sync(endpoint: dict[str, Any] | None) -> None:
+    if not isinstance(endpoint, dict):
+        return
+    eid = str(endpoint.get("endpoint_id") or "")
+    hostname = str(endpoint.get("hostname") or "").strip()
+    if not eid or not hostname or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname):
+        return
+    now = time.time()
+    if now - float(_hostname_ip_sync_at.get(eid) or 0) < 600:
+        return
+    _hostname_ip_sync_at[eid] = now
+    snapshot = dict(endpoint)
+    threading.Thread(
+        target=align_connected_hostname_ip,
+        args=(snapshot,),
+        daemon=True,
+        name="hostname-ip-sync",
+    ).start()
+
+
 def remember_live_connection(endpoint_id: str = "", openvpn_node_id: str = "") -> None:
     eid = str(endpoint_id or "").strip() or _resolve_openvpn_endpoint_id(openvpn_node_id)
     set_state(active_connected_at=time.time(), active_connected_endpoint=eid)
@@ -5013,6 +5087,10 @@ def remember_live_connection(endpoint_id: str = "", openvpn_node_id: str = "") -
         node_pool.note_connection_started(eid)
     except Exception as exc:
         log_to_json("WARNING", "Routing", f"记录连接时间失败: {exc}")
+    try:
+        align_connected_hostname_ip(node_pool.get_endpoint(eid))
+    except Exception as exc:
+        log_to_json("WARNING", "Routing", f"主连接域名核对失败: {exc}")
 
 
 def remember_connection_ended(endpoint_id: str = "", openvpn_node_id: str = "") -> None:
