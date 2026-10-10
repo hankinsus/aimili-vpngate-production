@@ -4605,6 +4605,8 @@ def routing_target_country(ui_cfg: dict[str, Any]) -> str:
     return ""
 
 def routing_favorite_rank(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) -> int:
+    if endpoint_is_blocked(endpoint, ui_cfg):
+        return 1
     favorites = {str(x) for x in (ui_cfg.get("favorite_node_ids") or []) if str(x)}
     if not favorites:
         return 1
@@ -7283,6 +7285,43 @@ def _overlay_dataplane(state: dict[str, Any]) -> None:
     state["accept_wait_ms"] = int(raw.get("accept_wait_ms") or 0)
 
 
+def _purge_blocked_standby(ui_cfg: dict[str, Any] | None = None) -> None:
+    """A blocked IP or domain cannot stay as cold or precold."""
+    ui_cfg = ui_cfg or load_ui_config()
+    if not routing_block_rules(ui_cfg):
+        return
+    cold = _cold_state()
+    changed = False
+    published = _cold_eid(str(cold.get("published") or ""))
+    if published:
+        try:
+            found = node_pool.get_endpoint(published)
+        except Exception:
+            found = None
+        if isinstance(found, dict) and endpoint_is_blocked(found, ui_cfg):
+            cold["published"] = ""
+            changed = True
+            set_state(standby_prepared=False, standby_node_id="", standby_ip="", standby_port=0, standby_protocol="")
+            log_to_json("INFO", "Standby", f"屏蔽列表移除冷备 {_endpoint_ip(found)}")
+    kept: list[str] = []
+    for raw in cold.get("precold") or []:
+        eid = _cold_eid(raw)
+        try:
+            found = node_pool.get_endpoint(eid) if eid else None
+        except Exception:
+            found = None
+        if isinstance(found, dict) and endpoint_is_blocked(found, ui_cfg):
+            changed = True
+            log_to_json("INFO", "Standby", f"屏蔽列表移除预冷备 {_endpoint_ip(found)}")
+            continue
+        kept.append(str(raw))
+    if list(cold.get("precold") or []) != kept:
+        cold["precold"] = kept
+        changed = True
+    if changed:
+        _save_cold_state()
+
+
 def _open_cold_round(candidates: dict[str, dict[str, Any]]) -> None:
     """One new round per pass. Do not un-fail a node again inside the same pass."""
     cold = _cold_state()
@@ -7926,6 +7965,7 @@ def _verify_one_standby_real(candidates: dict[str, dict[str, Any]]) -> None:
 
 def cold_standby_pass() -> None:
     ui_cfg = load_ui_config()
+    _purge_blocked_standby(ui_cfg)
     if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
         _publish_cold_standby(None)
         _cold_candidates.stats = {}
@@ -9783,6 +9823,8 @@ def _prepend_favorite_bench(grouped: dict[str, list[str]]) -> None:
         except Exception:
             endpoint = None
         if not endpoint:
+            continue
+        if endpoint_is_blocked(endpoint, ui_cfg):
             continue
         country = normalized_country_name(endpoint.get("country"))
         if not country:
@@ -23691,6 +23733,7 @@ class Handler(BaseHTTPRequestHandler):
                     write_json(auth_file, ui_cfg)
                 invalidate_ui_config_cache()
                 publish_proxy_auth(proxy_user, proxy_pass)
+                _purge_blocked_standby(ui_cfg)
 
                 clear_manual_route_pin()
                 invalidate_scheme_snapshot()
