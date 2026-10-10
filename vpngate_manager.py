@@ -12010,6 +12010,7 @@ INDEX_HTML = r"""<!doctype html>
       color: #e7eef6;
       font-weight: 500;
     }
+    .server-self-break { display: none; }
     @media (max-width: 768px) {
       .country-priority {
         flex-wrap: wrap;
@@ -13485,6 +13486,12 @@ INDEX_HTML = r"""<!doctype html>
         text-align: left;
         line-height: 1.5;
       }
+      .server-self-break { display: block; height: 2px; }
+      .egress-switch-wrap {
+        align-self: flex-end;
+        margin-left: auto;
+      }
+      .active-card .egress-switch button { width: auto; }
     }
 
     /* Admin dropdown styles */
@@ -15551,7 +15558,9 @@ function triState(value) {
 }
 
 function egressHealthBadge(state) {
-  if (state.connection_status === 'connecting') return ['正在连接', 'not_checked'];
+  const proxyOk = triState(state.client_proxy_ok);
+  const tunnelUp = state.active_tunnel_ok === true;
+  if (state.connection_status === 'connecting' && proxyOk !== true && !tunnelUp) return ['正在连接', 'not_checked'];
   const udpDown = triState(state.client_udp_ok) === false;
   const quicDown = triState(state.client_quic_ok) === false;
   if (state.egress_mode === 'direct') {
@@ -17115,12 +17124,14 @@ function currentServerMetaHtml() {
   if (!ip && !country && !location) return "";
   const place = formatNodeLocation({country, location}) || translateCountry(country);
   const flag = countryFlag(code || country || place, translateCountry(country) || place, "eager");
-  const bits = [];
-  if (ip) bits.push('<span class="mono">当前服务器：' + esc(ip) + '</span>');
-  if (place) bits.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
-  if (owner) bits.push('<span>' + esc(owner) + '</span>');
-  if (ipType) bits.push('<span>' + esc(translateIpType(ipType)) + '</span>');
-  return bits.join('<span class="meta-dot"> </span>');
+  const head = ip ? '<span class="mono server-self-ip">当前服务器：' + esc(ip) + '</span>' : '';
+  const tail = [];
+  if (place) tail.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
+  if (owner) tail.push('<span>' + esc(owner) + '</span>');
+  if (ipType) tail.push('<span>' + esc(translateIpType(ipType)) + '</span>');
+  const body = tail.join('<span class="meta-dot"> </span>');
+  if (head && body) return head + '<span class="server-self-break"></span>' + body;
+  return head || body;
 }
 
 function paintPriorityStatus() {
@@ -25243,7 +25254,7 @@ def _publish_fast_state_overlay(state: dict[str, Any]) -> None:
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["active_pool_endpoint_id"] = active_pool_endpoint_id
     state["maintenance_running"] = maintenance_lock.locked()
-    if is_connecting or manual_connection_active or failover_lock.locked():
+    if (is_connecting or manual_connection_active or failover_lock.locked()) and not active_tunnel_running():
         state["connection_status"] = "connecting"
         state["connection_message"] = "正在建立或切换 VPN 隧道"
         state["client_status"] = "validating"
