@@ -8799,16 +8799,16 @@ def _sample_exit_speed(interface: str) -> int:
     subprocess.run(["ip", "route", "replace", "default", "via", peer, "dev", interface, "table", "121"], timeout=3, check=False)
     subprocess.run(["ip", "rule", "add", "from", local, "lookup", "121", "priority", "121"], timeout=3, check=False)
     try:
-        sample = max(131072, min(SPEED_TEST_BYTES, 1048576))
+        sample = 2_000_000
         proc = subprocess.run(
             [
                 "curl", "-4", "-sS", "-o", "/dev/null", "--interface", local,
-                "--connect-timeout", "4", "--max-time", "6",
+                "--connect-timeout", "4", "--max-time", "8",
                 "-H", f"Range: bytes=0-{sample - 1}",
                 "-w", "%{size_download} %{time_total}",
                 "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
             ],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=12,
         )
         bits = (proc.stdout or "").split()
         if len(bits) >= 2:
