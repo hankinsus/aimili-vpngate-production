@@ -12298,7 +12298,7 @@ INDEX_HTML = r"""<!doctype html>
       color: #f4f7fb;
     }
     .active-server-corner .server-self-v6 {
-      margin-left: 0;
+      margin-left: 14px;
       font-size: 13px;
       font-weight: 500;
       color: #c5d0dc;
@@ -13738,6 +13738,7 @@ INDEX_HTML = r"""<!doctype html>
       }
       .active-server-corner .server-self-v6 {
         grid-column: 2;
+        margin-left: 0;
         font-size: 13px;
         font-weight: 500;
       }
