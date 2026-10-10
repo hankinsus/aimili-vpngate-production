@@ -13359,35 +13359,108 @@ INDEX_HTML = r"""<!doctype html>
     @media (max-width: 768px) {
       header {
         flex-direction: column;
-        align-items: flex-start;
-        padding: 16px 20px;
-      }
-      .btn-group {
-        width: 100%;
-        margin-top: 12px;
-      }
-      .btn-group button, .btn-group .btn-telegram {
-        flex: 1;
-      }
-      .btn-group .dropdown {
-        flex: 1;
-        display: flex;
-      }
-      .btn-group .dropdown button {
-        width: 100%;
-        flex: 1;
+        align-items: stretch;
+        padding: 12px 14px;
+        gap: 8px;
       }
       main {
-        padding: 16px 20px;
+        padding: 16px 14px;
       }
       .active-card {
         flex-direction: column;
         align-items: flex-start;
         gap: 16px;
       }
-      .active-card button {
+    }
+
+    @media (max-width: 699px) {
+      h1 { font-size: 17px; gap: 8px; }
+      .header-brand-system { font-size: 0.78em; }
+      .btn-group {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
         width: 100%;
+        margin-top: 0;
       }
+      .btn-group .dropdown {
+        display: block;
+        min-width: 0;
+        position: relative;
+      }
+      .btn-group button,
+      .btn-group .btn-telegram {
+        width: 100%;
+        min-width: 0;
+        height: 36px;
+        padding: 0 6px;
+        font-size: 12px;
+        flex: none;
+      }
+      #github_dropdown {
+        left: 0;
+        right: auto;
+        width: min(320px, calc(100vw - 24px));
+        min-width: 0;
+        max-height: 70vh;
+        overflow: auto;
+      }
+      #admin_dropdown {
+        left: auto;
+        right: 0;
+        max-width: calc(100vw - 24px);
+      }
+      .active-card button { width: 100%; }
+    }
+
+    @media (min-width: 700px) and (max-width: 1180px) {
+      header {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: center;
+        padding: 12px 18px;
+        gap: 10px;
+      }
+      .brand { flex: 1 1 260px; min-width: 0; }
+      h1 { font-size: 18px; }
+      .btn-group {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 8px;
+        flex: 1 1 560px;
+        width: auto;
+        min-width: min(100%, 520px);
+        margin-top: 0;
+      }
+      .btn-group .dropdown {
+        display: block;
+        min-width: 0;
+        position: relative;
+      }
+      .btn-group button,
+      .btn-group .btn-telegram {
+        width: 100%;
+        min-width: 0;
+        height: 36px;
+        padding: 0 8px;
+        font-size: 12px;
+        flex: none;
+      }
+      #github_dropdown {
+        left: 0;
+        right: auto;
+        width: min(340px, calc(100vw - 32px));
+        min-width: 0;
+        max-height: 70vh;
+        overflow: auto;
+      }
+      #admin_dropdown {
+        left: auto;
+        right: 0;
+        max-width: calc(100vw - 32px);
+      }
+      main { padding: 18px; }
+      .active-card { flex-wrap: wrap; gap: 16px; }
     }
 
     /* Admin dropdown styles */
