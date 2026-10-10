@@ -15859,6 +15859,14 @@ function nodeIsBlocked(node) {
   return hit.ip || hit.domain;
 }
 
+function nodeIsFavorite(node) {
+  const ids = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
+  const id = String(node?.id || "");
+  const poolId = String(node?.pool_endpoint_id || "");
+  const favId = poolId ? ("pool:" + poolId) : id;
+  return ids.includes(favId) || ids.includes(id) || (!!poolId && ids.includes(poolId));
+}
+
 function matchesNodeFilters(n, ignoreCountry = false) {
   if (!n) return false;
   const selectedCountry = $("country_filter")?.value || "";
@@ -15902,8 +15910,7 @@ function matchesNodeFilters(n, ignoreCountry = false) {
   if (selectedStatus === "testing" && n.probe_status !== "testing") return false;
   if (selectedStatus === "unavailable" && (n.probe_status !== "unavailable" || n.active)) return false;
 
-  const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
-  if (showFavoritesOnly && !favoriteIds.includes(n.id)) return false;
+  if (showFavoritesOnly && !nodeIsFavorite(n)) return false;
   return true;
 }
 
@@ -16647,8 +16654,7 @@ function getFilteredNodes() {
   // The server already applied the shared filter. Re-checking here hid rows
   // the page query had accepted. Favorites stay local because they are not
   // a Master Pool column.
-  const favoriteIds = new Set(Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : []);
-  if (showFavoritesOnly) return nodes.filter(n => n && favoriteIds.has(n.id));
+  if (showFavoritesOnly) return nodes.filter(n => n && nodeIsFavorite(n));
   return nodes.filter(n => !!n);
 }
 
@@ -17638,7 +17644,8 @@ function pageCacheKey(scope, offset, limit) {
     String(scope.speedMinBps || 0),
     String(scope.latency || ""),
     String(offset),
-    String(limit)
+    String(limit),
+    showFavoritesOnly ? "fav" : ""
   ].join("|");
 }
 
@@ -17735,6 +17742,7 @@ function noteResident(scope, list, total) {
 }
 
 function tryApplyLocalScope(country) {
+  if (showFavoritesOnly) return false;
   if (!residentScope || residentNodes.length === 0) return false;
   const next = readListScope();
   next.country = String(country || "").trim();
@@ -17786,6 +17794,7 @@ async function fetchScopedNodePage(offset, limit = 100, timeoutMs = 12000, signa
   if (scope.ipType) params.set("ip_type", scope.ipType);
   if (scope.speedMinBps) params.set("speed_min_bps", scope.speedMinBps < 0 ? "below10" : String(scope.speedMinBps));
   if (scope.latency) params.set("latency", scope.latency);
+  if (showFavoritesOnly) params.set("favorites", "1");
   const data = await fetchJsonWithTimeout("./api/ui/nodes?" + params.toString(), signal ? {signal} : {}, timeoutMs);
   if (bumpSeq && data && typeof data === "object") data._nodeQuerySeq = seq;
   if (data && typeof data === "object") rememberNodePage(key, data);
@@ -19406,7 +19415,8 @@ let showFavoritesOnly = false;
 function toggleFavoritesView() {
   showFavoritesOnly = !showFavoritesOnly;
   currentPage = 1;
-  render();
+  const generation = ++scopeLoadGeneration;
+  loadScopedNodes(String($("country_filter")?.value || activeCountryScope || ""), generation).catch(() => {});
 }
 
 function updateFavPanelUI() {
@@ -22750,10 +22760,29 @@ class Handler(BaseHTTPRequestHandler):
                 protocol = str((query.get("protocol") or [""])[0]).strip().lower()
                 ip_type = str((query.get("ip_type") or [""])[0]).strip().lower()
                 speed_min_bps = _parse_speed_filter((query.get("speed_min_bps") or ["0"])[0])
+                favorites_only = str((query.get("favorites") or ["0"])[0]).strip().lower() in ("1", "true", "yes")
                 try:
                     latency = normalize_routing_latency((query.get("latency") or [""])[0])
                 except ValueError:
                     latency = ""
+                if favorites_only:
+                    fav_nodes = [
+                        node for node in _favorite_ui_nodes()
+                        if _node_matches_ui_scope(node, country, status, protocol, ip_type, speed_min_bps, latency)
+                    ]
+                    page_nodes = fav_nodes[offset:offset + limit]
+                    self.send_json({
+                        "ok": True,
+                        "nodes": page_nodes,
+                        "offset": offset,
+                        "limit": limit,
+                        "total": len(fav_nodes),
+                        "has_more": offset + len(page_nodes) < len(fav_nodes),
+                        "cache_building": False,
+                        "scope": {"country": country, "status": status, "protocol": protocol, "ip_type": ip_type, "speed_min_bps": speed_min_bps, "latency": latency, "favorites": True},
+                        "generated_at": time.time(),
+                    })
+                    return
                 if offset == 0 and status == "usable" and not protocol and not ip_type and not speed_min_bps and not latency:
                     active_now = str(active_pool_endpoint_id or active_openvpn_node_id or "")
                     country_key = normalized_country_name(country) if country else ""
@@ -25216,6 +25245,34 @@ def _pin_connected_then_standby(page_nodes: list[dict[str, Any]]) -> list[dict[s
         seen.add(key)
         unique.append(node)
     return unique
+
+
+def _favorite_ui_nodes() -> list[dict[str, Any]]:
+    """Saved favorites, in the order they were clicked. Missing rows are skipped."""
+    try:
+        ui_cfg = load_ui_config()
+    except Exception:
+        return []
+    nodes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in ui_cfg.get("favorite_node_ids") or []:
+        eid = str(raw or "").strip()
+        if eid.startswith("pool:"):
+            eid = eid[5:]
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        try:
+            endpoint = node_pool.get_endpoint(eid)
+        except Exception:
+            endpoint = None
+        if not endpoint:
+            continue
+        try:
+            nodes.append(protocol_endpoint_to_ui_node(endpoint))
+        except Exception:
+            continue
+    return nodes
 
 
 def _get_ui_nodes_page(offset=0, limit=100, country="", status="", protocol="", ip_type="", speed_min_bps=0, latency=""):
