@@ -11998,41 +11998,43 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .active-server-corner-line > .server-self-stack {
-      display: inline-grid;
-      grid-template-columns: max-content max-content;
-      column-gap: 0;
-      row-gap: 2px;
-      justify-items: start;
-      text-align: left;
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 3px;
       max-width: 100%;
       vertical-align: top;
+      text-align: right;
     }
-    .active-server-corner .server-self-stack > .server-self-label {
-      grid-column: 1;
-      grid-row: 1;
+    .server-self-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: flex-end;
+      gap: 14px;
+      white-space: nowrap;
+    }
+    .active-server-corner .server-self-label {
       line-height: 22px;
       white-space: nowrap;
+      font-weight: 500;
     }
-    .active-server-corner .server-self-stack > .server-self-ip {
-      grid-column: 2;
-      grid-row: 1;
-      display: block;
+    .active-server-corner .server-self-ip {
+      font-size: 18px;
+      font-weight: 800;
+      color: #f4f7fb;
       white-space: nowrap;
     }
-    .active-server-corner .server-self-stack > .server-self-v6 {
-      grid-column: 2;
-      grid-row: 2;
-      display: block;
+    .active-server-corner .server-self-v6 {
+      font-size: 13px;
+      font-weight: 500;
+      color: #c5d0dc;
       white-space: nowrap;
     }
-    .active-server-corner .server-self-stack > .server-self-place {
-      grid-column: 1 / -1;
+    .active-server-corner .server-self-place {
       display: block;
-      justify-self: stretch;
-      width: 0;
-      min-width: 100%;
+      max-width: 100%;
       text-align: right;
-      white-space: normal;
+      white-space: nowrap;
     }
     .active-server-corner .active-location-with-flag {
       display: inline-flex !important;
@@ -12060,9 +12062,14 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 500;
     }
     .active-server-corner .server-self-ip {
-      font-size: 16px;
-      font-weight: 700;
+      font-size: 18px;
+      font-weight: 800;
       color: #f4f7fb;
+    }
+    .active-server-corner .server-self-v6 {
+      font-size: 13px;
+      font-weight: 500;
+      color: #c5d0dc;
     }
     @media (max-width: 768px) {
       .country-priority {
@@ -13429,8 +13436,22 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     @media (max-width: 699px) {
-      h1 { font-size: 17px; gap: 8px; }
-      .header-brand-system { font-size: 0.78em; }
+      h1 {
+        font-size: 20px;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: center;
+        text-align: center;
+      }
+      .brand { align-items: center; width: 100%; }
+      header { align-items: center; gap: 12px; }
+      .header-brand-system {
+        flex: 1 0 100%;
+        font-size: 15px;
+        font-weight: 700;
+        text-align: center;
+        line-height: 1.35;
+      }
       .btn-group {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -13451,9 +13472,10 @@ INDEX_HTML = r"""<!doctype html>
       .btn-group .btn-telegram {
         width: 100%;
         min-width: 0;
-        height: 36px;
-        padding: 0 6px;
-        font-size: 12px;
+        height: 40px;
+        padding: 0 8px;
+        font-size: 14px;
+        font-weight: 700;
         flex: none;
       }
       #github_dropdown {
@@ -13469,13 +13491,28 @@ INDEX_HTML = r"""<!doctype html>
         right: 0;
         max-width: calc(100vw - 24px);
       }
-      .active-server-corner .server-self-stack > .server-self-place {
+      .active-server-corner .server-self-stack {
+        align-items: flex-start;
+        width: 100%;
         text-align: left;
       }
-      .active-server-corner .server-self-stack > .server-self-ip,
-      .active-server-corner .server-self-stack > .server-self-v6 {
-        white-space: normal;
-        overflow-wrap: anywhere;
+      .active-server-corner .server-self-row {
+        display: grid;
+        grid-template-columns: auto auto;
+        justify-content: start;
+        column-gap: 0;
+        row-gap: 2px;
+      }
+      .active-server-corner .server-self-v6 {
+        grid-column: 2;
+        font-size: 13px;
+        font-weight: 500;
+      }
+      .active-server-corner .server-self-place {
+        text-align: left;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
       }
       .modal {
         align-items: flex-start;
@@ -13591,8 +13628,8 @@ INDEX_HTML = r"""<!doctype html>
         white-space: normal;
       }
       .active-server-corner .server-self-ip {
-        font-size: 16px;
-        font-weight: 700;
+        font-size: 17px;
+        font-weight: 800;
         color: #f4f7fb;
       }
       .egress-switch-wrap {
@@ -17244,9 +17281,11 @@ function currentServerMetaHtml() {
   if (ipType) bits.push('<span>' + esc(translateIpType(ipType)) + '</span>');
   if (!ip && !ip6 && !bits.length) return "";
   return '<span class="server-self-stack">'
+    + '<span class="server-self-row">'
     + ((ip || ip6) ? '<span class="server-self-label">当前服务器：</span>' : '')
     + (ip ? '<span class="mono server-self-ip">' + esc(ip) + '</span>' : '')
-    + (ip6 ? '<span class="mono server-self-ip server-self-v6">' + esc(ip6) + '</span>' : '')
+    + (ip6 ? '<span class="mono server-self-v6">' + esc(ip6) + '</span>' : '')
+    + '</span>'
     + (bits.length ? '<span class="server-self-place">' + bits.join('<span class="meta-dot"> </span>') + '</span>' : '')
     + '</span>';
 }
