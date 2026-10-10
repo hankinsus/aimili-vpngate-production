@@ -11967,24 +11967,31 @@ INDEX_HTML = r"""<!doctype html>
       left: 340px;
       display: flex;
       justify-content: flex-end;
-      align-items: center;
+      align-items: flex-start;
       min-width: 0;
-      overflow: hidden;
+      overflow: visible;
       z-index: 2;
       pointer-events: none;
     }
     .active-server-corner-line {
-      flex: 0 0 auto;
+      flex: 0 1 auto;
+      max-width: 100%;
       color: #d5dee8;
       font-size: 13px;
       font-weight: 500;
       line-height: 22px;
-      white-space: nowrap;
+      white-space: normal;
+      text-align: right;
     }
     .active-server-corner-line > span,
     .active-server-corner .meta-dot {
       display: inline;
       white-space: nowrap;
+    }
+    .active-server-corner-line > .server-self-break {
+      display: block;
+      height: 3px;
+      white-space: normal;
     }
     .active-server-corner .active-location-with-flag {
       display: inline-flex !important;
@@ -11993,6 +12000,7 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 0;
       vertical-align: middle;
       flex: none;
+      margin-left: 0;
     }
     .active-server-corner .active-location-with-flag > span:last-child {
       display: inline;
@@ -12010,7 +12018,11 @@ INDEX_HTML = r"""<!doctype html>
       color: #e7eef6;
       font-weight: 500;
     }
-    .server-self-break { display: none; }
+    .active-server-corner .server-self-ip {
+      font-size: 16px;
+      font-weight: 700;
+      color: #f4f7fb;
+    }
     @media (max-width: 768px) {
       .country-priority {
         flex-wrap: wrap;
