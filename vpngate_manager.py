@@ -13411,6 +13411,8 @@ INDEX_HTML = r"""<!doctype html>
         right: 0;
         max-width: calc(100vw - 24px);
       }
+      #btn_add_node { grid-column: 2; }
+      .btn-group > .dropdown:last-child { grid-column: 3; }
       .active-card button { width: 100%; }
     }
 
@@ -13486,10 +13488,24 @@ INDEX_HTML = r"""<!doctype html>
         text-align: left;
         line-height: 1.5;
       }
-      .server-self-break { display: block; height: 2px; }
+      .active-server-corner-line > .server-self-line {
+        display: block;
+        white-space: normal;
+      }
+      .active-server-corner-line > .server-self-break {
+        display: block;
+        height: 4px;
+        white-space: normal;
+      }
+      .active-server-corner .server-self-ip {
+        font-size: 16px;
+        font-weight: 700;
+        color: #f4f7fb;
+      }
       .egress-switch-wrap {
-        align-self: flex-end;
+        align-self: center;
         margin-left: auto;
+        margin-right: auto;
       }
       .active-card .egress-switch button { width: auto; }
     }
@@ -17123,7 +17139,7 @@ function currentServerMetaHtml() {
   if (!ip && !country && !location) return "";
   const place = formatNodeLocation({country, location}) || translateCountry(country);
   const flag = countryFlag(code || country || place, translateCountry(country) || place, "eager");
-  const head = ip ? '<span class="mono server-self-ip">当前服务器：' + esc(ip) + '</span>' : '';
+  const head = ip ? '<span class="server-self-line">当前服务器：<span class="mono server-self-ip">' + esc(ip) + '</span></span>' : '';
   const tail = [];
   if (place) tail.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
   if (owner) tail.push('<span>' + esc(owner) + '</span>');
