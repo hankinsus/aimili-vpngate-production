@@ -4631,7 +4631,7 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
         return 99
 
     # All routing preferences are soft priorities. The ordering is deliberate:
-    # 1) server-local country, 2) favorite/custom preference group,
+    # 1) favorites, 2) server-local country,
     # 3) mobile -> residential -> hosting -> proxy/other,
     # 4) >=500 Mbps -> >=50 Mbps -> slower fallback.
     # Latency and real web usability remain the final service-quality sort keys.
@@ -4640,7 +4640,7 @@ def routing_preference_tier(endpoint: dict[str, Any], ui_cfg: dict[str, Any]) ->
     favorite_rank = routing_favorite_rank(endpoint, ui_cfg)
     ip_rank = ip_type_preference_rank(ui_cfg.get("routing_ip_type", "all"), endpoint_ip_type(endpoint))
     speed_gate = routing_speed_gate(endpoint)
-    return country_rank * 10000 + favorite_rank * 1000 + ip_rank * 100 + speed_gate * 10
+    return favorite_rank * 100000 + country_rank * 10000 + ip_rank * 100 + speed_gate * 10
 
 def routing_session_rank(endpoint: dict[str, Any]) -> int:
     """0 会话且带宽够用最优先。10 以内优质，其后 20/30/50/80/100/100+。没有会话数据时保持中性。"""
@@ -7157,8 +7157,8 @@ def _cold_candidates(ui_cfg: dict[str, Any]) -> dict[str, dict[str, Any]] | None
         latency = endpoint_display_latency_ms(endpoint) or 999999
         country_rank = country_latency.get(country, 999999) if tier in (4, 5, 8) else 0
         return (
-            tier,
             int(endpoint.get("routing_favorite_rank") or 1),
+            tier,
             country_rank,
             latency,
             -_endpoint_speed_bps(endpoint),
@@ -9764,9 +9764,40 @@ def _bench_interval_seconds() -> int:
     return hours * 3600
 
 
+def _prepend_favorite_bench(grouped: dict[str, list[str]]) -> None:
+    """Favorites are checked first inside the 3-hour country quota. Still no tunnel."""
+    try:
+        ui_cfg = load_ui_config()
+    except Exception:
+        return
+    seen: set[str] = set()
+    for raw in ui_cfg.get("favorite_node_ids") or []:
+        eid = str(raw or "").strip()
+        if eid.startswith("pool:"):
+            eid = eid[5:]
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        try:
+            endpoint = node_pool.get_endpoint(eid)
+        except Exception:
+            endpoint = None
+        if not endpoint:
+            continue
+        country = normalized_country_name(endpoint.get("country"))
+        if not country:
+            continue
+        bucket = grouped.setdefault(country, [])
+        if eid in bucket:
+            bucket.remove(eid)
+        bucket.insert(0, eid)
+        del bucket[24:]
+
+
 def _run_country_bench() -> None:
     """Port and latency for up to six nodes in every country. Never a tunnel."""
     grouped = node_pool.country_probe_ids(24)
+    _prepend_favorite_bench(grouped)
     own_hits: dict[str, list[tuple[str, int]]] = {}
     writes: list[tuple[str, bool, int, str]] = []
     for country, endpoint_ids in grouped.items():
@@ -13454,7 +13485,7 @@ INDEX_HTML = r"""<!doctype html>
 
     @media (max-width: 699px) {
       h1 {
-        font-size: 15px;
+        font-size: 17px;
         gap: 8px;
         flex-wrap: nowrap;
         justify-content: center;
@@ -13465,7 +13496,7 @@ INDEX_HTML = r"""<!doctype html>
       header { align-items: center; gap: 16px; padding-top: 18px; padding-bottom: 14px; }
       .header-brand-system {
         flex: 0 0 auto;
-        font-size: 15px;
+        font-size: 17px;
         font-weight: 700;
         text-align: center;
         line-height: 1.2;
