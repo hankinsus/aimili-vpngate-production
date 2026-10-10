@@ -252,6 +252,7 @@ active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
 active_external_tunnel: tunnel_adapters.TunnelResult | None = None
 active_pool_endpoint_id = ""
+startup_exit_restore_pending = True
 protocol_discovery_lock = threading.Lock()
 protocol_probe_lock = threading.BoundedSemaphore(4)
 probe_route_table_lock = threading.Lock()
@@ -5091,6 +5092,14 @@ def remember_live_connection(endpoint_id: str = "", openvpn_node_id: str = "") -
         align_connected_hostname_ip(node_pool.get_endpoint(eid))
     except Exception as exc:
         log_to_json("WARNING", "Routing", f"主连接域名核对失败: {exc}")
+    try:
+        write_json(DATA_DIR / "last_exit.json", {
+            "endpoint_id": eid,
+            "openvpn_node_id": str(openvpn_node_id or active_openvpn_node_id or ""),
+            "at": time.time(),
+        })
+    except Exception:
+        pass
 
 
 def remember_connection_ended(endpoint_id: str = "", openvpn_node_id: str = "") -> None:
@@ -7282,16 +7291,28 @@ def _select_precold_ids(candidates: dict[str, dict[str, Any]], cold_eid: str) ->
         skip.add(published)
     skip.discard("")
     failed = {str(item) for item in (_cold_state().get("failed") or [])}
+    existing = [
+        _cold_eid(item)
+        for item in (_cold_state().get("precold") or [])
+        if _cold_eid(item) and _cold_eid(item) in candidates and _cold_eid(item) not in skip and _cold_eid(item) not in failed
+    ]
     fresh: list[str] = []
     rotated: list[str] = []
     for eid in candidates:
         if not eid or eid in skip:
             continue
-        if eid in failed:
-            rotated.append(eid)
+        if eid in failed or eid in existing:
+            if eid in failed:
+                rotated.append(eid)
         else:
             fresh.append(eid)
-    picked = fresh[:PRECOLD_TARGET]
+    picked = existing[:PRECOLD_TARGET]
+    if len(picked) < PRECOLD_TARGET:
+        for eid in fresh:
+            if eid not in picked:
+                picked.append(eid)
+            if len(picked) >= PRECOLD_TARGET:
+                break
     if len(picked) < PRECOLD_TARGET:
         picked.extend(rotated[: PRECOLD_TARGET - len(picked)])
     return picked
@@ -7415,6 +7436,9 @@ def _open_cold_round(candidates: dict[str, dict[str, Any]]) -> None:
 def _pick_cold(candidates: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     cold = _cold_state()
     failed = {eid for eid in cold["failed"] if eid in candidates}
+    published = _cold_eid(str(cold.get("published") or ""))
+    if published and published in candidates and published not in failed:
+        return candidates[published]
     for eid in candidates:
         if eid not in failed:
             return candidates[eid]
@@ -8042,6 +8066,8 @@ def _verify_one_standby_real(candidates: dict[str, dict[str, Any]]) -> None:
 
 
 def cold_standby_pass() -> None:
+    if startup_exit_restore_pending:
+        return
     ui_cfg = load_ui_config()
     _purge_blocked_standby(ui_cfg)
     if not bool(ui_cfg.get("connection_enabled", True)) or str(ui_cfg.get("routing_mode") or "") == "fixed_ip":
@@ -26516,48 +26542,119 @@ def reap_orphan_protocol_tunnels() -> None:
         log_to_json("WARNING", "VPN", f"清理 L2TP 残留失败: {exc}")
 
 
-def startup_recovery_loop():
-    """One-shot boot recovery; a failed startup must not churn forever.
+def _saved_exit_endpoint() -> dict[str, Any] | None:
+    raw = read_json(DATA_DIR / "last_exit.json", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    eid = str(raw.get("endpoint_id") or "").strip()
+    if eid.startswith("pool:"):
+        eid = eid.split(":", 1)[1]
+    if not eid:
+        eid = _resolve_openvpn_endpoint_id(str(raw.get("openvpn_node_id") or ""))
+    if not eid:
+        return None
+    try:
+        found = node_pool.get_endpoint(eid)
+    except Exception:
+        found = None
+    return found if isinstance(found, dict) else None
 
-    A browser refresh does not restart this task. The old implementation ran
-    every 15 seconds and could spend several minutes cycling through SoftEther/
-    SSTP/L2TP candidates while the UI continuously showed a stale-looking
-    "正在连接" state. Normal maintenance/failover loops remain responsible
-    for later recovery.
-    """
+
+def _dial_saved_endpoint(endpoint: dict[str, Any] | None, label: str) -> bool:
+    if not endpoint:
+        return False
+    ip = _endpoint_ip(endpoint)
+    if _cold_port_open(endpoint) is False:
+        log_to_json("INFO", "VPN", f"{label}端口不可用，不接回 {ip}")
+        return False
     try:
-        # Previous process is gone, so nothing in memory owns the vpnclient
-        # sessions or netns it left behind. Drop them before dialing again.
-        reap_orphan_protocol_tunnels()
+        connect_ranked_endpoint(endpoint, manual=False, fast=True)
     except Exception as exc:
-        log_to_json("WARNING", "VPN", f"启动清理残留隧道失败: {exc}")
-    time.sleep(8)
-    try:
-        if initial_bootstrap_active:
-            return
-        ui_cfg = load_ui_config()
-        if not bool(ui_cfg.get("connection_enabled", True)):
-            return
-        if global_pool_refresh_running or ui_command_plane.is_busy() or manual_connection_active or is_connecting or active_tunnel_running():
-            return
-        set_state(
-            last_check_message="启动恢复：正在尝试一次已验证备用节点连接；失败后交给后台维护周期重试。"
-        )
-        connected = _ensure_active_client_v2()
-        if connected:
-            set_state(last_check_message="启动恢复完成：已建立可用 VPN 出口。")
-        else:
-            set_state(
-                last_check_message="启动恢复未建立连接；不会循环占用检测，后台维护将在下一周期自动重试。"
-            )
-    except Exception as exc:
-        log_to_json("WARNING", "VPN", f"启动恢复任务异常: {exc}")
+        log_to_json("WARNING", "VPN", f"{label}接回失败 {ip}: {exc}")
+        return False
+    if active_tunnel_running():
+        log_to_json("INFO", "VPN", f"{label}已接回 {ip}")
+        return True
+    return False
+
+
+def _restore_previous_exit() -> str:
+    """Reconnect the last main. Cold and precold only if that main is down."""
+    previous = _saved_exit_endpoint()
+    if _dial_saved_endpoint(previous, "上次主连接"):
+        return "main"
+    previous_id = str((previous or {}).get("endpoint_id") or "")
+    cold = _cold_state()
+    published = _cold_eid(str(cold.get("published") or ""))
+    order: list[str] = []
+    if published:
+        order.append(published)
+    for item in cold.get("precold") or []:
+        eid = _cold_eid(item)
+        if eid and eid not in order:
+            order.append(eid)
+    for eid in order:
+        if eid == previous_id:
+            continue
         try:
-            set_state(
-                last_check_message=f"启动恢复未完成：{exc}；后台维护将在下一周期自动重试。"
-            )
+            endpoint = node_pool.get_endpoint(eid)
         except Exception:
-            pass
+            endpoint = None
+        label = "上次冷备" if eid == published else "上次预冷备"
+        if _dial_saved_endpoint(endpoint if isinstance(endpoint, dict) else None, label):
+            return "standby"
+    return ""
+
+
+def startup_recovery_loop():
+    """One-shot boot recovery. Reuse the last main, then its cold and precold.
+
+    A browser refresh does not restart this task. A new IP is chosen only when
+    the saved main and its saved standbys cannot be dialed.
+    """
+    global startup_exit_restore_pending
+    try:
+        try:
+            # Previous process is gone, so nothing in memory owns the vpnclient
+            # sessions or netns it left behind. Drop them before dialing again.
+            reap_orphan_protocol_tunnels()
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"启动清理残留隧道失败: {exc}")
+        time.sleep(8)
+        try:
+            if initial_bootstrap_active:
+                return
+            ui_cfg = load_ui_config()
+            if not bool(ui_cfg.get("connection_enabled", True)):
+                return
+            if global_pool_refresh_running or ui_command_plane.is_busy() or manual_connection_active or is_connecting or active_tunnel_running():
+                return
+            set_state(last_check_message="启动恢复：正在接回上次主连接")
+            restored = _restore_previous_exit()
+            if restored == "main":
+                set_state(last_check_message="启动恢复完成：已接回上次主连接")
+                return
+            if restored == "standby":
+                set_state(last_check_message="启动恢复完成：上次主连接不可用，已接上原来的冷备")
+                return
+            set_state(last_check_message="上次主连接和冷备都不可用，正在按代理设置重选")
+            connected = _ensure_active_client_v2()
+            if connected:
+                set_state(last_check_message="启动恢复完成：已建立可用 VPN 出口。")
+            else:
+                set_state(
+                    last_check_message="启动恢复未建立连接；不会循环占用检测，后台维护将在下一周期自动重试。"
+                )
+        except Exception as exc:
+            log_to_json("WARNING", "VPN", f"启动恢复任务异常: {exc}")
+            try:
+                set_state(
+                    last_check_message=f"启动恢复未完成：{exc}；后台维护将在下一周期自动重试。"
+                )
+            except Exception:
+                pass
+    finally:
+        startup_exit_restore_pending = False
 
 
 
@@ -26789,6 +26886,20 @@ def main() -> None:
     tee = Tee(str(log_file))
     sys.stdout = tee
     sys.stderr = tee
+
+    previous_state = read_json(STATE_FILE, {})
+    if isinstance(previous_state, dict):
+        saved_endpoint = str(previous_state.get("active_connected_endpoint") or previous_state.get("active_pool_endpoint_id") or "").strip()
+        saved_node = str(previous_state.get("active_openvpn_node_id") or "").strip()
+        if saved_endpoint or saved_node:
+            try:
+                write_json(DATA_DIR / "last_exit.json", {
+                    "endpoint_id": saved_endpoint,
+                    "openvpn_node_id": saved_node,
+                    "at": time.time(),
+                })
+            except Exception:
+                pass
 
     write_json(
         STATE_FILE,
