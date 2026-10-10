@@ -11099,6 +11099,15 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       gap: 12px;
     }
+    .btn-group > .btn-telegram { order: 1; }
+    .btn-group > #btn_add_node { order: 2; }
+    .btn-group > #refresh { order: 3; }
+    .btn-group > .dropdown { order: 4; }
+    html:has(.modal[style*="flex"]),
+    body:has(.modal[style*="flex"]) {
+      overflow: hidden !important;
+      overscroll-behavior: none;
+    }
 
     button, .btn-telegram {
       height: 38px;
@@ -11988,11 +11997,18 @@ INDEX_HTML = r"""<!doctype html>
       display: inline;
       white-space: nowrap;
     }
-    .active-server-corner-line > .server-self-break {
-      display: block;
-      height: 3px;
-      white-space: normal;
+    .active-server-corner-line > .server-self-block {
+      display: inline-flex;
+      align-items: flex-start;
+      white-space: nowrap;
+      vertical-align: top;
     }
+    .server-self-addrs {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .server-self-v6 { display: block; }
     .active-server-corner .active-location-with-flag {
       display: inline-flex !important;
       width: auto !important;
@@ -12229,6 +12245,7 @@ INDEX_HTML = r"""<!doctype html>
     .unified-select-log .toolbar-custom-select-menu { width: 156px; }
     .unified-select .toolbar-custom-option { min-height: 38px; font-size: 13px; }
     .unified-select-log .toolbar-custom-option { min-height: 34px; font-size: 12px; }
+    #library_check_modal .modal-content { padding: 18px 20px 16px; }
     #library_check_modal .library-scan-select { flex: 1 1 0; width: auto; min-width: 0; height: 40px; }
     #library_check_modal .library-scan-select .toolbar-custom-select-menu { width: auto; }
     .toolbar-custom-select.open {
@@ -13391,11 +13408,15 @@ INDEX_HTML = r"""<!doctype html>
       .header-brand-system { font-size: 0.78em; }
       .btn-group {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px;
         width: 100%;
         margin-top: 0;
       }
+      .btn-group > .btn-telegram { order: 1; }
+      .btn-group > #refresh { order: 2; }
+      .btn-group > #btn_add_node { order: 3; grid-column: auto; grid-row: auto; }
+      .btn-group > .dropdown { order: 4; grid-column: auto; grid-row: auto; }
       .btn-group .dropdown {
         display: block;
         min-width: 0;
@@ -13423,8 +13444,6 @@ INDEX_HTML = r"""<!doctype html>
         right: 0;
         max-width: calc(100vw - 24px);
       }
-      #btn_add_node { grid-column: 2; grid-row: 2; }
-      .btn-group > .dropdown:last-child { grid-column: 3; grid-row: 2; }
       .active-card button { width: 100%; }
     }
 
@@ -14462,7 +14481,7 @@ INDEX_HTML = r"""<!doctype html>
         </a>
         <a href="javascript:void(0)" onclick="openLogsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2-2z" /></svg>
-          日志
+          查看日志
         </a>
         <a href="javascript:void(0)" onclick="openUpdateModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18" /></svg>
@@ -14668,24 +14687,24 @@ INDEX_HTML = r"""<!doctype html>
           <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
         </button>
       </div>
-      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.5; margin-bottom: 14px;">TCP 看端口是否开放，UDP 发一包协议探测，记录往返时间。带 tls-auth 的 OpenVPN UDP 没有回应也不标不可用。不建立隧道，不测速。点击待检测才连接该节点并测速，速度写入列表；低于所选速度记为不可用，并自动换下一个。转发时等待，筛选不再打断检测，等待不算失败。</div>
-      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="color: var(--text-secondary); font-size: 12px; line-height: 1.45; margin-bottom: 8px;">只测端口和延迟，不建隧道、不测速。点待检测才测速。</div>
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:32px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">检测节点数</span>
         <strong id="library_check_total" style="font-variant-numeric:tabular-nums;">0</strong>
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:32px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">已检测</span>
         <strong id="library_check_tested" style="font-variant-numeric:tabular-nums;">0</strong>
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:32px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">可用</span>
         <strong id="library_check_available" style="color:#34d399; font-variant-numeric:tabular-nums;">0</strong>
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:32px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">不可用</span>
         <strong id="library_check_unavailable" style="color:#fb7185; font-variant-numeric:tabular-nums;">0</strong>
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; min-height:40px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
+      <div style="display:flex; justify-content:space-between; align-items:center; min-height:32px; font-size:15px; font-weight:500; border-bottom:1px solid rgba(255,255,255,0.06);">
         <span style="color:var(--text-secondary);">剩余</span>
         <strong id="library_check_remaining" style="font-variant-numeric:tabular-nums;">0</strong>
       </div>
@@ -14733,7 +14752,7 @@ INDEX_HTML = r"""<!doctype html>
             <div id="library_scan_hour_menu" class="toolbar-custom-select-menu" role="listbox"></div>
           </div>
         </div>
-        <div style="margin-top:14px; color:var(--text-secondary); font-size:12px; line-height:1.5;">开启自动更新只复测每个国家 6 个节点的端口和延迟，不扫全库，也不建隧道。默认 3 小时。内存低于 2GB 时不能选 1 小时或 2 小时。全库检测只有点「手动检测」才跑。512MB 上如果可用内存低于 30%，或者已经在用交换分区，这一轮全库检测会停下，当前隧道不停。</div>
+        <div style="margin-top:8px; color:var(--text-secondary); font-size:12px; line-height:1.45;">自动更新每国 6 个，默认 3 小时。低于 2GB 不能选 1、2 小时。全库只手动。内存不够会停，隧道不停。</div>
       </div>
       <div style="display:flex; gap:12px; margin-top:18px;">
         <button type="button" id="library_check_toggle" class="btn-primary" style="flex:1; height:40px; padding:0 18px; font-weight:600; border-radius:8px;">手动检测</button>
@@ -17148,6 +17167,7 @@ function libraryStatusLine() {
 
 function currentServerMetaHtml() {
   const ip = String(state?.server_public_ip || "").trim();
+  const ip6 = String(state?.server_public_ipv6 || "").trim();
   const country = String(state?.server_country || "").trim();
   const code = String(state?.server_country_code || "").trim();
   const location = String(state?.server_location || "").trim();
@@ -17156,7 +17176,12 @@ function currentServerMetaHtml() {
   if (!ip && !country && !location) return "";
   const place = formatNodeLocation({country, location}) || translateCountry(country);
   const flag = countryFlag(code || country || place, translateCountry(country) || place, "eager");
-  const head = ip ? '<span class="server-self-line">当前服务器：<span class="mono server-self-ip">' + esc(ip) + '</span></span>' : '';
+  const head = (ip || ip6)
+    ? '<span class="server-self-block"><span class="server-self-label">当前服务器：</span><span class="server-self-addrs">'
+      + (ip ? '<span class="mono server-self-ip">' + esc(ip) + '</span>' : '')
+      + (ip6 ? '<span class="mono server-self-ip server-self-v6">' + esc(ip6) + '</span>' : '')
+      + '</span></span>'
+    : '';
   const tail = [];
   if (place) tail.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
   if (owner) tail.push('<span>' + esc(owner) + '</span>');
@@ -17926,7 +17951,7 @@ function backendStateRenderSignature(s) {
     x.manual_switch_active,
     x.scheme_label, x.scheme_available, x.scheme_inventory, x.scheme_country,
     x.standby_ip, x.standby_protocol,
-    x.server_public_ip, x.server_country, x.server_location, x.server_owner, x.server_ip_type,
+    x.server_public_ip, x.server_public_ipv6, x.server_country, x.server_location, x.server_owner, x.server_ip_type,
     x.active_pool_endpoint?.current_ip, x.active_pool_endpoint?.hostname,
     x.active_pool_endpoint?.speed_bps
   ].map(v => String(v ?? "")).join("|");
@@ -24485,6 +24510,37 @@ def _schedule_server_identity_refresh() -> None:
     threading.Thread(target=_run, daemon=True, name="server-identity").start()
 
 
+def _direct_server_ipv6() -> str:
+    """Global IPv6 on the physical NIC. Empty when this machine has none."""
+    iface = ""
+    try:
+        iface = str(proxy_server.physical_egress_interface() or "")
+    except Exception:
+        iface = ""
+    if not iface or iface.startswith(("tun", "tap", "ppp", "wg")):
+        return ""
+    try:
+        res = subprocess.run(
+            ["ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return ""
+    fallback = ""
+    for line in (res.stdout or "").splitlines():
+        parts = line.split()
+        if "inet6" not in parts:
+            continue
+        ip = parts[parts.index("inet6") + 1].split("/")[0].strip()
+        if not ip or ip.lower().startswith("fe80"):
+            continue
+        if "temporary" in line or "mngtmpaddr" in line:
+            fallback = fallback or ip
+            continue
+        return ip
+    return fallback
+
+
 def _attach_local_server_identity(state: dict[str, Any]) -> None:
     """Expose this machine's direct egress. Never the connected VPN node."""
     ident = _cached_server_identity()
@@ -24506,6 +24562,7 @@ def _attach_local_server_identity(state: dict[str, Any]) -> None:
     if incomplete or age > 6 * 3600:
         _schedule_server_identity_refresh()
     state["server_public_ip"] = str(ident.get("public_ip") or "")
+    state["server_public_ipv6"] = _direct_server_ipv6()
     if ident.get("country"):
         state["server_country"] = str(ident.get("country") or "")
     else:
