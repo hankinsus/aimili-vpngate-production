@@ -26659,7 +26659,25 @@ def _saved_exit_record() -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _manual_pin_record() -> dict[str, str]:
+    raw = read_json(DATA_DIR / "manual_route_pin.json", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    node = str(raw.get("node_id") or "").strip()
+    eid = _exit_record_id(str(raw.get("endpoint_id") or ""))
+    if not node and not eid and isinstance(manual_route_pin, dict):
+        node = str(manual_route_pin.get("node_id") or "").strip()
+        eid = _exit_record_id(str(manual_route_pin.get("endpoint_id") or ""))
+    if not node and not eid:
+        return {}
+    if node and not eid:
+        eid = _resolve_openvpn_endpoint_id(node)
+    return {"endpoint_id": eid, "openvpn_node_id": node}
+
+
 def _has_saved_exit() -> bool:
+    if _manual_pin_record():
+        return True
     raw = _saved_exit_record()
     return bool(str(raw.get("endpoint_id") or "").strip() or str(raw.get("openvpn_node_id") or "").strip())
 
@@ -26681,18 +26699,67 @@ def _saved_exit_endpoint() -> dict[str, Any] | None:
 def _saved_main_already_up(record: dict[str, Any]) -> bool:
     if not active_tunnel_running():
         return False
-    eid = _exit_record_id(str(record.get("endpoint_id") or ""))
     node = str(record.get("openvpn_node_id") or "").strip()
+    if node:
+        return active_openvpn_node_id == node
+    eid = _exit_record_id(str(record.get("endpoint_id") or ""))
     current = ""
     try:
         current = str(get_state().get("active_connected_endpoint") or "")
     except Exception:
         current = ""
-    if eid and (active_pool_endpoint_id == eid or current in (eid, "pool:" + eid)):
-        return True
-    if node and active_openvpn_node_id == node:
+    return bool(eid and (active_pool_endpoint_id == eid or current in (eid, "pool:" + eid)))
+
+
+def _dial_saved_openvpn(node_id: str, label: str) -> bool:
+    """Reconnect the exact OpenVPN profile. Do not rebuild it from a different catalog IP."""
+    node_id = str(node_id or "").strip()
+    if not node_id:
+        return False
+    try:
+        nodes = read_nodes()
+    except Exception:
+        nodes = []
+    found = next((item for item in nodes if str(item.get("id") or "") == node_id), None)
+    if not found:
+        log_to_json("INFO", "VPN", f"{label}的节点不在列表里，不改连别的地址")
+        return False
+    eid = _exit_record_id(str(found.get("pool_endpoint_id") or "")) or _resolve_openvpn_endpoint_id(node_id)
+    if eid:
+        try:
+            endpoint = node_pool.get_endpoint(eid)
+        except Exception:
+            endpoint = None
+        if isinstance(endpoint, dict) and endpoint_is_blocked(endpoint, load_ui_config()):
+            log_to_json("INFO", "VPN", f"{label}在屏蔽列表，不接回 {node_id}")
+            return False
+    try:
+        connect_node(node_id, manual=False, fast=True)
+    except Exception as exc:
+        log_to_json("WARNING", "VPN", f"{label}接回失败 {node_id}: {exc}")
+        return False
+    if active_tunnel_running() and active_openvpn_node_id == node_id:
+        log_to_json("INFO", "VPN", f"{label}已接回 {node_id}")
         return True
     return False
+
+
+def _dial_recorded_main(record: dict[str, Any], label: str) -> bool:
+    if _saved_main_already_up(record):
+        log_to_json("INFO", "VPN", f"{label}还在，不换 IP")
+        return True
+    node = str(record.get("openvpn_node_id") or "").strip()
+    if node:
+        return _dial_saved_openvpn(node, label)
+    eid = _exit_record_id(str(record.get("endpoint_id") or ""))
+    endpoint = None
+    if eid:
+        try:
+            found = node_pool.get_endpoint(eid)
+        except Exception:
+            found = None
+        endpoint = found if isinstance(found, dict) else None
+    return _dial_saved_endpoint(endpoint, label)
 
 
 def _dial_saved_endpoint(endpoint: dict[str, Any] | None, label: str) -> bool:
@@ -26715,20 +26782,30 @@ def _dial_saved_endpoint(endpoint: dict[str, Any] | None, label: str) -> bool:
 
 
 def _restore_previous_exit() -> str:
-    """Priority: last main, then the recorded cold, then the recorded precold."""
+    """Priority: manual switch, then last main, then recorded cold, then precold."""
+    pin = _manual_pin_record()
     record = _saved_exit_record()
-    if _saved_main_already_up(record):
-        log_to_json("INFO", "VPN", "上次主连接还在，不换 IP")
-        return "main"
-    if active_tunnel_running():
-        try:
-            stop_all_tunnels()
-        except Exception as exc:
-            log_to_json("WARNING", "VPN", f"接回前断开其它隧道失败: {exc}")
-    previous = _saved_exit_endpoint()
-    if _dial_saved_endpoint(previous, "上次主连接"):
-        return "main"
-    previous_id = str((previous or {}).get("endpoint_id") or "")
+    tried: set[str] = set()
+    if pin:
+        if active_tunnel_running() and not _saved_main_already_up(pin):
+            try:
+                stop_all_tunnels()
+            except Exception as exc:
+                log_to_json("WARNING", "VPN", f"接回手动切换前断开其它隧道失败: {exc}")
+        if _dial_recorded_main(pin, "手动切换"):
+            return "manual"
+        tried.add(str(pin.get("openvpn_node_id") or ""))
+        log_to_json("WARNING", "VPN", "手动切换的节点接不上，改接上次主连接")
+    saved_node = str(record.get("openvpn_node_id") or "")
+    if record and not (saved_node and saved_node in tried):
+        if active_tunnel_running() and not _saved_main_already_up(record):
+            try:
+                stop_all_tunnels()
+            except Exception as exc:
+                log_to_json("WARNING", "VPN", f"接回前断开其它隧道失败: {exc}")
+        if _dial_recorded_main(record, "上次主连接"):
+            return "main"
+    previous_id = _exit_record_id(str(record.get("endpoint_id") or "")) or _exit_record_id(str(pin.get("endpoint_id") or ""))
     cold = _cold_state()
     published = _exit_record_id(str(record.get("cold_id") or "")) or _cold_eid(str(cold.get("published") or ""))
     precold_ids = [_exit_record_id(item) for item in (record.get("precold") or [])]
@@ -26801,13 +26878,21 @@ def startup_recovery_loop():
                 else:
                     set_state(last_check_message="默认方式暂未连上，后台会继续重试")
                 return
-            set_state(last_check_message="启动恢复：正在接回上次主连接")
-            log_to_json("INFO", "VPN", "启动恢复：先接上次主连接，不可用才用记下的冷备和预冷备")
+            set_state(last_check_message="启动恢复：手动切换优先，否则接回上次主连接")
+            log_to_json("INFO", "VPN", "启动恢复：先接手动切换，没有再接上次主连接，不可用才用记下的冷备和预冷备")
             _restore_dial_local.on = True
             try:
                 restored = _restore_previous_exit()
             finally:
                 _restore_dial_local.on = False
+            if restored == "manual":
+                startup_standby_frozen_until = time.time() + 180
+                try:
+                    _republish_saved_cold()
+                except Exception:
+                    pass
+                set_state(last_check_message="启动恢复完成：已接回手动切换的节点")
+                return
             if restored == "main":
                 startup_standby_frozen_until = time.time() + 180
                 try:
@@ -27068,6 +27153,16 @@ def main() -> None:
     if isinstance(previous_state, dict):
         saved_endpoint = str(previous_state.get("active_connected_endpoint") or previous_state.get("active_pool_endpoint_id") or "").strip()
         saved_node = str(previous_state.get("active_openvpn_node_id") or "").strip()
+        pin_raw = read_json(DATA_DIR / "manual_route_pin.json", {})
+        if isinstance(pin_raw, dict):
+            pin_node = str(pin_raw.get("node_id") or "").strip()
+            pin_eid = str(pin_raw.get("endpoint_id") or "").strip()
+            if pin_node or pin_eid:
+                if pin_node:
+                    saved_node = pin_node
+                    saved_endpoint = _resolve_openvpn_endpoint_id(pin_node) or pin_eid or saved_endpoint
+                else:
+                    saved_endpoint = pin_eid
         if saved_endpoint or saved_node:
             try:
                 _snapshot_last_exit(saved_endpoint, saved_node)
