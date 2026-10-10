@@ -11997,18 +11997,43 @@ INDEX_HTML = r"""<!doctype html>
       display: inline;
       white-space: nowrap;
     }
-    .active-server-corner-line > .server-self-block {
-      display: inline-flex;
-      align-items: flex-start;
-      white-space: nowrap;
+    .active-server-corner-line > .server-self-stack {
+      display: inline-grid;
+      grid-template-columns: max-content max-content;
+      column-gap: 0;
+      row-gap: 2px;
+      justify-items: start;
+      text-align: left;
+      max-width: 100%;
       vertical-align: top;
     }
-    .server-self-addrs {
-      display: flex;
-      flex-direction: column;
-      align-items: flex-start;
+    .active-server-corner .server-self-stack > .server-self-label {
+      grid-column: 1;
+      grid-row: 1;
+      line-height: 22px;
+      white-space: nowrap;
     }
-    .server-self-v6 { display: block; }
+    .active-server-corner .server-self-stack > .server-self-ip {
+      grid-column: 2;
+      grid-row: 1;
+      display: block;
+      white-space: nowrap;
+    }
+    .active-server-corner .server-self-stack > .server-self-v6 {
+      grid-column: 2;
+      grid-row: 2;
+      display: block;
+      white-space: nowrap;
+    }
+    .active-server-corner .server-self-stack > .server-self-place {
+      grid-column: 1 / -1;
+      display: block;
+      justify-self: stretch;
+      width: 0;
+      min-width: 100%;
+      text-align: right;
+      white-space: normal;
+    }
     .active-server-corner .active-location-with-flag {
       display: inline-flex !important;
       width: auto !important;
@@ -13444,6 +13469,43 @@ INDEX_HTML = r"""<!doctype html>
         right: 0;
         max-width: calc(100vw - 24px);
       }
+      .active-server-corner .server-self-stack > .server-self-place {
+        text-align: left;
+      }
+      .active-server-corner .server-self-stack > .server-self-ip,
+      .active-server-corner .server-self-stack > .server-self-v6 {
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      .modal {
+        align-items: flex-start;
+        padding: 8px;
+        box-sizing: border-box;
+        height: 100dvh;
+        overflow: hidden;
+      }
+      .modal-content {
+        width: 100%;
+        max-width: 100%;
+        max-height: calc(100dvh - 16px);
+        margin-top: 0;
+        padding: 16px 14px 14px;
+        border-radius: 16px;
+      }
+      .modal-content h3 { font-size: 16px; }
+      .form-group { margin-bottom: 10px; }
+      #cred_access_url, #cred_cert_status {
+        overflow-wrap: anywhere;
+        word-break: normal;
+      }
+      .modal-content form > div[style*="flex-end"],
+      .net-modal-actions {
+        position: sticky;
+        bottom: 0;
+        background: rgba(22, 30, 49, 0.98);
+        padding-top: 10px;
+        z-index: 2;
+      }
       .active-card button { width: 100%; }
     }
 
@@ -13728,9 +13790,9 @@ INDEX_HTML = r"""<!doctype html>
       background: rgba(22, 30, 49, 0.9);
       border: 1px solid var(--border-color);
       border-radius: 20px;
-      width: 90%;
-      max-width: 480px;
-      max-height: calc(100vh - 24px);
+      width: min(480px, calc(100vw - 24px));
+      max-width: calc(100vw - 24px);
+      max-height: calc(100dvh - 24px);
       padding: 32px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
       position: relative;
@@ -14804,7 +14866,7 @@ INDEX_HTML = r"""<!doctype html>
           <div id="cred_cert_status" style="margin-top:8px; padding:9px 11px; border:1px solid var(--border-color); border-radius:8px; color:var(--text-secondary); font-size:12px; line-height:1.55; background:rgba(15,23,42,.24);">
             填写已解析到本服务器的域名；首次绑定时自动申请 HTTPS 证书，后续同域名保存不会重复申请。
           </div>
-          <div id="cred_access_url" style="margin-top:8px; padding:9px 11px; border:1px solid rgba(20,184,166,.16); border-radius:8px; color:var(--text-secondary); font-size:12px; line-height:1.55; background:rgba(20,184,166,.045); word-break:break-all;">
+          <div id="cred_access_url" style="margin-top:8px; padding:9px 11px; border:1px solid rgba(20,184,166,.16); border-radius:8px; color:var(--text-secondary); font-size:12px; line-height:1.55; background:rgba(20,184,166,.045); overflow-wrap:anywhere;">
             当前访问地址：读取中…
           </div>
         </div>
@@ -17176,19 +17238,17 @@ function currentServerMetaHtml() {
   if (!ip && !country && !location) return "";
   const place = formatNodeLocation({country, location}) || translateCountry(country);
   const flag = countryFlag(code || country || place, translateCountry(country) || place, "eager");
-  const head = (ip || ip6)
-    ? '<span class="server-self-block"><span class="server-self-label">当前服务器：</span><span class="server-self-addrs">'
-      + (ip ? '<span class="mono server-self-ip">' + esc(ip) + '</span>' : '')
-      + (ip6 ? '<span class="mono server-self-ip server-self-v6">' + esc(ip6) + '</span>' : '')
-      + '</span></span>'
-    : '';
-  const tail = [];
-  if (place) tail.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
-  if (owner) tail.push('<span>' + esc(owner) + '</span>');
-  if (ipType) tail.push('<span>' + esc(translateIpType(ipType)) + '</span>');
-  const body = tail.join('<span class="meta-dot"> </span>');
-  if (head && body) return head + '<span class="server-self-break"></span>' + body;
-  return head || body;
+  const bits = [];
+  if (place) bits.push('<span class="active-location-with-flag">' + flag + '<span>' + esc(place) + '</span></span>');
+  if (owner) bits.push('<span>' + esc(owner) + '</span>');
+  if (ipType) bits.push('<span>' + esc(translateIpType(ipType)) + '</span>');
+  if (!ip && !ip6 && !bits.length) return "";
+  return '<span class="server-self-stack">'
+    + ((ip || ip6) ? '<span class="server-self-label">当前服务器：</span>' : '')
+    + (ip ? '<span class="mono server-self-ip">' + esc(ip) + '</span>' : '')
+    + (ip6 ? '<span class="mono server-self-ip server-self-v6">' + esc(ip6) + '</span>' : '')
+    + (bits.length ? '<span class="server-self-place">' + bits.join('<span class="meta-dot"> </span>') + '</span>' : '')
+    + '</span>';
 }
 
 function paintPriorityStatus() {
