@@ -11216,6 +11216,11 @@ INDEX_HTML = r"""<!doctype html>
       background: #4f46e5;
       color: #fff;
     }
+    .egress-switch button.is-pending {
+      color: #fbbf24;
+      font-weight: 700;
+      background: transparent;
+    }
 
     button:disabled {
       opacity: 0.4;
@@ -12020,7 +12025,7 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: baseline;
       justify-content: flex-end;
-      gap: 6px;
+      gap: 4px;
       white-space: nowrap;
     }
     .active-server-corner .server-self-label {
@@ -12035,7 +12040,7 @@ INDEX_HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .active-server-corner .server-self-v6 {
-      margin-left: 8px;
+      margin-left: 4px;
       font-size: 13px;
       font-weight: 500;
       color: #c5d0dc;
@@ -12078,6 +12083,7 @@ INDEX_HTML = r"""<!doctype html>
       color: #f4f7fb;
     }
     .active-server-corner .server-self-v6 {
+      margin-left: 0;
       font-size: 13px;
       font-weight: 500;
       color: #c5d0dc;
@@ -13448,20 +13454,21 @@ INDEX_HTML = r"""<!doctype html>
 
     @media (max-width: 699px) {
       h1 {
-        font-size: 20px;
-        gap: 6px;
-        flex-wrap: wrap;
+        font-size: 15px;
+        gap: 8px;
+        flex-wrap: nowrap;
         justify-content: center;
         text-align: center;
+        white-space: nowrap;
       }
-      .brand { align-items: center; width: 100%; }
-      header { align-items: center; gap: 12px; }
+      .brand { align-items: center; width: 100%; padding: 6px 0 2px; }
+      header { align-items: center; gap: 16px; padding-top: 18px; padding-bottom: 14px; }
       .header-brand-system {
-        flex: 1 0 100%;
+        flex: 0 0 auto;
         font-size: 15px;
         font-weight: 700;
         text-align: center;
-        line-height: 1.35;
+        line-height: 1.2;
       }
       .btn-group {
         display: grid;
@@ -18419,20 +18426,30 @@ function egressPendingLabel() {
   return "切换中";
 }
 
+function egressButtonText(kind) {
+  const switching = egressSwitchInFlight || !!(state && state.egress_switching);
+  const target = egressSwitchTarget || (state && state.pending_egress_mode) || "";
+  if (switching && target === kind) return "切换中";
+  return kind === "direct" ? "直连模式" : "代理模式";
+}
+
 function paintEgressChrome() {
   const switching = egressSwitchInFlight || !!(state && state.egress_switching);
   const mode = state && state.egress_mode === "direct" ? "direct" : "proxy";
   const showDone = !switching && Date.now() < egressHoldUntil;
   const failed = showDone && /失败|恢复/.test(String(state && state.last_check_message || ""));
   const label = egressPendingLabel();
+  const target = egressSwitchTarget || (state && state.pending_egress_mode) || "";
   document.querySelectorAll(".egress-status").forEach((statusEl) => {
     statusEl.textContent = switching ? (label || "切换中") : (failed ? "已恢复" : (showDone ? "已切换" : ""));
     statusEl.className = "egress-status" + ((switching || showDone) ? " is-live" : "") + ((showDone && !failed) ? " ok" : "");
   });
   document.querySelectorAll(".egress-switch button[data-egress]").forEach((btn) => {
     const kind = btn.getAttribute("data-egress");
-    btn.className = kind === mode ? ("is-on " + kind) : "";
+    const pending = switching && target === kind;
+    btn.className = pending ? "is-pending" : (kind === mode ? ("is-on " + kind) : "");
     btn.disabled = switching;
+    btn.textContent = egressButtonText(kind);
   });
 }
 
@@ -18541,8 +18558,8 @@ function egressSwitchHtml() {
   return `<div class="egress-switch-wrap">
     ${egressStatusHtml()}
     <div class="egress-switch" role="group" aria-label="出口模式">
-      <button type="button" data-egress="direct" class="${mode === "direct" ? "is-on direct" : ""}" ${switching ? "disabled" : ""} onclick="setEgressMode('direct')">直连模式</button>
-      <button type="button" data-egress="proxy" class="${mode === "proxy" ? "is-on proxy" : ""}" ${switching ? "disabled" : ""} onclick="setEgressMode('proxy')">代理模式</button>
+      <button type="button" data-egress="direct" class="${mode === "direct" && !(switching && (egressSwitchTarget || state.pending_egress_mode) === "direct") ? "is-on direct" : (switching && (egressSwitchTarget || state.pending_egress_mode) === "direct" ? "is-pending" : "")}" ${switching ? "disabled" : ""} onclick="setEgressMode('direct')">${egressButtonText("direct")}</button>
+      <button type="button" data-egress="proxy" class="${mode === "proxy" && !(switching && (egressSwitchTarget || state.pending_egress_mode) === "proxy") ? "is-on proxy" : (switching && (egressSwitchTarget || state.pending_egress_mode) === "proxy" ? "is-pending" : "")}" ${switching ? "disabled" : ""} onclick="setEgressMode('proxy')">${egressButtonText("proxy")}</button>
     </div>
   </div>`;
 }
