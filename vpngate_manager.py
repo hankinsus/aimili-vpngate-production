@@ -13463,6 +13463,30 @@ INDEX_HTML = r"""<!doctype html>
       .active-card { flex-wrap: wrap; gap: 16px; }
     }
 
+    @media (max-width: 1180px) {
+      .active-card { padding-top: 14px; }
+      .active-server-corner {
+        position: static;
+        top: auto;
+        right: auto;
+        left: auto;
+        display: block;
+        width: 100%;
+        flex: 1 0 100%;
+        order: -1;
+        margin: 0 0 8px;
+        overflow: visible;
+        justify-content: flex-start;
+      }
+      .active-server-corner-line {
+        display: block;
+        max-width: 100%;
+        white-space: normal;
+        text-align: left;
+        line-height: 1.5;
+      }
+    }
+
     /* Admin dropdown styles */
     .dropdown {
       position: relative;
