@@ -12239,13 +12239,14 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       align-items: baseline;
       justify-content: flex-end;
-      gap: 4px;
+      gap: 0;
       white-space: nowrap;
     }
     .active-server-corner .server-self-label {
       line-height: 22px;
       white-space: nowrap;
       font-weight: 500;
+      margin-right: 3px;
     }
     .active-server-corner .server-self-ip {
       font-size: 18px;
@@ -17520,7 +17521,7 @@ function currentServerMetaHtml() {
   if (!ip && !ip6 && !bits.length) return "";
   return '<span class="server-self-stack">'
     + '<span class="server-self-row">'
-    + ((ip || ip6) ? '<span class="server-self-label">当前服务器：</span>' : '')
+    + ((ip || ip6) ? '<span class="server-self-label">当前服务器:</span>' : '')
     + (ip ? '<span class="mono server-self-ip">' + esc(ip) + '</span>' : '')
     + (ip6 ? '<span class="mono server-self-v6">' + esc(ip6) + '</span>' : '')
     + '</span>'
