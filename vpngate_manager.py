@@ -12234,6 +12234,10 @@ INDEX_HTML = r"""<!doctype html>
       max-width: 100%;
       vertical-align: top;
       text-align: right;
+      pointer-events: auto;
+      user-select: text;
+      -webkit-user-select: text;
+      cursor: text;
     }
     .server-self-row {
       display: flex;
