@@ -5,9 +5,6 @@ Bilingual: [中文](#中文) | [English](#english)
 
 本项目用于在 Linux VPS 上统一管理 OpenVPN、SoftEther、SSTP、L2TP/IPsec 等多协议节点，提供节点资源采集、持续可用性检测、真实连接延迟、自动故障切换、HTTP/SOCKS5 出站代理与 Web 管理。
 
-
-[🎁 专线流媒体｜顶级三网优化](https://yiy.one/register?codes=98BA33)
-[📢 无限流量住宅 IP](https://www.miyaip.com/?invitecode=2955039)
 <a name="中文"></a>
 
 ## 中文
@@ -140,9 +137,9 @@ export https_proxy="http://服务器IP:8500"
 
 项目代码遵循仓库中的 [GNU GPL v3](LICENSE)。
 
-### 12. 开发支持
+### 12. 捐赠支持项目开发
 
-感谢使用与反馈。项目官方入口统一从 [我爱研究.ILovestudy](https://ilovestudyip.com/) 访问。
+USDT (TRON / TRC20)：`TPuueui5rRCL3ECV6dWmBzeDkaTV2JEyAn`
 
 ---
 
@@ -156,9 +153,6 @@ export https_proxy="http://服务器IP:8500"
 
 The system is designed for Linux VPS deployments and manages OpenVPN, SoftEther, SSTP, and L2TP/IPsec resources from one web console. It provides resource collection, continuous availability testing, real connection latency, automatic failover, an HTTP/SOCKS5 egress proxy, and web administration.
 
-
-[🎁 Dedicated Streaming Media｜Top 3-Network Optimization](https://yiy.one/register?codes=98BA33)
-[📢 Unlimited Traffic Residential IP](https://www.miyaip.com/?invitecode=2955039)
 ### 2. Port architecture
 
 | Purpose | Port | Binding |
@@ -278,9 +272,9 @@ Official technical references, open-source license links, required GitHub links,
 
 The project is released under the [GNU GPL v3](LICENSE).
 
-### 12. Project support
+### 12. Support the project
 
-Thank you for using and reporting issues. The official project entry point is [ILovestudy](https://ilovestudyip.com/).
+USDT (TRON / TRC20): `TPuueui5rRCL3ECV6dWmBzeDkaTV2JEyAn`
 
 ---
 

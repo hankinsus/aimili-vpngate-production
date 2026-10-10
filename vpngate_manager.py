@@ -13423,8 +13423,8 @@ INDEX_HTML = r"""<!doctype html>
         right: 0;
         max-width: calc(100vw - 24px);
       }
-      #btn_add_node { grid-column: 2; }
-      .btn-group > .dropdown:last-child { grid-column: 3; }
+      #btn_add_node { grid-column: 2; grid-row: 2; }
+      .btn-group > .dropdown:last-child { grid-column: 3; grid-row: 2; }
       .active-card button { width: 100%; }
     }
 
@@ -14425,27 +14425,6 @@ INDEX_HTML = r"""<!doctype html>
   </div>
   <div class="btn-group">
 
-    <div class="dropdown">
-      <button id="github_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        GITHUB
-        <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
-      </button>
-      <div id="github_dropdown" class="dropdown-content">
-        <a href="https://github.com/hankinsus/aimili-vpngate-production" target="_blank">正式版</a>
-        <div class="github-update-panel" id="github_update_panel">
-          <div class="github-update-row">
-            <span class="github-update-label">当前正式版</span>
-            <code class="github-update-version" id="github_current_version">__APP_VERSION__</code>
-          </div>
-          <div class="github-update-message" id="github_update_message">点击“检查更新”获取 GitHub 最新版本。</div>
-          <div class="github-update-actions">
-            <button type="button" id="github_check_update">检查更新</button>
-            <button type="button" id="github_apply_update" class="btn-primary" style="display:none;">立即更新</button>
-          </div>
-        </div>
-      </div>
-    </div>
     <a href="https://t.me/ILovestudycn" target="_blank" class="btn-telegram">
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
@@ -14484,6 +14463,10 @@ INDEX_HTML = r"""<!doctype html>
         <a href="javascript:void(0)" onclick="openLogsModal()">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2-2z" /></svg>
           日志
+        </a>
+        <a href="javascript:void(0)" onclick="openUpdateModal()">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18" /></svg>
+          检测更新
         </a>
         <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger); border-top: 1px solid rgba(255,255,255,0.05);">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
@@ -15318,6 +15301,28 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <!-- Logs Modal (日志监控与分类筛选) -->
+  <div id="update_modal" class="modal">
+    <div class="modal-content" style="max-width: 460px; width: 90%;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <h3 style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary);">检测更新</h3>
+        <button type="button" onclick="closeUpdateModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;">
+          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      <div class="github-update-panel" id="github_update_panel">
+        <div class="github-update-row">
+          <span class="github-update-label">当前正式版</span>
+          <code class="github-update-version" id="github_current_version">__APP_VERSION__</code>
+        </div>
+        <div class="github-update-message" id="github_update_message">点击“检查更新”获取最新正式版。</div>
+        <div class="github-update-actions">
+          <button type="button" id="github_check_update">检查更新</button>
+          <button type="button" id="github_apply_update" class="btn-primary" style="display:none;">立即更新</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="logs_modal" class="modal">
     <div class="modal-content">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
@@ -19157,28 +19162,34 @@ async function applyGithubUpdate() {
   }
 }
 
-// Admin dropdown toggle & GitHub dropdown toggle
+function openUpdateModal() {
+  if (adminDropdown) adminDropdown.style.display = "none";
+  const modal = $("update_modal");
+  if (modal) modal.style.display = "flex";
+  loadGithubCurrentVersion();
+}
+
+function closeUpdateModal() {
+  const modal = $("update_modal");
+  if (modal) modal.style.display = "none";
+}
+
+const updateModal = $("update_modal");
+if (updateModal) {
+  updateModal.addEventListener("click", (event) => {
+    if (event.target === updateModal) closeUpdateModal();
+  });
+}
+
+// Admin dropdown toggle
 const adminBtn = $("admin_btn");
 const adminDropdown = $("admin_dropdown");
-const githubBtn = $("github_btn");
-const githubDropdown = $("github_dropdown");
 
 if (adminBtn && adminDropdown) {
   adminBtn.onclick = (e) => {
     e.stopPropagation();
     const isShow = adminDropdown.style.display === "block";
     adminDropdown.style.display = isShow ? "none" : "block";
-    if (githubDropdown) githubDropdown.style.display = "none";
-  };
-}
-
-if (githubBtn && githubDropdown) {
-  githubBtn.onclick = (e) => {
-    e.stopPropagation();
-    const isShow = githubDropdown.style.display === "block";
-    githubDropdown.style.display = isShow ? "none" : "block";
-    if (adminDropdown) adminDropdown.style.display = "none";
-    if (!isShow) loadGithubCurrentVersion();
   };
 }
 
@@ -19198,7 +19209,6 @@ if ($("github_apply_update")) {
 
 document.addEventListener("click", () => {
   if (adminDropdown) adminDropdown.style.display = "none";
-  if (githubDropdown) githubDropdown.style.display = "none";
 });
 
 let showFavoritesOnly = false;
