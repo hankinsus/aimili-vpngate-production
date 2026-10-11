@@ -8756,6 +8756,56 @@ def check_interface_egress(interface: str, gateway: str = "", table: int = PROBE
     finally:
         cleanup_probe_policy_routing(table)
 
+def _server_public_ip() -> str:
+    """This machine's own egress. Cached. Used only to detect a proxy leak."""
+    cached = str(getattr(_server_public_ip, "value", "") or "")
+    if cached and time.time() - float(getattr(_server_public_ip, "at", 0) or 0) < 600:
+        return cached
+    try:
+        proc = subprocess.run(
+            ["curl", "-4", "-sS", "--connect-timeout", "3", "--max-time", "5", "https://api.ipify.org"],
+            capture_output=True, text=True, timeout=8,
+        )
+        ip = (proc.stdout or "").strip()
+    except Exception:
+        ip = ""
+    if ip and "." in ip:
+        _server_public_ip.value = ip
+        _server_public_ip.at = time.time()
+        return ip
+    return cached
+
+
+def _proxy_exit_ip() -> str:
+    """Exit seen by a client using 8500. Empty means the sample failed."""
+    try:
+        user = str(proxy_server.get_proxy_credentials()[0] or "socks5")
+        password = str(proxy_server.get_proxy_credentials()[1] or "")
+        proc = subprocess.run(
+            [
+                "curl", "-4", "-sS", "--connect-timeout", "4", "--max-time", "6",
+                "--socks5-hostname", f"{user}:{password}@127.0.0.1:{LOCAL_PROXY_PORT}",
+                "https://api.ipify.org",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        ip = (proc.stdout or "").strip()
+    except Exception:
+        return ""
+    return ip if ip and "." in ip else ""
+
+
+def _proxy_exit_leaks_server() -> bool:
+    """Proxy mode, but the client sees this server's own address."""
+    if proxy_server.get_egress_mode() != "proxy":
+        return False
+    server_ip = _server_public_ip()
+    exit_ip = _proxy_exit_ip()
+    if not server_ip or not exit_ip:
+        return False
+    return exit_ip == server_ip
+
+
 def _iface_forwards(interface: str, timeout: float = 4.0) -> bool:
     """One request through the tunnel NIC. A live process is not a working exit."""
     interface = str(interface or "").strip()
@@ -22204,14 +22254,16 @@ def fast_tunnel_liveness_loop() -> None:
             if now_plane - float(getattr(fast_tunnel_liveness_loop, "plane_at", 0) or 0) >= 30:
                 fast_tunnel_liveness_loop.plane_at = now_plane
                 iface = str(proxy_server.get_active_interface() or "").strip()
-                if iface and not _iface_forwards(iface):
+                leak = _proxy_exit_leaks_server()
+                if iface and (not _iface_forwards(iface) or leak):
                     # A just-connected tunnel gets one short grace. After that, misses count.
                     if time.time() - float(getattr(fast_tunnel_liveness_loop, "forward_ok_at", 0) or 0) < 45:
                         time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                         continue
                     misses = int(getattr(fast_tunnel_liveness_loop, "plane_miss", 0) or 0) + 1
                     fast_tunnel_liveness_loop.plane_miss = misses
-                    log_to_json("WARNING", "Proxy", f"隧道 {iface} 不通网 {misses}/2")
+                    why = "客户端出口是服务器地址" if leak else "不通网"
+                    log_to_json("WARNING", "Proxy", f"隧道 {iface} {why} {misses}/2")
                     if misses >= 2:
                         fast_tunnel_liveness_loop.plane_miss = 0
                         current = current_active_routing_endpoint() or {}
@@ -26936,6 +26988,16 @@ def startup_recovery_loop():
                     _republish_saved_cold()
                 except Exception:
                     pass
+                if _proxy_exit_leaks_server() or not _iface_forwards(str(proxy_server.get_active_interface() or "")):
+                    log_to_json("WARNING", "VPN", "接回的主连接出口是服务器地址或不转发，改走冷备")
+                    failed = str(active_pool_endpoint_id or "")
+                    try:
+                        stop_all_tunnels()
+                    except Exception:
+                        pass
+                    outcome = promote_cold_standby_to_main(exclude_endpoint_id=failed)
+                    set_state(last_check_message="启动恢复：上次主连接出口不对，已改用冷备" if outcome == "up" else "启动恢复：上次主连接出口不对，正在重选")
+                    return
                 set_state(last_check_message="启动恢复完成：已接回上次主连接")
                 return
             if restored == "standby":
