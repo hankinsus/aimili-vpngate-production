@@ -7789,7 +7789,7 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
     if startup_restore_holding() and not _in_restore_dial():
         return "busy"
     global _cold_promote_cooldown_until
-    if active_tunnel_running():
+    if active_tunnel_running() and str(active_pool_endpoint_id or active_openvpn_node_id or "") != str(exclude_endpoint_id or ""):
         return "up"
     if is_connecting or manual_connection_active or ui_command_plane.is_busy():
         return "busy"
@@ -7806,7 +7806,8 @@ def promote_cold_standby_to_main(exclude_endpoint_id: str = "", candidates: dict
     if not _cold_promote_lock.acquire(blocking=False):
         return "busy"
     try:
-        if active_tunnel_running():
+        live_id = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+        if active_tunnel_running() and live_id != str(exclude_endpoint_id or ""):
             return "up"
         if candidates is None:
             candidates = _cold_candidates(ui_cfg)
@@ -22200,17 +22201,18 @@ def fast_tunnel_liveness_loop() -> None:
                 time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                 continue
             now_plane = time.time()
-            if now_plane - float(getattr(fast_tunnel_liveness_loop, "plane_at", 0) or 0) >= 60:
+            if now_plane - float(getattr(fast_tunnel_liveness_loop, "plane_at", 0) or 0) >= 30:
                 fast_tunnel_liveness_loop.plane_at = now_plane
                 iface = str(proxy_server.get_active_interface() or "").strip()
                 if iface and not _iface_forwards(iface):
-                    if time.time() - float(getattr(fast_tunnel_liveness_loop, "forward_ok_at", 0) or 0) < 180:
-                        fast_tunnel_liveness_loop.plane_miss = 0
+                    # A just-connected tunnel gets one short grace. After that, misses count.
+                    if time.time() - float(getattr(fast_tunnel_liveness_loop, "forward_ok_at", 0) or 0) < 45:
                         time.sleep(FAST_LIVENESS_INTERVAL_SECONDS)
                         continue
                     misses = int(getattr(fast_tunnel_liveness_loop, "plane_miss", 0) or 0) + 1
                     fast_tunnel_liveness_loop.plane_miss = misses
-                    if misses >= 3:
+                    log_to_json("WARNING", "Proxy", f"隧道 {iface} 不通网 {misses}/2")
+                    if misses >= 2:
                         fast_tunnel_liveness_loop.plane_miss = 0
                         current = current_active_routing_endpoint() or {}
                         failed = str(current.get("endpoint_id") or active_pool_endpoint_id or "")
@@ -22317,9 +22319,27 @@ def background_proxy_checker() -> None:
                     continue
                 res = {"ok": False, "error": "活动 VPN 隧道进程或网卡已消失"}
             else:
-                # Tunnel process is up. Do not curl the web or probe QUIC.
-                # Mark the client usable from the live process so the badge
-                # does not stay on 不可用 after a restart.
+                # Process up is not enough. If the NIC does not forward, the client is down.
+                iface = str(proxy_server.get_active_interface() or "").strip()
+                if iface and not _iface_forwards(iface):
+                    set_state(
+                        client_proxy_ok=False,
+                        active_tunnel_ok=False,
+                        tunnel_role="STALE",
+                        proxy_error="对端不转发",
+                        last_check_message="当前隧道不转发，正在改用冷备",
+                    )
+                    log_to_json("WARNING", "Proxy", f"健康检查：隧道 {iface} 不通网，改走冷备")
+                    try:
+                        stop_all_tunnels()
+                    except Exception as exc:
+                        log_to_json("WARNING", "Proxy", f"拆掉不转发的隧道失败: {exc}")
+                    failed = str(active_pool_endpoint_id or active_openvpn_node_id or "")
+                    outcome = promote_cold_standby_to_main(exclude_endpoint_id=failed)
+                    if outcome not in ("up", "direct"):
+                        ensure_main_connection("当前隧道不转发", engage_proxy=True, force=True)
+                    time.sleep(PROXY_HEALTH_INTERVAL_SECONDS)
+                    continue
                 state_now = get_state()
                 updates: dict[str, Any] = {}
                 if state_now.get("client_quic_ok") is False or state_now.get("client_udp_ok") is False:
